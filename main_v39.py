@@ -1481,6 +1481,28 @@ DOMAIN_SUBJECT_NAME_KEYWORDS = {
 }
 
 
+def _query_is_toy_or_kids(query: str) -> bool:
+    """Запрос пользователя явно про игрушки/детское?"""
+    q = (query or '').lower().replace('ё', 'е')
+    return any(w in q for w in (
+        "игрушк", "игрушеч", "игров", "детск", "для детей", "малыш", "кукол",
+    ))
+
+
+def _card_conflicts_with_query(query: str, product_name: str, subject_name: str) -> bool:
+    """v27.8: если пользователь НЕ искал игрушки/детское, отбрасываем игрушечные
+    товары. Симптом: по запросу «бытовая техника» в выдачу WB попадали
+    «Утюг детский игрушечный», «Игрушечный миксер» и сверялись с сертификатом
+    на игрушки. Маркеры подобраны так, чтобы НЕ задевать обычные товары
+    (например «органайзер для игрушек» не содержит подстроку «игрушк»)."""
+    if _query_is_toy_or_kids(query):
+        return False
+    text = ((product_name or '') + ' ' + (subject_name or '')).lower().replace('ё', 'е')
+    return any(w in text for w in (
+        "игрушеч", "игрушк", "игровой набор", "для кукол",
+    ))
+
+
 def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '', product_name: str = '') -> bool:
     """v39.10: проверяет относится ли карточка к ожидаемому домену.
 
@@ -1709,6 +1731,11 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                 # Если subjectName пустой (WB иногда не отдаёт его), название карточки
                 # всё равно подскажет правильный домен.
                 if domain and not is_card_relevant_for_domain(subj_id, domain, subj_name, name):
+                    if stats is not None:
+                        stats['filtered_out'] = stats.get('filtered_out', 0) + 1
+                    continue
+                # v27.8: query-aware фильтр игрушек (если запрос не про игрушки/детское)
+                if _card_conflicts_with_query(query, name, subj_name):
                     if stats is not None:
                         stats['filtered_out'] = stats.get('filtered_out', 0) + 1
                     continue

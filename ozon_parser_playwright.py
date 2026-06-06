@@ -40,6 +40,13 @@ try:
         now_iso,
         _write_diagnostic_xlsx,
         _write_run_log,
+        # v27.7: переиспользуем готовый парсер JSON-виджетов и обогащение реестрами
+        parse_widget_states,
+        extract_documents_from_widgets,
+        extract_original_mark,
+        resolve_registry_url_from_documents,
+        enrich_registry_data,
+        _parse_price,
     )
 except ImportError as e:
     print(f"[FATAL] Не удалось импортировать ozon_parser: {e}")
@@ -101,6 +108,50 @@ if (origPermQuery) {
 async def _human_delay(min_s: float = 1.0, max_s: float = 3.0) -> None:
     """Имитация человеческой задержки."""
     await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+# Эндпоинты внутреннего JSON-API Ozon, которые отдают widgetStates.
+# Перехват их ответов — основной способ получить ЧИСТЫЕ данные карточки
+# (название, цена, продавец, документы, метка «Оригинал»), а не парсить
+# хрупкие/обфусцированные CSS-классы DOM.
+_OZON_API_MARKERS = (
+    "entrypoint-api.bx/page/json",
+    "composer-api.bx/page/json",
+)
+
+
+def _attach_widget_capture(page: "Page") -> Dict[str, str]:
+    """
+    Вешает на страницу обработчик ответов, который собирает widgetStates из
+    всех JSON-ответов Ozon-API в один общий словарь.
+
+    Возвращает dict, который наполняется асинхронно по мере прихода ответов.
+    Ключи — имена виджетов (как в widgetStates), значения — сырой JSON-текст.
+    """
+    captured: Dict[str, str] = {}
+
+    async def on_response(response: Any) -> None:
+        try:
+            url_r = response.url or ""
+            if not any(m in url_r for m in _OZON_API_MARKERS):
+                return
+            ctype = (response.headers or {}).get("content-type", "")
+            if "json" not in ctype.lower():
+                return
+            data = await response.json()
+            if isinstance(data, dict):
+                ws = data.get("widgetStates")
+                if isinstance(ws, dict):
+                    # Не затираем уже непустые значения пустыми
+                    for k, v in ws.items():
+                        if k not in captured or (v and not captured.get(k)):
+                            captured[k] = v
+        except Exception:
+            # Тихо игнорируем — это лишь один из многих ответов
+            pass
+
+    page.on("response", on_response)
+    return captured
 
 
 # ---------------------------------------------------------------------------
@@ -303,10 +354,20 @@ class OzonPlaywrightParser:
     # -----------------------------------------------------------------------
 
     async def parse_card(self, product_url: str, query: str = "") -> Optional[OzonResultRow]:
-        """Открывает карточку, извлекает поля, возвращает OzonResultRow."""
+        """
+        Открывает карточку и собирает данные.
+
+        v27.7: основной источник данных — перехват JSON-ответов Ozon-API
+        (widgetStates), которые парсятся готовыми parse_widget_states /
+        extract_documents_from_widgets / extract_original_mark из ozon_parser.
+        DOM-скрейпинг по CSS-селекторам остаётся лишь как fallback, если API
+        ничего не отдал. Это убирает зависимость от обфусцированных классов и,
+        главное, наполняет документы и реестровую ссылку.
+        """
         self.stats["cards_attempts"] += 1
         page = await self._context.new_page()
         try:
+            captured = _attach_widget_capture(page)
             try:
                 await page.goto(product_url, wait_until="domcontentloaded", timeout=self.card_timeout_ms)
             except Exception as e:
@@ -320,48 +381,120 @@ class OzonPlaywrightParser:
             content = await page.content()
             if any(s in content.lower() for s in ["проверка безопасности", "cloudflare", "captcha"]):
                 self.stats["cf_blocks"] += 1
-                # ждём
                 for _ in range(10):
                     await asyncio.sleep(1.0)
                     content = await page.content()
                     if not any(s in content.lower() for s in ["cloudflare", "captcha"]):
                         break
 
-            # Извлечение данных через JS
-            try:
-                card_data = await page.evaluate(self._CARD_EXTRACT_JS)
-            except Exception as e:
-                log.warning("JS-extract упал на %s: %s", product_url, e)
-                self.stats["cards_fail"] += 1
-                return self._empty_row(product_url, query, status=f"js_extract_error: {type(e).__name__}")
+            # Прокручиваем карточку — это триггерит ленивую подгрузку виджетов
+            # (характеристики, документы продавца, метка «Оригинал»),
+            # которые приходят отдельными entrypoint-api ответами.
+            for _ in range(4):
+                try:
+                    await page.evaluate("window.scrollBy(0, window.innerHeight * 1.2)")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.6)
+            # Даём дозагрузиться последним XHR
+            await asyncio.sleep(1.0)
 
             sku = _extract_sku_from_url(product_url)
+
+            # --- ОСНОВНОЙ путь: разбор перехваченных widgetStates ---
+            card = None
+            documents: List[Dict[str, Any]] = []
+            is_original = ""
+            original_info = ""
+            widgets_seen = len(captured)
+            if captured:
+                try:
+                    card = parse_widget_states(captured)
+                    documents = list(card.documents or [])
+                    if not documents:
+                        documents = extract_documents_from_widgets(captured)
+                    is_original = card.is_original or ""
+                    original_info = card.original_mark_info or ""
+                    if not is_original:
+                        is_original, original_info2 = extract_original_mark(captured)
+                        original_info = original_info or original_info2
+                except Exception as e:
+                    log.debug("Разбор widgetStates упал на %s: %s", product_url, e)
+                    card = None
+
+            # --- FALLBACK: DOM-скрейпинг, если API ничего не дал ---
+            dom = {}
+            if not card or not (card.product_name or "").strip():
+                try:
+                    dom = await page.evaluate(self._CARD_EXTRACT_JS)
+                except Exception as e:
+                    log.debug("DOM-fallback упал на %s: %s", product_url, e)
+                    dom = {}
+
+            # Собираем итоговые значения (приоритет — данные из API)
+            def _pick(api_val: Any, dom_val: Any) -> str:
+                s = str(api_val or "").strip()
+                return s if s else str(dom_val or "").strip()
+
+            product_name = _pick(getattr(card, "product_name", ""), dom.get("title"))
+            brand = _pick(getattr(card, "brand", ""), dom.get("brand"))
+            subject = _pick(getattr(card, "category", ""), dom.get("category"))
+            seller_name = _pick(getattr(card, "seller_name", ""), dom.get("seller"))
+            seller_url = _pick(getattr(card, "seller_url", ""), dom.get("seller_url"))
+            brand_url = _pick(getattr(card, "brand_url", ""), dom.get("brand_url"))
+            price_rub = float(getattr(card, "price_rub", 0.0) or 0.0) or _parse_price_text(dom.get("price") or "")
+            sale_price_rub = float(getattr(card, "sale_price_rub", 0.0) or 0.0) or _parse_price_text(dom.get("sale_price") or "")
+            rating = float(getattr(card, "rating", 0.0) or 0.0) or float(dom.get("rating") or 0.0)
+            feedbacks = int(getattr(card, "feedbacks", 0) or 0) or int(dom.get("reviews_count") or 0)
+            characteristics = getattr(card, "characteristics", None) or dom.get("chars") or []
+            if not documents and dom.get("docs"):
+                documents = dom.get("docs") or []
+            if not is_original:
+                is_original = dom.get("original_mark") or ""
+
+            # Резолвим реестровую ссылку из документов карточки
+            registry_url, registry_host, registry_record_id = "", "", ""
+            if documents:
+                try:
+                    registry_url, registry_host, registry_record_id = \
+                        resolve_registry_url_from_documents(documents)
+                except Exception as e:
+                    log.debug("resolve_registry_url упал на %s: %s", product_url, e)
+
+            # Честный подсчёт: карточка успешна только при непустом названии
+            ok = bool(product_name)
             row = OzonResultRow(
                 query=query,
                 nm_id=int(sku) if sku.isdigit() else 0,
-                product_name=(card_data.get("title") or "")[:500],
-                brand=(card_data.get("brand") or "")[:200],
-                subject=(card_data.get("category") or "")[:200],
+                product_name=product_name[:500],
+                brand=brand[:200],
+                subject=subject[:200],
                 product_url=product_url,
-                status="OK",
-                price_rub=_parse_price_text(card_data.get("price") or ""),
-                sale_price_rub=_parse_price_text(card_data.get("sale_price") or ""),
-                seller_name=(card_data.get("seller") or "")[:200],
-                supplier_id="",
-                rating=float(card_data.get("rating") or 0.0),
-                feedbacks=int(card_data.get("reviews_count") or 0),
-                is_original="",
+                status="OK" if ok else "EMPTY_CARD",
+                price_rub=price_rub,
+                sale_price_rub=sale_price_rub,
+                seller_name=seller_name[:200],
+                supplier_id=str(getattr(card, "seller_id", "") or ""),
+                rating=rating,
+                feedbacks=feedbacks,
+                is_original=is_original,
+                registry_url=registry_url,
+                registry_host=registry_host,
+                registry_record_id=registry_record_id,
                 checked_at=now_iso(),
                 ozon_sku=sku,
-                ozon_seller_url=card_data.get("seller_url") or "",
-                ozon_brand_url=card_data.get("brand_url") or "",
-                ozon_docs_raw=json.dumps(card_data.get("docs") or [], ensure_ascii=False)[:5000],
-                ozon_characteristics=json.dumps(card_data.get("chars") or [], ensure_ascii=False)[:5000],
-                ozon_original_mark_info=card_data.get("original_mark") or "",
-                details=f"playwright_card; widgets_seen={len(card_data.get('widgets', []))}",
+                ozon_seller_url=seller_url,
+                ozon_brand_url=brand_url,
+                ozon_docs_raw=json.dumps(documents or [], ensure_ascii=False)[:5000],
+                ozon_characteristics=json.dumps(characteristics or [], ensure_ascii=False)[:5000],
+                ozon_original_mark_info=original_info or "",
+                details=f"src={'api' if widgets_seen else 'dom'}; widgets={widgets_seen}; docs={len(documents)}",
                 worker="ozon_playwright",
             )
-            self.stats["cards_success"] += 1
+            if ok:
+                self.stats["cards_success"] += 1
+            else:
+                self.stats["cards_fail"] += 1
             return row
         finally:
             try:
@@ -504,6 +637,45 @@ class OzonPlaywrightParser:
 # Главный runner
 # ---------------------------------------------------------------------------
 
+def _apply_ozon_verdicts(rows: List[OzonResultRow]) -> None:
+    """
+    Выносит финальный вердикт сверки названия карточки с названием из реестра.
+
+    Переиспользует единый алгоритм compare_product_names из main_v39, чтобы
+    Ozon и WB оценивались одинаково по всем категориям. Вердикт пишется в
+    row.status — так же, как это делает WB-движок (status=verdict).
+    """
+    try:
+        from main_v39 import compare_product_names
+    except Exception as e:
+        log.warning("compare_product_names недоступна (%s) — вердикт пропущен", e)
+        return
+
+    BELGISS_HOSTS = ("belgiss.by", "www.belgiss.by", "tsouz.belgiss.by")
+    for r in rows:
+        if not r.registry_url:
+            continue
+        prod = (r.certificate_product_name or "").strip()
+        try:
+            verdict, score, cmp_details = compare_product_names(
+                r.product_name or "", prod,
+                brand=r.brand or "", subject=r.subject or "",
+                doc_status=r.document_status or "",
+            )
+        except Exception as e:
+            log.debug("compare_product_names упал: %s", e)
+            continue
+        if not prod and verdict != "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ":
+            if r.certificate_number and (r.registry_host or "") in BELGISS_HOSTS:
+                verdict, score = "НОМЕР ИЗВЛЕЧЁН ИЗ РЕЕСТРА", 0.5
+            else:
+                verdict, score = "НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА", 0.0
+        r.status = verdict
+        r.score = float(score or 0.0)
+        if cmp_details:
+            r.details = (r.details + " | " if r.details else "") + str(cmp_details)[:300]
+
+
 async def run_playwright_parser(
     query: str,
     limit: int,
@@ -596,6 +768,24 @@ async def run_playwright_parser(
             print(f"[Ozon-Playwright] карточки: {len(rows)} собрано за {time.time()-t1:.1f}с")
             diag.update({f"stat_{k}": v for k, v in parser.stats.items()})
             diag["items_collected"] = len(rows)
+
+        # --- Этап 3: обогащение данными из реестров (ФСА/SWIS/Belgiss) ---
+        # Это ГЛАВНАЯ функция проекта — в прежней версии она не вызывалась
+        # из браузерного пути, поэтому сверка с реестрами не выполнялась.
+        n_with_reg = sum(1 for r in rows if r.registry_url)
+        if n_with_reg:
+            print(f"[Ozon-Playwright] обогащение реестрами: {n_with_reg} карточек с реестровой ссылкой", flush=True)
+            t2 = time.time()
+            try:
+                rows = await enrich_registry_data(rows, workers=8, timeout_sec=12.0)
+            except Exception as e:
+                log.warning("Обогащение реестрами упало: %s", e)
+            # Финальный вердикт сверки названия карточки с названием из реестра
+            _apply_ozon_verdicts(rows)
+            print(f"[Ozon-Playwright] реестры обработаны за {time.time()-t2:.1f}с", flush=True)
+            diag["rows_with_registry"] = n_with_reg
+        else:
+            print("[Ozon-Playwright] реестровых ссылок в карточках не найдено", flush=True)
     except KeyboardInterrupt:
         print("[Ozon-Playwright] Прерван пользователем")
         diag["error"] = "interrupted"

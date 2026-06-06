@@ -1646,6 +1646,7 @@ tbody tr:last-child td { border-bottom: none; }
 .ml-auto { margin-left: auto; }
 hr.section-sep { border: none; border-top: 1px solid var(--border); margin: 0; }
 </style>
+<!--__CHARTJS_INLINE__-->
 </head>
 <body>
 <div id="toast-container"></div>
@@ -3011,7 +3012,10 @@ function drawSparkline(series) {
   ctx.stroke();
 }
 
-// Load Chart.js from CDN
+// Загрузка Chart.js. v27.7: библиотека встроена локально (offline) через
+// _build_frontend_html на стороне Python — поэтому window.Chart обычно уже
+// доступен сразу. CDN остаётся лишь аварийным fallback'ом, если локальный
+// файл vendor/chart.umd.min.js по какой-то причине не встроился.
 function loadChartJs() {
   return new Promise((resolve, reject) => {
     if (window.Chart) { resolve(); return; }
@@ -3112,6 +3116,33 @@ def check_python_deps() -> List[str]:
     return missing
 
 
+def _build_frontend_html() -> str:
+    """
+    Возвращает HTML интерфейса со ВСТРОЕННОЙ библиотекой Chart.js (offline).
+
+    v27.7: раньше Chart.js грузился с интернет-CDN (cdn.jsdelivr.net) — без
+    сети графики молча не рисовались (главная причина жалоб на интерфейс).
+    Теперь локальный vendor/chart.umd.min.js инлайнится прямо в HTML, и графики
+    работают полностью офлайн. Если файла нет — остаётся CDN-fallback в JS.
+    """
+    html = FRONTEND_HTML
+    try:
+        chart_path = APP_DIR / "vendor" / "chart.umd.min.js"
+        if chart_path.exists():
+            js = chart_path.read_text(encoding="utf-8")
+            # Закрывающий </script> внутри библиотеки маловероятен, но на всякий
+            # случай экранируем, чтобы не разорвать наш inline-блок.
+            js = js.replace("</script>", "<\\/script>")
+            inline = "<script>\n" + js + "\n</script>"
+            html = html.replace("<!--__CHARTJS_INLINE__-->", inline, 1)
+            log.info("Chart.js встроен локально (%d КБ) — графики работают офлайн", len(js) // 1024)
+        else:
+            log.warning("vendor/chart.umd.min.js не найден — графики будут грузиться с CDN (нужен интернет)")
+    except Exception as e:
+        log.warning("Не удалось встроить Chart.js локально: %s — fallback на CDN", e)
+    return html
+
+
 def main() -> None:
     """Запускает приложение WB+Ozon Checker v27."""
     check_engines()
@@ -3126,7 +3157,7 @@ def main() -> None:
     bridge._missing_deps = missing
     window = webview.create_window(
         title="WB+Ozon Checker v27",
-        html=FRONTEND_HTML,
+        html=_build_frontend_html(),
         js_api=bridge,
         width=1400,
         height=900,

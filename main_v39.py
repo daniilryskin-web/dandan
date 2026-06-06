@@ -215,8 +215,13 @@ def _walk_leaves(obj: Any, path: Tuple[str, ...] = ()) -> List[Tuple[Tuple[str, 
     return out
 
 
-def _find_value(leaves, include_any, include_all=(), exclude_any=()):
-    """Найти первое значение чей путь содержит ключевые слова."""
+def _find_value(leaves, include_any, include_all=(), exclude_any=(), require_text=False):
+    """Найти первое значение чей путь содержит ключевые слова.
+
+    require_text=True: пропускать чисто числовые значения — это почти всегда
+    идентификаторы (idManufacturer, idScheme, idTechReg), а не название/код,
+    которое нужно человеку.
+    """
     inc_any = [s.lower() for s in include_any]
     inc_all = [s.lower() for s in include_all]
     exc_any = [s.lower() for s in exclude_any]
@@ -233,6 +238,8 @@ def _find_value(leaves, include_any, include_all=(), exclude_any=()):
         if isinstance(v, (dict, list)):
             continue
         s = str(v).strip()
+        if require_text and re.fullmatch(r"\d+([.,]\d+)?", s):
+            continue  # чисто числовое — это ID, не название
         if s and len(s) < 2000:
             return s
     return ""
@@ -263,14 +270,23 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
         "status_basis": _find_value(leaves, ("statusbasis", "status_basis", "decisionnumber"), exclude_any=("date",)),
         "date_start": _format_date(_find_value(leaves, ("certregdate", "regdate", "datestart", "date_start", "issuedate"), exclude_any=("end", "expir"))),
         "date_end": _format_date(_find_value(leaves, ("certenddate", "datetill", "dateend", "date_end", "expirationdate"))),
-        "applicant": _find_value(leaves, ("applicant", "fullname"), include_all=("applicant",)) or _find_value(leaves, ("applicantname",)),
+        "applicant": _find_value(leaves, ("applicant", "fullname"), include_all=("applicant",), require_text=True) or _find_value(leaves, ("applicantname",), require_text=True),
         "applicant_inn": _find_value(leaves, ("applicantinn", "applicant_inn"), include_all=("applicant",)) or _find_value(leaves, ("inn",), include_all=("applicant",)),
-        "manufacturer": _find_value(leaves, ("manufacturer", "fullname"), include_all=("manufacturer",)) or _find_value(leaves, ("manufacturername",)),
-        "product_group": _find_value(leaves, ("productgroup", "product_group")),
-        "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group")),
+        # v27.8: имя изготовителя — только текст (раньше хватало idManufacturer=число).
+        # Ищем поле name/fullName в контексте manufacturer, либо отдельный объект изготовителя.
+        "manufacturer": (
+            _find_value(leaves, ("fullname", "shortname", "name"), include_all=("manufacturer",), require_text=True)
+            or _find_value(leaves, ("manufacturername",), require_text=True)
+            or _find_value(leaves, ("manufacturer",), include_all=("manufacturer",),
+                           exclude_any=("id", "inn", "ogrn", "kpp", "type", "country", "region", "address", "phone", "email", "date"),
+                           require_text=True)
+        ),
+        "product_group": _find_value(leaves, ("productgroup", "product_group"), require_text=True),
+        "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group"), require_text=True),
         "tnved": _find_value(leaves, ("tnved", "tncode", "tn_ved")),
-        "scheme": _find_value(leaves, ("scheme",)),
-        "technical_regulation": _find_value(leaves, ("techreg", "technicalregulation", "technical_regulation")),
+        # v27.8: схема и техрегламент — текстовые коды/названия, не числовые ID.
+        "scheme": _find_value(leaves, ("schemecode", "schemename", "scheme"), exclude_any=("id",), require_text=True),
+        "technical_regulation": _find_value(leaves, ("techreg", "technicalregulation", "technical_regulation", "reglament", "регламент"), exclude_any=("id",), require_text=True),
         "evidence": _find_value(leaves, ("evidence",)),
         "source": f"curl_cffi:{url}",
     }

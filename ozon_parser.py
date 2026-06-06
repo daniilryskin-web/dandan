@@ -197,6 +197,9 @@ class OzonCard:
     images: List[str] = field(default_factory=list)
     characteristics: List[Dict[str, Any]] = field(default_factory=list)
     documents: List[Dict[str, Any]] = field(default_factory=list)  # webProductDocuments
+    # Сохраняем сырой widgetStates для fallback-извлечения документов/плашек,
+    # потому что Ozon регулярно переносит сертификаты между виджетами.
+    raw_widget_states: Dict[str, str] = field(default_factory=dict)
     is_original: str = ""           # "Да" / "Нет" / ""
     original_mark_info: str = ""
     description: str = ""
@@ -723,6 +726,7 @@ def parse_widget_states(widget_states: Dict[str, str]) -> OzonCard:
     webSeller для продавца и т.д.
     """
     card = OzonCard(sku="")
+    card.raw_widget_states = dict(widget_states)
 
     for widget_key, widget_raw in widget_states.items():
         try:
@@ -1051,8 +1055,9 @@ class OzonClient:
         Возвращает (список товаров, next_page_url или None).
         Каждый товар — dict с полями: sku, title, url, price, finalPrice, ...
         """
-        encoded_query = urllib.parse.quote(query)
-        url_path = f"/search/?text={encoded_query}&page={page}"
+        # fetch_json передаёт url_path через params, поэтому aiohttp сам один раз
+        # кодирует кириллицу. Предварительное quote() ломало запрос (% → %25).
+        url_path = f"/search/?text={query}&page={page}"
         data = await self.fetch_json(url_path)
         if data is None:
             return [], None
@@ -1139,6 +1144,40 @@ class OzonClient:
 # Search item extractors — вспомогательные функции для парсинга поисковых результатов
 # ---------------------------------------------------------------------------
 
+def _iter_dict_nodes(obj: Any, max_depth: int = 9) -> List[Dict[str, Any]]:
+    """Возвращает вложенные dict из произвольного JSON с ограничением глубины."""
+    out: List[Dict[str, Any]] = []
+
+    def walk(node: Any, depth: int) -> None:
+        if depth < 0:
+            return
+        if isinstance(node, dict):
+            out.append(node)
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth - 1)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    walk(value, depth - 1)
+
+    walk(obj, max_depth)
+    return out
+
+
+def _looks_like_ozon_product(item: Dict[str, Any]) -> bool:
+    """Фильтр для рекурсивного извлечения товаров из новых search-виджетов."""
+    parsed = _normalize_search_item(item)
+    if not parsed:
+        return False
+    sku = parsed.get("sku", "")
+    title = parsed.get("title", "")
+    url = parsed.get("url", "")
+    if sku and (title or url):
+        return True
+    return bool(url and "/product/" in url and _extract_sku_from_url(url))
+
+
 def _extract_search_items(widget: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Пытается извлечь список товаров из поискового виджета.
@@ -1163,6 +1202,21 @@ def _extract_search_items(widget: Dict[str, Any]) -> List[Dict[str, Any]]:
                 parsed = _normalize_search_item(item)
                 if parsed:
                     items.append(parsed)
+
+    # Структура 3: универсальный fallback для новых/переименованных виджетов.
+    if not items:
+        seen_keys: Set[str] = set()
+        for node in _iter_dict_nodes(widget):
+            if not _looks_like_ozon_product(node):
+                continue
+            parsed = _normalize_search_item(node)
+            if not parsed:
+                continue
+            key = parsed.get("sku") or parsed.get("url") or parsed.get("title")
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            items.append(parsed)
 
     return items
 
@@ -1200,8 +1254,13 @@ def _normalize_search_item(item: Any) -> Optional[Dict[str, Any]]:
 
     # URL
     url = str(item.get("url") or item.get("link") or item.get("href") or "")
+    action = item.get("action") or item.get("clickAction") or {}
+    if not url and isinstance(action, dict):
+        url = str(action.get("link") or action.get("url") or action.get("href") or "")
     if url and not url.startswith("http"):
-        url = "https://www.ozon.ru" + url
+        url = "https://www.ozon.ru" + (url if url.startswith("/") else "/" + url)
+    if not sku and url:
+        sku = _extract_sku_from_url(url)
 
     # Цена
     price_raw = (item.get("price") or item.get("originalPrice") or
@@ -1215,6 +1274,9 @@ def _normalize_search_item(item: Any) -> Optional[Dict[str, Any]]:
         m = re.search(r"/product/([^/?#]+)", url)
         if m:
             slug = m.group(1)
+
+    if not (sku or title or url):
+        return None
 
     return {
         "sku": sku,
@@ -1439,6 +1501,101 @@ def resolve_registry_url_from_documents(
 # Main collection flow
 # ---------------------------------------------------------------------------
 
+async def fetch_search_playwright(query: str, limit: int = 100, headless: bool = True) -> List[Dict[str, Any]]:
+    """Browser fallback поиска Ozon, если composer-api заблокирован/сменил виджеты."""
+    if not PLAYWRIGHT_OK or async_playwright is None:
+        return []
+    url = f"https://www.ozon.ru/search/?text={urllib.parse.quote(query)}"
+    items: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    browser = None
+    pw = None
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            locale="ru-RU",
+            viewport={"width": 1440, "height": 1200},
+        )
+        page = await ctx.new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        for _ in range(5):
+            await page.mouse.wheel(0, 1800)
+            await page.wait_for_timeout(900)
+            if len(items) >= limit:
+                break
+        payload = await page.evaluate(
+            """
+            () => ({
+              anchors: Array.from(document.querySelectorAll('a[href*="/product/"]')).map(a => ({
+                href: a.href,
+                text: (a.innerText || a.getAttribute('title') || '').trim()
+              })),
+              scripts: Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean).slice(0, 80)
+            })
+            """
+        )
+        for a in payload.get("anchors", []):
+            href = str(a.get("href") or "")
+            if "/product/" not in href:
+                continue
+            sku = _extract_sku_from_url(href)
+            key = sku or href
+            if key in seen:
+                continue
+            seen.add(key)
+            m = re.search(r"/product/([^/?#]+)", href)
+            items.append({
+                "sku": sku,
+                "title": clean_text(str(a.get("text") or "")),
+                "url": href,
+                "slug": m.group(1) if m else "",
+                "price": 0.0,
+                "finalPrice": 0.0,
+                "brand": "",
+            })
+            if len(items) >= limit:
+                break
+        if len(items) < limit:
+            script_text = "\n".join(payload.get("scripts", []))
+            for href in re.findall(r"https?://www\.ozon\.ru/product/[^\\\"'<>\\s]+|/product/[^\\\"'<>\\s]+", script_text):
+                href = href.replace("\\/", "/")
+                if href.startswith("/"):
+                    href = "https://www.ozon.ru" + href
+                sku = _extract_sku_from_url(href)
+                key = sku or href
+                if key in seen:
+                    continue
+                seen.add(key)
+                m = re.search(r"/product/([^/?#]+)", href)
+                items.append({"sku": sku, "title": "", "url": href, "slug": m.group(1) if m else "", "price": 0.0, "finalPrice": 0.0, "brand": ""})
+                if len(items) >= limit:
+                    break
+        await ctx.close()
+        return items[:limit]
+    except Exception as e:
+        log.warning("Playwright fallback поиска Ozon не сработал: %s", e)
+        return items[:limit]
+    finally:
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                await pw.stop()
+        except Exception:
+            pass
+
+
 # Глобальная диагностика последнего прогона — читается в run() и пишется в xlsx
 LAST_SEARCH_DIAGNOSTICS: Dict[str, Any] = {}
 
@@ -1540,6 +1697,14 @@ async def collect_search_results(
                 LAST_SEARCH_DIAGNOSTICS["diagnosis"] = " | ".join(reasons)
                 log.warning("Диагноз: %s", LAST_SEARCH_DIAGNOSTICS["diagnosis"])
 
+    if not all_items and PLAYWRIGHT_OK:
+        log.info("composer-api не дал товаров — пробуем Playwright fallback поиска Ozon")
+        browser_items = await fetch_search_playwright(query, limit=limit, headless=True)
+        if browser_items:
+            all_items.extend(browser_items)
+            LAST_SEARCH_DIAGNOSTICS["playwright_search_fallback_items"] = len(browser_items)
+            LAST_SEARCH_DIAGNOSTICS["diagnosis"] = "Использован Playwright fallback поиска Ozon"
+
     log.info("Собрано %d товаров для запроса '%s'", len(all_items), query)
     return all_items[:limit]
 
@@ -1635,12 +1800,19 @@ async def enrich_cards(
             if not card.product_url:
                 card.product_url = product_url
 
-            # Ищем реестровые документы
-            all_docs = card.documents
-            if not all_docs:
-                all_docs = extract_documents_from_widgets(
-                    {}  # уже было вызвано внутри parse_card
-                )
+            # Ищем реестровые документы: объединяем явно распознанный
+            # webProductDocuments и общий проход по сырым widgetStates.
+            all_docs = list(card.documents or [])
+            widget_docs = extract_documents_from_widgets(card.raw_widget_states)
+            if widget_docs:
+                seen_doc_urls = {str(d.get("url") or "") for d in all_docs if isinstance(d, dict)}
+                for doc in widget_docs:
+                    doc_url = str(doc.get("url") or "")
+                    if doc_url and doc_url in seen_doc_urls:
+                        continue
+                    all_docs.append(doc)
+                    if doc_url:
+                        seen_doc_urls.add(doc_url)
 
             # Дополнительно: ищем в характеристиках
             chars_text = json.dumps(card.characteristics, ensure_ascii=False)
@@ -2083,6 +2255,7 @@ def _write_diagnostic_xlsx(
         "pages_tried", "total_requests", "http_403", "http_307",
         "curl_cffi_available", "curl_cffi_success", "curl_cffi_fail",
         "aiohttp_available", "playwright_available",
+        "playwright_search_fallback_items",
         "items_collected", "diagnosis", "error",
     ):
         if k in diagnostics:
@@ -2163,7 +2336,19 @@ async def run(
         headless=headless,
     )
 
-    print(f"[Ozon] Обработано {len(results)} карточек. Сохраняю...")
+    print(f"[Ozon] Обработано {len(results)} карточек. Проверяю реестры...")
+
+    # --- Этап 3: обогащение реестрами (ФСА — только браузерный путь) ---
+    results = await enrich_registry_data(
+        results,
+        workers=max(1, min(workers, 6)),
+        timeout_sec=30.0,
+        fsa=True,
+        swis=True,
+        belgiss=True,
+    )
+
+    print(f"[Ozon] Реестры проверены. Сохраняю...")
 
     # --- Сохранение CSV ---
     csv_path = output_path.with_suffix(".csv")
@@ -2968,55 +3153,115 @@ async def fetch_fsa_document_async(
 
 async def enrich_with_fsa_data(
     rows: List[OzonResultRow],
-    workers: int = 10,
-    timeout_sec: float = 10.0,
+    workers: int = 4,
+    timeout_sec: float = 30.0,
 ) -> List[OzonResultRow]:
     """
-    Второй мини-этап: для строк с registry_url на pub.fsa.gov.ru
-    загружает детали документа (номер, статус, даты, заявитель и т.д.)
-    через HTTP curl_cffi.
+    Обогащает строки ФСА только браузерным путём.
 
-    Обновляет поля OzonResultRow на месте (возвращает тот же список).
+    По требованию проекта для pub.fsa.gov.ru не используем прямой HTTP/API в
+    production-run: открываем SPA-страницы Chromium, ждём рендеринга и парсим
+    видимый текст тем же strict-парсером, что используется WB-движком.
     """
-    if not CURL_CFFI_OK:
-        log.info("curl_cffi не установлен — обогащение данными ФСА пропущено")
-        return rows
-
     fsa_rows = [
         (i, r) for i, r in enumerate(rows)
-        if r.registry_url and "fsa.gov.ru" in r.registry_url
-        and not r.certificate_number  # Не перезаписываем уже заполненные
+        if r.registry_url and "fsa.gov.ru" in r.registry_url and not r.certificate_number
     ]
-
     if not fsa_rows:
         return rows
+    if not PLAYWRIGHT_OK or async_playwright is None:
+        log.info("Playwright не установлен — браузерное обогащение ФСА пропущено")
+        for _, row in fsa_rows:
+            if row.details:
+                row.details += "; "
+            row.details += "FSA browser enrich skipped: Playwright not installed"
+        return rows
 
-    log.info("Обогащение данными ФСА: %d строк из %d", len(fsa_rows), len(rows))
-    sem = asyncio.Semaphore(workers)
-    counter = [0]
+    try:
+        from main_v39 import parse_html_registry as _parse_registry_visible_text  # type: ignore
+    except Exception as e:
+        log.info("Не удалось импортировать strict-парсер ФСА из main_v39.py: %s", e)
+        return rows
+
+    log.info("Браузерное обогащение ФСА: %d строк из %d", len(fsa_rows), len(rows))
+    sem = asyncio.Semaphore(max(1, min(workers, 6)))
+    pw = None
+    browser = None
+
+    def _fsa_product_url(url: str) -> str:
+        kind, doc_id = extract_fsa_kind_id(url)
+        if not kind or not doc_id:
+            return url
+        if kind == "rss_certificate":
+            return f"https://pub.fsa.gov.ru/rss/certificate/view/{doc_id}/product"
+        return f"https://pub.fsa.gov.ru/rds/declaration/view/{doc_id}/product"
+
+    async def _visible_text(page: Any, url: str) -> str:
+        await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_sec * 1000))
+        await page.wait_for_timeout(6000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        return await page.evaluate("() => document.body ? document.body.innerText : ''")
 
     async def process_fsa_row(idx: int, row: OzonResultRow) -> None:
         async with sem:
+            context = None
             try:
-                result = await fetch_fsa_document_async(row.registry_url, timeout_sec=timeout_sec)
-                if result:
-                    for field_name, value in result.items():
-                        if hasattr(row, field_name) and value:
-                            current = getattr(row, field_name, "")
-                            if not current:
-                                setattr(row, field_name, value)
-                    # Обновляем статус если получили данные
-                    if result.get("certificate_number") and row.status == STATUS_LINK_COLLECTED:
-                        row.status = STATUS_LINK_COLLECTED + " (подтверждено ФСА)"
+                context = await browser.new_context(  # type: ignore[union-attr]
+                    locale="ru-RU",
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    ),
+                )
+                page = await context.new_page()
+                base_text = await _visible_text(page, row.registry_url)
+                cert, prod, typ = _parse_registry_visible_text(row.registry_url, base_text)
+                product_url = _fsa_product_url(row.registry_url)
+                if product_url != row.registry_url:
+                    product_text = await _visible_text(page, product_url)
+                    cert2, prod2, typ2 = _parse_registry_visible_text(product_url, product_text)
+                    cert = cert or cert2
+                    prod = prod or prod2
+                    typ = typ or typ2
+                if cert and not row.certificate_number:
+                    row.certificate_number = cert
+                if prod and not row.certificate_product_name:
+                    row.certificate_product_name = prod
+                if typ and not row.document_type:
+                    row.document_type = typ
+                if cert or prod:
+                    row.status = STATUS_LINK_COLLECTED + " (подтверждено ФСА браузером)"
+                row.details = (row.details + "; " if row.details else "") + "FSA browser enrich"
             except Exception as e:
-                log.debug("FSA enrich error для %s: %s", row.registry_url, e)
+                row.details = (row.details + "; " if row.details else "") + f"FSA browser enrich error: {type(e).__name__}: {str(e)[:160]}"
             finally:
-                counter[0] += 1
-                if counter[0] % 10 == 0:
-                    log.info("FSA обогащение: %d/%d", counter[0], len(fsa_rows))
+                try:
+                    if context:
+                        await context.close()
+                except Exception:
+                    pass
 
-    tasks = [process_fsa_row(i, r) for i, r in fsa_rows]
-    await asyncio.gather(*tasks)
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        await asyncio.gather(*[process_fsa_row(i, r) for i, r in fsa_rows])
+    finally:
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                await pw.stop()
+        except Exception:
+            pass
 
     return rows
 
@@ -3292,7 +3537,7 @@ async def enrich_registry_data(
     """
     Полный цикл обогащения данными из реестров.
     Обрабатывает все реестровые URL параллельно по типам:
-    - ФСА (pub.fsa.gov.ru) через curl_cffi
+    - ФСА (pub.fsa.gov.ru) только через браузерный Playwright-путь
     - SWIS (swis.trade.kg) через HTML
     - Belgiss (belgiss.by, tsouz.belgiss.by) через HTML
 
@@ -3959,7 +4204,7 @@ MODULE_DEPENDENCIES = [
     "aiohttp>=3.8.0",
     "openpyxl>=3.0.0",
     "playwright>=1.30.0 (optional, for Cloudflare fallback)",
-    "curl_cffi>=0.5.0 (optional, for FSA HTTP)",
+    "curl_cffi>=0.5.0 (optional, for legacy diagnostics)",
     "beautifulsoup4>=4.9.0 (optional, for SWIS HTML)",
 ]
 

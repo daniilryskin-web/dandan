@@ -1,7 +1,15 @@
-# WB+Ozon Checker v27.1
+# WB+Ozon Checker v27.2
 
 Программа для сбора карточек Wildberries и Ozon, извлечения ссылок на документы,
 сверки с реестрами (ФСА, SWIS, BelGISS, EAEU) и выдачи финального вердикта.
+
+## Что нового в v27.2
+
+- Ozon: исправлено двойное URL-кодирование поискового запроса, из-за которого кириллический поиск мог возвращать 0 карточек.
+- Ozon: добавлен рекурсивный разбор новых search-виджетов и браузерный fallback поиска через публичную страницу Ozon.
+- Ozon: ссылки на реестры теперь извлекаются из всех `widgetStates`, а не только из `webProductDocuments`.
+- Ozon: этап реестров включён в основной `run()`, ФСА обогащается только браузерным путём через Playwright.
+- Добавлены unit-тесты для новых сценариев Ozon.
 
 ## Что нового в v27.1 (хотфикс)
 
@@ -35,7 +43,7 @@ python wb_checker.py
 | `wb_checker.py` | Главное pywebview-приложение с UI |
 | `main_v39.py` | WB query-движок (поиск по запросу + реестры) |
 | `main_brand.py` | WB brand-движок (поиск по бренду) |
-| `ozon_parser.py` | Ozon-парсер (mobile API + карточки + реестры) |
+| `ozon_parser.py` | Ozon-парсер (composer-api + browser fallback + карточки + реестры; ФСА только браузером) |
 | `fsa_enhanced.py` | Расширенный парсер реестра ФСА (54 поля) |
 | `wb_enhanced.py` | Устойчивый сбор продавца WB и плашки «Оригинал» |
 | `wb_gui_modern.py` | Альтернативный UI (customtkinter) |
@@ -55,7 +63,7 @@ python wb_checker.py
 
 ## Реестры
 
-- **ФСА** (`pub.fsa.gov.ru`) — полный парсинг через REST API (54 поля)
+- **ФСА** (`pub.fsa.gov.ru`) — браузерный SPA-путь через Chromium/Playwright; прямой HTTP/API для production-обогащения Ozon отключён
 - **SWIS** (`swis.trade.kg`) — полный парсинг HTML
 - **BelGISS** и **EAEU** — собирается только ссылка на документ
 

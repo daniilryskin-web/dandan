@@ -1855,8 +1855,9 @@ async def collect_cards(args) -> List[Card]:
     if bool(getattr(args, 'check_original', True)) and final_cards:
         try:
             from wb_enhanced import WBEnhancedClient as _WBEnh
-            print(f"🔍 Проверяю плашку «Оригинальный товар» для {len(final_cards)} карточек через wb_enhanced...")
-            client = _WBEnh()
+            _orig_domains = [d.strip() for d in str(getattr(args, 'check_original_domains', 'ru') or 'ru').split(',') if d.strip()]
+            print(f"🔍 Проверяю плашку «Оригинальный товар» для {len(final_cards)} карточек через wb_enhanced (домены: {','.join(_orig_domains)})...")
+            client = _WBEnh(html_domains=_orig_domains)
             # Сбросим старую "не указано" — иначе enrich_cards_batch пропустит их (truthy-check).
             for _c in final_cards:
                 try:
@@ -6774,8 +6775,10 @@ def build_parser():
     # v27.5: проверка плашки «Оригинальный товар» через wb_enhanced. По умолчанию включено.
     ap.add_argument("--check-original", type=str_to_bool, default=True,
                     help="Проверять плашку «Оригинальный товар» через HTML-страницу WB и basket card.json (wb_enhanced).")
-    ap.add_argument("--check-original-workers", type=int, default=10,
-                    help="Сколько параллельных воркеров для проверки оригинальности.")
+    ap.add_argument("--check-original-workers", type=int, default=20,
+                    help="Сколько параллельных воркеров для проверки оригинальности. v27.7: поднято 10→20 — после сведения проверки к одному домену (ru) нагрузка на карточку упала ~4×, можно больше параллелизма.")
+    ap.add_argument("--check-original-domains", default="ru",
+                    help="Доменные зоны WB для HTML-проверки плашки «Оригинал», через запятую. По умолчанию только 'ru' (быстро). Можно 'ru,by,kg,ge' для максимального покрытия (медленнее ~4×).")
 
     ap.add_argument("--browser-count", type=int, default=2, help="Сколько процессов Chromium держать одновременно. Воркеры распределяются между ними как контексты/страницы")
     ap.add_argument("--workers", type=int, default=8)
@@ -6840,8 +6843,8 @@ def build_parser():
                     help="v40.3: дотягивать имена продавцов (seller_name) через card.wb.ru detail API. WB-поиск отдаёт только supplierId. true/false (default true).")
     ap.add_argument("--cert-timeout-sec", type=float, default=6.0,
                     help="таймаут одного запроса к basket-NN.wbbasket.ru/certificate.json")
-    ap.add_argument("--cert-max-hosts", type=int, default=30,
-                    help="сколько basket-шардов пробовать на карточку (1..30). 30 = все шарды, надёжнее всего определяет наличие json.")
+    ap.add_argument("--cert-max-hosts", type=int, default=8,
+                    help="сколько basket-шардов пробовать на карточку (1..30). v27.7: уменьшено 30→8. Первым идёт детерминированно вычисленный по vol шард, затем соседи ±2 и популярные 13/12/14 — этого хватает практически всегда, а худший случай (карточка без документа) ускоряется ~4×: было до 30 последовательных 404, стало 8. Для максимальной надёжности можно вернуть 30.")
     ap.add_argument("--no-docs-confirm-404", type=int, default=0,
                     help="v40: устарел (логика теперь автоматическая: все честные 404 = нет документов, сетевая ошибка = повтор). Оставлен для совместимости команд.")
     # v39.13: HTTP fast-path для FSA-парсинга на 2 этапе

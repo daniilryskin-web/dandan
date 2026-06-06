@@ -1,0 +1,28 @@
+# WB+Ozon Checker v27 — зависимости
+# Установка одной командой:
+#   python -m pip install -U -r requirements.txt
+#   python -m playwright install chromium
+
+# Основной UI (нативное окно с HTML/CSS/JS)
+pywebview>=5.0
+
+# Excel-отчёт
+openpyxl>=3.1.0
+
+# HTTP / async
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Обход TLS-fingerprint для ФСА (КРИТИЧНО — без этого ФСА не работает)
+curl_cffi>=0.7.0
+
+# Браузерный fallback (для запроса карточек когда HTTP не работает,
+# и для строгого UI-пути к документам в WB)
+playwright>=1.40.0
+
+# HTML-парсинг (SWIS, BelGISS, публичный HTML WB)
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Опциональный современный Tkinter UI (альтернатива pywebview)
+customtkinter>=5.2.0

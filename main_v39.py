@@ -6134,6 +6134,160 @@ async def _parse_swis_with_existing_page_v386(page, url: str, args) -> Tuple[str
         return '', '', '', '', f'swis_browser_error={type(e).__name__}: {str(e)[:120]}'
 
 
+# ---------------------------------------------------------------------------
+# v27.7: HTTP-парсер киргизского реестра SWIS (требование: только HTTP-путь).
+# Страница swis.trade.kg отдаётся сервером готовым HTML (НЕ SPA), поэтому
+# браузер не нужен. Данные лежат в <table> внутри
+# <div class="ComplianceDeclaration_public_table_view"> строками вида
+# <tr><td>Лейбл</td><td>Значение</td></tr>, разделы — <th colspan="2">.
+# Разбор ведётся С УЧЁТОМ текущего раздела, потому что лейбл «Полное
+# наименование» встречается и у Заявителя, и у Изготовителя.
+# ---------------------------------------------------------------------------
+
+def _swis_cell_text(td) -> str:
+    """Текст ячейки SWIS с сохранением кусочков <span class="Value"> через пробел."""
+    spans = td.find_all("span", class_="Value")
+    if spans:
+        parts = [s.get_text(" ", strip=True) for s in spans]
+        return clean_registry_value(" ".join(p for p in parts if p))
+    return clean_registry_value(td.get_text(" ", strip=True))
+
+
+def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
+    """Разбирает HTML-страницу SWIS (сертификат/декларация ТС или KGZ-National).
+
+    Возвращает dict со всеми извлечёнными полями. Раздел отслеживается по
+    строкам-заголовкам <th>, чтобы корректно различать «Полное наименование»
+    Заявителя и Изготовителя.
+    """
+    out: Dict[str, str] = {}
+    homogeneous: List[str] = []
+    full_products: List[str] = []
+    tnved_codes: List[str] = []
+
+    if not BeautifulSoup:
+        return out
+    soup = BeautifulSoup(text or "", "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    section = ""  # текущий раздел (Заявитель / Изготовитель / ...)
+    for tr in soup.find_all("tr"):
+        th = tr.find("th")
+        if th is not None:
+            section = norm_text(th.get_text(" ", strip=True))
+            continue
+        tds = tr.find_all("td", recursive=False) or tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        label = norm_text(tds[0].get_text(" ", strip=True))
+        value = _swis_cell_text(tds[1])
+        if not label or not value:
+            continue
+
+        # --- Общие сведения ---
+        if "регистрационный номер документа" in label and not out.get("cert_number"):
+            out["cert_number"] = value
+        elif label.startswith("учетный номер") and not out.get("blank_number"):
+            out["blank_number"] = value
+        elif "дата начала действия" in label and not out.get("date_start"):
+            out["date_start"] = value
+        elif "дата окончания действия" in label and not out.get("date_end"):
+            out["date_end"] = value
+        elif "признак действия" in label and not out.get("status"):
+            out["status"] = _normalize_doc_status(value)
+
+        # --- Заявитель ---
+        elif "заявител" in section:
+            if label == "полное наименование" and not out.get("applicant_name"):
+                out["applicant_name"] = _clean_org_name(value)
+            elif label == "инн" and not out.get("applicant_inn"):
+                out["applicant_inn"] = value
+
+        # --- Изготовитель ---
+        elif "изготовител" in section:
+            if "полное наименование" in label and not out.get("manufacturer_name"):
+                out["manufacturer_name"] = _clean_org_name(value)
+
+        # --- Сведения о продукции / Товар N (раздел может быть любым) ---
+        if "однородное наименование продукции" in label:
+            v = _trim_product_value(value)
+            if _looks_like_product_value(v):
+                homogeneous.append(v)
+        elif "полное наименование продукции" in label and "идентификац" in label:
+            v = _trim_product_value(value)
+            if _looks_like_product_value(v) and not _swis_value_is_not_product(v):
+                full_products.append(v)
+        elif "схема сертификации" in label and not out.get("scheme"):
+            out["scheme"] = value[:40]
+        elif ("обозначение тр" in label or "технического регламента" in label or
+              "технический регламент" in label) and not out.get("technical_regulation"):
+            out["technical_regulation"] = value[:400]
+        elif ("тн вэд" in label) and value not in tnved_codes:
+            code = _clean_tnved_code(value)
+            if code:
+                tnved_codes.append(code)
+
+    # Итоговое наименование продукции: однородное (чистое для сверки) + детальные
+    homogeneous = _unique_keep_order(homogeneous)
+    full_products = _unique_keep_order(full_products)
+    product_parts: List[str] = []
+    product_parts.extend(homogeneous[:5])
+    product_parts.extend(full_products[:20])
+    if product_parts:
+        out["product"] = "; ".join(_unique_keep_order(product_parts))
+    if tnved_codes:
+        out["tnved"] = "; ".join(tnved_codes[:10])
+
+    # Тип документа — ТОЛЬКО по заголовку страницы (в теле есть навигация с
+    # обоими словами). Заголовок SWIS иногда содержит латинскую 'c' в слове
+    # «cертификате» — нормализуем латиницу в кириллицу перед проверкой.
+    head_txt = norm_text(soup.title.get_text() if soup.title else "")
+    head_txt = head_txt.replace("c", "с").replace("a", "а").replace("o", "о").replace("e", "е")
+    if "деклараци" in head_txt:
+        out["doc_type"] = "декларация"
+    else:
+        out["doc_type"] = "сертификат"
+    return out
+
+
+async def _parse_swis_http_v277(session, url: str, args) -> Tuple[str, str, str, str, str]:
+    """SWIS только по HTTP (без браузера). Возвращает 5-tuple
+    (cert, product, doc_type, doc_status, detail) и кладёт расширенные поля
+    (заявитель/изготовитель/ТН ВЭД/ТР/даты/схема) в общий кэш, как у FSA."""
+    timeout = float(getattr(args, "registry_http_timeout", 30.0) or 30.0)
+    status_code, text, ct = await http_get(session, url, timeout=timeout)
+    if not text:
+        return "", "", "", "", f"swis_http_no_body(status={status_code})"
+    try:
+        data = parse_swis_http_full(text, url)
+    except Exception as e:
+        return "", "", "", "", f"swis_http_parse_error={type(e).__name__}: {str(e)[:120]}"
+
+    # Расширенные поля → общий кэш (подставляются в ResultRow на этапе flush)
+    merged = dict(_FSA_EXTENDED_FIELDS_CACHE.get(url, {}))
+    for k in ("applicant_name", "applicant_inn", "manufacturer_name", "tnved",
+              "technical_regulation", "scheme", "date_start", "date_end"):
+        v = data.get(k)
+        if not v:
+            continue
+        target = {"date_start": "document_date_start",
+                  "date_end": "document_date_end"}.get(k, k)
+        if not merged.get(target):
+            merged[target] = v
+    if merged:
+        _FSA_EXTENDED_FIELDS_CACHE[url] = merged
+
+    detail = "swis_http_ok" + (";ext_ok" if merged else "")
+    return (
+        data.get("cert_number", ""),
+        data.get("product", ""),
+        data.get("doc_type", "сертификат"),
+        data.get("status", ""),
+        detail,
+    )
+
+
 async def _parse_belgiss_with_existing_page_v42(page, url: str, args) -> Tuple[str, str, str, str, str]:
     """v27.5: УПРОЩЁННЫЙ парсер реестра ЕАЭС Belgiss (tsouz.belgiss.by).
 
@@ -6480,8 +6634,10 @@ async def run_registry_stage(args):
                                     timeout=per_registry_timeout,
                                 )
                             elif h in {'swis.trade.kg', 'trade.kg'}:
+                                # v27.7: киргизский SWIS — ТОЛЬКО HTTP (требование).
+                                # Страница серверного рендеринга, браузер не нужен.
                                 cert, prod, typ, doc_status, detail = await asyncio.wait_for(
-                                    _parse_swis_with_existing_page_v386(page, url, args),
+                                    _parse_swis_http_v277(session, url, args),
                                     timeout=per_registry_timeout,
                                 )
                             elif h in {'belgiss.by', 'www.belgiss.by', 'tsouz.belgiss.by'}:

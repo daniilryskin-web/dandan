@@ -6488,62 +6488,167 @@ async def _parse_swis_http_v277(session, url: str, args) -> Tuple[str, str, str,
     )
 
 
+# Регэкспы номеров документов ЕАЭС/ТС (общие для текста и JSON Belgiss).
+_BELGISS_NUMBER_PATTERNS = (
+    r'ЕАЭС\s+BY/[0-9.\s]+\s*ТР\d+\s+[0-9.\s]+',  # ЕАЭС BY/112 02.01. ТР007 118.01 02748
+    r'ЕАЭС\s+[NN№]?\s*RU\s*[ДД]-[A-ZА-Я0-9./\-]+',
+    r'ЕАЭС\s+RU\s*[СC]-[A-ZА-Я0-9./\-]+',
+    r'[NN№]\s*BY/[0-9./\-]+',
+    r'ROSS\s+[A-ZА-Я0-9./\-]+',
+)
+
+
+def _walk_json_strings(obj, depth: int = 0):
+    """Рекурсивно перебирает (key, value) для всех строковых листьев JSON."""
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                yield str(k), v
+            else:
+                yield from _walk_json_strings(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json_strings(v, depth + 1)
+
+
+def _belgiss_extract_from_json(objs: List[Any]) -> Dict[str, str]:
+    """Best-effort извлечение полей документа из перехваченного JSON Belgiss.
+
+    Структуру backend-API Belgiss мы не фиксируем — поэтому ищем поля по
+    общим признакам имён ключей. Источник чистый (в отличие от склеенного DOM),
+    поэтому отсюда можно безопасно брать не только номер, но и название
+    продукции/статус/даты, что раньше было недоступно.
+    """
+    out: Dict[str, str] = {}
+    product_candidates: List[str] = []
+    for objs_item in objs:
+        for key, val in _walk_json_strings(objs_item):
+            v = (val or "").strip()
+            if not v:
+                continue
+            kl = key.lower()
+            # Номер документа
+            if not out.get("number"):
+                for pat in _BELGISS_NUMBER_PATTERNS:
+                    mm = re.search(pat, v)
+                    if mm:
+                        out["number"] = re.sub(r'\s+', ' ', mm.group(0)).strip()
+                        break
+            # Название продукции — по имени ключа (product/goods/наимен/товар/объект)
+            if any(t in kl for t in ("productname", "product", "goods", "наимен",
+                                     "товар", "объект", "tovar", "naimen")):
+                # описания продукции — длинные; коды/идентификаторы отсекаем
+                if len(v) >= 10 and not re.fullmatch(r'[A-Za-z0-9._\-]+', v):
+                    product_candidates.append(v)
+            # Статус документа
+            if not out.get("status") and any(t in kl for t in ("status", "статус", "state")):
+                if 3 <= len(v) <= 60:
+                    out["status"] = v
+            # Даты
+            if not out.get("date_start") and any(t in kl for t in ("begin", "start", "datebegin", "дата")) and re.search(r'\d{2}[.\-/]\d{2}[.\-/]\d{4}|\d{4}-\d{2}-\d{2}', v):
+                out["date_start"] = v
+            if not out.get("date_end") and any(t in kl for t in ("end", "expire", "till", "until")) and re.search(r'\d{2}[.\-/]\d{2}[.\-/]\d{4}|\d{4}-\d{2}-\d{2}', v):
+                out["date_end"] = v
+    if product_candidates:
+        # самое длинное описание — почти всегда и есть «наименование продукции»
+        out["product"] = max(product_candidates, key=len)[:1000]
+    return out
+
+
 async def _parse_belgiss_with_existing_page_v42(page, url: str, args) -> Tuple[str, str, str, str, str]:
-    """v27.5: УПРОЩЁННЫЙ парсер реестра ЕАЭС Belgiss (tsouz.belgiss.by).
+    """Парсер реестра ЕАЭС Belgiss (tsouz.belgiss.by) — SPA на Angular.
 
-    По требованию пользователя — с белорусского реестра берём ТОЛЬКО номер
-    сертификата/декларации. Все остальные поля (applicant/manufacturer/product/
-    status/dates) НЕ извлекаем, потому что DOM Belgiss отдаёт их склеенными с
-    заголовками таблиц («Страна (BY)», «Краткое наименование хозяйствующего
-    субъекта», «оценки соответствия», «действия сертификата (декларации)»),
-    и их корректная разборка нерентабельна.
+    v27.8: раньше брали ТОЛЬКО номер из текста DOM, но SPA часто не успевал
+    наполнить DOM (render_text_len≈30 → не извлекалось вообще ничего). Теперь
+    основной источник — перехват JSON-ответов backend-API Belgiss (как у Ozon
+    и FSA): из чистого JSON достаём номер, название продукции, статус и даты.
+    Текстовый regex по DOM остаётся резервом.
 
-    Возвращает (cert_number, '', doc_type, '', detail) — только номер и тип.
+    Возвращает (cert_number, product_name, doc_type, doc_status, detail).
     """
     timeout_ms = int(getattr(args, 'registry_browser_timeout_ms', 30000))
     details: List[str] = []
     cert_vals: List[str] = []
 
-    try:
-        await page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
-    except Exception as e:
-        return '', '', '', '', f'belgiss_goto_error={type(e).__name__}:{str(e)[:120]}'
+    # --- Перехват JSON-ответов backend-API Belgiss ---
+    captured_json: List[Any] = []
 
-    # Ждём пока SPA наполнит DOM.
-    try:
-        await page.wait_for_function(
-            "() => document.body && (document.body.innerText||'').length > 400",
-            timeout=min(timeout_ms, 12000),
-        )
-    except Exception:
-        pass
-    try:
-        text_len = await page.evaluate("() => (document.body ? (document.body.innerText||'').length : 0)")
-    except Exception:
-        text_len = -1
-    details.append(f'belgiss_render_text_len={text_len}')
+    async def _on_response(response):
+        try:
+            ru = response.url or ""
+            if "belgiss.by" not in ru:
+                return
+            ctype = (response.headers or {}).get("content-type", "")
+            if "json" not in ctype.lower():
+                return
+            data = await response.json()
+            if data:
+                captured_json.append(data)
+        except Exception:
+            pass
 
-    # Сначала пробуем взять номер из URL (для /certifs/<id>/view это не работает,
-    # но дальше у нас regex по тексту страницы).
-    # Главное — regex по тексту страницы для номера документа ЕАЭС.
+    page.on("response", _on_response)
     try:
-        body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
-    except Exception:
-        body_text = ''
-    for pat in (
-        r'ЕАЭС\s+BY/[0-9.\s]+\s*ТР\d+\s+[0-9.\s]+',  # ЕАЭС BY/112 02.01. ТР007 118.01 02748
-        r'ЕАЭС\s+[NN№]?\s*RU\s*[ДД]-[A-ZА-Я0-9./\-]+',
-        r'ЕАЭС\s+RU\s*[СC]-[A-ZА-Я0-9./\-]+',
-        r'[NN№]\s*BY/[0-9./\-]+',
-        r'ROSS\s+[A-ZА-Я0-9./\-]+',
-    ):
-        mm = re.search(pat, body_text or '')
-        if mm:
-            cert_vals.append(re.sub(r'\s+', ' ', mm.group(0)).strip())
-            details.append('belgiss_number_from_regex')
-            break
+        try:
+            await page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
+        except Exception as e:
+            return '', '', '', '', f'belgiss_goto_error={type(e).__name__}:{str(e)[:120]}'
 
-    # Если regex не сработал — пробуем по подписям (только номер).
+        # Ждём XHR backend-API (надёжнее, чем ожидание текста в DOM).
+        try:
+            await page.wait_for_response(
+                lambda r: ("belgiss.by" in (r.url or "")) and ("json" in ((r.headers or {}).get("content-type", "")).lower()),
+                timeout=min(timeout_ms, 15000),
+            )
+        except Exception:
+            pass
+        # Дополнительно ждём наполнения DOM (резервный путь).
+        try:
+            await page.wait_for_function(
+                "() => document.body && (document.body.innerText||'').length > 400",
+                timeout=min(timeout_ms, 8000),
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)  # дать дойти последним XHR
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
+
+    # --- ОСНОВНОЙ путь: разбор перехваченного JSON ---
+    json_fields = _belgiss_extract_from_json(captured_json)
+    details.append(f'belgiss_json_responses={len(captured_json)}')
+    prod = json_fields.get("product", "")
+    doc_status = json_fields.get("status", "")
+    if json_fields.get("number"):
+        cert_vals.append(json_fields["number"])
+        details.append('belgiss_number_from_json')
+    if prod:
+        details.append('belgiss_product_from_json')
+
+    # --- РЕЗЕРВ: regex по тексту DOM, если JSON не дал номер ---
+    if not cert_vals:
+        try:
+            text_len = await page.evaluate("() => (document.body ? (document.body.innerText||'').length : 0)")
+        except Exception:
+            text_len = -1
+        details.append(f'belgiss_render_text_len={text_len}')
+        try:
+            body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        except Exception:
+            body_text = ''
+        for pat in _BELGISS_NUMBER_PATTERNS:
+            mm = re.search(pat, body_text or '')
+            if mm:
+                cert_vals.append(re.sub(r'\s+', ' ', mm.group(0)).strip())
+                details.append('belgiss_number_from_regex')
+                break
+
+    # Если номер всё ещё не найден — пробуем по подписям.
     if not cert_vals:
         number_labels = [
             "Регистрационный номер", "Номер документа", "Номер сертификата",
@@ -6562,15 +6667,22 @@ async def _parse_belgiss_with_existing_page_v42(page, url: str, args) -> Tuple[s
     low = url.lower()
     doc_type = 'декларация' if 'declaration' in low or '/decl' in low else ('сертификат' if 'cert' in low else '')
 
-    # ВАЖНО: НЕ заполняем _FSA_EXTENDED_FIELDS_CACHE — у Belgiss поля грязные,
-    # пользователь явно сказал не фиксить, брать только номер.
-    details.append('belgiss_minimal_mode')
+    # Даты из JSON — кладём в общий кэш расширенных полей (как делает FSA-парсер),
+    # чтобы они попали в итоговую строку.
+    if json_fields.get("date_start") or json_fields.get("date_end"):
+        try:
+            _FSA_EXTENDED_FIELDS_CACHE[url] = {
+                'document_date_start': json_fields.get("date_start", ''),
+                'document_date_end': json_fields.get("date_end", ''),
+            }
+        except Exception:
+            pass
 
     return (
         (cert_vals[0] if cert_vals else ''),
-        '',  # product_name — пусто
+        prod,
         doc_type,
-        '',  # doc_status — пусто
+        doc_status,
         'belgiss_browser; ' + ';'.join(details),
     )
 

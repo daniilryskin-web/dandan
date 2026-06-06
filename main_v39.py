@@ -2064,60 +2064,8 @@ def _build_summary_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
     ws.column_dimensions["B"].width = 16
     ws.column_dimensions["C"].width = 12
     ws.freeze_panes = "A7"
-
-    # --- v27.7: нативные графики Excel + условное форматирование ---
-    # Раньше отчёт был полностью статичным (ни графиков, ни data-bar).
-    try:
-        from openpyxl.chart import PieChart, BarChart, Reference
-        from openpyxl.formatting.rule import DataBarRule
-
-        # Пончик по техническому статусу
-        if status_end >= status_hdr + 1:
-            pie = PieChart()
-            pie.title = "Технический статус"
-            pie.height, pie.width = 7.5, 13
-            data = Reference(ws, min_col=2, min_row=status_hdr, max_row=status_end)
-            cats = Reference(ws, min_col=1, min_row=status_hdr + 1, max_row=status_end)
-            pie.add_data(data, titles_from_data=True)
-            pie.set_categories(cats)
-            ws.add_chart(pie, "E7")
-
-        # Пончик по плашке «Оригинал»
-        if orig_end >= orig_hdr + 1:
-            pie2 = PieChart()
-            pie2.title = "Плашка «Оригинал»"
-            pie2.height, pie2.width = 7.5, 13
-            data2 = Reference(ws, min_col=2, min_row=orig_hdr, max_row=orig_end)
-            cats2 = Reference(ws, min_col=1, min_row=orig_hdr + 1, max_row=orig_end)
-            pie2.add_data(data2, titles_from_data=True)
-            pie2.set_categories(cats2)
-            ws.add_chart(pie2, "E24")
-
-        # Столбчатый график по рискам срока действия
-        if risk_end >= risk_hdr + 1:
-            bar = BarChart()
-            bar.type = "col"
-            bar.title = "Риски по сроку действия"
-            bar.height, bar.width = 7.5, 13
-            bar.legend = None
-            data3 = Reference(ws, min_col=2, min_row=risk_hdr, max_row=risk_end)
-            cats3 = Reference(ws, min_col=1, min_row=risk_hdr + 1, max_row=risk_end)
-            bar.add_data(data3, titles_from_data=True)
-            bar.set_categories(cats3)
-            ws.add_chart(bar, "E41")
-
-        # Data-bar на колонку «Количество» по всем трём таблицам
-        rule = DataBarRule(start_type="num", start_value=0,
-                           end_type="max", color="4F81BD", showValue=True)
-        ws.conditional_formatting.add(f"B{status_hdr + 1}:B{status_end}", rule)
-        ws.conditional_formatting.add(f"B{orig_hdr + 1}:B{orig_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="9BBB59", showValue=True))
-        ws.conditional_formatting.add(f"B{risk_hdr + 1}:B{risk_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="C0504D", showValue=True))
-    except Exception as _e:
-        log.warning("Не удалось добавить графики/условное форматирование в Сводку: %s", _e)
+    # Примечание: графики/диаграммы в Excel убраны по требованию —
+    # лист «Сводка» остаётся чисто табличным.
 
 
 def _write_run_log_v39(rows: List["ResultRow"], xlsx_path: Path, warning_days: int,

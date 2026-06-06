@@ -950,6 +950,21 @@ class Bridge:
 
     # ---- результаты ----
 
+    def _discover_result_file(self) -> Optional[Path]:
+        """Ищет самый свежий существующий файл отчёта в рабочей папке.
+
+        Используется, когда прогон в текущей сессии не запускался (state пуст),
+        но файлы результата от прошлых запусков уже лежат в APP_DIR.
+        """
+        candidates = [
+            "unified_result.xlsx", "result.xlsx", "wb_result.xlsx",
+            "brand_result.xlsx", "ozon_result.xlsx",
+        ]
+        existing = [APP_DIR / name for name in candidates if (APP_DIR / name).exists()]
+        if not existing:
+            return None
+        return max(existing, key=lambda p: p.stat().st_mtime)
+
     def get_results(self, xlsx_path: Optional[str] = None, limit: int = 2000) -> dict:
         """
         Читает лист «Подробности» из XLSX и возвращает данные для таблицы.
@@ -957,7 +972,16 @@ class Bridge:
         """
         path = Path(xlsx_path or self.state.output_path or "")
         if not path.exists():
-            return {"ok": False, "error": "Файл результата не найден. Запустите прогон."}
+            # Авто-поиск: если прогон в этой сессии не запускался (output_path пуст)
+            # или указанного файла нет — берём самый свежий из известных отчётов в
+            # рабочей папке. Иначе вкладка «Результаты» оставалась пустой, хотя
+            # файлы результата лежат рядом.
+            discovered = self._discover_result_file()
+            if discovered is None:
+                return {"ok": False, "error": "Файл результата не найден. Запустите прогон."}
+            path = discovered
+            if not self.state.output_path:
+                self.state.output_path = str(path)
         try:
             from openpyxl import load_workbook  # type: ignore
             wb = load_workbook(path, read_only=True, data_only=True)

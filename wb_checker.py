@@ -1031,14 +1031,14 @@ class Bridge:
 
             try:
                 idx_status      = find_col("технический статус", "status", "статус")
-                idx_registry    = find_col("registry_host", "реестр (host)", "registry_url")
+                idx_registry    = find_col("registry_host", "реестр (хост)", "реестр (host)", "реестр", "registry_url")
                 idx_marketplace = find_col("marketplace", "маркетплейс")
-                idx_original    = find_col("is_original", "оригинал")
+                idx_original    = find_col("is_original", "плашка 'оригинал'", "оригинал")
                 idx_docstatus   = find_col("document_status", "статус документа")
                 idx_brand       = find_col("brand", "бренд")
                 idx_risk        = find_col("риск по сроку", "риск", "risk")
                 # Если маркетплейс не в файле — определяем по product_url
-                idx_purl = find_col("product_url")
+                idx_purl = find_col("product_url", "ссылка на товар")
                 for row in rows:
                     if idx_status is not None and idx_status < len(row):
                         v = str(row[idx_status] or "").strip()

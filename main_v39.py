@@ -5912,6 +5912,34 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     ext_vals: Dict[str, List[str]] = {}  # v44: расширенные поля (схема/изготовитель/ТР ТС/даты) — со всех вкладок
     details: List[str] = []
     number_labels = _fsa_number_labels_for_url(url)
+
+    # v27.8: перехват JSON backend-API FSA прямо в браузере. HTTP fast-path
+    # (curl_cffi) часто заблокирован антиботом, и тогда applicant_inn /
+    # manufacturer_name / scheme / technical_regulation оставались пустыми
+    # (вкладки /applicant, /manufacturer, /document отдавали 0 полей). Браузер
+    # грузит тот же API без блокировки — ловим ответы и разбираем уже готовым
+    # parse_fsa_json (тем же, что и HTTP-путь).
+    _fsa_kind, _fsa_doc_id = extract_fsa_kind_id(url)
+    _captured_fsa_json: List[Any] = []
+
+    async def _on_fsa_response(response):
+        try:
+            ru = response.url or ''
+            if 'pub.fsa.gov.ru' not in ru or '/api/' not in ru:
+                return
+            ctype = (response.headers or {}).get('content-type', '')
+            if 'json' not in ctype.lower():
+                return
+            data = await response.json()
+            if data:
+                _captured_fsa_json.append((ru, data))
+        except Exception:
+            pass
+
+    try:
+        page.on('response', _on_fsa_response)
+    except Exception:
+        pass
     status_labels = _fsa_status_labels_for_url(url)  # v39.5
 
     # Шаг 1: номер документа.
@@ -6105,6 +6133,47 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             except Exception as e:
                 details.append(f'ext_tab_error={type(e).__name__}:{str(e)[:60]}')
                 continue
+
+    # v27.8: снимаем слушатель и разбираем перехваченный JSON FSA — добираем поля,
+    # которых не дали ни /baseInfo, ни /product, ни вкладки (частый случай:
+    # applicant_inn / manufacturer / scheme / technical_regulation).
+    try:
+        page.remove_listener('response', _on_fsa_response)
+    except Exception:
+        pass
+    if _captured_fsa_json:
+        try:
+            json_parsed: Dict[str, str] = {}
+            for ru, data in _captured_fsa_json:
+                p = parse_fsa_json(data, ru, _fsa_kind or '', _fsa_doc_id or '')
+                # копим первое непустое значение каждого поля по всем ответам
+                for k, v in (p or {}).items():
+                    if v and not json_parsed.get(k):
+                        json_parsed[k] = v
+            details.append(f'fsa_json_responses={len(_captured_fsa_json)};fsa_json_fields={len(json_parsed)}')
+            # Номер/продукт/статус — если ещё не нашли через DOM-лейблы.
+            if not cert_vals and json_parsed.get('doc_number'):
+                cert_vals.append(json_parsed['doc_number'])
+            if not prod_vals and json_parsed.get('product_full'):
+                prod_vals.append(json_parsed['product_full'])
+            if not status_vals and json_parsed.get('status'):
+                status_vals.append(json_parsed['status'])
+            # Расширенные поля → в ext_vals (списком, как ждёт merge ниже).
+            _json_to_ext = {
+                'applicant_name': 'applicant',
+                'applicant_inn': 'applicant_inn',
+                'manufacturer_name': 'manufacturer',
+                'tnved': 'tnved',
+                'scheme': 'scheme',
+                'technical_regulation': 'technical_regulation',
+                'document_date_start': 'date_start',
+                'document_date_end': 'date_end',
+            }
+            for ext_key, json_key in _json_to_ext.items():
+                if ext_key not in ext_vals and json_parsed.get(json_key):
+                    ext_vals[ext_key] = [json_parsed[json_key]]
+        except Exception as e:
+            details.append(f'fsa_json_parse_error={type(e).__name__}')
 
     # v39.2: если НИ ОДИН goto не прошёл — нет смысла скроллить и делать диагностику,
     # это всё равно chrome-error://chromewebdata/. Сразу возвращаем с явной пометкой.

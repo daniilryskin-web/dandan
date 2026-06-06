@@ -1702,28 +1702,34 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                 # v39.14: извлекаем дополнительные поля из WB API
                 price_rub = 0.0
                 sale_price_rub = 0.0
-                # WB v18 отдаёт цены либо в копейках (старое поле priceU), либо в новом sizes[0].price.total
+                # WB всегда отдаёт цены в КОПЕЙКАХ — и в классических полях
+                # priceU/salePriceU, и в новом sizes[].price.{total,product,basic}.
+                # v27.7: убрана ошибочная эвристика "/100 если >10000", из-за
+                # которой дешёвые товары (<100 ₽ = <10000 коп) показывались
+                # тысячами, а часть дорогих делилась неверно. Теперь всегда /100.
                 try:
-                    for key in ("salePriceU", "priceU"):
-                        val = p.get(key)
-                        if isinstance(val, (int, float)) and val > 0:
-                            v = float(val) / 100 if val > 10000 else float(val)
-                            if key == "salePriceU":
-                                sale_price_rub = round(v, 2)
-                            else:
-                                price_rub = round(v, 2)
-                            break
-                    if not price_rub:
+                    sv = p.get("salePriceU")
+                    if isinstance(sv, (int, float)) and sv > 0:
+                        sale_price_rub = round(float(sv) / 100.0, 2)
+                    pv = p.get("priceU")
+                    if isinstance(pv, (int, float)) and pv > 0:
+                        price_rub = round(float(pv) / 100.0, 2)
+                    if not price_rub or not sale_price_rub:
                         sizes = p.get("sizes") or []
                         for s in sizes:
                             pr = s.get("price") or {}
-                            for k in ("total", "product", "basic"):
-                                v = pr.get(k)
-                                if isinstance(v, (int, float)) and v > 0:
-                                    price_rub = round(float(v) / 100 if v > 10000 else float(v), 2)
-                                    break
-                            if price_rub:
+                            basic = pr.get("basic")
+                            total = pr.get("total") or pr.get("product")
+                            if not price_rub and isinstance(basic, (int, float)) and basic > 0:
+                                price_rub = round(float(basic) / 100.0, 2)
+                            if not sale_price_rub and isinstance(total, (int, float)) and total > 0:
+                                sale_price_rub = round(float(total) / 100.0, 2)
+                            if price_rub and sale_price_rub:
                                 break
+                    # Если базовая цена не найдена, но есть цена со скидкой —
+                    # используем её как базовую (лучше, чем 0).
+                    if not price_rub and sale_price_rub:
+                        price_rub = sale_price_rub
                 except Exception:
                     pass
                 # v43: WB-поиск отдаёт продавца в поле supplier (ТЕКСТ), не supplierName.
@@ -2231,16 +2237,26 @@ class ResultStore:
             cell.font = Font(bold=True)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.fill = PatternFill("solid", fgColor="D9EAD3")
-        # v39.5: колонки = поля ResultRow в порядке dataclass'a:
-        # A query, B nm_id, C product_name, D brand, E subject, F product_url, G status,
-        # H registry_url, I registry_host, J registry_record_id, K certificate_number,
-        # L document_type, M document_status, N certificate_product_name, O score, P details, Q worker, R checked_at
-        widths = {
-            "A": 18, "B": 12, "C": 42, "D": 22, "E": 20, "F": 48, "G": 28,
-            "H": 60, "I": 24, "J": 20, "K": 30, "L": 16, "M": 14, "N": 55, "O": 10, "P": 60
+        # v27.7: ширины колонок вычисляются динамически по ИМЕНИ поля.
+        # Раньше был жёсткий словарь A..P под старую схему из 18 колонок, а
+        # в ResultRow теперь 33 поля (добавлены price/seller/rating и расширенные
+        # поля реестра) — из-за рассинхрона колонки визуально съезжали.
+        from openpyxl.utils import get_column_letter as _gcl
+        _field_widths = {
+            "query": 18, "nm_id": 12, "product_name": 42, "brand": 22, "subject": 20,
+            "product_url": 48, "status": 28, "price_rub": 12, "sale_price_rub": 14,
+            "seller_name": 26, "supplier_id": 14, "rating": 8, "feedbacks": 10,
+            "is_original": 14, "registry_url": 60, "registry_host": 24,
+            "registry_record_id": 20, "certificate_number": 30, "document_type": 16,
+            "document_status": 16, "certificate_product_name": 55,
+            "document_date_start": 16, "document_date_end": 16, "applicant_name": 40,
+            "applicant_inn": 16, "manufacturer_name": 40, "tnved": 16, "scheme": 14,
+            "technical_regulation": 30, "score": 10, "details": 60, "worker": 14,
+            "checked_at": 20,
         }
-        for col, width in widths.items():
-            ws.column_dimensions[col].width = width
+        for _idx, _fname in enumerate(fields, start=1):
+            ws.column_dimensions[_gcl(_idx)].width = _field_widths.get(
+                _fname, max(12, min(40, len(_fname) + 4)))
         # review sheet
         review = wb.create_sheet("review")
         review.append(fields)

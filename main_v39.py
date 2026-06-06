@@ -6865,8 +6865,8 @@ def build_parser():
                     help="v40: устарел (логика теперь автоматическая: все честные 404 = нет документов, сетевая ошибка = повтор). Оставлен для совместимости команд.")
     # v39.13: HTTP fast-path для FSA-парсинга на 2 этапе
     ap.add_argument("--fsa-http-fast-path", type=lambda s: s.lower() in ('1','true','yes','y','on'),
-                    default=True,
-                    help="v39.13: перед браузером пробовать HTTP-парсинг FSA через curl_cffi. Требует pip install curl_cffi. В 10-30 раз быстрее браузера. true/false (default true).")
+                    default=False,
+                    help="v27.7: по умолчанию FALSE — ФСА парсится ТОЛЬКО браузером (требование: для ФСА только браузерный путь). HTTP-fast-path через curl_cffi был быстрее, но менее надёжен/режется TLS-fingerprint'ом. Включи true, если хочешь рискнуть скоростью.")
     ap.add_argument("--fsa-curl-cffi-impersonate", default="chrome",
                     help="v39.13: профиль TLS-имперсонации curl_cffi: chrome / chrome120 / chrome110. Если основной даёт 403 — пробуются дополнительные.")
     # --- v25-reporting: отчётный слой ---

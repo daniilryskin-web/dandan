@@ -1051,8 +1051,11 @@ class OzonClient:
         Возвращает (список товаров, next_page_url или None).
         Каждый товар — dict с полями: sku, title, url, price, finalPrice, ...
         """
-        encoded_query = urllib.parse.quote(query)
-        url_path = f"/search/?text={encoded_query}&page={page}"
+        # Важно: url_path передаётся в aiohttp/curl_cffi как значение query-параметра
+        # ``url``. Если заранее percent-encode'ить кириллицу, HTTP-клиент
+        # экранирует проценты повторно (``%`` -> ``%25``), и Ozon получает
+        # сломанный поисковый запрос. Поэтому здесь оставляем исходный текст.
+        url_path = f"/search/?text={query}&page={page}"
         data = await self.fetch_json(url_path)
         if data is None:
             return [], None
@@ -1097,6 +1100,13 @@ class OzonClient:
         if not products:
             products = _extract_from_layout(data)
 
+        # v28: Ozon часто меняет имена/вложенность search-виджетов.
+        # Если точечные парсеры выше ничего не нашли, делаем безопасный
+        # рекурсивный проход по всему JSON ответа и достаём карточки по
+        # URL /product/... Это спасает парсер при переименовании виджетов.
+        if not products:
+            products = _extract_search_items_deep(data)
+
         # Следующая страница
         next_page = data.get("nextPage")
         if not next_page:
@@ -1104,7 +1114,7 @@ class OzonClient:
             shared = data.get("shared") or {}
             next_page = shared.get("nextPage")
 
-        return products, next_page
+        return _dedupe_search_items(products), next_page
 
     async def parse_card(self, url_path: str) -> Optional[OzonCard]:
         """
@@ -1166,6 +1176,138 @@ def _extract_search_items(widget: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return items
 
+
+
+def _dedupe_search_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Дедупликация поисковых карточек с сохранением порядка и слиянием полей."""
+    out: List[Dict[str, Any]] = []
+    by_key: Dict[str, Dict[str, Any]] = {}
+
+    def key_for(item: Dict[str, Any]) -> str:
+        url = str(item.get("url") or "")
+        sku = str(item.get("sku") or "") or _extract_sku_from_url(url)
+        if sku and not item.get("sku"):
+            item["sku"] = sku
+        if url:
+            # URL с query-параметрами и без них — одна и та же карточка.
+            return re.sub(r"[?#].*$", "", url)
+        return sku
+
+    for item in items:
+        key = key_for(item)
+        if not key:
+            continue
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = item
+            out.append(item)
+            continue
+        # Сливаем более полные данные из дубля в первую запись.
+        for field_name, value in item.items():
+            if value not in (None, "", 0, 0.0, []):
+                old_value = existing.get(field_name)
+                if old_value in (None, "", 0, 0.0, []):
+                    existing[field_name] = value
+    return out
+
+
+def _extract_product_url_from_any(value: Any) -> str:
+    """Возвращает абсолютный URL товара Ozon из строки/словаря, если он там есть."""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, dict):
+        parts: List[str] = []
+        for key in ("url", "link", "href", "action", "deeplink", "path", "to"):
+            v = value.get(key)
+            if isinstance(v, str):
+                parts.append(v)
+        text = " ".join(parts)
+    else:
+        return ""
+
+    m = re.search(r"https?://www\.ozon\.ru/product/[^\s\"'<>]+", text)
+    if m:
+        return m.group(0).rstrip(".,;)")
+    m = re.search(r"/product/[^\s\"'<>]+", text)
+    if m:
+        return ("https://www.ozon.ru" + m.group(0)).rstrip(".,;)")
+    return ""
+
+
+def _title_from_nearby_dict(obj: Dict[str, Any]) -> str:
+    """Эвристически достаёт название из ближайшего словаря поисковой карточки."""
+    for key in ("title", "name", "productName", "displayName", "text", "header"):
+        v = obj.get(key)
+        if isinstance(v, str) and len(v.strip()) >= 3 and "/product/" not in v:
+            return re.sub(r"\s+", " ", v).strip()
+    for key in ("cellTrackingInfo", "trackingInfo", "analytics", "product"):
+        v = obj.get(key)
+        if isinstance(v, dict):
+            t = _title_from_nearby_dict(v)
+            if t:
+                return t
+    return ""
+
+
+def _extract_search_items_deep(data: Any, limit: int = 500) -> List[Dict[str, Any]]:
+    """
+    Рекурсивный fallback для поиска Ozon.
+
+    Ozon регулярно меняет названия widgetStates и форму выдачи. Вместо привязки
+    только к одному search-виджету этот проход ищет любые ссылки ``/product/``
+    во всём JSON-ответе, затем нормализует SKU/slug/title. Это не заменяет
+    точечные парсеры, но делает поиск работоспособным после переименований.
+    """
+    found: List[Dict[str, Any]] = []
+
+    def walk(obj: Any, parent: Optional[Dict[str, Any]] = None) -> None:
+        if len(found) >= limit:
+            return
+        if isinstance(obj, dict):
+            parsed = _normalize_search_item(obj)
+            if parsed and (parsed.get("sku") or parsed.get("url")):
+                found.append(parsed)
+            url = _extract_product_url_from_any(obj)
+            if url:
+                slug = ""
+                m = re.search(r"/product/([^/?#]+)", url)
+                if m:
+                    slug = m.group(1)
+                sku = _extract_sku_from_url(url)
+                title = _title_from_nearby_dict(obj) or (_title_from_nearby_dict(parent) if parent else "")
+                found.append({
+                    "sku": sku,
+                    "title": title,
+                    "url": url,
+                    "slug": slug,
+                    "price": _parse_price(obj.get("price") or obj.get("originalPrice") or 0),
+                    "finalPrice": _parse_price(obj.get("finalPrice") or obj.get("cardPrice") or obj.get("salePrice") or obj.get("price") or 0),
+                    "brand": str(obj.get("brand") or obj.get("brandName") or ""),
+                })
+            for v in obj.values():
+                walk(v, obj)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v, parent)
+        elif isinstance(obj, str):
+            url = _extract_product_url_from_any(obj)
+            if url:
+                slug = ""
+                m = re.search(r"/product/([^/?#]+)", url)
+                if m:
+                    slug = m.group(1)
+                found.append({
+                    "sku": _extract_sku_from_url(url),
+                    "title": "",
+                    "url": url,
+                    "slug": slug,
+                    "price": 0.0,
+                    "finalPrice": 0.0,
+                    "brand": "",
+                })
+
+    walk(data)
+    return _dedupe_search_items(found)
 
 def _normalize_search_item(item: Any) -> Optional[Dict[str, Any]]:
     """
@@ -1435,6 +1577,121 @@ def resolve_registry_url_from_documents(
     return "", "", ""
 
 
+
+async def collect_search_results_playwright(
+    query: str,
+    limit: int = 100,
+    headless: bool = True,
+    timeout_ms: int = 35000,
+) -> List[Dict[str, Any]]:
+    """
+    Браузерный fallback для поиска Ozon.
+
+    Нужен, когда composer-api не вернул товары (изменились widgetStates,
+    блокировка API, сеть режет api.ozon.ru). Открывает обычную страницу поиска,
+    перехватывает JSON-ответы Ozon и одновременно читает видимые ссылки DOM.
+    """
+    if not PLAYWRIGHT_OK:
+        log.warning("Playwright не установлен — Ozon search fallback недоступен")
+        return []
+
+    items: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    def add_many(candidates: List[Dict[str, Any]]) -> None:
+        for item in candidates:
+            if len(items) >= limit:
+                return
+            sku = str(item.get("sku") or "")
+            url = str(item.get("url") or "")
+            key = sku or url
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+
+    search_url = f"https://www.ozon.ru/search/?text={urllib.parse.quote(query)}"
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=headless,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            ctx = await browser.new_context(
+                viewport={"width": 1365, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="ru-RU",
+            )
+            page = await ctx.new_page()
+
+            async def on_response(response: Any) -> None:
+                try:
+                    url_r = response.url
+                    if not ("/page/json" in url_r or "composer-api" in url_r or "entrypoint-api" in url_r):
+                        return
+                    j = await response.json()
+                    if isinstance(j, dict):
+                        add_many(_extract_search_items_deep(j, limit=limit))
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+            try:
+                await page.goto(search_url, timeout=timeout_ms, wait_until="domcontentloaded")
+                # Несколько лёгких прокруток помогают Ozon догрузить первые плитки.
+                for _ in range(4):
+                    await page.mouse.wheel(0, 1400)
+                    await asyncio.sleep(1.0)
+                    if len(items) >= limit:
+                        break
+            except PlaywrightTimeoutError:
+                log.debug("Ozon search Playwright timeout для %s", search_url)
+
+            # DOM fallback: даже если XHR JSON не прочитался, ссылки на карточки
+            # обычно уже есть в HTML после рендера.
+            try:
+                links = await page.eval_on_selector_all(
+                    "a[href*='/product/']",
+                    """els => els.map(a => ({href: a.href, text: (a.innerText || a.getAttribute('aria-label') || '').trim()}))""",
+                )
+                dom_items: List[Dict[str, Any]] = []
+                if isinstance(links, list):
+                    for link in links:
+                        if not isinstance(link, dict):
+                            continue
+                        url = str(link.get("href") or "")
+                        if "/product/" not in url:
+                            continue
+                        m = re.search(r"/product/([^/?#]+)", url)
+                        slug = m.group(1) if m else ""
+                        dom_items.append({
+                            "sku": _extract_sku_from_url(url),
+                            "title": re.sub(r"\s+", " ", str(link.get("text") or "")).strip()[:300],
+                            "url": url,
+                            "slug": slug,
+                            "price": 0.0,
+                            "finalPrice": 0.0,
+                            "brand": "",
+                        })
+                add_many(dom_items)
+            except Exception as e:
+                log.debug("Ozon DOM fallback failed: %s", e)
+
+            await browser.close()
+    except Exception as e:
+        log.warning("Ozon search Playwright fallback error: %s", e)
+
+    log.info("Ozon Playwright fallback собрал %d товаров", len(items))
+    return items[:limit]
+
 # ---------------------------------------------------------------------------
 # Main collection flow
 # ---------------------------------------------------------------------------
@@ -1539,6 +1796,13 @@ async def collect_search_results(
                     reasons.append("Ответ API не содержит widgetStates — возможно изменилась структура widget'ов Ozon")
                 LAST_SEARCH_DIAGNOSTICS["diagnosis"] = " | ".join(reasons)
                 log.warning("Диагноз: %s", LAST_SEARCH_DIAGNOSTICS["diagnosis"])
+
+    if not all_items:
+        fallback_items = await collect_search_results_playwright(query, limit=limit, headless=True)
+        if fallback_items:
+            all_items.extend(fallback_items)
+            LAST_SEARCH_DIAGNOSTICS["playwright_search_fallback_items"] = len(fallback_items)
+            LAST_SEARCH_DIAGNOSTICS["diagnosis"] = "Поиск восстановлен через браузерный fallback Ozon"
 
     log.info("Собрано %d товаров для запроса '%s'", len(all_items), query)
     return all_items[:limit]

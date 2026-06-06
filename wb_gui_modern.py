@@ -576,8 +576,8 @@ class QueryStage2Tab(BaseRunTab):
         self.add_sep()
         self.add_check("headless", "Скрытый браузер (headless)", True,
                        "Без видимого окна — быстрее.")
-        self.add_check("fsa_http", "Пробовать HTTP для FSA (curl_cffi)", True,
-                       "Если FSA блокирует — автоматически уходим в браузер.")
+        self.add_check("fsa_http", "Пробовать HTTP для FSA (curl_cffi)", False,
+                       "По умолчанию выключено: ФСА проверяется только браузером; SWIS остаётся HTTP.")
         self.add_sep()
         self.add_section("Отчёт")
         self.add_spin("Скоро истекает, дней", "expiry_warning_days", 30, 1, 365,

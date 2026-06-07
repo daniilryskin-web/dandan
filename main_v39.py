@@ -380,6 +380,11 @@ def fetch_fsa_via_http(
 # -----------------------------
 
 STATUS_LINK_COLLECTED = "ССЫЛКА НА РЕЕСТР СОБРАНА"
+# v27.9.x: реестры, которые по требованию НЕ парсим (оставляем только ссылку).
+_BELGISS_EAEU_HOSTS = {
+    "belgiss.by", "www.belgiss.by", "tsouz.belgiss.by",
+    "portal.eaeunion.org", "eaeunion.org",
+}
 STATUS_NO_DOCS = "НЕТ ДОКУМЕНТОВ"
 STATUS_NO_REGISTRY_LINK = "НЕТ ССЫЛКИ НА РЕЕСТР"
 STATUS_TIMEOUT = "ТАЙМАУТ"
@@ -6170,6 +6175,46 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     any_goto_succeeded = False  # v39.2: трекаем удалось ли вообще достучаться
     number_route_used = ''
     last_page_url_after_number = ''
+
+    # v27.9.x: ГЛАВНЫЙ путь ФСА — ПЕРЕХВАТ ответа JSON-API, который Angular-SPA
+    # ФСА делает САМА при загрузке страницы (с настоящим Bearer-токеном). Это
+    # даёт ПОЛНЫЙ набор полей (ИНН заявителя, изготовитель, схема, техрегламент)
+    # там, где curl_cffi и «голый» fetch получают 403. page.expect_response
+    # авто-очищается (не течёт между документами). Не вышло — ниже обычный
+    # браузерный парсинг (полный откат).
+    _kind_fsa, _doc_id_fsa = extract_fsa_kind_id(url)
+    if _kind_fsa and _doc_id_fsa and number_routes:
+        def _fsa_api_match(r):
+            u = r.url
+            return ("/api/v1/" in u and str(_doc_id_fsa) in u
+                    and ("certificate" in u or "declaration" in u))
+        try:
+            async with page.expect_response(_fsa_api_match, timeout=min(timeout_ms, 15000)) as _info:
+                await page.goto(number_routes[0], wait_until='domcontentloaded', timeout=timeout_ms)
+                await _wait_until_fsa_rendered(page, timeout_ms=min(timeout_ms, 12000))
+            _resp = await _info.value
+            any_goto_succeeded = True
+            number_route_used = number_routes[0]
+            if _resp.ok:
+                _cap = await _resp.json()
+                _parsed = parse_fsa_json(_cap, url, _kind_fsa, _doc_id_fsa)
+                if _parsed.get('doc_number'):
+                    _FSA_EXTENDED_FIELDS_CACHE[url] = {
+                        'document_date_start': _parsed.get('date_start', ''),
+                        'document_date_end': _parsed.get('date_end', ''),
+                        'applicant_name': _clean_org_name(_parsed.get('applicant', '')),
+                        'applicant_inn': _parsed.get('applicant_inn', ''),
+                        'manufacturer_name': _clean_org_name(_parsed.get('manufacturer', '')),
+                        'tnved': _clean_tnved_code(_parsed.get('tnved', '')),
+                        'scheme': _parsed.get('scheme', ''),
+                        'technical_regulation': _parsed.get('technical_regulation', ''),
+                    }
+                    return (_parsed.get('doc_number', ''), _parsed.get('product_full', ''),
+                            _parsed.get('doc_type', ''), _parsed.get('status', ''),
+                            'fsa_api_capture_ok; via=spa_response')
+        except Exception as _e:
+            details.append(f'fsa_api_capture_miss={type(_e).__name__}')
+
     for route in number_routes:
         try:
             await page.goto(route, wait_until='domcontentloaded', timeout=timeout_ms)
@@ -6185,29 +6230,6 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             except Exception:
                 _len_now = -1
             details.append(f'number_page_render={"ok" if rendered else "timeout"};number_page_text_len={_len_now}')
-
-            # v27.9.x: страница уже на pub.fsa.gov.ru — пробуем JSON-API ЧЕРЕЗ БРАУЗЕР.
-            # Это обходит 403 curl_cffi и даёт ПОЛНЫЙ набор полей (ИНН, изготовитель,
-            # схема, техрегламент), которых не хватало при скрейпе рендера. Если не
-            # вышло — молча продолжаем обычный браузерный парсинг (полный откат).
-            try:
-                _bdata = await _fetch_fsa_via_browser_page(page, url)
-            except Exception:
-                _bdata = None
-            if _bdata and _bdata.get('doc_number'):
-                _FSA_EXTENDED_FIELDS_CACHE[url] = {
-                    'document_date_start': _bdata.get('date_start', ''),
-                    'document_date_end': _bdata.get('date_end', ''),
-                    'applicant_name': _clean_org_name(_bdata.get('applicant', '')),
-                    'applicant_inn': _bdata.get('applicant_inn', ''),
-                    'manufacturer_name': _clean_org_name(_bdata.get('manufacturer', '')),
-                    'tnved': _clean_tnved_code(_bdata.get('tnved', '')),
-                    'scheme': _bdata.get('scheme', ''),
-                    'technical_regulation': _bdata.get('technical_regulation', ''),
-                }
-                return (_bdata.get('doc_number', ''), _bdata.get('product_full', ''),
-                        _bdata.get('doc_type', ''), _bdata.get('status', ''),
-                        'fsa_browser_api_ok; via=page.fetch')
 
             await _click_fsa_section_tab_if_exists(page, url, 'number')
 
@@ -6957,20 +6979,19 @@ async def run_registry_stage(args):
         v39.14: подставляем расширенные поля из _FSA_EXTENDED_FIELDS_CACHE + WB-поля из row."""
         # v39.14: достаём расширенные поля документа из глобального кэша
         ext = _FSA_EXTENDED_FIELDS_CACHE.get(url, {})
+        _host = hostname(url)
         for row in rows_by_url.get(url, []):
-            verdict, score, cmp_details = compare_product_names(
-                row.get('product_name', ''), prod,
-                brand=row.get('brand', ''), subject=row.get('subject', ''),
-                doc_status=doc_status,
-            )
-            # v27.6: BelGISS теперь даёт только номер сертификата — это нормально.
-            # Если есть cert и реестр = BelGISS — статус «номер извлечён», не «не удалось».
-            _host = hostname(url)
-            if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
-                if cert and _host in ('belgiss.by', 'www.belgiss.by', 'tsouz.belgiss.by'):
-                    verdict = 'НОМЕР ИЗВЛЕЧЁН ИЗ РЕЕСТРА'
-                    score = 0.5
-                else:
+            # v27.9.x: BelGISS/ЕАЭС по требованию НЕ парсим — просто оставляем
+            # ссылку на реестр (статус «собрана»), без вердикта «не удалось».
+            if _host in _BELGISS_EAEU_HOSTS:
+                verdict, score, cmp_details = STATUS_LINK_COLLECTED, 0.0, 'belgiss_link_only'
+            else:
+                verdict, score, cmp_details = compare_product_names(
+                    row.get('product_name', ''), prod,
+                    brand=row.get('brand', ''), subject=row.get('subject', ''),
+                    doc_status=doc_status,
+                )
+                if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                     verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'
                     score = 0.0
             rr = ResultRow(
@@ -7117,12 +7138,10 @@ async def run_registry_stage(args):
                                     _parse_swis_http_v277(session, url, args),
                                     timeout=per_registry_timeout,
                                 )
-                            elif h in {'belgiss.by', 'www.belgiss.by', 'tsouz.belgiss.by'}:
-                                # v42: Belgiss — SPA как FSA, парсим браузером (раньше шёл в HTTP-only и не извлекал ничего)
-                                cert, prod, typ, doc_status, detail = await asyncio.wait_for(
-                                    _parse_belgiss_with_existing_page_v42(page, url, args),
-                                    timeout=per_registry_timeout,
-                                )
+                            elif h in _BELGISS_EAEU_HOSTS:
+                                # v27.9.x: BelGISS/ЕАЭС по требованию НЕ парсим —
+                                # оставляем только ссылку. Экономит ~2-4с на документ.
+                                cert, prod, typ, doc_status, detail = '', '', '', '', 'belgiss_link_only'
                             else:
                                 cert, prod, typ, doc_status, detail = await asyncio.wait_for(
                                     _parse_other_registry_http_v386(session, url, args),
@@ -7283,17 +7302,16 @@ async def run_registry_stage(args):
         # Этот url не был записан — допишем как «not_parsed»
         # v39.5: unpack 5-tuple (cert, prod, typ, doc_status, detail)
         cert, prod, typ, doc_status, parse_detail = parsed.get(url, ('', '', '', '', 'not_parsed'))
-        verdict, score, cmp_details = compare_product_names(
-            row.get('product_name', ''), prod, brand=row.get('brand', ''), subject=row.get('subject', ''),
-            doc_status=doc_status,
-        )
-        # v27.6: BelGISS — специальный статус «номер извлечён» вместо «не удалось»
         _host = hostname(url)
-        if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
-            if cert and _host in ('belgiss.by', 'www.belgiss.by', 'tsouz.belgiss.by'):
-                verdict = 'НОМЕР ИЗВЛЕЧЁН ИЗ РЕЕСТРА'
-                score = 0.5
-            else:
+        if _host in _BELGISS_EAEU_HOSTS:
+            # v27.9.x: BelGISS/ЕАЭС не парсим — только ссылка.
+            verdict, score, cmp_details = STATUS_LINK_COLLECTED, 0.0, 'belgiss_link_only'
+        else:
+            verdict, score, cmp_details = compare_product_names(
+                row.get('product_name', ''), prod, brand=row.get('brand', ''), subject=row.get('subject', ''),
+                doc_status=doc_status,
+            )
+            if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                 verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'
                 score = 0.0
         # v39.14: достаём расширенные поля FSA из глобального кэша

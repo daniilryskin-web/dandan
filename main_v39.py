@@ -498,6 +498,20 @@ class ResultRow:
 def now_iso() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
+# v27.9.x: машиночитаемый прогресс для GUI. Раньше окно вытаскивало прогресс
+# слабым regex (\d+/\d+) прямо из логов и ловило ложные срабатывания —
+# «повтор 2/5», «заполнено 120/200» и т.п. дёргали полосу прогресса. Этот
+# однозначный маркер парсится в первую очередь; печатается рядом с обычным
+# человекочитаемым логом, поэтому логи остаются прежними.
+def emit_progress(stage: str, done: int, total: int) -> None:
+    try:
+        print(f"@@PROGRESS@@ stage={stage} done={int(done)} total={int(total)}",
+              flush=True)
+    except Exception:
+        pass
+
+
 # v39.8: precompiled regex и LRU cache для горячих утилит.
 # Эти функции вызываются десятки тысяч раз за прогон (compare_product_names
 # вызывает их через _detect_*). Inline re.compile внутри них раньше ел ~3-5%
@@ -1057,6 +1071,7 @@ async def run_http_link_prefetch(
                     f"нет_ссылки={stats['no_link']}, ошибки={stats['errors']}, "
                     f"fallback→браузер={stats['fallback']}, ETA≈{eta:.0f}с"
                 )
+                emit_progress("links", stats['done'], len(cards))
                 last_print = time.time()
         except asyncio.CancelledError:
             return
@@ -6900,6 +6915,7 @@ async def run_registry_stage(args):
                     f"строк_в_xlsx={stats['rows_written']}/{len(rows)}, "
                     f"очередь={q.qsize()}, FSA={stats['fsa']}, SWIS={stats['swis']}, активные=[{act}]"
                 )
+                emit_progress("registry", stats['done'], len(unique_urls))
                 await asyncio.sleep(max(5, min(30, int(getattr(args, 'progress_interval_sec', 15)))))
         except asyncio.CancelledError:
             return
@@ -7087,6 +7103,7 @@ async def run_registry_stage(args):
                             print("=" * 80)
                             print(f"⚠️  WATCHDOG-2 #{restart_count[0]}: нет прогресса {int(stuck_for)}с (порог {stall_restart_sec_stage2}с)")
                             print(f"   Прогресс: {stats['done']}/{len(unique_urls)} реестров")
+                            emit_progress("registry", stats['done'], len(unique_urls))
                             print(f"   Зависшие: {stuck_workers}")
                             print(f"   Действие: cancel воркеров + перезапуск")
                             print("=" * 80)

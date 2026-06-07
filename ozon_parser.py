@@ -96,6 +96,15 @@ OZON_API_BASE_ALT = "https://www.ozon.ru/api/composer-api.bx/page/json/v2"
 OZON_WEB_BASE = "https://www.ozon.ru"
 APP_VERSION = "2026-06-05-v27-ozon"
 
+
+def emit_progress(stage: str, done: int, total: int) -> None:
+    """Машиночитаемый прогресс для GUI (см. main_v39.emit_progress)."""
+    try:
+        print(f"@@PROGRESS@@ stage={stage} done={int(done)} total={int(total)}",
+              flush=True)
+    except Exception:
+        pass
+
 # Подтверждённые заголовки из JTJag/ozon-sellers-parser + research_apis.md
 # Версия 18.47.0 задокументирована в research_apis.md (раздел 1.3)
 OZON_HEADERS: Dict[str, str] = {
@@ -3459,6 +3468,8 @@ async def run_full_pipeline(
         return []
 
     print(f"[Ozon Pipeline] Найдено {len(search_items)} товаров")
+    n_items = len(search_items)
+    emit_progress("cards", 0, n_items)
 
     # Этап 2: загрузка карточек
     results = await enrich_cards(
@@ -3468,11 +3479,13 @@ async def run_full_pipeline(
         headless=headless,
     )
     print(f"[Ozon Pipeline] Карточки обработаны: {len(results)}")
+    emit_progress("cards", n_items, n_items)
 
     # Этап 3: обогащение реестрами
     if enrich_registries:
         n_with_reg = sum(1 for r in results if r.registry_url)
         print(f"[Ozon Pipeline] Обогащение реестрами: {n_with_reg} строк с реестровыми ссылками")
+        emit_progress("registry", 0, max(1, n_with_reg))
         results = await enrich_registry_data(
             results,
             workers=workers,
@@ -3481,6 +3494,7 @@ async def run_full_pipeline(
             swis=swis_enrich,
             belgiss=belgiss_enrich,
         )
+        emit_progress("registry", max(1, n_with_reg), max(1, n_with_reg))
 
     # Этап 3b: финальный вердикт сверки названий (как в Playwright-пути)
     results = apply_verdicts(results)

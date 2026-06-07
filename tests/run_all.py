@@ -18,6 +18,7 @@ MODULES = [
     "test_cert_fetch",
     "test_xlsx_safe",
     "test_ozon_verdict",
+    "test_progress",
 ]
 
 

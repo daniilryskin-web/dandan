@@ -272,6 +272,7 @@ class AppState:
     progress_done: int = 0
     progress_total: int = 0
     progress_pct: float = 0.0
+    progress_stage: str = ""
     log_lines: List[str] = field(default_factory=list)
     output_path: str = ""
     ozon_output_path: str = ""
@@ -318,6 +319,7 @@ class AppState:
             "progress_done": self.progress_done,
             "progress_total": self.progress_total,
             "progress_pct": self.progress_pct,
+            "progress_stage": self.progress_stage,
             "output_path": self.output_path,
             "ozon_output_path": self.ozon_output_path,
             "log_path": self.log_path,
@@ -334,8 +336,15 @@ class AppState:
 # ---------------------------------------------------------------------------
 # Regex для парсинга stdout движков
 # ---------------------------------------------------------------------------
+# v27.9.x: однозначный маркер прогресса от движков (emit_progress). Парсится
+# в первую очередь — это убирает скачки полосы из-за «повтор 2/5» и т.п.
+PROGRESS_SENTINEL_RX = re.compile(
+    r"@@PROGRESS@@\s+stage=(\S+)\s+done=(\d+)\s+total=(\d+)"
+)
 PROGRESS_RX = re.compile(r"(\d+)\s*/\s*(\d+)")
 PROGRESS_PCT_RX = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+# Строки, где «X/Y» — это НЕ прогресс (счётчик повторов, попытки и т.п.).
+PROGRESS_FALSE_RX = re.compile(r"повтор|retry|попытк|/мин|/час", re.IGNORECASE)
 STATUS_RX = re.compile(
     r"\[(OK|ОШИБКА|ТАЙМАУТ|НЕТ ДОКУМЕНТОВ|НЕТ ССЫЛКИ НА РЕЕСТР|НЕСООТВЕТСТВИЕ|ССЫЛКА НА РЕЕСТР СОБРАНА)\]"
 )
@@ -389,6 +398,7 @@ class EngineRunner:
         s.progress_done = 0
         s.progress_total = 0
         s.progress_pct = 0.0
+        s.progress_stage = ""
         s.log_lines = []
         s.error = ""
         s.output_path = ""
@@ -581,12 +591,13 @@ class EngineRunner:
 
     def _parse_line(self, line: str) -> None:
         """Парсит строку stdout: прогресс, метрики, пути к файлам."""
-        # Прогресс X/Y
-        m = PROGRESS_RX.search(line)
+        # 1) Однозначный машиночитаемый маркер прогресса (приоритет).
+        m = PROGRESS_SENTINEL_RX.search(line)
         if m:
             try:
-                d, t = int(m.group(1)), int(m.group(2))
+                stage, d, t = m.group(1), int(m.group(2)), int(m.group(3))
                 if 0 < t < 10_000_000:
+                    self.state.progress_stage = stage
                     self.state.progress_done = d
                     self.state.progress_total = t
                     self.state.progress_pct = min(100.0, 100.0 * d / t)
@@ -594,6 +605,21 @@ class EngineRunner:
                     return
             except ValueError:
                 pass
+        # 2) Запасной разбор «X/Y» из обычного лога — но не из строк, где
+        #    «X/Y» означает счётчик повторов/скорость (иначе полоса скачет).
+        if not PROGRESS_FALSE_RX.search(line):
+            m = PROGRESS_RX.search(line)
+            if m:
+                try:
+                    d, t = int(m.group(1)), int(m.group(2))
+                    if 0 < t < 10_000_000 and d <= t:
+                        self.state.progress_done = d
+                        self.state.progress_total = t
+                        self.state.progress_pct = min(100.0, 100.0 * d / t)
+                        self.state.tick_activity()
+                        return
+                except ValueError:
+                    pass
         # Прогресс X%
         m = PROGRESS_PCT_RX.search(line)
         if m:
@@ -2481,7 +2507,13 @@ function updateQueueScreen(s) {
   $('#kpi-mode-lbl').textContent = s.mode || '—';
   $('#kpi-speed').textContent = s.speed_per_min > 0 ? s.speed_per_min.toFixed(1) : '—';
   $('#prog-label').textContent = s.running ? 'выполняется' : (s.output_path ? 'завершено' : 'ожидание');
-  $('#prog-stage').textContent = s.stage_label || '';
+  const STAGE_LABELS = {
+    links: 'этап: сбор ссылок на документы',
+    registry: 'этап: проверка реестров',
+    search: 'этап: поиск карточек',
+    cards: 'этап: загрузка карточек',
+  };
+  $('#prog-stage').textContent = s.stage_label || STAGE_LABELS[s.progress_stage] || '';
 
   const st  = (s.metrics && s.metrics.status)      || {};
   const reg = (s.metrics && s.metrics.registry)     || {};

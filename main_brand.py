@@ -174,6 +174,15 @@ class BrandResult:
 def now_iso() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
+def emit_progress(stage: str, done: int, total: int) -> None:
+    """Машиночитаемый прогресс для GUI (см. main_v39.emit_progress)."""
+    try:
+        print(f"@@PROGRESS@@ stage={stage} done={int(done)} total={int(total)}",
+              flush=True)
+    except Exception:
+        pass
+
 def norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("ё", "е").lower()).strip()
 
@@ -2260,6 +2269,7 @@ async def collect_brand_cards(args) -> List[BrandCard]:
                 topq = sorted(query_hits.items(), key=lambda x: x[1], reverse=True)[:5]
                 topq_s = "; ".join(f"{q}:{n}" for q, n in topq)
                 print(f"[collect] задач={done_count}/{len(tasks)}, карточек={len(cards)}, топ-запросы=[{topq_s}]")
+                emit_progress("search", done_count, len(tasks))
             if stop.is_set():
                 for x in tasks:
                     if not x.done():
@@ -4579,6 +4589,7 @@ async def progress_loop(q: asyncio.Queue, store: BrandResultStore, args, progres
                 f"найдено ссылок={progress['links']}, оригинал={progress['original_yes']}, нет документов={progress['no_docs']}, "
                 f"нет ссылки={progress['no_link']}, очередь={q.qsize()}, тех={progress['tech']}, активные=[{'; '.join(active[:8])}]"
             )
+            emit_progress("links", progress['done'], total)
             await store.save()
     except asyncio.CancelledError:
         return

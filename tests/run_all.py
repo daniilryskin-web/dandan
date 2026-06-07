@@ -20,6 +20,7 @@ MODULES = [
     "test_ozon_verdict",
     "test_progress",
     "test_report_e2e",
+    "test_preflight",
 ]
 
 

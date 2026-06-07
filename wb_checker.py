@@ -642,6 +642,19 @@ class EngineRunner:
             st = self.state.metrics.setdefault("status", {})
             st[k] = st.get(k, 0) + 1
             self.state.tick_activity()
+        # v27.9.x: распределение по реестрам из строк прогресса (FSA=.., SWIS=..).
+        # Это наполняет график «Реестры», который раньше оставался «нет данных».
+        reg_hits = re.findall(r"\b(FSA|SWIS|BELGISS|BelGISS)\s*=\s*(\d+)", line)
+        if reg_hits:
+            reg = self.state.metrics.setdefault("registry", {})
+            for _name, _val in reg_hits:
+                _up = _name.upper()
+                _key = "ФСА" if _up == "FSA" else ("SWIS" if _up == "SWIS" else "BelGISS")
+                try:
+                    reg[_key] = int(_val)  # в логе кумулятивные тоталы — присваиваем
+                except ValueError:
+                    pass
+            self.state.tick_activity()
         # Путь к выходному файлу
         m = OUTPUT_RX.search(line)
         if m:

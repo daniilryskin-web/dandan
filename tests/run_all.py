@@ -21,6 +21,7 @@ MODULES = [
     "test_progress",
     "test_report_e2e",
     "test_preflight",
+    "check_frontend",
 ]
 
 

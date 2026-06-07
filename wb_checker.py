@@ -1671,6 +1671,55 @@ tbody tr:last-child td { border-bottom: none; }
 .text-sm { font-size: 12px; }
 .ml-auto { margin-left: auto; }
 hr.section-sep { border: none; border-top: 1px solid var(--border); margin: 0; }
+
+/* ===================== v27.9.x: Polish (additive) ===================== */
+/* Дополняющие правила в конце каскада: глубина, мягкие микро-взаимодействия,
+   доступный фокус. Не переопределяют структуру — только визуальный лоск. */
+:root { --shadow-1: 0 1px 2px rgba(0,0,0,0.18), 0 4px 16px rgba(0,0,0,0.22);
+        --shadow-2: 0 6px 24px rgba(0,0,0,0.30);
+        --ring: 0 0 0 3px rgba(91,140,255,0.35); }
+[data-theme="light"] { --shadow-1: 0 1px 2px rgba(16,24,40,0.06), 0 4px 14px rgba(16,24,40,0.08);
+        --shadow-2: 0 10px 28px rgba(16,24,40,0.12); }
+
+.card, .kpi-card, .chart-card {
+  box-shadow: var(--shadow-1);
+  transition: box-shadow 0.2s ease, transform 0.2s ease, border-color 0.2s ease;
+  will-change: transform;
+}
+.kpi-card:hover, .chart-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-2);
+  border-color: var(--border2);
+}
+
+/* Главная кнопка — мягкий градиент и выразительный hover */
+.btn-primary {
+  background-image: linear-gradient(135deg, var(--accent), var(--accent2));
+}
+.btn-primary:hover:not(:disabled) {
+  background-image: linear-gradient(135deg, var(--accent), var(--accent3, var(--accent2)));
+  transform: translateY(-1px);
+}
+.btn-lg { box-shadow: 0 4px 14px rgba(91,140,255,0.35); }
+
+/* Доступный фокус по клавиатуре (не мешает мыши) */
+.btn:focus-visible, .nav-btn:focus-visible, .seg-btn:focus-visible,
+.field input:focus-visible, .field select:focus-visible {
+  outline: none; box-shadow: var(--ring);
+}
+
+/* Активный пункт меню — аккуратная акцентная полоса слева */
+.nav-btn { position: relative; }
+.nav-btn.active::before {
+  content: ''; position: absolute; left: 0; top: 8px; bottom: 8px;
+  width: 3px; border-radius: 0 3px 3px 0; background: var(--accent);
+}
+
+/* Числа KPI — моноширинные цифры, чтобы не «прыгали» при обновлении */
+.kpi-value { font-variant-numeric: tabular-nums; }
+
+/* Чуть живее переходы экранов */
+.screen.active { animation: fadeUp 0.22s cubic-bezier(0.16,1,0.3,1); }
 </style>
 <!--__CHARTJS_INLINE__-->
 </head>

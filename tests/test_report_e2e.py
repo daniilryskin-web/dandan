@@ -39,6 +39,7 @@ def make_rows():
             certificate_product_name="Изделия чулочно-носочные\x0b для взрослых",
             document_status="Действует", document_date_end="2027-01-01",
             details="ok\x00", score=82.0,
+            colors="чёрный, белый", wb_root="987654",
         ),
         m.ResultRow(
             query="носки", nm_id=600000123, product_name="Платье",
@@ -87,6 +88,14 @@ if xlsx_path.exists():
     svodka = wb["Сводка"]
     check("на 'Сводке' есть графики", len(getattr(svodka, "_charts", [])) >= 1,
           f"charts={len(getattr(svodka, '_charts', []))}")
+    # новые поля карточки доходят до отчёта
+    podробnosti = wb["Подробности"]
+    header = [c.value for c in podробnosti[1]]
+    pod_text = " ".join(
+        str(c.value) for row in podробnosti.iter_rows() for c in row if c.value is not None
+    )
+    check("в 'Подробностях' есть колонка 'Цвет'", "Цвет" in header, str(header))
+    check("значение цвета попало в отчёт", "чёрный" in pod_text)
 
 # --------------------------------------------------------------------------
 # Ozon-отчёт тем же сценарием (был ключевой жалобой)

@@ -448,6 +448,8 @@ class Card:
     pics_count: int = 0
     in_stock: int = 0
     is_original: str = ""  # v43: признак оригинальности из карточки WB
+    colors: str = ""        # v27.9.x: цвет(а) товара из карточки WB
+    wb_root: str = ""       # v27.9.x: корневой ID карточки WB (группировка вариантов)
 
 @dataclass
 class ResultRow:
@@ -466,6 +468,8 @@ class ResultRow:
     rating: float = 0.0
     feedbacks: int = 0
     is_original: str = ""  # v43: признак оригинальности
+    colors: str = ""        # v27.9.x: цвет(а) товара из карточки WB
+    wb_root: str = ""       # v27.9.x: корневой ID карточки WB
     # Реестровая ссылка
     registry_url: str = ""
     registry_host: str = ""
@@ -1711,6 +1715,8 @@ def _card_fields_for_result(card: Card) -> Dict[str, Any]:
         "rating": getattr(card, "rating", 0.0),
         "feedbacks": getattr(card, "feedbacks", 0),
         "is_original": getattr(card, "is_original", ""),
+        "colors": getattr(card, "colors", ""),
+        "wb_root": getattr(card, "wb_root", ""),
     }
 
 
@@ -1820,6 +1826,15 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                 # v43: оригинальность товара — по флагам/полям карточки WB.
                 # supplierFlags и отдельные поля могут содержать признак оригинала.
                 is_original = _detect_wb_original(p)
+                # v27.9.x: дополнительные поля карточки (защитно, пусто если нет).
+                color_names: List[str] = []
+                for _c in (p.get("colors") or []):
+                    if isinstance(_c, dict):
+                        _cn = str(_c.get("name") or "").strip()
+                        if _cn:
+                            color_names.append(_cn)
+                colors_str = ", ".join(dict.fromkeys(color_names))
+                wb_root = str(p.get("root") or "")
                 rating = 0.0
                 try:
                     r_v = p.get("rating") or p.get("reviewRating") or p.get("supplierRating")
@@ -1836,7 +1851,7 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                     price_rub=price_rub, sale_price_rub=sale_price_rub or price_rub,
                     seller_name=seller_name, supplier_id=supplier_id,
                     rating=rating, feedbacks=feedbacks, pics_count=pics_count, in_stock=in_stock,
-                    is_original=is_original,
+                    is_original=is_original, colors=colors_str, wb_root=wb_root,
                 ))
             break
     return cards
@@ -2006,6 +2021,8 @@ DETAILS_HEADERS_RU_V39: Dict[str, str] = {
     "rating": "Рейтинг",
     "feedbacks": "Отзывы",
     "is_original": "Плашка 'Оригинал'",
+    "colors": "Цвет",
+    "wb_root": "Корневой ID (WB)",
     "registry_url": "Ссылка на реестр",
     "registry_host": "Реестр (хост)",
     "registry_record_id": "ID записи реестра",
@@ -2436,7 +2453,8 @@ class ResultStore:
             "query": 18, "nm_id": 12, "product_name": 42, "brand": 22, "subject": 20,
             "product_url": 48, "status": 28, "price_rub": 12, "sale_price_rub": 14,
             "seller_name": 26, "supplier_id": 14, "rating": 8, "feedbacks": 10,
-            "is_original": 14, "registry_url": 60, "registry_host": 24,
+            "is_original": 14, "colors": 20, "wb_root": 14,
+            "registry_url": 60, "registry_host": 24,
             "registry_record_id": 20, "certificate_number": 30, "document_type": 16,
             "document_status": 16, "certificate_product_name": 55,
             "document_date_start": 16, "document_date_end": 16, "applicant_name": 40,

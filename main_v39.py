@@ -3316,6 +3316,7 @@ async def progress_loop(queue: asyncio.Queue, store: ResultStore, args, progress
                 f"нет документов={progress['no_docs']}, нет ссылки={progress['no_link']}, "
                 f"очередь={queue.qsize()}, тех={progress['tech']}, активные=[{'; '.join(active_desc)}]{stall_str}"
             )
+            emit_progress("links", done, total)
             if now - last_change > args.stuck_report_sec:
                 stuck = []
                 for w, info in list(progress["active"].items()):

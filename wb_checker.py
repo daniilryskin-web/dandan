@@ -2588,6 +2588,7 @@ function updateQueueScreen(s) {
   const st  = (s.metrics && s.metrics.status)      || {};
   const reg = (s.metrics && s.metrics.registry)     || {};
   const mkt = (s.metrics && s.metrics.marketplace)  || {};
+  _lastRunMode = s.mode || _lastRunMode;
 
   let okCnt = 0, errCnt = 0;
   Object.entries(st).forEach(([k,v]) => {
@@ -2614,9 +2615,19 @@ function updateQueueScreen(s) {
   // После завершения — подгружаем из xlsx полную статистику.
   if (_chartjs) {
     if (s.running) {
-      updateDonutChart('chart-status',      'chart-status-fb',      st,  STATUS_COLORS);
-      updateDonutChart('chart-registry',    'chart-registry-fb',    reg, REGISTRY_COLORS);
-      updateDonutChart('chart-marketplace', 'chart-marketplace-fb', mkt, MKT_COLORS);
+      // Маркетплейс: движок WB/Ozon не присылает распределение — выводим по
+      // режиму, иначе график всегда «нет данных».
+      let mktData = mkt;
+      if (!mktData || !Object.keys(mktData).length) {
+        const totalSt = Object.values(st || {}).reduce((a, b) => a + b, 0);
+        if (totalSt > 0) {
+          const md = (s.mode || '').toLowerCase();
+          mktData = (md.indexOf('ozon') >= 0) ? { 'Ozon': totalSt } : { 'Wildberries': totalSt };
+        }
+      }
+      updateDonutChart('chart-status',      'chart-status-fb',      st,      STATUS_COLORS);
+      updateDonutChart('chart-registry',    'chart-registry-fb',    reg,     REGISTRY_COLORS);
+      updateDonutChart('chart-marketplace', 'chart-marketplace-fb', mktData, MKT_COLORS);
       // Оригинальность лайв не можем — она в xlsx
       updateDonutChart('chart-original', 'chart-original-fb', {}, ORIGINAL_COLORS);
     } else if (s.output_path && !_queueChartsLoaded) {
@@ -2998,8 +3009,23 @@ function updateDonutChart(canvasId, fallbackId, data, colorMap, opts) {
   const colors = fullLabels.map((k, i) =>
     (colorMap && colorMap[k]) || colorFor(i, fullLabels.length));
 
+  const chartType = opts.type || 'doughnut';
+
+  // v27.9.x: ОБНОВЛЯЕМ существующий график на месте (а не destroy+create на
+  // каждом опросе) — иначе график мерцал каждые 600мс. Полные подписи храним на
+  // самом графике ($fullLabels), чтобы tooltip работал и после обновления.
+  const existing = _charts[canvasId];
+  if (existing && existing.$chartType === chartType) {
+    existing.$fullLabels = fullLabels;
+    existing.data.labels = labels;
+    existing.data.datasets[0].data = values;
+    existing.data.datasets[0].backgroundColor = colors;
+    existing.update('none');  // без анимации — плавно и без мерцания
+    return;
+  }
+
   const cfg = {
-    type: opts.type || 'doughnut',
+    type: chartType,
     data: {
       labels,
       datasets: [{
@@ -3011,6 +3037,7 @@ function updateDonutChart(canvasId, fallbackId, data, colorMap, opts) {
     },
     options: {
       responsive: true, maintainAspectRatio: false,
+      animation: { duration: 200 },
       cutout: opts.type === 'bar' ? undefined : '62%',
       indexAxis: opts.type === 'bar' ? 'y' : undefined,
       plugins: {
@@ -3021,11 +3048,13 @@ function updateDonutChart(canvasId, fallbackId, data, colorMap, opts) {
         },
         tooltip: {
           callbacks: {
-            title: (items) => fullLabels[items[0].dataIndex] || '',
+            // полные подписи берём с самого графика (переживает обновления)
+            title: (items) => ((items[0].chart.$fullLabels || [])[items[0].dataIndex]) || '',
             label: ctx => {
-              const total = values.reduce((a, b) => a + b, 0) || 1;
-              const pct = ((ctx.parsed.x ?? ctx.parsed.y ?? ctx.parsed) / total * 100).toFixed(1);
-              return ` ${ctx.parsed.x ?? ctx.parsed.y ?? ctx.parsed} (${pct}%)`;
+              const arr = ctx.chart.data.datasets[0].data || [];
+              const total = arr.reduce((a, b) => a + b, 0) || 1;
+              const v = ctx.parsed.x ?? ctx.parsed.y ?? ctx.parsed;
+              return ` ${v} (${(v / total * 100).toFixed(1)}%)`;
             },
           },
         },
@@ -3039,6 +3068,8 @@ function updateDonutChart(canvasId, fallbackId, data, colorMap, opts) {
   if (_charts[canvasId]) { destroyChart(canvasId); }
   if (!_chartjs) return;
   _charts[canvasId] = new _chartjs(canvas, cfg);
+  _charts[canvasId].$fullLabels = fullLabels;
+  _charts[canvasId].$chartType = chartType;
 }
 
 function buildResultsCharts(stats) {
@@ -3054,6 +3085,7 @@ function buildResultsCharts(stats) {
 
 // Кэш последней статистики для вкладки «Очередь»
 let _lastQueueStats = null;
+let _lastRunMode = '';
 async function refreshQueueCharts() {
   // Гружаем статистику из файла-результата (если он есть)
   try {
@@ -3065,9 +3097,18 @@ async function refreshQueueCharts() {
     }
   } catch (e) { _lastQueueStats = null; }
   const st = _lastQueueStats || { by_status: {}, by_registry: {}, by_marketplace: {}, by_original: {} };
+  // Маркетплейс: если в выгрузке нет распределения — выводим по режиму прогона.
+  let mkt2 = st.by_marketplace || {};
+  if (!Object.keys(mkt2).length) {
+    const totalSt = Object.values(st.by_status || {}).reduce((a, b) => a + b, 0);
+    if (totalSt > 0) {
+      mkt2 = ((_lastRunMode || '').toLowerCase().indexOf('ozon') >= 0)
+        ? { 'Ozon': totalSt } : { 'Wildberries': totalSt };
+    }
+  }
   updateDonutChart('chart-status',      'chart-status-fb',      st.by_status      || {}, STATUS_COLORS);
   updateDonutChart('chart-registry',    'chart-registry-fb',    st.by_registry    || {}, REGISTRY_COLORS);
-  updateDonutChart('chart-marketplace', 'chart-marketplace-fb', st.by_marketplace || {}, MKT_COLORS);
+  updateDonutChart('chart-marketplace', 'chart-marketplace-fb', mkt2, MKT_COLORS);
   updateDonutChart('chart-original',    'chart-original-fb',    st.by_original    || {}, ORIGINAL_COLORS);
 }
 

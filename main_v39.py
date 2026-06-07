@@ -6366,19 +6366,25 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                 _cap = await _resp.json()
                 _parsed = parse_fsa_json(_cap, url, _kind_fsa, _doc_id_fsa)
                 if _parsed.get('doc_number'):
-                    _FSA_EXTENDED_FIELDS_CACHE[url] = {
+                    # v27.9.x ГИБРИД: реальный JSON-API ФСА отдаёт status и scheme
+                    # ЧИСЛОВЫМИ кодами, а product — не названием (это ломало вердикт).
+                    # Поэтому из API берём только НАДЁЖНЫЕ поля (ИНН, изготовитель,
+                    # заявитель, ТН ВЭД, даты) в кэш, а название и текстовый статус
+                    # документа добываем ниже браузером (как раньше) — вердикт
+                    # снова корректный. Браузерный merge не перетирает эти поля
+                    # (заполняет только пустые). Точный разбор status/scheme/название
+                    # из JSON будет добавлен по реальному телу certificate.json-API.
+                    _api_ext = {
                         'document_date_start': _parsed.get('date_start', ''),
                         'document_date_end': _parsed.get('date_end', ''),
                         'applicant_name': _clean_org_name(_parsed.get('applicant', '')),
                         'applicant_inn': _parsed.get('applicant_inn', ''),
                         'manufacturer_name': _clean_org_name(_parsed.get('manufacturer', '')),
                         'tnved': _clean_tnved_code(_parsed.get('tnved', '')),
-                        'scheme': _parsed.get('scheme', ''),
-                        'technical_regulation': _parsed.get('technical_regulation', ''),
                     }
-                    return (_parsed.get('doc_number', ''), _parsed.get('product_full', ''),
-                            _parsed.get('doc_type', ''), _parsed.get('status', ''),
-                            'fsa_api_capture_ok; via=spa_response')
+                    _FSA_EXTENDED_FIELDS_CACHE[url] = {k: v for k, v in _api_ext.items() if v}
+                    details.append('fsa_api_ext_ok')
+                    # НЕ возвращаемся: пусть браузер добудет название + текстовый статус
         except Exception as _e:
             details.append(f'fsa_api_capture_miss={type(_e).__name__}')
 

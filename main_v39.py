@@ -673,14 +673,12 @@ def wb_basket_by_volume(vol: int) -> int:
     """Официальная шардировка WB media-basket по vol.
     Источник: реальные HAR-дампы. Для vol=1982 → basket-13.
 
-    ВАЖНО (v27.9.x): раньше таблица обрывалась на basket-30 для любого vol>5429.
-    WB постоянно добавляет новые basket-шарды равномерными бэндами по 216 vol
-    (4565→25, 4781→26, …, 5429→29 — шаг ровно 216). Для НОВЫХ (высоких nm_id)
-    товаров primary-шард был >30, и старый код всегда возвращал 30 → primary
-    оказывался неверным, карточка зря перебирала все шарды и могла ошибочно
-    помечаться «нет документа». Теперь экстраполируем наблюдаемый шаг, поэтому
-    primary остаётся корректным и для будущих товаров (а соседние шарды всё
-    равно подстраховывают возможный дрейф границ).
+    v27.9.x: таблица точна для vol≤5429. Для бОльших vol мэппинг продолжается,
+    но НЕ шагом 216 — по реальным прогонам (5514→29, 6708→32, 7627→36, 8004→37)
+    шаг более пологий, ≈311 vol на шард. Прежняя экстраполяция по 216 «перелетала»
+    в несуществующие basket-50+ (vol≈9800 давал basket-50, а реальный — ~40),
+    из-за чего запросы шли к нерезолвящимся хостам (DNS-ошибки) и карточка зря
+    помечалась ОШИБКОЙ. Теперь наклон ≈311 и осторожный кап.
     """
     ranges = [
         (143, 1), (287, 2), (431, 3), (719, 4), (1007, 5),
@@ -693,10 +691,9 @@ def wb_basket_by_volume(vol: int) -> int:
     for max_vol, basket in ranges:
         if vol <= max_vol:
             return basket
-    # vol > 5429 — продолжаем равномерный бэнд по 216 vol на шард.
-    # basket-30 покрывает 5430..5645, basket-31 → 5646..5861, и т.д.
-    extra = (int(vol) - 5429 + 215) // 216  # целочисленный ceil
-    return min(199, 29 + max(1, extra))
+    # vol > 5429 — пологое продолжение ≈311 vol/шард (подтверждено прогонами).
+    extra = round((int(vol) - 5429) / 311.0)
+    return min(60, 29 + extra)
 
 
 def certificate_json_urls(nm_id: int, max_hosts: int = 12) -> List[str]:
@@ -718,14 +715,21 @@ def certificate_json_urls(nm_id: int, max_hosts: int = 12) -> List[str]:
         if 1 <= b <= 199 and b not in order:
             order.append(b)
 
-    # 1) расчётный шард и его близкие соседи (страховка от дрейфа границ)
-    for d in (0, -1, 1, -2, 2, -3, 3, -4, 4):
+    # 1) расчётный шард и широкий круг соседей (страховка от неточности мэппинга
+    #    высоких vol — там границы шардов известны хуже)
+    for d in (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6):
         push(primary + d)
-    # 2) исторически «населённые» шарды
+    # 2) для высоких vol реальные шарды лежат в диапазоне ~30..40 (по прогонам
+    #    встречаются вплоть до basket-37). Плотно добиваем именно его, иначе при
+    #    неточном primary карточка не нашла бы свой шард среди первых кандидатов.
+    if primary >= 28:
+        for b in (37, 36, 38, 35, 39, 34, 40, 33, 32, 31, 30, 41, 42, 43):
+            push(b)
+    # 3) исторически «населённые» низкие шарды
     for b in (13, 12, 14, 15, 16, 11, 10, 17, 18, 1):
         push(b)
-    # 3) добиваем остальной диапазон (вокруг primary и снизу вверх)
-    upper = max(40, primary + 8)
+    # 4) добиваем остальной диапазон
+    upper = max(42, primary + 6)
     for b in range(1, upper + 1):
         push(b)
 
@@ -813,12 +817,23 @@ async def fetch_certificate_json_for_nm(
 
     state = {
         "not_found": 0,            # честные 404
-        "net_errors": [],          # timeout / connection — это НЕ 404
+        "host_absent": 0,          # DNS не резолвится = такого basket-шарда НЕТ (как 404)
+        "net_errors": [],          # timeout / connection reset — это НЕ 404 (повторить)
         "other_status": [],        # 5xx и прочее
         "json_hosts": [],          # шарды где json реально есть (200)
         "urls": [],                # извлечённые ссылки на реестр
     }
     found = asyncio.Event()
+
+    def _is_host_absent(exc: BaseException) -> bool:
+        # Несуществующий basket-хост: DNS не резолвится. Это НЕ временный сбой —
+        # такого шарда просто нет, повтор не поможет, трактуем как «нет файла».
+        name = type(exc).__name__
+        if "DNS" in name or "gaierror" in name:
+            return True
+        s = str(exc).lower()
+        return ("getaddrinfo" in s or "name or service not known" in s
+                or "nodename nor servname" in s or "temporary failure in name resolution" in s)
 
     async def probe(url: str) -> None:
         if found.is_set():
@@ -858,9 +873,15 @@ async def fetch_certificate_json_for_nm(
             except asyncio.TimeoutError:
                 state["net_errors"].append(f"timeout:{hostname(url)}")
             except aiohttp.ClientError as e:
-                state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
+                if _is_host_absent(e):
+                    state["host_absent"] += 1   # такого basket-шарда нет = как 404
+                else:
+                    state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
             except Exception as e:
-                state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
+                if _is_host_absent(e):
+                    state["host_absent"] += 1
+                else:
+                    state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
 
     tasks = [asyncio.create_task(probe(u)) for u in urls]
     try:
@@ -879,20 +900,24 @@ async def fetch_certificate_json_for_nm(
     all_urls = state["urls"]
     json_hosts = state["json_hosts"]
     not_found = state["not_found"]
+    host_absent = state["host_absent"]
     net_errors = state["net_errors"]
     other_status = state["other_status"]
+    # «нет файла» = честный 404 ИЛИ несуществующий хост (DNS). И то и другое —
+    # достоверный сигнал отсутствия документа на этом шарде, а не сетевой сбой.
+    absent = not_found + host_absent
     if all_urls:
         return all_urls, f"cert_json_ok:{json_hosts[0] if json_hosts else '?'}"
     if json_hosts:
         # json существует (документ есть), но ссылку извлечь не удалось
         return [], f"cert_json_has_doc_no_url:hosts={','.join(json_hosts[:3])}"
-    if not_found and not net_errors and not other_status:
-        # ВСЕ шарды честно вернули 404 → документа нет
-        return [], f"cert_json_no_docs:tried={tried},404={not_found}"
     if net_errors:
-        # были сетевые ошибки, не получили полную картину 404 → надо повторить
-        return [], f"cert_json_neterror:tried={tried},404={not_found},net={';'.join(net_errors[:4])}"
-    # смешанный случай (только other_status, без 404 и без net): помечаем neterror
+        # БЫЛИ настоящие сетевые сбои (timeout/reset) без 200 → надо повторить
+        return [], f"cert_json_neterror:tried={tried},404={not_found},dns={host_absent},net={';'.join(net_errors[:4])}"
+    if absent:
+        # все ответы — 404 и/или несуществующие шарды → документа действительно нет
+        return [], f"cert_json_no_docs:tried={tried},404={not_found},dns={host_absent}"
+    # ничего внятного (только other_status) → помечаем neterror
     return [], f"cert_json_neterror:tried={tried},404={not_found},other={';'.join(other_status[:2])}"
 
 
@@ -6030,6 +6055,49 @@ async def _wait_until_fsa_rendered(page, timeout_ms: int = 20000) -> bool:
         return False
 
 
+async def _fetch_fsa_via_browser_page(page, url: str) -> Optional[Dict[str, str]]:
+    """v27.9.x: тянет JSON-API ФСА ЧЕРЕЗ САМ БРАУЗЕР (same-origin fetch со страницы
+    pub.fsa.gov.ru).
+
+    Зачем: когда антибот ФСА блокирует curl_cffi (HTTP 403 → срабатывает circuit
+    breaker), весь парсинг уходит в скрейп рендера, который НЕ добирает часть
+    полей (ИНН заявителя, изготовитель, схема, техрегламент — они на других
+    вкладках/в JSON). Но страницы ФСА в браузере открываются нормально, значит
+    same-origin fetch к /api/v1/... несёт настоящие cookie/TLS браузера и
+    проходит там, где curl_cffi падает. Ответ — структурированный JSON со ВСЕМИ
+    полями, парсим его тем же parse_fsa_json.
+
+    Требование: страница уже должна быть на домене pub.fsa.gov.ru (иначе fetch
+    будет cross-origin). Возвращает dict полей (как parse_fsa_json) или None.
+    """
+    kind, doc_id = extract_fsa_kind_id(url)
+    if not kind or not doc_id:
+        return None
+    for _label, api_url in _fsa_candidates(kind, doc_id, aggressive=True):
+        try:
+            data = await page.evaluate(
+                """async (u) => {
+                    try {
+                        const r = await fetch(u, {headers: {'Accept': 'application/json'}, credentials: 'include'});
+                        if (!r.ok) return {__status: r.status};
+                        return await r.json();
+                    } catch (e) { return {__error: String(e)}; }
+                }""",
+                api_url,
+            )
+        except Exception:
+            continue
+        if isinstance(data, dict) and "__status" not in data and "__error" not in data:
+            try:
+                parsed = parse_fsa_json(data, url, kind, doc_id)
+            except Exception:
+                parsed = None
+            if parsed and parsed.get("doc_number"):
+                parsed["source"] = f"browser_page_fetch:{api_url}"
+                return parsed
+    return None
+
+
 async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str, str, str, str, str]:
     """v39.5: возвращает (cert_number, product_name, doc_type, doc_status, detail).
 
@@ -6117,6 +6185,30 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             except Exception:
                 _len_now = -1
             details.append(f'number_page_render={"ok" if rendered else "timeout"};number_page_text_len={_len_now}')
+
+            # v27.9.x: страница уже на pub.fsa.gov.ru — пробуем JSON-API ЧЕРЕЗ БРАУЗЕР.
+            # Это обходит 403 curl_cffi и даёт ПОЛНЫЙ набор полей (ИНН, изготовитель,
+            # схема, техрегламент), которых не хватало при скрейпе рендера. Если не
+            # вышло — молча продолжаем обычный браузерный парсинг (полный откат).
+            try:
+                _bdata = await _fetch_fsa_via_browser_page(page, url)
+            except Exception:
+                _bdata = None
+            if _bdata and _bdata.get('doc_number'):
+                _FSA_EXTENDED_FIELDS_CACHE[url] = {
+                    'document_date_start': _bdata.get('date_start', ''),
+                    'document_date_end': _bdata.get('date_end', ''),
+                    'applicant_name': _clean_org_name(_bdata.get('applicant', '')),
+                    'applicant_inn': _bdata.get('applicant_inn', ''),
+                    'manufacturer_name': _clean_org_name(_bdata.get('manufacturer', '')),
+                    'tnved': _clean_tnved_code(_bdata.get('tnved', '')),
+                    'scheme': _bdata.get('scheme', ''),
+                    'technical_regulation': _bdata.get('technical_regulation', ''),
+                }
+                return (_bdata.get('doc_number', ''), _bdata.get('product_full', ''),
+                        _bdata.get('doc_type', ''), _bdata.get('status', ''),
+                        'fsa_browser_api_ok; via=page.fetch')
+
             await _click_fsa_section_tab_if_exists(page, url, 'number')
 
             # v40.2: до 2 попыток extract (было 3) с короткой паузой — ускоряет парсинг.
@@ -7401,8 +7493,8 @@ def build_parser():
                     help="v40.3: дотягивать имена продавцов (seller_name) через card.wb.ru detail API. WB-поиск отдаёт только supplierId. true/false (default true).")
     ap.add_argument("--cert-timeout-sec", type=float, default=6.0,
                     help="таймаут одного запроса к basket-NN.wbbasket.ru/certificate.json")
-    ap.add_argument("--cert-max-hosts", type=int, default=8,
-                    help="сколько basket-шардов пробовать на карточку (1..30). v27.7: уменьшено 30→8. Первым идёт детерминированно вычисленный по vol шард, затем соседи ±2 и популярные 13/12/14 — этого хватает практически всегда, а худший случай (карточка без документа) ускоряется ~4×: было до 30 последовательных 404, стало 8. Для максимальной надёжности можно вернуть 30.")
+    ap.add_argument("--cert-max-hosts", type=int, default=16,
+                    help="сколько basket-шардов пробовать на карточку. v27.9.x: перебор стал ПАРАЛЛЕЛЬНЫМ, поэтому большее число шардов почти не стоит времени, но заметно повышает покрытие — особенно для товаров с высоким vol (новые nm_id), где границы шардов известны хуже. Дефолт поднят 8→16. Можно повышать до 30+ для максимальной надёжности.")
     ap.add_argument("--no-docs-confirm-404", type=int, default=0,
                     help="v40: устарел (логика теперь автоматическая: все честные 404 = нет документов, сетевая ошибка = повтор). Оставлен для совместимости команд.")
     # v39.13: HTTP fast-path для FSA-парсинга на 2 этапе

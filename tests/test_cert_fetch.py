@@ -33,6 +33,8 @@ class FakeResp:
     async def __aenter__(self):
         if self._delay:
             await asyncio.sleep(self._delay)
+        if self._raise_timeout == "dns":
+            raise Exception("Cannot connect to host: getaddrinfo failed")
         if self._raise_timeout:
             raise asyncio.TimeoutError()
         return self
@@ -154,6 +156,35 @@ async def _timeout_case():
 
 urls, status = _run(_timeout_case())
 check("все таймауты -> cert_json_neterror", status.startswith("cert_json_neterror"), status)
+
+
+# 7) РЕГРЕССИЯ: высокий vol больше НЕ перелетает в несуществующие basket-50+
+check("vol=8004 -> basket≈37 (по реальным данным)", m.wb_basket_by_volume(8004) == 37,
+      f"got {m.wb_basket_by_volume(8004)}")
+check("vol=9808 -> basket в реальном диапазоне (<=46), а не 50+",
+      m.wb_basket_by_volume(9808) <= 46, f"got {m.wb_basket_by_volume(9808)}")
+high_urls = m.certificate_json_urls(980839943, max_hosts=14)  # vol 9808
+import re as _re
+high_baskets = [int(_re.search(r"basket-(\d+)", u).group(1)) for u in high_urls]
+check("кандидаты высокого vol включают реальные шарды 30..40",
+      any(30 <= b <= 40 for b in high_baskets), str(high_baskets))
+
+
+# 8) РЕГРЕССИЯ: DNS-ошибка (несуществующий basket-хост) = «нет файла», НЕ ОШИБКА.
+#    Раньше это давало cert_json_neterror -> карточка помечалась ОШИБКОЙ.
+async def _dns_case():
+    # часть хостов 404, часть — несуществующие (DNS); ни одного 200
+    sess = FakeSession(
+        routes={"basket-37": (404, "", 0.0), "basket-36": (404, "", 0.0)},
+        default=(0, "", 0.0, "dns"),  # остальные не резолвятся
+    )
+    return await m.fetch_certificate_json_for_nm(
+        sess, 980839943, timeout_sec=2.0, max_hosts=8, concurrency=8
+    )
+
+urls, status = _run(_dns_case())
+check("DNS-несуществующие шарды -> cert_json_no_docs (не neterror)",
+      status.startswith("cert_json_no_docs"), status)
 
 
 # --------------------------------------------------------------------------

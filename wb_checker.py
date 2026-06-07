@@ -442,6 +442,14 @@ class EngineRunner:
         finally:
             self.state.running = False
             self.state.finished_at = time.time()
+            # v27.9.x: явно «закрываем» прогресс, иначе после завершения полоса
+            # остаётся на старом значении/этапе (особенно если движок нашёл 0
+            # результатов и прогресс не двигался) — и кажется, что работа идёт.
+            self.state.progress_stage = ""
+            if not self.state.error:
+                self.state.progress_pct = 100.0
+                if self.state.progress_total:
+                    self.state.progress_done = self.state.progress_total
             self._finalize_paths(spec)
 
     def _run_unified(self, spec: RunSpec) -> None:

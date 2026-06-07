@@ -22,6 +22,7 @@ MODULES = [
     "test_report_e2e",
     "test_preflight",
     "test_fsa_parse",
+    "test_ozon_search",
     "check_frontend",
 ]
 

@@ -1926,6 +1926,9 @@ _FSA_EXTENDED_FIELDS_CACHE: Dict[str, Dict[str, str]] = {}
 _FSA_HTTP_FAILS = 0
 _FSA_HTTP_DISABLED = False
 _FSA_HTTP_FAIL_LIMIT = 5
+# v27.9.x: один раз за прогон сохраняем сырой JSON-ответ API ФСА в файл —
+# чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
+_FSA_SAMPLE_DUMPED = False
 
 async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None) -> List[Card]:
     """v39.9: subject отдельно от subjectName.
@@ -6364,6 +6367,18 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             number_route_used = number_routes[0]
             if _resp.ok:
                 _cap = await _resp.json()
+                # v27.9.x: один раз за прогон сохраняем сырой JSON ФСА для разбора
+                # структуры (status/scheme/название приходят кодами/в др. полях).
+                global _FSA_SAMPLE_DUMPED
+                if not _FSA_SAMPLE_DUMPED:
+                    try:
+                        Path("fsa_api_sample.json").write_text(
+                            json.dumps(_cap, ensure_ascii=False, indent=2), encoding="utf-8")
+                        _FSA_SAMPLE_DUMPED = True
+                        print("📝 [diag] Структура ответа API ФСА сохранена в fsa_api_sample.json "
+                              "— пришлите этот файл для полного быстрого разбора ФСА.")
+                    except Exception:
+                        pass
                 _parsed = parse_fsa_json(_cap, url, _kind_fsa, _doc_id_fsa)
                 if _parsed.get('doc_number'):
                     # v27.9.x ГИБРИД: реальный JSON-API ФСА отдаёт status и scheme

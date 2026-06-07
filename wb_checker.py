@@ -58,7 +58,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026-06-07-v27.8-playwright"
+APP_VERSION = "2026-06-07-v27.9-playwright"
 APP_DIR = Path(__file__).resolve().parent
 # pywebview на Windows часто запускается через pythonw.exe (без консоли) — это ломает stdout pipe в дочерних
 # процессах. Сила принуждаем использовать python.exe (с консолью) для subprocess.
@@ -3082,6 +3082,11 @@ function loadChartJs() {
   // Загружаем Chart.js в фоне — не блокируем UI
   loadChartJs().then(() => {
     tryInitCharts();
+    // v27.8: при старте сразу подтягиваем последний результат (даже если прогон
+    // был в прошлой сессии/через CLI) — иначе графики «Очереди» и вкладка
+    // «Результаты» оставались пустыми, хотя файл result.xlsx есть.
+    refreshQueueCharts().catch(() => {});
+    if (typeof loadResults === 'function') { loadResults().catch(() => {}); }
   }).catch(() => {
     // Без интернета — charts работать не будут, показываем fallback
   });

@@ -256,6 +256,40 @@ def _format_date(s: Any) -> str:
     return s[:10]
 
 
+def _fsa_pick_scheme(leaves) -> str:
+    """Схема сертификации/декларирования — это короткий код (1с, 3с, 6д, 2д…),
+    а НЕ длинный текст «Решение Комиссии… N 621…». Берём значение нужной формы."""
+    for path, v in leaves:
+        if isinstance(v, (dict, list)) or v in (None, ""):
+            continue
+        s = str(v).strip()
+        # 1с / 3д / 6 с / 1C и т.п. (кириллица или латиница)
+        if re.fullmatch(r"\d{1,2}\s*[сcдd]", s, re.I):
+            return s.replace(" ", "")
+    return ""
+
+
+def _fsa_pick_techreg(leaves) -> str:
+    """Технический регламент — значение, содержащее «ТР ТС/ТР ЕАЭС NNN/YYYY»
+    или обозначение вида NNN/YYYY. Обобщённое «Технический регламент ТС/ЕАЭС»
+    без номера — не подходит."""
+    best = ""
+    for path, v in leaves:
+        if isinstance(v, (dict, list)) or v in (None, ""):
+            continue
+        s = re.sub(r"\s+", " ", str(v)).strip()
+        if not s or len(s) > 400:
+            continue
+        has_designation = bool(re.search(r"\b\d{3}\s*/\s*\d{4}\b", s)) or bool(
+            re.search(r"ТР\s*(?:ТС|ЕАЭС)\b", s, re.I) and re.search(r"\d", s)
+        )
+        if has_designation:
+            # самое информативное (с названием регламента) обычно длиннее
+            if len(s) > len(best):
+                best = s
+    return best
+
+
 def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]:
     """Достаёт ключевые поля из JSON-ответа FSA. Возвращает dict с registry_*."""
     payload = _unwrap_payload(obj)
@@ -284,9 +318,11 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
         "product_group": _find_value(leaves, ("productgroup", "product_group"), require_text=True),
         "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group"), require_text=True),
         "tnved": _find_value(leaves, ("tnved", "tncode", "tn_ved")),
-        # v27.8: схема и техрегламент — текстовые коды/названия, не числовые ID.
-        "scheme": _find_value(leaves, ("schemecode", "schemename", "scheme"), exclude_any=("id",), require_text=True),
-        "technical_regulation": _find_value(leaves, ("techreg", "technicalregulation", "technical_regulation", "reglament", "регламент"), exclude_any=("id",), require_text=True),
+        # v27.8.1: схема — короткий код (1с/3д), техрегламент — с обозначением
+        # «ТР ТС NNN/YYYY». Раньше хватали длинный юридический текст («Решение
+        # Комиссии … N 621») и обобщённое «Технический регламент ТС/ЕАЭС».
+        "scheme": _fsa_pick_scheme(leaves),
+        "technical_regulation": _fsa_pick_techreg(leaves),
         "evidence": _find_value(leaves, ("evidence",)),
         "source": f"curl_cffi:{url}",
     }
@@ -402,7 +438,7 @@ STATUS_TIMEOUT = "ТАЙМАУТ"
 STATUS_ERROR = "ОШИБКА"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-07-v27.8-playwright"
+APP_VERSION = "2026-06-07-v27.9-playwright"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -1481,26 +1517,36 @@ DOMAIN_SUBJECT_NAME_KEYWORDS = {
 }
 
 
-def _query_is_toy_or_kids(query: str) -> bool:
-    """Запрос пользователя явно про игрушки/детское?"""
+def _query_wants_toys(query: str) -> bool:
+    """Пользователь ЯВНО ищет игрушки? Только явные «игрушечные» слова.
+    ВАЖНО: «детск»/«малыш» здесь НЕ считаются — запрос «бытовая техника для
+    малышей» означает реальную технику для детей, а НЕ игрушки."""
     q = (query or '').lower().replace('ё', 'е')
-    return any(w in q for w in (
-        "игрушк", "игрушеч", "игров", "детск", "для детей", "малыш", "кукол",
-    ))
+    return any(w in q for w in ("игрушк", "игрушеч", "игров", "кукол", "playset"))
 
 
-def _card_conflicts_with_query(query: str, product_name: str, subject_name: str) -> bool:
-    """v27.8: если пользователь НЕ искал игрушки/детское, отбрасываем игрушечные
-    товары. Симптом: по запросу «бытовая техника» в выдачу WB попадали
-    «Утюг детский игрушечный», «Игрушечный миксер» и сверялись с сертификатом
-    на игрушки. Маркеры подобраны так, чтобы НЕ задевать обычные товары
-    (например «органайзер для игрушек» не содержит подстроку «игрушк»)."""
-    if _query_is_toy_or_kids(query):
+# WB subject-id игрушечных категорий (по реальным выгрузкам: игрушечная бытовая
+# техника лежит в этих subject). Используется, когда название карточки не
+# содержит слова «игрушечный» (напр. «Детский пылесос»), но это игрушка.
+TOY_SUBJECT_IDS = {"1042", "5945", "267", "268", "1462", "2095", "2547", "125", "291", "227", "283"}
+
+
+def _card_conflicts_with_query(query: str, product_name: str, subject_name: str = '', subject_id: str = '') -> bool:
+    """v27.8.1: если пользователь НЕ искал игрушки, отбрасываем игрушечные товары.
+
+    Симптом: по запросу «бытовая техника для малышей» в выдачу WB попадали
+    «Утюг детский игрушечный», «Игрушечный миксер», «Детский пылесос» (игрушка)
+    и сверялись с сертификатом на игрушки. Признак игрушки: маркер в названии/
+    категории ЛИБО subject_id из игрушечной категории WB.
+    """
+    if _query_wants_toys(query):
         return False
     text = ((product_name or '') + ' ' + (subject_name or '')).lower().replace('ё', 'е')
-    return any(w in text for w in (
-        "игрушеч", "игрушк", "игровой набор", "для кукол",
-    ))
+    if any(w in text for w in ("игрушеч", "игрушк", "игровой набор", "игровая техника", "для кукол")):
+        return True
+    if (subject_id or '').strip() in TOY_SUBJECT_IDS:
+        return True
+    return False
 
 
 def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '', product_name: str = '') -> bool:
@@ -1734,8 +1780,8 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                     if stats is not None:
                         stats['filtered_out'] = stats.get('filtered_out', 0) + 1
                     continue
-                # v27.8: query-aware фильтр игрушек (если запрос не про игрушки/детское)
-                if _card_conflicts_with_query(query, name, subj_name):
+                # v27.8: query-aware фильтр игрушек (если запрос не про игрушки)
+                if _card_conflicts_with_query(query, name, subj_name, subj_id):
                     if stats is not None:
                         stats['filtered_out'] = stats.get('filtered_out', 0) + 1
                     continue

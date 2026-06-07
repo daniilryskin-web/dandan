@@ -749,6 +749,11 @@ async def run_playwright_parser(
                     continue
                 print(f"[Ozon-Playwright] карточка {idx}/{len(search_results)}: {url}", flush=True)
                 try:
+                    from main_v39 import emit_progress as _emit
+                    _emit("cards", idx, len(search_results))
+                except Exception:
+                    pass
+                try:
                     row = await parser.parse_card(url, query=query)
                     if row:
                         rows.append(row)
@@ -777,11 +782,21 @@ async def run_playwright_parser(
             print(f"[Ozon-Playwright] обогащение реестрами: {n_with_reg} карточек с реестровой ссылкой", flush=True)
             t2 = time.time()
             try:
+                from main_v39 import emit_progress as _emit
+                _emit("registry", 0, n_with_reg)
+            except Exception:
+                pass
+            try:
                 rows = await enrich_registry_data(rows, workers=8, timeout_sec=12.0)
             except Exception as e:
                 log.warning("Обогащение реестрами упало: %s", e)
             # Финальный вердикт сверки названия карточки с названием из реестра
             _apply_ozon_verdicts(rows)
+            try:
+                from main_v39 import emit_progress as _emit
+                _emit("registry", n_with_reg, n_with_reg)
+            except Exception:
+                pass
             print(f"[Ozon-Playwright] реестры обработаны за {time.time()-t2:.1f}с", flush=True)
             diag["rows_with_registry"] = n_with_reg
         else:

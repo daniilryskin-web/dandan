@@ -4594,8 +4594,142 @@ async def progress_loop(q: asyncio.Queue, store: BrandResultStore, args, progres
     except asyncio.CancelledError:
         return
 
+# v27.9.x: ПОСТ-ОБРАБОТКА — пишем итоговый XLSX в ТОЧНО ТАКОЙ ЖЕ структуре, как
+# result.xlsx (режим проверки по запросу): те же столбцы и листы «Сводка»/
+# «Подробности», проверка «Оригинал» ПО ТОМУ ЖЕ ПРИНЦИПУ (card.json basket-API,
+# как в main_v39), а технический статус — через тот же compare_product_names.
+# Делается отдельным шагом в конце; при любой ошибке исходный brand_result.xlsx
+# (формат бренд-движка) остаётся на диске как запасной.
+def _brand_first(s: str) -> str:
+    return (str(s or "").split("|")[0]).strip()
+
+
+def _brand_result_to_result_row(br, mv, is_original: str, status: str, score: float):
+    """BrandResult -> main_v39.ResultRow (один-в-один по столбцам result.xlsx)."""
+    return mv.ResultRow(
+        query=getattr(br, "brand_query", ""),
+        nm_id=br.nm_id,
+        product_name=br.product_name,
+        brand=br.brand,
+        subject=br.subject,
+        product_url=br.product_url,
+        status=status,
+        price_rub=br.price_rub,
+        sale_price_rub=0.0,
+        seller_name=br.seller_name,
+        supplier_id=br.supplier_id,
+        rating=0.0,
+        feedbacks=0,
+        is_original=is_original,
+        colors="",
+        wb_root="",
+        registry_url=_brand_first(br.registry_urls),
+        registry_host=_brand_first(br.registry_hosts),
+        registry_record_id=_brand_first(br.registry_record_ids),
+        certificate_number=br.registry_doc_number,
+        document_type=br.registry_doc_type,
+        document_status=br.registry_status,
+        certificate_product_name=br.registry_product_full,
+        document_date_start=br.registry_date_start,
+        document_date_end=br.registry_date_end,
+        applicant_name=br.registry_applicant,
+        applicant_inn=br.registry_applicant_inn,
+        manufacturer_name=br.registry_manufacturer,
+        tnved=br.registry_tnved,
+        scheme=br.registry_scheme,
+        technical_regulation=br.registry_technical_regulation,
+        score=score,
+        details=br.details,
+        worker=br.worker,
+        checked_at=br.checked_at,
+    )
+
+
+async def write_query_compatible_report(rows, args) -> bool:
+    """Перезаписывает args.output (XLSX) в формате result.xlsx. Возвращает True/False."""
+    try:
+        import main_v39 as mv
+    except Exception as e:
+        print(f"[unify] main_v39 недоступен, оставляю бренд-формат XLSX: {type(e).__name__}: {e}")
+        return False
+
+    # 1) Оригинальность ПО ТОМУ ЖЕ ПРИНЦИПУ, что и при проверке по запросу:
+    #    card.json через basket-шарды (mv.fetch_original_via_card_json).
+    orig_map: Dict[int, Optional[bool]] = {}
+    try:
+        timeout = aiohttp.ClientTimeout(total=max(20, int(getattr(args, "registry_http_timeout", 30))))
+        ua = getattr(args, "user_agent", "") or "Mozilla/5.0"
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": ua}) as session:
+            sem = asyncio.Semaphore(12)
+            nm_ids = list({int(r.nm_id) for r in rows if r.nm_id})
+
+            async def _one(nm: int):
+                async with sem:
+                    try:
+                        val, _detail = await mv.fetch_original_via_card_json(session, nm)
+                        orig_map[nm] = val
+                    except Exception:
+                        orig_map[nm] = None
+
+            await asyncio.gather(*[_one(n) for n in nm_ids], return_exceptions=True)
+        print(f"[unify] Оригинальность по card.json: проверено {len(orig_map)} карточек "
+              f"(оригинал={sum(1 for v in orig_map.values() if v is True)})")
+    except Exception as e:
+        print(f"[unify] enrich originality пропущен: {type(e).__name__}: {e}")
+
+    # 2) Конвертация в ResultRow с тем же вердиктом и нормализованной плашкой.
+    rrows = []
+    for br in rows:
+        ov = orig_map.get(int(br.nm_id)) if br.nm_id else None
+        if ov is True:
+            is_original = "оригинал"
+        elif ov is False:
+            is_original = "не указано"
+        else:
+            # card.json не нашли — мягкий fallback на флаг бренд-движка
+            is_original = "оригинал" if str(br.is_original).strip().upper() in (
+                "ДА", "ОРИГИНАЛ", "ORIGINAL", "YES", "TRUE", "1") else "не указано"
+
+        prod = (br.registry_product_full or "").strip()
+        status, score = br.status, 0.0
+        if prod:
+            try:
+                verdict, sc, _cmp = mv.compare_product_names(
+                    br.product_name, prod, brand=br.brand, subject=br.subject,
+                    doc_status=br.registry_status,
+                )
+                status, score = verdict, sc
+            except Exception:
+                pass
+        rrows.append(_brand_result_to_result_row(br, mv, is_original, status, score))
+
+    # 3) Запись тем же отчётным слоем, что и result.xlsx (Сводка + Подробности).
+    #    Пишем во временный файл и атомарно заменяем, чтобы не оставить битый XLSX.
+    out = Path(args.output)
+    tmp = out.with_suffix(out.suffix + ".qtmp")
+    try:
+        rs = mv.ResultStore(
+            tmp, csv_path=None,
+            expiry_warning_days=int(getattr(args, "expiry_warning_days", 30) or 30),
+            make_report_xlsx=bool(getattr(args, "make_report_xlsx", True)),
+        )
+        for rr in rrows:
+            await rs.add(rr)
+        await rs.save()
+        os.replace(tmp, out)
+        print(f"[unify] Итоговый XLSX записан в формате result.xlsx: {out.resolve()}")
+        return True
+    except Exception as e:
+        print(f"[unify] не удалось записать унифицированный XLSX: {type(e).__name__}: {e}")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
 async def run_check(args):
-    # v25-reporting: время старта для финального лога прогона.
     _run_started_at = time.time()
     # v24: режим --no-browser. Если включён, не запускаем Playwright вообще —
     # всё работает через HTTP (certificate.json + curl_cffi для FSA + aiohttp для SWIS).
@@ -4655,6 +4789,10 @@ async def run_check(args):
     print(f"К обработке: всего={len(cards)}, уже есть={len(processed)}, осталось={len(remaining)}")
     if not remaining:
         await store.save()
+        try:
+            await write_query_compatible_report(list(store.rows), args)
+        except Exception as _e:
+            print(f"[unify] пропущено: {type(_e).__name__}: {_e}")
         print(f"Готово. Все карточки уже обработаны: {Path(args.output).resolve()}")
         return
 
@@ -4702,6 +4840,13 @@ async def run_check(args):
                 await asyncio.gather(prog, return_exceptions=True)
                 await pool.close_all()
     await store.save()
+    # v27.9.x: перезаписываем итоговый XLSX в формате result.xlsx (те же столбцы,
+    # та же проверка «Оригинал» по card.json, тот же вердикт). Если не вышло —
+    # на диске остаётся бренд-формат, который только что записал store.save().
+    try:
+        await write_query_compatible_report(list(store.rows), args)
+    except Exception as _e:
+        print(f"[unify] пропущено: {type(_e).__name__}: {_e}")
     elapsed = time.time() - progress["start"]
     print(f"Финальный прогресс: обработано={progress['done']}/{len(cards)}, ссылок={progress['links']}, нет документов={progress['no_docs']}, нет ссылки={progress['no_link']}, тех={progress['tech']}")
     if elapsed > 0:

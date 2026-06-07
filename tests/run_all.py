@@ -15,6 +15,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MODULES = [
     "test_compare_categories",
+    "test_compare_layers",
     "test_cert_fetch",
     "test_xlsx_safe",
     "test_ozon_verdict",

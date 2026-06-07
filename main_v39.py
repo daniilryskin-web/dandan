@@ -5582,8 +5582,21 @@ def _seq_ratio(a: str, b: str) -> float:
 
 
 def _contains_broad_child_clothing(cert_text: str) -> bool:
+    """True только для ДЕЙСТВИТЕЛЬНО широких сертификатов на детскую одежду
+    («Изделия швейные/трикотажные для детей», «Одежда детская»).
+
+    v27.9.x: сертификат со СПЕЦИФИЧНЫМ слоем/типом («первого слоя», «бельевые»,
+    «верхняя одежда» и т.п.) — НЕ широкий: он покрывает только свой слой, и
+    приклеивать к нему другие виды одежды (костюм, платье) нельзя. Раньше слово
+    «бельевые» считалось «широким» и давало ложный OK для костюма против
+    бельевого сертификата. По решению пользователя такие случаи → ПРОВЕРИТЬ ВРУЧНУЮ.
+    """
     low = norm_text(cert_text)
-    broad = ('изделия швейные', 'изделия трикотажные', 'одежда', 'бельевые', 'верхняя одежда', 'одежда верхняя', 'изделия верхние')
+    specific = ('первого слоя', 'второго слоя', 'третьего слоя', 'верхнего слоя',
+                'бельев', 'белье', 'верхняя одежда', 'одежда верхняя', 'изделия верхние')
+    if any(x in low for x in specific):
+        return False
+    broad = ('изделия швейные', 'изделия трикотажные', 'одежда')
     child = ('дет', 'подрост', 'дошколь', 'школь', 'новорожден', 'ясель')
     return any(x in low for x in broad) and any(x in low for x in child)
 
@@ -5629,6 +5642,7 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
     cert_conflict_domains = _detect_hard_conflict_domain(cert_text)
 
     conflicts: List[str] = []
+    soft_conflicts: List[str] = []  # v27.9.x: «мягкие» (несовпадение слоя) -> ПРОВЕРИТЬ ВРУЧНУЮ
     # Hard domain conflicts: e.g. WB clothing card vs toy/electronics certificate.
     if 'clothing' in card_cats and cert_conflict_domains:
         conflicts.append(f'сертификат относится к другой группе: {sorted(cert_conflict_domains)}')
@@ -5658,7 +5672,10 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
     if 'clothing' in card_cats and 'clothing' in cert_cats and card_layers and cert_layers and card_layers.isdisjoint(cert_layers):
         # Allow if exact subtype still overlaps (e.g. комбинезон can be different layer depending on context).
         if not (card_sub & cert_sub):
-            conflicts.append(f'слой/вид одежды не совпадает: карточка {sorted(card_layers)}, сертификат {sorted(cert_layers)}')
+            # v27.9.x: несовпадение слоя — «мягкий» сигнал. Узкий сертификат (напр.
+            # «бельё первого слоя») vs другой вид одежды (костюм/свитшот/платье) —
+            # это НЕ доказанное несоответствие, а повод ПРОВЕРИТЬ ВРУЧНУЮ.
+            soft_conflicts.append(f'слой/вид одежды не совпадает: карточка {sorted(card_layers)}, сертификат {sorted(cert_layers)}')
 
     card_tokens = _tokens_for_compare(card_text)
     cert_tokens = _tokens_for_compare(cert_text)
@@ -5713,6 +5730,11 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
         return 'OK', max(score, 78.0), 'Костюм покрыт компонентами сертификата (верх + низ); ' + detail_base
     if 'clothing' in card_cats and 'clothing' in cert_cats and card_layers & cert_layers and (cert_age in {'child', 'unknown'} or card_age != 'child'):
         return 'OK', max(score, 78.0), 'Совпал слой/класс детской одежды; ' + detail_base
+    # v27.9.x: «мягкий» конфликт слоя (без жёстких конфликтов и без точного
+    # совпадения вида/слоя) — не авто-OK и не доказанное несоответствие.
+    # Решение пользователя: узкий сертификат vs другой вид одежды → ПРОВЕРИТЬ ВРУЧНУЮ.
+    if soft_conflicts:
+        return 'ПРОВЕРИТЬ ВРУЧНУЮ', score, 'soft_conflicts=' + '; '.join(soft_conflicts) + '; ' + detail_base
     if 'clothing' in card_cats and _contains_broad_child_clothing(cert_text) and not card_layers:
         return 'OK', max(score, 72.0), 'Сертификат содержит широкую группу детской одежды, явных конфликтов нет; ' + detail_base
 

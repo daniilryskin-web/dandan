@@ -652,8 +652,17 @@ def wb_volume_part(nm_id: int) -> Tuple[int, int]:
 
 
 def wb_basket_by_volume(vol: int) -> int:
-    """Приблизительная официальная шардировка WB media basket по vol.
+    """Официальная шардировка WB media-basket по vol.
     Источник: реальные HAR-дампы. Для vol=1982 → basket-13.
+
+    ВАЖНО (v27.9.x): раньше таблица обрывалась на basket-30 для любого vol>5429.
+    WB постоянно добавляет новые basket-шарды равномерными бэндами по 216 vol
+    (4565→25, 4781→26, …, 5429→29 — шаг ровно 216). Для НОВЫХ (высоких nm_id)
+    товаров primary-шард был >30, и старый код всегда возвращал 30 → primary
+    оказывался неверным, карточка зря перебирала все шарды и могла ошибочно
+    помечаться «нет документа». Теперь экстраполируем наблюдаемый шаг, поэтому
+    primary остаётся корректным и для будущих товаров (а соседние шарды всё
+    равно подстраховывают возможный дрейф границ).
     """
     ranges = [
         (143, 1), (287, 2), (431, 3), (719, 4), (1007, 5),
@@ -661,31 +670,50 @@ def wb_basket_by_volume(vol: int) -> int:
         (1655, 11), (1919, 12), (2045, 13), (2189, 14), (2405, 15),
         (2621, 16), (2837, 17), (3053, 18), (3269, 19), (3485, 20),
         (3701, 21), (3917, 22), (4133, 23), (4349, 24), (4565, 25),
-        (4781, 26), (4997, 27), (5213, 28), (5429, 29), (10**9, 30),
+        (4781, 26), (4997, 27), (5213, 28), (5429, 29),
     ]
     for max_vol, basket in ranges:
         if vol <= max_vol:
             return basket
-    return 30
+    # vol > 5429 — продолжаем равномерный бэнд по 216 vol на шард.
+    # basket-30 покрывает 5430..5645, basket-31 → 5646..5861, и т.д.
+    extra = (int(vol) - 5429 + 215) // 216  # целочисленный ceil
+    return min(199, 29 + max(1, extra))
 
 
 def certificate_json_urls(nm_id: int, max_hosts: int = 12) -> List[str]:
     """Возвращает упорядоченный список URL'ов для перебора basket-хостов.
-    Первым идёт наиболее вероятный (по vol), затем соседи (±2), затем популярные 13/12/14.
+    Первым идёт наиболее вероятный (по vol), затем соседи (±4), затем
+    исторически «населённые» шарды и полный диапазон.
+
+    Под конкурентным перебором (см. fetch_certificate_json_for_nm) порядок не
+    критичен для скорости, но primary + соседи дают самый быстрый HTTP 200 в
+    типичном случае. Диапазон fill больше не обрывается на 30 — иначе новые
+    высоковолюмные товары (primary>30) никогда не нашли бы свой шард.
     """
     nm = int(nm_id)
     vol, part = wb_volume_part(nm)
     primary = wb_basket_by_volume(vol)
     order: List[int] = []
-    for b in [primary, primary - 1, primary + 1, primary - 2, primary + 2, 13, 12, 14]:
-        if 1 <= b <= 30 and b not in order:
+
+    def push(b: int) -> None:
+        if 1 <= b <= 199 and b not in order:
             order.append(b)
-    for b in range(1, 31):
-        if b not in order:
-            order.append(b)
+
+    # 1) расчётный шард и его близкие соседи (страховка от дрейфа границ)
+    for d in (0, -1, 1, -2, 2, -3, 3, -4, 4):
+        push(primary + d)
+    # 2) исторически «населённые» шарды
+    for b in (13, 12, 14, 15, 16, 11, 10, 17, 18, 1):
+        push(b)
+    # 3) добиваем остальной диапазон (вокруг primary и снизу вверх)
+    upper = max(40, primary + 8)
+    for b in range(1, upper + 1):
+        push(b)
+
     return [
         f"https://basket-{b:02d}.wbbasket.ru/vol{vol}/part{part}/{nm}/info/certificate.json"
-        for b in order[:max_hosts]
+        for b in order[:max(1, int(max_hosts))]
     ]
 
 
@@ -724,7 +752,7 @@ def extract_registry_urls_from_certificate_json(parsed: Any) -> List[str]:
 
 async def fetch_certificate_json_for_nm(
     session: "aiohttp.ClientSession", nm_id: int, timeout_sec: float = 6.0,
-    max_hosts: int = 30
+    max_hosts: int = 30, concurrency: int = 0
 ) -> Tuple[List[str], str]:
     """v40: HTTP-определение наличия документа по certificate.json. БЕЗ браузера.
 
@@ -750,68 +778,104 @@ async def fetch_certificate_json_for_nm(
         "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
     }
     timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec)))
-    tried = 0
-    not_found = 0          # честные 404
-    net_errors: List[str] = []   # timeout / connection — это НЕ 404
-    other_status: List[str] = [] # 5xx и прочее
-    found_json_hosts: List[str] = []  # шарды где json реально есть (200)
-    all_urls: List[str] = []
+    urls = certificate_json_urls(nm_id, max_hosts=max_hosts)
+    tried = len(urls)
 
-    for url in certificate_json_urls(nm_id, max_hosts=max_hosts):
-        tried += 1
-        try:
-            async with session.get(url, headers=headers, timeout=timeout) as r:
-                status = int(r.status)
-                if status == 404:
-                    not_found += 1
-                    continue
-                if status != 200:
-                    other_status.append(f"{status}:{hostname(url)}")
-                    continue
-                # HTTP 200 — json существует, значит документ ЕСТЬ
-                raw = (await r.text(errors="replace")).strip()
-                found_json_hosts.append(hostname(url))
-                if not raw:
-                    # json пустой, но он есть — документ есть, ссылки нет
-                    continue
-                parsed: Any = raw
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    pass
-                urls_found = extract_registry_urls_from_certificate_json(parsed)
-                if not urls_found and isinstance(raw, str):
-                    urls_found = extract_registry_urls_from_certificate_json(raw)
-                for u in urls_found:
-                    if u not in all_urls:
-                        all_urls.append(u)
-                if all_urls:
-                    # Нашли ссылку — этого достаточно, возвращаем сразу
-                    return all_urls, f"cert_json_ok:{found_json_hosts[0]}"
-                # json есть, но ссылки внутри пока нет — продолжаем искать на др. шардах
-                # (вдруг на соседнем basket лежит более полный json со ссылкой)
-        except asyncio.TimeoutError:
-            net_errors.append(f"timeout:{hostname(url)}")
-        except aiohttp.ClientError as e:
-            net_errors.append(f"{type(e).__name__}:{hostname(url)}")
-        except Exception as e:
-            net_errors.append(f"{type(e).__name__}:{hostname(url)}")
+    # v27.9.x: КЛЮЧЕВОЕ УСКОРЕНИЕ. Раньше шарды перебирались ПОСЛЕДОВАТЕЛЬНО —
+    # для карточки без документа это до max_hosts таймаутов подряд (десятки секунд
+    # на карточку). Теперь все шарды проверяются ПАРАЛЛЕЛЬНО, и худший случай (нет
+    # документа) занимает ~один таймаут вместо суммы. Как только найдена ссылка на
+    # реестр — остальные пробы немедленно отменяются.
+    if concurrency and concurrency > 0:
+        probe_concurrency = int(concurrency)
+    else:
+        probe_concurrency = min(len(urls), 16)
+    probe_concurrency = max(1, probe_concurrency)
+    sem = asyncio.Semaphore(probe_concurrency)
 
-    # Прошли все шарды. Классифицируем исход.
+    state = {
+        "not_found": 0,            # честные 404
+        "net_errors": [],          # timeout / connection — это НЕ 404
+        "other_status": [],        # 5xx и прочее
+        "json_hosts": [],          # шарды где json реально есть (200)
+        "urls": [],                # извлечённые ссылки на реестр
+    }
+    found = asyncio.Event()
+
+    async def probe(url: str) -> None:
+        if found.is_set():
+            return
+        async with sem:
+            if found.is_set():
+                return
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as r:
+                    status = int(r.status)
+                    if status == 404:
+                        state["not_found"] += 1
+                        return
+                    if status != 200:
+                        state["other_status"].append(f"{status}:{hostname(url)}")
+                        return
+                    # HTTP 200 — json существует, значит документ ЕСТЬ
+                    raw = (await r.text(errors="replace")).strip()
+                    state["json_hosts"].append(hostname(url))
+                    if not raw:
+                        return  # json пустой, но он есть — документ есть, ссылки нет
+                    parsed: Any = raw
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        pass
+                    urls_found = extract_registry_urls_from_certificate_json(parsed)
+                    if not urls_found and isinstance(raw, str):
+                        urls_found = extract_registry_urls_from_certificate_json(raw)
+                    for u in urls_found:
+                        if u not in state["urls"]:
+                            state["urls"].append(u)
+                    if state["urls"]:
+                        found.set()  # ссылка найдена — сигнал отменить остальные пробы
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                state["net_errors"].append(f"timeout:{hostname(url)}")
+            except aiohttp.ClientError as e:
+                state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
+            except Exception as e:
+                state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
+
+    tasks = [asyncio.create_task(probe(u)) for u in urls]
+    try:
+        pending = set(tasks)
+        while pending:
+            _done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if found.is_set():
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Классифицируем исход (контракт статусов сохранён 1:1 со старой версией).
+    all_urls = state["urls"]
+    json_hosts = state["json_hosts"]
+    not_found = state["not_found"]
+    net_errors = state["net_errors"]
+    other_status = state["other_status"]
     if all_urls:
-        return all_urls, f"cert_json_ok:{found_json_hosts[0] if found_json_hosts else '?'}"
-    if found_json_hosts:
+        return all_urls, f"cert_json_ok:{json_hosts[0] if json_hosts else '?'}"
+    if json_hosts:
         # json существует (документ есть), но ссылку извлечь не удалось
-        return [], f"cert_json_has_doc_no_url:hosts={','.join(found_json_hosts[:3])}"
+        return [], f"cert_json_has_doc_no_url:hosts={','.join(json_hosts[:3])}"
     if not_found and not net_errors and not other_status:
         # ВСЕ шарды честно вернули 404 → документа нет
         return [], f"cert_json_no_docs:tried={tried},404={not_found}"
-    if net_errors and not_found < max_hosts:
+    if net_errors:
         # были сетевые ошибки, не получили полную картину 404 → надо повторить
         return [], f"cert_json_neterror:tried={tried},404={not_found},net={';'.join(net_errors[:4])}"
-    # смешанный случай: часть 404, часть ошибок — считаем что скорее нет докум,
-    # но помечаем как neterror чтобы можно было повторить
-    return [], f"cert_json_neterror:tried={tried},404={not_found},net={';'.join(net_errors[:3])},other={';'.join(other_status[:2])}"
+    # смешанный случай (только other_status, без 404 и без net): помечаем neterror
+    return [], f"cert_json_neterror:tried={tried},404={not_found},other={';'.join(other_status[:2])}"
 
 
 # =============================================================================

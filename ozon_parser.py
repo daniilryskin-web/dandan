@@ -1734,6 +1734,35 @@ async def enrich_cards(
 # Save functions — совместимы с main_v39.py
 # ---------------------------------------------------------------------------
 
+_XLSX_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xlsx_safe(value: Any, max_len: int = 32000):
+    """Безопасное значение для ячейки xlsx (см. main_v39._xlsx_safe).
+
+    openpyxl падает с IllegalCharacterError на управляющих символах из
+    спарсенного текста и роняет весь отчёт. Числа оставляем числами, остальное
+    чистим от control-символов, схлопываем переводы строк/табы и режем длину.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "да" if value else ""
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if not s:
+        return ""
+    s = _XLSX_ILLEGAL_RE.sub("", s)
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if "  " in s:
+        s = re.sub(r"\s{2,}", " ", s)
+    s = s.strip()
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
 def _result_row_fields() -> List[str]:
     """Список полей OzonResultRow в порядке dataclass."""
     return list(OzonResultRow.__dataclass_fields__.keys())
@@ -1784,7 +1813,7 @@ def save_xlsx(
     ws.title = "results"
     ws.append(fields)
     for r in rows:
-        ws.append([getattr(r, f) for f in fields])
+        ws.append([_xlsx_safe(getattr(r, f)) for f in fields])
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     for cell in ws[1]:
@@ -1810,7 +1839,7 @@ def save_xlsx(
     good_statuses = {STATUS_LINK_COLLECTED, "OK"}
     for r in rows:
         if r.status not in good_statuses:
-            review.append([getattr(r, f) for f in fields])
+            review.append([_xlsx_safe(getattr(r, f)) for f in fields])
     review.freeze_panes = "A2"
     review.auto_filter.ref = review.dimensions
     for cell in review[1]:

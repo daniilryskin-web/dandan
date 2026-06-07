@@ -4099,6 +4099,35 @@ def _compute_expiry(row: BrandResult, warning_days: int,
     return days_left, EXPIRY_RISK_OK
 
 
+_XLSX_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xlsx_safe(value: Any, max_len: int = 32000):
+    """Безопасное значение для ячейки xlsx (см. main_v39._xlsx_safe).
+
+    openpyxl падает с IllegalCharacterError на управляющих символах из
+    спарсенного текста и роняет весь отчёт. Числа оставляем числами, остальное
+    чистим от control-символов, схлопываем переводы строк/табы и режем длину.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "да" if value else ""
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if not s:
+        return ""
+    s = _XLSX_ILLEGAL_RE.sub("", s)
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if "  " in s:
+        s = re.sub(r"\s{2,}", " ", s)
+    s = s.strip()
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
 def _build_summary_sheet(wb_obj, rows: List["BrandResult"], warning_days: int) -> None:
     """Лист 'Сводка' с шапкой и агрегатами."""
     ws = wb_obj.create_sheet("Сводка", 0)
@@ -4193,7 +4222,7 @@ def _build_details_sheet(wb_obj, rows: List["BrandResult"], warning_days: int) -
         days_left, risk = _compute_expiry(r, warning_days)
         d["expiry_days_left"] = "" if days_left is None else days_left
         d["expiry_risk"] = risk
-        ws.append([d.get(f, "") for f in fields])
+        ws.append([_xlsx_safe(d.get(f, "")) for f in fields])
     # шапка
     hdr_fill = PatternFill("solid", fgColor="1F4E78")
     hdr_font = Font(color="FFFFFF", bold=True)
@@ -4282,7 +4311,7 @@ def save_results_xlsx(rows: List[BrandResult], path: Path,
     ws.append(headers)
     for r in rows:
         d = asdict(r)
-        ws.append([d.get(h, "") for h in headers])
+        ws.append([_xlsx_safe(d.get(h, "")) for h in headers])
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     for cell in ws[1]:

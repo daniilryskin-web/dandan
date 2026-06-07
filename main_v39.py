@@ -2223,6 +2223,40 @@ def _write_run_log_v39(rows: List["ResultRow"], xlsx_path: Path, warning_days: i
         return None
 
 
+# v27.9.x: openpyxl роняет ВЕСЬ файл (IllegalCharacterError) на управляющих
+# символах, которые регулярно встречаются в спарсенном тексте (наименования и
+# описания из карточек/реестров). Из-за этого отчёт мог сохраняться «криво» или
+# не сохраняться целиком. _xlsx_safe гарантирует безопасное значение в ячейке.
+_XLSX_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xlsx_safe(value: Any, max_len: int = 32000):
+    """Безопасное значение для ячейки xlsx.
+
+    Числа оставляем числами (для сортировки и числового формата Excel), всё
+    остальное приводим к строке, вычищаем недопустимые управляющие символы,
+    схлопываем переводы строк/табуляции в пробел (иначе колонки визуально
+    «разъезжаются») и обрезаем по лимиту ячейки Excel (~32767 символов).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "да" if value else ""
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if not s:
+        return ""
+    s = _XLSX_ILLEGAL_RE.sub("", s)
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if "  " in s:
+        s = re.sub(r"\s{2,}", " ", s)
+    s = s.strip()
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
 # v25-reporting: единый порядок ядра 'Подробностей' в обоих движках.
 # Специфичные поля движка пойдут после ядра, expiry-флаги — в самом конце.
 CORE_DETAILS_ORDER_V39: Tuple[str, ...] = (
@@ -2256,7 +2290,7 @@ def _build_details_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
         days_left, risk = _compute_expiry_v39(r, warning_days)
         d["expiry_days_left"] = "" if days_left is None else days_left
         d["expiry_risk"] = risk
-        ws.append([d.get(f, "") for f in fields])
+        ws.append([_xlsx_safe(d.get(f, "")) for f in fields])
     hdr_fill = PatternFill("solid", fgColor="1F4E78")
     hdr_font = Font(color="FFFFFF", bold=True)
     for cell in ws[1]:
@@ -2371,7 +2405,7 @@ class ResultStore:
         fields = list(ResultRow.__dataclass_fields__.keys())
         ws.append(fields)
         for r in rows:
-            ws.append([getattr(r, f) for f in fields])
+            ws.append([_xlsx_safe(getattr(r, f)) for f in fields])
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
         for cell in ws[1]:
@@ -2406,7 +2440,7 @@ class ResultStore:
         good_statuses = {STATUS_LINK_COLLECTED, "OK"}
         for r in rows:
             if r.status not in good_statuses:
-                review.append([getattr(r, f) for f in fields])
+                review.append([_xlsx_safe(getattr(r, f)) for f in fields])
         review.freeze_panes = "A2"
         review.auto_filter.ref = review.dimensions
         for cell in review[1]:

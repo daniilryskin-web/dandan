@@ -1060,9 +1060,12 @@ async def fetch_original_via_card_json(
 
 # v27.9.x: бит маски viewFlags, означающий плашку «Оригинал». viewFlags WB
 # отдаёт в поисковой выдаче по каждому товару, поэтому проверка БЕСПЛАТНА (без
-# доп. запросов) и мгновенна. Значение подтверждается по реальным viewFlags
-# оригинального vs обычного товара. 0 = бит ещё не определён (проверка выключена).
-WB_ORIGINAL_VIEWFLAG_BIT = 0
+# доп. запросов) и мгновенна.
+# Значение подтверждено на реальных данных (3 товара с плашкой vs 4 без):
+#   оригинал  863239425=135671833, 173642704=135028761, 519200637=202899465  → бит 3 есть
+#   обычные   1008983494=811026, 267983778=135798913, 237643208=135028736, 663082548=8591261696 → бита 3 нет
+# Бит 3 (значение 8) установлен у ВСЕХ оригинальных и НИ У ОДНОГО обычного.
+WB_ORIGINAL_VIEWFLAG_BIT = 8
 
 
 def _detect_wb_original(p: Dict[str, Any]) -> str:
@@ -1179,6 +1182,12 @@ async def enrich_sellers_batch(cards: List[Card], args) -> None:
                         sid = str(p.get("supplierId") or p.get("supplierID") or "")
                         if sid:
                             c.supplier_id = sid
+                    # v27.9.x: признак «Оригинал» из viewFlags detail-ответа
+                    # (подстраховка к основному пути — viewFlags из поиска).
+                    if WB_ORIGINAL_VIEWFLAG_BIT:
+                        _vf = p.get("viewFlags")
+                        if isinstance(_vf, int) and (_vf & WB_ORIGINAL_VIEWFLAG_BIT):
+                            c.is_original = "оригинал"
                 break  # один из шаблонов сработал
         tasks = [asyncio.create_task(do_batch(b)) for b in batches]
         await asyncio.gather(*tasks, return_exceptions=True)

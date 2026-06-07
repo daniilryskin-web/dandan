@@ -24,6 +24,7 @@ MODULES = [
     "test_fsa_parse",
     "test_ozon_search",
     "test_original_cardjson",
+    "test_original_viewflags",
     "check_frontend",
 ]
 

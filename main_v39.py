@@ -7231,6 +7231,35 @@ async def run_registry_stage(args):
     HTTP is used only for other allowed registries.
     """
     _run_started_at = time.time()
+
+    # v27.9.x: глушим КОСМЕТИЧЕСКИЕ ошибки event-loop'а вида «Future exception was
+    # never retrieved» с net::ERR_ABORTED / «frame was detached». Они возникают,
+    # когда жёсткий per-record timeout отменяет навигацию Playwright в момент
+    # перехода между вкладками FSA (например .../manufacturer): навигация затем
+    # завершается с ERR_ABORTED, но её результат уже никто не ждёт. На итог это
+    # не влияет, но в логе выглядит как «программа выдала ошибку». Прочие ошибки
+    # пропускаем дальше без изменений.
+    try:
+        _loop = asyncio.get_running_loop()
+        _prev_exc_handler = _loop.get_exception_handler()
+
+        def _quiet_nav_exc_handler(loop, context):
+            exc = context.get('exception')
+            text = f"{context.get('message', '')} {type(exc).__name__ if exc else ''}: {exc if exc else ''}"
+            for marker in ('ERR_ABORTED', 'frame was detached',
+                           'Target page, context or browser has been closed',
+                           'ERR_CONNECTION_TIMED_OUT', 'ERR_TIMED_OUT', 'ERR_NETWORK_CHANGED'):
+                if marker in text:
+                    return  # косметика отменённой/упавшей навигации — не шумим
+            if _prev_exc_handler is not None:
+                _prev_exc_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        _loop.set_exception_handler(_quiet_nav_exc_handler)
+    except Exception:
+        pass
+
     input_csv = Path(args.input_links_csv)
     if not input_csv.exists():
         raise FileNotFoundError(input_csv)
@@ -7602,6 +7631,82 @@ async def run_registry_stage(args):
                 pass
             # Ждём завершения воркеров (они должны сами выйти когда очередь пуста)
             await asyncio.gather(*workers, return_exceptions=True)
+
+            # v27.9.x: ВТОРОЙ ПРОХОД для FSA-ссылок, упавших по ТРАНЗИТНОЙ сетевой
+            # ошибке/таймауту. pub.fsa.gov.ru периодически отвечает медленно или
+            # рвёт соединение под нагрузкой; повтор в конце прогона (нагрузка спала)
+            # обычно успешен. Строго ОДИН проход, последовательно, и целиком в
+            # try/except — сбой ретрая не должен портить основной результат.
+            try:
+                def _is_transient_fsa_fail(detail_str: str) -> bool:
+                    d = detail_str or ''
+                    return any(k in d for k in (
+                        'ERR_CONNECTION_TIMED_OUT', 'ERR_TIMED_OUT', 'ERR_CONNECTION',
+                        'ERR_NETWORK', 'ERR_ABORTED', 'registry_hard_timeout',
+                        'NETWORK_FAILURE_all_goto_failed', 'TimeoutError',
+                    ))
+                retry_urls = [
+                    u for u, val in list(parsed.items())
+                    if hostname(u) == 'pub.fsa.gov.ru'
+                    and not (val[1] or '').strip()        # нет названия продукции
+                    and _is_transient_fsa_fail(val[4])    # упал по сети/таймауту
+                ]
+                max_retry = int(getattr(args, 'registry_fsa_retry_max', 50) or 0)
+                if retry_urls and max_retry > 0:
+                    retry_urls = retry_urls[:max_retry]
+                    print("=" * 80)
+                    print(f"🔁 Второй проход FSA: повтор {len(retry_urls)} ссылок, упавших по сетевой ошибке/таймауту")
+                    print("=" * 80)
+                    per_registry_timeout = max(
+                        30, int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30)
+                    rctx = await browser.new_context(
+                        user_agent=args.user_agent, viewport={'width': 1440, 'height': 1000}, locale='ru-RU')
+                    rpage = await rctx.new_page()
+                    recovered = 0
+                    try:
+                        for ru in retry_urls:
+                            cert = prod = typ = doc_status = detail = ''
+                            try:
+                                cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                    _parse_fsa_with_existing_page_v386(rpage, ru, args),
+                                    timeout=per_registry_timeout,
+                                )
+                            except asyncio.TimeoutError:
+                                detail = 'fsa_retry_hard_timeout'
+                                try:
+                                    await rctx.close()
+                                except Exception:
+                                    pass
+                                rctx = await browser.new_context(
+                                    user_agent=args.user_agent, viewport={'width': 1440, 'height': 1000}, locale='ru-RU')
+                                rpage = await rctx.new_page()
+                            except Exception as e:
+                                detail = f'fsa_retry_error={type(e).__name__}'
+                            if (prod or '').strip():
+                                # заменяем устаревшие (пустые) строки этого url на свежие
+                                cu = clean_url(ru)
+                                async with out_store.lock:
+                                    out_store.rows = [r for r in out_store.rows
+                                                      if clean_url(r.registry_url) != cu]
+                                parsed[ru] = (cert or '', prod or '', typ or '',
+                                              doc_status or '', (detail or '') + ';fsa_retry_ok')
+                                await _flush_url_to_store(
+                                    ru, cert or '', prod or '', typ or '', doc_status or '',
+                                    (detail or '') + ';fsa_retry_ok')
+                                recovered += 1
+                    finally:
+                        try:
+                            await rctx.close()
+                        except Exception:
+                            pass
+                    print(f"🔁 Второй проход FSA: восстановлено {recovered}/{len(retry_urls)}")
+                    try:
+                        await out_store.save()
+                    except Exception:
+                        pass
+            except Exception as _e:
+                print(f"⚠️  Второй проход FSA пропущен: {type(_e).__name__}: {_e}")
+
             await browser.close()
             if restart_count[0] > 0:
                 print(f"🛡  Watchdog 2 этапа сработал {restart_count[0]} раз за прогон")

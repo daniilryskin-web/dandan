@@ -89,7 +89,7 @@ log = logging.getLogger("ozon_parser")
 # ---------------------------------------------------------------------------
 OZON_API_BASE = "https://api.ozon.ru/composer-api.bx/page/json/v2"
 OZON_WEB_BASE = "https://www.ozon.ru"
-APP_VERSION = "2026-06-07-v27.9-ozon"
+APP_VERSION = "2026-06-07-v27.9.1-ozon"
 
 # Подтверждённые заголовки из JTJag/ozon-sellers-parser + research_apis.md
 # Версия 18.47.0 задокументирована в research_apis.md (раздел 1.3)

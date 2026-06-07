@@ -269,25 +269,58 @@ def _fsa_pick_scheme(leaves) -> str:
     return ""
 
 
+def normalize_tech_regulations(text: str) -> str:
+    """Из любого текста про техрегламенты достаёт КОРОТКИЕ обозначения
+    «ТР ТС NNN/YYYY» / «ТР ЕАЭС NNN/YYYY», дедуплицирует и склеивает через «; ».
+
+    Примеры:
+      «…(ТР ТС 004/2011), …(ТР ТС 020/2011)» → «ТР ТС 004/2011; ТР ТС 020/2011»
+      «ТС 037 … ТР ТС 037/2016 (Приложение 2 и 3)» → «ТР ТС 037/2016»
+    """
+    if not text:
+        return ""
+    found: List[str] = []
+    for m in re.finditer(r"ТР\s*(ТС|ЕАЭС|EAEU|EEU)\s*0*(\d{1,3})\s*/\s*(\d{4})", str(text), re.I):
+        union = m.group(1).upper()
+        union = {"EAEU": "ЕАЭС", "EEU": "ЕАЭС", "TC": "ТС"}.get(union, union)
+        norm = f"ТР {union} {int(m.group(2)):03d}/{m.group(3)}"
+        if norm not in found:
+            found.append(norm)
+    return "; ".join(found)
+
+
 def _fsa_pick_techreg(leaves) -> str:
-    """Технический регламент — значение, содержащее «ТР ТС/ТР ЕАЭС NNN/YYYY»
-    или обозначение вида NNN/YYYY. Обобщённое «Технический регламент ТС/ЕАЭС»
-    без номера — не подходит."""
-    best = ""
+    """Техрегламент в коротком виде. Сканируем все строковые листья JSON,
+    собираем обозначения ТР ТС/ЕАЭС NNN/YYYY и склеиваем через «; »."""
+    blob = " ".join(
+        str(v) for _p, v in leaves
+        if isinstance(v, str) and len(v) < 600
+    )
+    return normalize_tech_regulations(blob)
+
+
+# Значения, которые НЕ являются именем изготовителя (служебные пометки FSA).
+_FSA_NOT_A_MANUFACTURER_RE = re.compile(
+    r"договор|выполнени[ея]\s+функц|^\s*изготовитель\s*$|уполномоченн", re.I)
+
+
+def _fsa_pick_manufacturer(leaves) -> str:
+    """Имя изготовителя: только текстовые поля name/fullName в контексте
+    manufacturer, исключая служебные пометки («Договор на выполнение функций
+    иностранного изготовителя») и числовые ID."""
     for path, v in leaves:
         if isinstance(v, (dict, list)) or v in (None, ""):
             continue
-        s = re.sub(r"\s+", " ", str(v)).strip()
-        if not s or len(s) > 400:
+        pl = "/".join(path).lower()
+        if "manufacturer" not in pl:
             continue
-        has_designation = bool(re.search(r"\b\d{3}\s*/\s*\d{4}\b", s)) or bool(
-            re.search(r"ТР\s*(?:ТС|ЕАЭС)\b", s, re.I) and re.search(r"\d", s)
-        )
-        if has_designation:
-            # самое информативное (с названием регламента) обычно длиннее
-            if len(s) > len(best):
-                best = s
-    return best
+        if not any(t in pl for t in ("name", "fullname", "shortname", "наимен")):
+            continue
+        s = str(v).strip()
+        if not s or re.fullmatch(r"\d+", s) or _FSA_NOT_A_MANUFACTURER_RE.search(s):
+            continue
+        return s
+    return ""
 
 
 def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]:
@@ -306,15 +339,9 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
         "date_end": _format_date(_find_value(leaves, ("certenddate", "datetill", "dateend", "date_end", "expirationdate"))),
         "applicant": _find_value(leaves, ("applicant", "fullname"), include_all=("applicant",), require_text=True) or _find_value(leaves, ("applicantname",), require_text=True),
         "applicant_inn": _find_value(leaves, ("applicantinn", "applicant_inn"), include_all=("applicant",)) or _find_value(leaves, ("inn",), include_all=("applicant",)),
-        # v27.8: имя изготовителя — только текст (раньше хватало idManufacturer=число).
-        # Ищем поле name/fullName в контексте manufacturer, либо отдельный объект изготовителя.
-        "manufacturer": (
-            _find_value(leaves, ("fullname", "shortname", "name"), include_all=("manufacturer",), require_text=True)
-            or _find_value(leaves, ("manufacturername",), require_text=True)
-            or _find_value(leaves, ("manufacturer",), include_all=("manufacturer",),
-                           exclude_any=("id", "inn", "ogrn", "kpp", "type", "country", "region", "address", "phone", "email", "date"),
-                           require_text=True)
-        ),
+        # v27.9: имя изготовителя — только текст name/fullName, без служебных
+        # пометок («Договор на выполнение функций иностранного изготовителя»).
+        "manufacturer": _fsa_pick_manufacturer(leaves) or _find_value(leaves, ("manufacturername",), require_text=True),
         "product_group": _find_value(leaves, ("productgroup", "product_group"), require_text=True),
         "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group"), require_text=True),
         "tnved": _find_value(leaves, ("tnved", "tncode", "tn_ved")),
@@ -438,7 +465,7 @@ STATUS_TIMEOUT = "ТАЙМАУТ"
 STATUS_ERROR = "ОШИБКА"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-07-v27.9-playwright"
+APP_VERSION = "2026-06-07-v27.9.1-playwright"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -1528,7 +1555,7 @@ def _query_wants_toys(query: str) -> bool:
 # WB subject-id игрушечных категорий (по реальным выгрузкам: игрушечная бытовая
 # техника лежит в этих subject). Используется, когда название карточки не
 # содержит слова «игрушечный» (напр. «Детский пылесос»), но это игрушка.
-TOY_SUBJECT_IDS = {"1042", "5945", "267", "268", "1462", "2095", "2547", "125", "291", "227", "283"}
+TOY_SUBJECT_IDS = {"1042", "5945", "267", "5100", "268", "1462", "2095", "2547", "125", "291", "227", "283", "284", "120"}
 
 
 def _card_conflicts_with_query(query: str, product_name: str, subject_name: str = '', subject_id: str = '') -> bool:
@@ -1542,7 +1569,8 @@ def _card_conflicts_with_query(query: str, product_name: str, subject_name: str 
     if _query_wants_toys(query):
         return False
     text = ((product_name or '') + ' ' + (subject_name or '')).lower().replace('ё', 'е')
-    if any(w in text for w in ("игрушеч", "игрушк", "игровой набор", "игровая техника", "для кукол")):
+    if any(w in text for w in ("игрушеч", "игрушк", "игровой набор", "игровая техника",
+                               "кукол", "кукольн", "для кукл")):
         return True
     if (subject_id or '').strip() in TOY_SUBJECT_IDS:
         return True
@@ -1630,9 +1658,14 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
 
     variants: List[str] = [base_query]
 
-    # Стратегия 1: исходный запрос + универсальные модификаторы
-    for m in UNIVERSAL_MODIFIERS:
-        variants.append(f'{base_query} {m}')
+    # Стратегия 1: исходный запрос + универсальные модификаторы.
+    # v27.9.1: UNIVERSAL_MODIFIERS — это ДЕТСКИЕ модификаторы («детские»,
+    # «для малышей», «для мальчиков»…). Применяем их ТОЛЬКО если пользователь
+    # сам ищет детское. Иначе «бытовая техника» превращалась в «бытовая техника
+    # для малышей» и в выдачу лезли игрушки/куклы — главная жалоба.
+    if is_kids:
+        for m in UNIVERSAL_MODIFIERS:
+            variants.append(f'{base_query} {m}')
 
     # Стратегия 2: для одежды/обуви — ещё цветовые/сезонные модификаторы
     if is_apparel_like:
@@ -1647,17 +1680,19 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
             variants.append(t)
 
     # Стратегия 4: тип + модификатор (только для apparel-like, чтобы не размывать игрушки)
-    if is_apparel_like:
+    if is_apparel_like and is_kids:
         for t in types[:20]:
             for m in UNIVERSAL_MODIFIERS[:6]:  # только базовые мод-ры
                 variants.append(f'{t} {m}')
 
-    # Если домен неизвестен — добавляем только базовый и универсальные комбинации.
-    # Это не мусорит выдачу случайными цветами для категорий типа «канцелярия».
+    # Если домен неизвестен — strict: только базовый запрос (+ детские варианты,
+    # если пользователь сам ищет детское). Раньше сюда добавлялись детские
+    # модификаторы всегда, из-за чего «бытовая техника» тянула игрушки/куклы.
     if domain == 'unknown':
         variants = [base_query]
-        for m in UNIVERSAL_MODIFIERS:
-            variants.append(f'{base_query} {m}')
+        if is_kids:
+            for m in UNIVERSAL_MODIFIERS:
+                variants.append(f'{base_query} {m}')
 
     # Дедупликация + ремонт «детские детские» / «детские детская»
     clean: List[str] = []
@@ -6194,12 +6229,51 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             details.append(f'product_route_error={type(e).__name__}:{err_msg}')
             continue
 
-    # v44: добираем поля с дополнительных вкладок FSA (изготовитель, ТР ТС, заявитель/ИНН).
-    # Эти данные НЕ на /baseInfo и /product — поэтому раньше manufacturer/tech_reg/date_end были 0%.
-    # Заходим только за теми полями, которых ещё нет.
+    # v27.9: СНАЧАЛА разбираем перехваченный JSON backend-API ФСА — он, как правило,
+    # содержит ВСЕ расширенные поля (заявитель/ИНН/изготовитель/схема/ТР ТС/даты).
+    # Это делается ДО навигации по вкладкам /applicant,/manufacturer,/document,
+    # чтобы вообще не ходить туда (лишние goto = +100 сек и net::ERR_ABORTED).
+    try:
+        page.remove_listener('response', _on_fsa_response)
+    except Exception:
+        pass
+    if _captured_fsa_json:
+        try:
+            json_parsed: Dict[str, str] = {}
+            for ru, data in _captured_fsa_json:
+                p = parse_fsa_json(data, ru, _fsa_kind or '', _fsa_doc_id or '')
+                for k, v in (p or {}).items():
+                    if v and not json_parsed.get(k):
+                        json_parsed[k] = v
+            details.append(f'fsa_json_responses={len(_captured_fsa_json)};fsa_json_fields={len(json_parsed)}')
+            if not cert_vals and json_parsed.get('doc_number'):
+                cert_vals.append(json_parsed['doc_number'])
+            if not prod_vals and json_parsed.get('product_full'):
+                prod_vals.append(json_parsed['product_full'])
+            if not status_vals and json_parsed.get('status'):
+                status_vals.append(json_parsed['status'])
+            _json_to_ext = {
+                'applicant_name': 'applicant',
+                'applicant_inn': 'applicant_inn',
+                'manufacturer_name': 'manufacturer',
+                'tnved': 'tnved',
+                'scheme': 'scheme',
+                'technical_regulation': 'technical_regulation',
+                'document_date_start': 'date_start',
+                'document_date_end': 'date_end',
+            }
+            for ext_key, json_key in _json_to_ext.items():
+                if ext_key not in ext_vals and json_parsed.get(json_key):
+                    ext_vals[ext_key] = [json_parsed[json_key]]
+        except Exception as e:
+            details.append(f'fsa_json_parse_error={type(e).__name__}')
+
+    # v44: добираем поля с дополнительных вкладок FSA, ТОЛЬКО если JSON их не дал.
+    # v27.9: если ключевые поля уже есть из JSON — вкладки НЕ открываем (быстрее,
+    # без net::ERR_ABORTED). Раньше эти goto и тормозили прогон.
     need_more = any(k not in ext_vals for k in
                     ("manufacturer_name", "technical_regulation", "applicant_name", "document_date_end"))
-    if need_more:
+    if need_more and not _captured_fsa_json:
         for ext_route in fsa_extended_routes(url):
             # какие поля ищем на этой вкладке
             still_missing = [k for k in FSA_EXTENDED_LABELS if k not in ext_vals]
@@ -6222,47 +6296,6 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             except Exception as e:
                 details.append(f'ext_tab_error={type(e).__name__}:{str(e)[:60]}')
                 continue
-
-    # v27.8: снимаем слушатель и разбираем перехваченный JSON FSA — добираем поля,
-    # которых не дали ни /baseInfo, ни /product, ни вкладки (частый случай:
-    # applicant_inn / manufacturer / scheme / technical_regulation).
-    try:
-        page.remove_listener('response', _on_fsa_response)
-    except Exception:
-        pass
-    if _captured_fsa_json:
-        try:
-            json_parsed: Dict[str, str] = {}
-            for ru, data in _captured_fsa_json:
-                p = parse_fsa_json(data, ru, _fsa_kind or '', _fsa_doc_id or '')
-                # копим первое непустое значение каждого поля по всем ответам
-                for k, v in (p or {}).items():
-                    if v and not json_parsed.get(k):
-                        json_parsed[k] = v
-            details.append(f'fsa_json_responses={len(_captured_fsa_json)};fsa_json_fields={len(json_parsed)}')
-            # Номер/продукт/статус — если ещё не нашли через DOM-лейблы.
-            if not cert_vals and json_parsed.get('doc_number'):
-                cert_vals.append(json_parsed['doc_number'])
-            if not prod_vals and json_parsed.get('product_full'):
-                prod_vals.append(json_parsed['product_full'])
-            if not status_vals and json_parsed.get('status'):
-                status_vals.append(json_parsed['status'])
-            # Расширенные поля → в ext_vals (списком, как ждёт merge ниже).
-            _json_to_ext = {
-                'applicant_name': 'applicant',
-                'applicant_inn': 'applicant_inn',
-                'manufacturer_name': 'manufacturer',
-                'tnved': 'tnved',
-                'scheme': 'scheme',
-                'technical_regulation': 'technical_regulation',
-                'document_date_start': 'date_start',
-                'document_date_end': 'date_end',
-            }
-            for ext_key, json_key in _json_to_ext.items():
-                if ext_key not in ext_vals and json_parsed.get(json_key):
-                    ext_vals[ext_key] = [json_parsed[json_key]]
-        except Exception as e:
-            details.append(f'fsa_json_parse_error={type(e).__name__}')
 
     # v39.2: если НИ ОДИН goto не прошёл — нет смысла скроллить и делать диагностику,
     # это всё равно chrome-error://chromewebdata/. Сразу возвращаем с явной пометкой.
@@ -6383,6 +6416,9 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             merged["tnved"] = tnved_val
         for k in ("applicant_inn", "scheme", "technical_regulation"):
             val = _first_clean(k)
+            if k == "technical_regulation" and val:
+                # короткие обозначения «ТР ТС NNN/YYYY», склейка через «; »
+                val = normalize_tech_regulations(val) or val
             if val and not merged.get(k):
                 merged[k] = val
         for k in ("document_date_start", "document_date_end"):
@@ -6474,7 +6510,8 @@ async def _parse_swis_with_existing_page_v386(page, url: str, args) -> Tuple[str
             if cleaned_tnved and not merged.get("tnved"):
                 merged["tnved"] = cleaned_tnved
             if swis_ext_vals.get("technical_regulation") and not merged.get("technical_regulation"):
-                merged["technical_regulation"] = swis_ext_vals["technical_regulation"]
+                _tr = swis_ext_vals["technical_regulation"]
+                merged["technical_regulation"] = normalize_tech_regulations(_tr) or _tr
             for k in ("document_date_start", "document_date_end"):
                 if swis_ext_vals.get(k) and not merged.get(k):
                     merged[k] = _nd(swis_ext_vals[k])

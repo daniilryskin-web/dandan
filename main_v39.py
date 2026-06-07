@@ -250,32 +250,139 @@ def _format_date(s: Any) -> str:
 
 
 def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]:
-    """Достаёт ключевые поля из JSON-ответа FSA. Возвращает dict с registry_*."""
+    """Достаёт ключевые поля из JSON-ответа FSA. Возвращает dict с registry_*.
+
+    v27.9.x: разбор по РЕАЛЬНОЙ структуре API ФСА (подтверждена живым ответом).
+    Реальный JSON вложенный и кодирует status/scheme/техрегламент числами, а
+    название/изготовителя держит в под-объектах (product.fullName,
+    manufacturer.fullName и т.п.) — наивный поиск по подстроке ключа брал не те
+    поля (idLegalSubject вместо fullName, idProduct вместо названия). Поэтому
+    сначала пытаемся СТРОГО по структуре, и только то, что не нашли — добираем
+    старым обобщённым поиском.
+    """
     payload = _unwrap_payload(obj)
-    leaves = _walk_leaves(payload)
-    # Имена полей в FSA-JSON могут варьироваться, ищем по нескольким ключам.
+    is_cert = (kind == "rss_certificate")
     out: Dict[str, str] = {
-        "doc_type": "Сертификат" if kind == "rss_certificate" else "Декларация",
-        "doc_number": _find_value(leaves, ("number", "regnumber", "registrationnumber"), exclude_any=("blank", "applicant", "manufacturer")),
-        "blank_number": _find_value(leaves, ("blanknumber", "blank_number")),
-        "status": _find_value(leaves, ("status",), exclude_any=("change", "history")),
-        "status_date": _format_date(_find_value(leaves, ("statusdate", "status_date"))),
-        "status_basis": _find_value(leaves, ("statusbasis", "status_basis", "decisionnumber"), exclude_any=("date",)),
-        "date_start": _format_date(_find_value(leaves, ("certregdate", "regdate", "datestart", "date_start", "issuedate"), exclude_any=("end", "expir"))),
-        "date_end": _format_date(_find_value(leaves, ("certenddate", "datetill", "dateend", "date_end", "expirationdate"))),
-        "applicant": _find_value(leaves, ("applicant", "fullname"), include_all=("applicant",)) or _find_value(leaves, ("applicantname",)),
-        "applicant_inn": _find_value(leaves, ("applicantinn", "applicant_inn"), include_all=("applicant",)) or _find_value(leaves, ("inn",), include_all=("applicant",)),
-        "manufacturer": _find_value(leaves, ("manufacturer", "fullname"), include_all=("manufacturer",)) or _find_value(leaves, ("manufacturername",)),
-        "product_group": _find_value(leaves, ("productgroup", "product_group")),
-        "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group")),
-        "tnved": _find_value(leaves, ("tnved", "tncode", "tn_ved")),
-        "scheme": _find_value(leaves, ("scheme",)),
-        "technical_regulation": _find_value(leaves, ("techreg", "technicalregulation", "technical_regulation")),
-        "evidence": _find_value(leaves, ("evidence",)),
-        "source": f"curl_cffi:{url}",
+        "doc_type": "Сертификат" if is_cert else "Декларация",
+        "source": f"json:{url}",
     }
-    # Чистим пустые
+
+    if isinstance(payload, dict):
+        def _org_name(d: Any) -> str:
+            if isinstance(d, dict):
+                return str(d.get("fullName") or d.get("shortName") or "").strip()
+            return ""
+
+        def _org_inn(d: Any) -> str:
+            if isinstance(d, dict):
+                return str(d.get("inn") or "").strip()
+            return ""
+
+        prod = payload.get("product") if isinstance(payload.get("product"), dict) else {}
+        applicant = payload.get("applicant")
+        manufacturer = payload.get("manufacturer")
+
+        # Номер документа
+        if payload.get("number"):
+            out["doc_number"] = str(payload["number"]).strip()
+        if payload.get("blankNumber"):
+            out["blank_number"] = str(payload["blankNumber"]).strip()
+
+        # Статус (числовой код idStatus -> текст). 6 = «Действует» (подтверждено).
+        st_id = payload.get("idStatus")
+        if st_id is None:
+            chg = payload.get("statusChanges")
+            if isinstance(chg, list) and chg and isinstance(chg[-1], dict):
+                st_id = chg[-1].get("idStatus")
+        if st_id is not None:
+            out["status"] = _FSA_STATUS_MAP.get(int(st_id), f"Статус {st_id}") \
+                if isinstance(st_id, (int, float)) or str(st_id).isdigit() else str(st_id)
+            out["status_code"] = str(st_id)
+
+        # Даты
+        ds = _format_date(payload.get("certRegDate") or payload.get("declRegDate")
+                          or payload.get("regDate"))
+        de = _format_date(payload.get("certEndDate") or payload.get("declEndDate")
+                          or payload.get("endDate"))
+        if ds:
+            out["date_start"] = ds
+        if de:
+            out["date_end"] = de
+
+        # Заявитель / изготовитель — берём имя из под-объекта (НЕ id!)
+        if _org_name(applicant):
+            out["applicant"] = _org_name(applicant)
+        if _org_inn(applicant):
+            out["applicant_inn"] = _org_inn(applicant)
+        if _org_name(manufacturer):
+            out["manufacturer"] = _org_name(manufacturer)
+        if _org_inn(manufacturer):
+            out["manufacturer_inn"] = _org_inn(manufacturer)
+
+        # Название продукции
+        if prod.get("fullName"):
+            out["product_full"] = str(prod["fullName"]).strip()
+
+        # Схема (idCertScheme/idDeclScheme -> «1с»/«1д»)
+        sch = payload.get("idCertScheme") if is_cert else payload.get("idDeclScheme")
+        if sch is None:
+            sch = payload.get("idCertScheme") or payload.get("idDeclScheme")
+        if sch is not None and (isinstance(sch, (int, float)) or str(sch).isdigit()):
+            out["scheme"] = f"{int(sch)}{'с' if is_cert else 'д'}"
+
+        # Технические регламенты (idTechnicalReglaments -> текст по словарю)
+        tregs = payload.get("idTechnicalReglaments")
+        if isinstance(tregs, list) and tregs:
+            names = []
+            for t in tregs:
+                try:
+                    names.append(_FSA_TECHREG_MAP.get(int(t), f"ТР (код {t})"))
+                except Exception:
+                    pass
+            if names:
+                out["technical_regulation"] = "; ".join(dict.fromkeys(names))
+
+        # ТН ВЭД — в JSON только внутренние idTnveds (не сами коды), пропускаем.
+
+    # Добор обобщённым поиском только тех полей, что не нашли строго.
+    leaves = _walk_leaves(payload)
+    if not out.get("doc_number"):
+        out["doc_number"] = _find_value(leaves, ("number", "regnumber"), exclude_any=("blank", "applicant", "manufacturer"))
+    if not out.get("applicant"):
+        out["applicant"] = _find_value(leaves, ("applicantname",)) or _find_value(leaves, ("applicant", "fullname"), include_all=("applicant", "fullname"))
+    if not out.get("manufacturer"):
+        out["manufacturer"] = _find_value(leaves, ("manufacturername",)) or _find_value(leaves, ("manufacturer", "fullname"), include_all=("manufacturer", "fullname"))
+    if not out.get("product_full"):
+        out["product_full"] = _find_value(leaves, ("productfullname", "product_fullname"))
+    # Схема/техрегламент: если в JSON они даны строкой (не числовым кодом) —
+    # добираем обобщённо. exclude id*, чтобы не схватить idCertScheme и пр.
+    if not out.get("scheme"):
+        out["scheme"] = _find_value(leaves, ("scheme",), exclude_any=("id", "object"))
+    if not out.get("technical_regulation"):
+        out["technical_regulation"] = _find_value(
+            leaves, ("techreg", "technicalregulation", "technical_regulation"), exclude_any=("id",))
+    if not out.get("status"):
+        out["status"] = _find_value(leaves, ("status",), exclude_any=("id", "change", "history", "date"))
+
     return {k: v for k, v in out.items() if v}
+
+
+# Словарь статусов ФСА (idStatus). Подтверждён ТОЛЬКО код 6 = «Действует» (живым
+# ответом API и сверкой с прежним браузерным парсингом тех же сертификатов).
+# Остальные коды НЕ угадываем: отдаём как «Статус N», и такие документы
+# дорабатываются браузером (надёжный текст статуса) — чтобы не выдать неверный
+# вердикт. По мере подтверждения коды можно добавлять сюда.
+_FSA_STATUS_MAP: Dict[int, str] = {
+    6: "Действует",
+}
+
+# Словарь технических регламентов ФСА (idTechnicalReglaments). 39 = ТР ТС
+# 007/2011 подтверждён живым ответом (в тексте документов). Остальные —
+# по мере подтверждения; неизвестные отдаются как «ТР (код N)».
+_FSA_TECHREG_MAP: Dict[int, str] = {
+    39: "ТР ТС 007/2011",
+}
+
 
 
 # =============================================================================
@@ -6381,25 +6488,32 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                         pass
                 _parsed = parse_fsa_json(_cap, url, _kind_fsa, _doc_id_fsa)
                 if _parsed.get('doc_number'):
-                    # v27.9.x ГИБРИД: реальный JSON-API ФСА отдаёт status и scheme
-                    # ЧИСЛОВЫМИ кодами, а product — не названием (это ломало вердикт).
-                    # Поэтому из API берём только НАДЁЖНЫЕ поля (ИНН, изготовитель,
-                    # заявитель, ТН ВЭД, даты) в кэш, а название и текстовый статус
-                    # документа добываем ниже браузером (как раньше) — вердикт
-                    # снова корректный. Браузерный merge не перетирает эти поля
-                    # (заполняет только пустые). Точный разбор status/scheme/название
-                    # из JSON будет добавлен по реальному телу certificate.json-API.
+                    # v27.9.x: разбор по реальной структуре JSON ФСА. В кэш кладём
+                    # все надёжные поля (ИНН, заявитель, изготовитель, схема,
+                    # техрегламент, даты).
                     _api_ext = {
                         'document_date_start': _parsed.get('date_start', ''),
                         'document_date_end': _parsed.get('date_end', ''),
                         'applicant_name': _clean_org_name(_parsed.get('applicant', '')),
                         'applicant_inn': _parsed.get('applicant_inn', ''),
                         'manufacturer_name': _clean_org_name(_parsed.get('manufacturer', '')),
-                        'tnved': _clean_tnved_code(_parsed.get('tnved', '')),
+                        'scheme': _parsed.get('scheme', ''),
+                        'technical_regulation': _parsed.get('technical_regulation', ''),
                     }
                     _FSA_EXTENDED_FIELDS_CACHE[url] = {k: v for k, v in _api_ext.items() if v}
+                    _st = _parsed.get('status', '')
+                    _known = bool(_st) and not _st.startswith('Статус ')
+                    if _known and _parsed.get('product_full'):
+                        # Статус ПОДТВЕРЖДЁН (idStatus в словаре, напр. 6=Действует)
+                        # и есть название из product.fullName — отдаём всё из API,
+                        # БЕЗ браузера: быстро и консистентно. Название берём из
+                        # JSON (а не со скачущей вёрстки) — это чинит и сравнение.
+                        details.append('fsa_api_full_ok; via=spa_response')
+                        return (_parsed.get('doc_number', ''), _parsed.get('product_full', ''),
+                                _parsed.get('doc_type', ''), _st, 'fsa_api_capture_ok')
+                    # Статус неизвестен (не код 6) — добираем браузером надёжный
+                    # текст статуса и название (редкий случай: недействующие).
                     details.append('fsa_api_ext_ok')
-                    # НЕ возвращаемся: пусть браузер добудет название + текстовый статус
         except Exception as _e:
             details.append(f'fsa_api_capture_miss={type(_e).__name__}')
 

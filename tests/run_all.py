@@ -22,6 +22,7 @@ MODULES = [
     "test_report_e2e",
     "test_preflight",
     "test_fsa_parse",
+    "test_fsa_json_parse",
     "test_ozon_search",
     "test_original_cardjson",
     "test_original_viewflags",
@@ -39,6 +40,12 @@ def _load_and_run(name: str) -> bool:
     except Exception as e:  # pragma: no cover
         print(f"[{name}] ОШИБКА ИМПОРТА/ЗАПУСКА: {e}")
         return False
+    # Большинство тестов накапливают результаты в модульном списке RESULTS
+    # (check() добавляет туда bool). Падение под __main__ через sys.exit при
+    # импорте НЕ срабатывает, поэтому проверяем RESULTS напрямую.
+    results = getattr(mod, "RESULTS", None)
+    if isinstance(results, list) and results:
+        return all(results)
     # У некоторых тестов есть функция run() с кодом возврата
     if hasattr(mod, "run"):
         try:

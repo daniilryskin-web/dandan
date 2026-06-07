@@ -1,0 +1,710 @@
+{
+  "idCertificate": 3403978,
+  "idTechnicalReglaments": [
+    39
+  ],
+  "idCertScheme": 1,
+  "idObjectCertType": 3,
+  "idCertType": 1,
+  "isTs": true,
+  "idProductSingleLists": [],
+  "awaitForApprove": false,
+  "idStatus": 6,
+  "expiredInspectionControl": false,
+  "editApp": false,
+  "assignRegNumber": false,
+  "number": "ЕАЭС RU С-UZ.НВ10.В.04409/24",
+  "certRegDate": "2024-03-18",
+  "certEndDate": "2027-03-17",
+  "idBlank": 15139,
+  "blankNumber": "0511089",
+  "noSanction": true,
+  "batchInspection": false,
+  "inspectionControlPlanDate": "2025-03-17",
+  "idSigner": 16292968,
+  "idEmployee": 231817,
+  "firstName": "Ренат",
+  "surname": "Аляшетдинов",
+  "patronymic": "Тахирович",
+  "annexes": [],
+  "applicant": {
+    "idLegalSubject": 7556990,
+    "idEgrul": null,
+    "idApplicantType": 1,
+    "idLegalSubjectType": 1,
+    "fullName": "Общество с ограниченной ответственностью \"УЗКОТТОН\"",
+    "shortName": "ООО \"УЗКОТТОН\"",
+    "idPerson": 16292963,
+    "surname": "ИСМАИЛОВ",
+    "firstName": "БУНЕД",
+    "patronymic": "ТАХИРОВИЧ",
+    "headPosition": "Генеральный директор",
+    "ogrn": "1177746483892",
+    "ogrnAssignDate": "2017-05-16",
+    "inn": "7724409915",
+    "kpp": "772401001",
+    "idLegalForm": 9,
+    "regDate": "2017-05-16",
+    "regOrganName": "Межрайонная инспекция Федеральной налоговой службы № 46 по г. Москве",
+    "addlRegInfo": "",
+    "isEecRegister": true,
+    "contacts": [
+      {
+        "idContact": 5290703,
+        "idContactType": 4,
+        "value": "sale@uzcotton.ru"
+      },
+      {
+        "idContact": 5290702,
+        "idContactType": 1,
+        "value": "+74993437340"
+      }
+    ],
+    "addresses": [
+      {
+        "idAddress": 22148467,
+        "idAddrType": 3,
+        "idCodeOksm": "643",
+        "oksmShort": true,
+        "idSubject": null,
+        "idDistrict": null,
+        "idCity": null,
+        "idLocality": null,
+        "idStreet": null,
+        "idHouse": null,
+        "flat": null,
+        "postCode": null,
+        "fullAddress": "115477, РОССИЯ, МОСКВА ГОРОД, УЛИЦА КАНТЕМИРОВСКАЯ, ДОМ 61, ЭТАЖ 2, ПОМЕЩЕНИЕ I, КОМНАТА 1",
+        "gln": null,
+        "foreignDistrict": null,
+        "foreignCity": null,
+        "foreignLocality": null,
+        "foreignStreet": null,
+        "foreignHouse": null,
+        "uniqueAddress": null,
+        "otherGln": null,
+        "glonass": null
+      },
+      {
+        "idAddress": 22148466,
+        "idAddrType": 1,
+        "idCodeOksm": "643",
+        "oksmShort": true,
+        "idSubject": null,
+        "idDistrict": null,
+        "idCity": null,
+        "idLocality": null,
+        "idStreet": null,
+        "idHouse": null,
+        "flat": null,
+        "postCode": null,
+        "fullAddress": "115477, РОССИЯ, МОСКВА ГОРОД, УЛИЦА КАНТЕМИРОВСКАЯ, ДОМ 61, ЭТАЖ 2, ПОМЕЩЕНИЕ I, КОМНАТА 1",
+        "gln": null,
+        "foreignDistrict": null,
+        "foreignCity": null,
+        "foreignLocality": null,
+        "foreignStreet": null,
+        "foreignHouse": null,
+        "uniqueAddress": null,
+        "otherGln": null,
+        "glonass": null
+      }
+    ],
+    "transnational": [],
+    "passportIssueDate": null,
+    "passportIssuedBy": null,
+    "passportNum": null,
+    "idPersonDoc": null
+  },
+  "applicantFilials": [],
+  "manufIsApplicant": false,
+  "manufacturer": {
+    "idLegalSubject": 7556991,
+    "idEgrul": null,
+    "idLegalSubjectType": 3,
+    "fullName": "Частное предприятие «Нозимабону-2001»",
+    "shortName": "",
+    "idPerson": 16292967,
+    "surname": "",
+    "firstName": "",
+    "patronymic": "",
+    "headPosition": "",
+    "ogrn": "",
+    "ogrnAssignDate": null,
+    "inn": "",
+    "kpp": "",
+    "idLegalForm": null,
+    "regDate": null,
+    "regOrganName": "",
+    "addlRegInfo": "",
+    "isEecRegister": true,
+    "contacts": [],
+    "addresses": [
+      {
+        "idAddress": 22148472,
+        "idAddrType": 3,
+        "idCodeOksm": "860",
+        "oksmShort": true,
+        "idSubject": null,
+        "idDistrict": null,
+        "idCity": null,
+        "idLocality": null,
+        "idStreet": null,
+        "idHouse": null,
+        "flat": null,
+        "postCode": null,
+        "fullAddress": "Республика Узбекистан, 171301, Андижанская область, Андижанский район, сельсовет Хакан, улица Чем, дом 3; GLN: 4780107229998",
+        "gln": null,
+        "foreignDistrict": null,
+        "foreignCity": null,
+        "foreignLocality": null,
+        "foreignStreet": null,
+        "foreignHouse": null,
+        "uniqueAddress": null,
+        "otherGln": null,
+        "glonass": null
+      },
+      {
+        "idAddress": 22148471,
+        "idAddrType": 1,
+        "idCodeOksm": "860",
+        "oksmShort": true,
+        "idSubject": null,
+        "idDistrict": null,
+        "idCity": null,
+        "idLocality": null,
+        "idStreet": null,
+        "idHouse": null,
+        "flat": null,
+        "postCode": null,
+        "fullAddress": "Республика Узбекистан, 171301, Андижанская область, Андижанский район, сельсовет Хакан, улица Чем, дом 3; GLN: 4780107229998",
+        "gln": null,
+        "foreignDistrict": null,
+        "foreignCity": null,
+        "foreignLocality": null,
+        "foreignStreet": null,
+        "foreignHouse": null,
+        "uniqueAddress": null,
+        "otherGln": null,
+        "glonass": null
+      }
+    ],
+    "transnational": [],
+    "passportIssueDate": null,
+    "passportIssuedBy": null,
+    "passportNum": null,
+    "idPersonDoc": null
+  },
+  "manufacturerFilials": [
+    {
+      "idFilial": 6373844,
+      "fullName": null,
+      "shortName": null,
+      "idLegalForm": null,
+      "kpp": null,
+      "annex": false,
+      "contacts": [],
+      "addresses": [
+        {
+          "idAddress": 22148473,
+          "idAddrType": 3,
+          "idCodeOksm": "860",
+          "oksmShort": true,
+          "idSubject": null,
+          "idDistrict": null,
+          "idCity": null,
+          "idLocality": null,
+          "idStreet": null,
+          "idHouse": null,
+          "flat": null,
+          "postCode": null,
+          "fullAddress": "171301, Республика Узбекистан, Андижанская область, Андижанский район, сельсовет Хакан, улица Чем, дом 3; GLN: 4780107229998",
+          "gln": null,
+          "foreignDistrict": null,
+          "foreignCity": null,
+          "foreignLocality": null,
+          "foreignStreet": null,
+          "foreignHouse": null,
+          "uniqueAddress": null,
+          "otherGln": null,
+          "glonass": null
+        }
+      ]
+    }
+  ],
+  "certificationAuthority": {
+    "idCertificationAuthority": 4306159,
+    "fullName": "Орган по сертификации Общество с ограниченной ответственностью  \"НЗ-АВТОМАТИКА\"",
+    "accredOrgName": "Межрайонная инспекция Федеральной налоговой службы № 46 по г. Москве",
+    "attestatRegNumber": "RA.RU.11СТ12",
+    "attestatRegDate": "2015-11-24",
+    "attestatEndDate": null,
+    "idRal": 11840,
+    "ogrn": "1157746137394",
+    "idPerson": 18405875,
+    "firstName": "Анна",
+    "surname": "Мамаева",
+    "patronymic": "Павловна",
+    "contacts": [
+      {
+        "idContact": 6754215,
+        "idContactType": 1,
+        "value": "+74991109207"
+      },
+      {
+        "idContact": 6754216,
+        "idContactType": 4,
+        "value": "nz-avtomatika@mail.ru"
+      },
+      {
+        "idContact": 6754217,
+        "idContactType": 5,
+        "value": "nz-avtomatika.ru"
+      }
+    ],
+    "addresses": [
+      {
+        "idAddress": 24609630,
+        "idAddrType": 3,
+        "idCodeOksm": "643",
+        "oksmShort": null,
+        "idSubject": "0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+        "idDistrict": null,
+        "idCity": null,
+        "idLocality": null,
+        "idStreet": "be3b9b97-a924-41cd-af6a-0255268afabb",
+        "idHouse": "0a78fb3e-7ad8-4c35-925a-d10070233c0d",
+        "flat": null,
+        "postCode": "115088",
+        "fullAddress": "115088, РОССИЯ, Г Москва, ул Шарикоподшипниковская, дом 38 строение 2, 108а",
+        "gln": null,
+        "foreignDistrict": null,
+        "foreignCity": null,
+        "foreignLocality": null,
+        "foreignStreet": null,
+        "foreignHouse": null,
+        "uniqueAddress": "108а",
+        "otherGln": null,
+        "glonass": null
+      }
+    ],
+    "prevAttestatRegNumber": "RA.RU.11АЖ36",
+    "prevIdRal": 11811
+  },
+  "product": {
+    "idProduct": 3612150,
+    "idProductOrigin": "860",
+    "fullName": "Изделия трикотажные бельевые первого слоя для детей дошкольного, школьного возраста и подростков из хлопчатобумажной пряжи, в том числе с вложением эластомерных нитей:",
+    "marking": null,
+    "usageScope": "Сертификат распространяется на серийно выпускаемую продукцию, изготовленную с даты изготовления отобранных образцов (проб) продукции, прошедших исследования (испытания) и измерения. Сведения о дате изготовления образцов: 04.11.2023",
+    "storageCondition": "Условия хранения: изделия хранятся в сухих, проветриваемых складских помещениях при температуре 15-20 °С, относительной влажности воздуха 60-70% и защищены от прямого попадания солнечных лучей и атмосферных воздействий. Срок службы (годности) не установлен",
+    "usageCondition": null,
+    "batchSize": null,
+    "batchId": null,
+    "identification": null,
+    "identifications": [
+      {
+        "idIdentification": 7077137,
+        "annex": false,
+        "name": "фуфайки (футболки), в том числе с воротом типа «поло», в том числе с длинным рукавом типа \"лонгслив\", майки, в том числе модель «топ», панталоны, боди, пижамы, ночные сорочки, кальсоны, нижние юбки, трусы, в том числе модель «боксеры», марка: «UZCOTTON»",
+        "type": null,
+        "tradeMark": null,
+        "model": null,
+        "article": null,
+        "sort": null,
+        "idOkpds": [],
+        "idTnveds": [
+          68582,
+          68566,
+          68554
+        ],
+        "gtin": [
+          ""
+        ],
+        "lifeTime": null,
+        "storageTime": null,
+        "description": null,
+        "amount": null,
+        "idOkei": null,
+        "factoryNumber": null,
+        "productionDate": null,
+        "expiryDate": null,
+        "documents": [],
+        "standards": [
+          {
+            "idStandard": 5635701,
+            "annex": false,
+            "idDictStandard": null,
+            "designation": "ГОСТ 31408-2009",
+            "name": "\"Изделия трикотажные бельевые для мужчин и мальчиков. Общие технические условия\"",
+            "section": "пункты 4.3.3 и 4.3.4",
+            "addlInfo": "",
+            "idStatus": null
+          },
+          {
+            "idStandard": 5635700,
+            "annex": false,
+            "idDictStandard": null,
+            "designation": "ГОСТ 31405-2009",
+            "name": "\"Изделия трикотажные бельевые для женщин и девочек. Общие технические условия\"",
+            "section": "пункты 4.3.4 и 4.3.5",
+            "addlInfo": "",
+            "idStatus": null
+          }
+        ]
+      }
+    ]
+  },
+  "experts": [
+    {
+      "idExpert": 3511297,
+      "idPerson": 16292966,
+      "idEmployee": 231999,
+      "firstName": "Екатерина",
+      "surname": "Борисова",
+      "patronimyc": "Николаевна"
+    },
+    {
+      "idExpert": 3511296,
+      "idPerson": 16292964,
+      "idEmployee": 368351,
+      "firstName": "Мария",
+      "surname": "Мельникова",
+      "patronimyc": "Александровна"
+    }
+  ],
+  "statusChanges": [
+    {
+      "idChangeStatus": 6271645,
+      "idStatus": 6,
+      "beginDate": "2024-03-18T13:58:35.507",
+      "endDate": null,
+      "comment": null,
+      "idBasis": null,
+      "docNumber": null,
+      "publicated": true,
+      "publishDate": "2024-03-18T13:58:35.971",
+      "lkType": "dict.orgtypes.os-ppu",
+      "idMrpa": null,
+      "docName": null,
+      "docDate": null,
+      "idBasisSolutions": [],
+      "levelStateControl": null,
+      "typeStateControl": null,
+      "idOngoingEvent": null,
+      "idFileScan": null
+    }
+  ],
+  "testingLabs": [
+    {
+      "idTestingLab": 3343634,
+      "annex": false,
+      "idRal": null,
+      "regNumber": "RA.RU.21НН55",
+      "fullName": "Испытательной лабораторией Общества с ограниченной ответственностью «ТСЛ»",
+      "beginDate": "2018-11-29",
+      "endDate": null,
+      "basis": null,
+      "accredEec": true,
+      "idAccredPlace": "643",
+      "importedForResearchTesting": true,
+      "docConfirmCustom": [
+        {
+          "idDocConfirmCustom": 701543,
+          "idDocConfirmCustomType": 1,
+          "customInfo": [
+            {
+              "idCustomInfo": 861520,
+              "customDeclNumber": "10131010/270224/3049788"
+            }
+          ],
+          "otherDocs": [],
+          "reasonNonRegistrCustomsDeclaration": null
+        }
+      ],
+      "protocols": [
+        {
+          "idProtocol": 1747427,
+          "idProtocolRpi": null,
+          "number": "0320243539-ТСЛ",
+          "date": "2024-03-15",
+          "standards": [],
+          "isProtocolInvalid": false
+        },
+        {
+          "idProtocol": 1747426,
+          "idProtocolRpi": null,
+          "number": "0320243538-ТСЛ",
+          "date": "2024-03-15",
+          "standards": [],
+          "isProtocolInvalid": false
+        }
+      ],
+      "actNumber": null,
+      "actDate": null,
+      "actIdentificationNumber": null,
+      "actIdentificationDate": null
+    }
+  ],
+  "productGroups": [
+    {
+      "idProductGroup": 1680917,
+      "idTechReg": 39,
+      "idGroup": 555
+    }
+  ],
+  "documents": {
+    "productTypeResearchConclusion": {
+      "id": 17255260,
+      "idTechnicalReglament": null,
+      "annex": false,
+      "number": null,
+      "issueDate": null,
+      "accreditedPersonName": null,
+      "attestatRegNumber": null,
+      "attestatRegDate": null,
+      "attestatEndDate": null,
+      "sampleProduct": null
+    },
+    "productTypeCertificates": [
+      {
+        "id": 17255261,
+        "idTechnicalReglament": null,
+        "annex": false,
+        "number": null,
+        "issueDate": null,
+        "accreditedPersonName": null,
+        "attestatRegNumber": null,
+        "attestatRegDate": null,
+        "attestatEndDate": null,
+        "sampleProduct": null
+      }
+    ],
+    "productDesignResearchConclusion": {
+      "id": 17255262,
+      "idTechnicalReglament": null,
+      "annex": false,
+      "number": null,
+      "issueDate": null,
+      "accreditedPersonName": null,
+      "attestatRegNumber": null,
+      "attestatRegDate": null,
+      "attestatEndDate": null
+    },
+    "qmsCertificates": [
+      {
+        "id": 17255263,
+        "idTechnicalReglament": null,
+        "annex": false,
+        "number": null,
+        "issueDate": null,
+        "endDate": null,
+        "accredEec": true,
+        "idAccredPlace": "643",
+        "idType": null,
+        "idTypeActivity": null,
+        "accreditedPersonName": null,
+        "attestatRegNumber": null,
+        "attestatRegDate": null,
+        "attestatEndDate": null,
+        "qmsCertificationDocuments": []
+      }
+    ],
+    "manufacturingConditionAnalysisActs": [
+      {
+        "id": 17255264,
+        "idTechnicalReglament": null,
+        "annex": false,
+        "number": "С-20240124-004",
+        "date": "2024-01-31",
+        "analysisBeginDate": "2024-01-31",
+        "analysisEndDate": "2024-01-31",
+        "addresses": [
+          {
+            "idAddress": 22148470,
+            "idAddrType": 3,
+            "idCodeOksm": null,
+            "oksmShort": true,
+            "idSubject": null,
+            "idDistrict": null,
+            "idCity": null,
+            "idLocality": null,
+            "idStreet": null,
+            "idHouse": null,
+            "flat": null,
+            "postCode": null,
+            "fullAddress": null,
+            "gln": null,
+            "foreignDistrict": null,
+            "foreignCity": null,
+            "foreignLocality": null,
+            "foreignStreet": null,
+            "foreignHouse": null,
+            "uniqueAddress": null,
+            "otherGln": null,
+            "glonass": null
+          }
+        ],
+        "certExperts": [
+          {
+            "idExpert": 3511297,
+            "idPerson": 16292966,
+            "idEmployee": 231999,
+            "firstName": "Екатерина",
+            "surname": "Борисова",
+            "patronimyc": "Николаевна"
+          }
+        ],
+        "analysisTakenDate": null
+      }
+    ],
+    "conformityAssessmentDocuments": [],
+    "reportsOnTypeApprovalUnderUNRegulation": [
+      {
+        "id": 17255269,
+        "idTechnicalReglament": 39,
+        "annex": false,
+        "idCategory": null,
+        "name": null,
+        "country": null,
+        "orgName": null,
+        "number": null,
+        "date": null
+      }
+    ],
+    "protocolTestingTechnicalService": {
+      "id": 17255271,
+      "idTechnicalReglament": null,
+      "annex": false,
+      "idCategory": null,
+      "name": null,
+      "number": null,
+      "techServiceName": null,
+      "date": null
+    },
+    "commonDocuments": {
+      "39": [
+        {
+          "id": 17255280,
+          "idDocumentType": 48,
+          "number": "10131010/270224/3049788",
+          "date": "2024-02-27",
+          "name": "копии таможенной декларации на товары"
+        },
+        {
+          "id": 17255279,
+          "idDocumentType": 48,
+          "number": "б/н",
+          "date": "2023-12-01",
+          "name": "копии перечня стандартов, в результате применения которых на  добровольной основе обеспечивается соблюдение требований  Технического регламента Таможенного союза «О безопасности продукции, предназначенной для детей и подростков» (ТР ТС 007/2011)"
+        },
+        {
+          "id": 17255278,
+          "idDocumentType": 48,
+          "number": "б/н",
+          "date": "2023-12-01",
+          "name": "копии технического описания продукции"
+        },
+        {
+          "id": 17255277,
+          "idDocumentType": 48,
+          "number": "б/н",
+          "date": "2023-12-01",
+          "name": "копии информации о сырье, материалах и комплектующих изделиях"
+        },
+        {
+          "id": 17255276,
+          "idDocumentType": 48,
+          "number": "б/н",
+          "date": "2023-12-01",
+          "name": "копии инструкции по эксплуатации изделия"
+        },
+        {
+          "id": 17255275,
+          "idDocumentType": 48,
+          "number": "б/н",
+          "date": "2024-01-24",
+          "name": "макета этикеток"
+        },
+        {
+          "id": 17255274,
+          "idDocumentType": 48,
+          "number": "03",
+          "date": "2023-03-12",
+          "name": "копии договора на выполнение функции иностранного изготовителя"
+        },
+        {
+          "id": 17255273,
+          "idDocumentType": 48,
+          "number": "ЮЭ9965-24- 26064675",
+          "date": "2024-01-17",
+          "name": "Копии - Выписка из единого государственного реестра юридических лиц"
+        },
+        {
+          "id": 17255272,
+          "idDocumentType": 48,
+          "number": "С-20240124-004 ",
+          "date": "2024-01-24",
+          "name": "Заявки на подтверждение соответствия продукции требованиям технических регламентов ЕАЭС"
+        }
+      ]
+    },
+    "samplingAct": {
+      "id": 17255265,
+      "idTechnicalReglament": null,
+      "number": "С-20240124-004",
+      "date": "2024-01-31"
+    },
+    "productCertificationContract": {
+      "id": 17255266,
+      "idTechnicalReglament": null,
+      "number": null,
+      "date": null
+    },
+    "applicationCertificationDecision": {
+      "id": 17255267,
+      "idTechnicalReglament": null,
+      "number": null,
+      "date": null
+    },
+    "foreignManufacturerContract": {
+      "id": 17255268,
+      "idTechnicalReglament": null,
+      "number": "03",
+      "date": "2023-03-12",
+      "endDate": null,
+      "subject": null,
+      "applicantResponsibility": null,
+      "manufacturerResponsibility": null
+    },
+    "rawMaterialCertificates": [],
+    "vehicleChassisTypeApprovals": [],
+    "applicantOtherDocuments": [],
+    "expertConclusion": {
+      "id": 17255270,
+      "idTechnicalReglament": null,
+      "annex": false,
+      "idCategory": null,
+      "name": null,
+      "number": null,
+      "attestateRegNumber": null,
+      "accreditedPersonName": null,
+      "attestateBeginDate": null,
+      "attestateEndDate": null,
+      "date": null
+    }
+  },
+  "idFgisRaV1": null,
+  "changes": null,
+  "awaitOperatorCheck": null,
+  "productInfoOon106": null,
+  "productMatchOON106": null,
+  "idDeclarationChecker": null,
+  "idMrpa": null,
+  "showInOpenPart": true,
+  "idCertBasis": null,
+  "replacement": null,
+  "replacedBy": null,
+  "isBlock": false,
+  "isCanPublish": true
+}

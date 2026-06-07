@@ -1058,6 +1058,13 @@ async def fetch_original_via_card_json(
 # Имя берём батчами через card.wb.ru/cards/v2/detail?nm=id1;id2;... (до 100 nm за раз).
 # =============================================================================
 
+# v27.9.x: бит маски viewFlags, означающий плашку «Оригинал». viewFlags WB
+# отдаёт в поисковой выдаче по каждому товару, поэтому проверка БЕСПЛАТНА (без
+# доп. запросов) и мгновенна. Значение подтверждается по реальным viewFlags
+# оригинального vs обычного товара. 0 = бит ещё не определён (проверка выключена).
+WB_ORIGINAL_VIEWFLAG_BIT = 0
+
+
 def _detect_wb_original(p: Dict[str, Any]) -> str:
     """v43: определяет признак оригинальности товара из объекта WB.
 
@@ -1068,6 +1075,12 @@ def _detect_wb_original(p: Dict[str, Any]) -> str:
     (см. enrich-режим), но это даёт быстрый сигнал по данным поиска.
     """
     try:
+        # 0) viewFlags — битовая маска бейджей WB (есть прямо в поисковой выдаче).
+        #    Если известен бит «Оригинал» — это самый быстрый и точный сигнал.
+        if WB_ORIGINAL_VIEWFLAG_BIT:
+            vf = p.get("viewFlags")
+            if isinstance(vf, int) and (vf & WB_ORIGINAL_VIEWFLAG_BIT):
+                return "оригинал"
         # 1) Явные строковые поля, где WB иногда помечает оригинальность
         for key in ("promoTextCard", "promoTextCat", "name"):
             v = str(p.get(key) or "")
@@ -1249,10 +1262,12 @@ async def run_http_link_prefetch(
                 except Exception as e:
                     urls, detail = [], f"cert_json_exception:{type(e).__name__}:{str(e)[:120]}"
 
-                # v27.9.x: быстрый признак «Оригинал» через статический card.json
-                # (тот же basket-шард, без браузера). Ставим «оригинал» только при
-                # уверенном True; иначе не трогаем (оставляем эвристику поиска).
-                if getattr(args, 'check_original', True):
+                # v27.9.x: card.json НЕ содержит признак «Оригинал» (подтверждено
+                # реальным телом card.json) — плашка приходит из viewFlags в
+                # динамическом API. Поэтому card.json-проба по умолчанию ОТКЛЮЧЕНА
+                # (не тратим лишние запросы). Определение «Оригинал» — по биту
+                # viewFlags из поисковой выдачи (см. _detect_wb_original).
+                if getattr(args, 'check_original_cardjson', False):
                     try:
                         _is_orig, _odet = await fetch_original_via_card_json(
                             session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts

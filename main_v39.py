@@ -927,6 +927,132 @@ async def fetch_certificate_json_for_nm(
 
 
 # =============================================================================
+# v27.9.x: БЫСТРОЕ определение плашки «Оригинал» через статический card.json.
+# Найдено по HAR живой карточки WB: страница тянет card.json из той же basket-CDN,
+# что и certificate.json (путь /info/ru/card.json). Это СТАТИЧЕСКИЙ файл — берётся
+# обычным HTTP без браузера/токена/антибота, быстро и батчами (как certificate.json).
+# В нём лежит полная карточка, включая признак оригинальности.
+# =============================================================================
+
+def card_json_urls(nm_id: int, max_hosts: int = 16) -> List[str]:
+    """URL'ы статического card.json в той же basket-CDN (тот же шард, что и
+    certificate.json). Путь /info/ru/card.json."""
+    nm = int(nm_id)
+    cert = certificate_json_urls(nm, max_hosts=max_hosts)
+    return [u.replace(f"/{nm}/info/certificate.json", f"/{nm}/info/ru/card.json") for u in cert]
+
+
+# Ключи/значения card.json, означающие «оригинальный товар».
+# ВНИМАНИЕ: точный набор подтверждается по реальному телу card.json. Сканер
+# намеренно широкий: и булевы флаги по ключу, и текст «оригинальный товар».
+_ORIGINAL_KEY_RE = re.compile(
+    r"(?:is_?original|has_?original(?:mark)?|original_?mark|original_?badge|"
+    r"isoriginal|originalproduct|panelpromo)", re.I
+)
+
+
+def card_json_has_original(parsed: Any) -> bool:
+    """Глубокий обход card.json: True, если найден признак «Оригинал»
+    (булев флаг по ключу ИЛИ текст «оригинальный товар»)."""
+    found = False
+
+    def truthy(v: Any) -> bool:
+        if v is True:
+            return True
+        if isinstance(v, (int, float)):
+            return v != 0
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "да", "yes", "y", "оригинал", "original")
+        return False
+
+    def walk(o: Any) -> None:
+        nonlocal found
+        if found:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if _ORIGINAL_KEY_RE.search(str(k)) and truthy(v):
+                    found = True
+                    return
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+        elif isinstance(o, str):
+            if "оригинальный товар" in o.lower():
+                found = True
+
+    walk(parsed)
+    return found
+
+
+async def fetch_original_via_card_json(
+    session: "aiohttp.ClientSession", nm_id: int, timeout_sec: float = 6.0,
+    max_hosts: int = 16, concurrency: int = 0
+) -> Tuple[Optional[bool], str]:
+    """Тянет card.json по basket-шардам (конкурентно, первый 200 выигрывает) и
+    определяет признак «Оригинал».
+
+    Возвращает (is_original|None, detail). None = card.json не нашли (не знаем),
+    тогда результат не должен перетирать другие методы.
+    """
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+    }
+    timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec)))
+    urls = card_json_urls(nm_id, max_hosts=max_hosts)
+    probe_concurrency = max(1, int(concurrency) if concurrency else min(len(urls), 16))
+    sem = asyncio.Semaphore(probe_concurrency)
+    state = {"result": None, "host": ""}
+    done = asyncio.Event()
+
+    async def probe(url: str) -> None:
+        if done.is_set():
+            return
+        async with sem:
+            if done.is_set():
+                return
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as r:
+                    if int(r.status) != 200:
+                        return
+                    raw = (await r.text(errors="replace")).strip()
+                    if not raw:
+                        return
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        parsed = raw
+                    state["result"] = card_json_has_original(parsed)
+                    state["host"] = hostname(url)
+                    done.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    tasks = [asyncio.create_task(probe(u)) for u in urls]
+    try:
+        pending = set(tasks)
+        while pending:
+            _d, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if done.is_set():
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    if state["result"] is None:
+        return None, "card_json_not_found"
+    return bool(state["result"]), f"card_json_ok:{state['host']}:{'orig' if state['result'] else 'no'}"
+
+
+# =============================================================================
 # v40.3: дотягивание имени продавца (seller_name).
 # WB API v18 в поисковой выдаче отдаёт supplierId, но НЕ имя продавца.
 # Имя берём батчами через card.wb.ru/cards/v2/detail?nm=id1;id2;... (до 100 nm за раз).
@@ -1122,6 +1248,19 @@ async def run_http_link_prefetch(
                     )
                 except Exception as e:
                     urls, detail = [], f"cert_json_exception:{type(e).__name__}:{str(e)[:120]}"
+
+                # v27.9.x: быстрый признак «Оригинал» через статический card.json
+                # (тот же basket-шард, без браузера). Ставим «оригинал» только при
+                # уверенном True; иначе не трогаем (оставляем эвристику поиска).
+                if getattr(args, 'check_original', True):
+                    try:
+                        _is_orig, _odet = await fetch_original_via_card_json(
+                            session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
+                        )
+                        if _is_orig is True:
+                            card.is_original = 'оригинал'
+                    except Exception:
+                        pass
 
                 base_fields = dict(
                     query=card.source_query or args.query,
@@ -1982,7 +2121,11 @@ async def collect_cards(args) -> List[Card]:
     # v27.5: проверка плашки «Оригинальный товар» через wb_enhanced.
     # Поля .is_original проставляются внутри enrich_cards_batch в формате bool;
     # в ResultRow это попадает как "оригинал" / "не указано".
-    if bool(getattr(args, 'check_original', True)) and final_cards:
+    # v27.9.x: СТАРЫЙ HTML-детектор «Оригинал» по умолчанию ОТКЛЮЧЁН — WB рендерит
+    # плашку через JS, и в HTML её больше нет (всегда давал «не указано»). Его
+    # заменил быстрый card.json-детектор в run_http_link_prefetch. Старый путь
+    # оставлен только под явный флаг --check-original-html для отладки.
+    if bool(getattr(args, 'check_original_html', False)) and final_cards:
         try:
             from wb_enhanced import WBEnhancedClient as _WBEnh
             _orig_domains = [d.strip() for d in str(getattr(args, 'check_original_domains', 'ru') or 'ru').split(',') if d.strip()]

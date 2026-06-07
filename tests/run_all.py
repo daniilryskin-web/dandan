@@ -23,6 +23,7 @@ MODULES = [
     "test_preflight",
     "test_fsa_parse",
     "test_ozon_search",
+    "test_original_cardjson",
     "check_frontend",
 ]
 

@@ -17,6 +17,7 @@ MODULES = [
     "test_compare_categories",
     "test_compare_layers",
     "test_chart_stats",
+    "test_fsa_fastfail",
     "test_cert_fetch",
     "test_xlsx_safe",
     "test_ozon_verdict",

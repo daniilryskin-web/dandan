@@ -6597,6 +6597,16 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             # v39.2: вытащить точную причину (net::ERR_NAME_NOT_RESOLVED, net::ERR_CONNECTION_TIMED_OUT и т.п.)
             err_msg = str(e)[:200].replace(';', ',').replace('\n', ' ')
             details.append(f'number_route_error={type(e).__name__}:{err_msg}')
+            # v27.9.x: если это СЕТЕВОЙ сбой (host недоступен/таймаут соединения),
+            # остальные маршруты ТОГО ЖЕ хоста тоже не достучатся — не перебираем их
+            # по 30с каждый. Раньше один недоступный FSA-документ занимал воркер
+            # ~114с (перебор number+product+manufacturer вкладок) и UI «висел».
+            if any(mk in err_msg for mk in (
+                    'ERR_CONNECTION', 'ERR_TIMED_OUT', 'ERR_NAME_NOT_RESOLVED',
+                    'ERR_ADDRESS_UNREACHABLE', 'ERR_INTERNET_DISCONNECTED',
+                    'ERR_NETWORK', 'ERR_ABORTED', 'ERR_SOCKET')):
+                details.append('number_routes_network_abort')
+                break
             continue
 
     # v39.4: если поиск по точному label НЕ нашёл номер — пробуем regex-fallback
@@ -6660,6 +6670,18 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                         details.append('status_keyword_fallback_ok')
         except Exception as e:
             details.append(f'number_regex_error={type(e).__name__}')
+
+    # v27.9.x: если НИ ОДИН number-route не достучался — это сетевой сбой host'а
+    # (pub.fsa.gov.ru недоступен/таймаутит). Вкладки /product и /manufacturer того
+    # же хоста тоже не загрузятся, поэтому НЕ тратим ещё 60-90с на заведомо
+    # провальные goto — сразу выходим с пометкой network failure (её ловит
+    # счётчик fsa_network_failures и второй проход FSA). Это убирает «зависание»
+    # этапа 2, когда FSA недоступен: запись падает за ~30-60с, а не за ~114с.
+    if not any_goto_succeeded:
+        details.append('NETWORK_FAILURE_all_goto_failed')
+        doc_type = ('декларация' if '/rds/declaration/' in url.lower()
+                    else ('сертификат' if '/rss/certificate/' in url.lower() else ''))
+        return '', '', doc_type, '', ';'.join(details)
 
     # Шаг 2: название продукции.
     for route in product_routes:
@@ -7651,6 +7673,16 @@ async def run_registry_stage(args):
                     and not (val[1] or '').strip()        # нет названия продукции
                     and _is_transient_fsa_fail(val[4])    # упал по сети/таймауту
                 ]
+                # v27.9.x: ретрай оправдан только для МЕНЬШИНСТВА упавших (реально
+                # транзитные таймауты). Если упало большинство FSA — host недоступен
+                # в этой сети; последовательный повтор всех ссылок ничего не вернёт,
+                # лишь добавит ~45с×N минут. В таком случае ретрай пропускаем.
+                fsa_total = sum(1 for u in parsed if hostname(u) == 'pub.fsa.gov.ru')
+                if fsa_total and len(retry_urls) > max(3, int(fsa_total * 0.5)):
+                    print(f"🔁 Второй проход FSA ПРОПУЩЕН: упало {len(retry_urls)}/{fsa_total} FSA-ссылок — "
+                          f"похоже pub.fsa.gov.ru недоступен в этой сети (VPN с РФ-IP / мобильный интернет). "
+                          f"Повтор не поможет; ссылки сохранены — перезапустите позже.")
+                    retry_urls = []
                 max_retry = int(getattr(args, 'registry_fsa_retry_max', 50) or 0)
                 if retry_urls and max_retry > 0:
                     retry_urls = retry_urls[:max_retry]

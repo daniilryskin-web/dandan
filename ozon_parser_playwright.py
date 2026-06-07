@@ -290,22 +290,63 @@ class OzonPlaywrightParser:
                 "Playwright не установлен. Выполните: pip install playwright && playwright install chromium"
             )
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            args=BROWSER_ARGS,
-        )
-        self._context = await self._browser.new_context(
-            user_agent=UA_MAC,
-            viewport=VIEWPORT,
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            extra_http_headers={
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-        )
+        # v27.9.1: ПЕРСИСТЕНТНЫЙ профиль браузера. Ozon выдаёт анти-бот доверие
+        # (cookies, __Secure-*, токены challenge) на профиль; в чистом одноразовом
+        # контексте поиск часто возвращал 0 товаров. Сохраняя профиль между
+        # запусками, мы накапливаем «доверие» и проходим проверки как реальный
+        # пользователь (так делают рабочие парсеры Ozon).
+        profile_dir = str(Path(__file__).resolve().parent / ".ozon_profile")
+        try:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                profile_dir,
+                headless=self.headless,
+                args=BROWSER_ARGS,
+                user_agent=UA_MAC,
+                viewport=VIEWPORT,
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+                extra_http_headers={
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+            )
+            self._browser = None  # персистентный контекст сам владеет браузером
+        except Exception as e:
+            # Fallback на обычный launch, если персистентный контекст недоступен
+            log.warning("Персистентный профиль недоступен (%s) — обычный контекст", e)
+            self._browser = await self._playwright.chromium.launch(headless=self.headless, args=BROWSER_ARGS)
+            self._context = await self._browser.new_context(
+                user_agent=UA_MAC, viewport=VIEWPORT, locale="ru-RU", timezone_id="Europe/Moscow",
+                extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},
+            )
         await self._context.add_init_script(STEALTH_JS)
-        log.info("Playwright Chromium запущен (headless=%s)", self.headless)
+        self._warmed = False
+        log.info("Playwright Chromium запущен (headless=%s, профиль=%s)", self.headless, profile_dir)
         return self
+
+    async def _warm_up(self) -> None:
+        """v27.9.1: «прогрев» — заходим на главную Ozon, чтобы получить cookies и
+        пройти первичную проверку анти-бота ДО поискового запроса."""
+        if getattr(self, "_warmed", False):
+            return
+        page = await self._context.new_page()
+        try:
+            await page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=self.search_timeout_ms)
+            await _human_delay(2.0, 4.0)
+            # Прокрутим немного — имитация живого пользователя
+            try:
+                await page.evaluate("window.scrollBy(0, 600)")
+            except Exception:
+                pass
+            await _human_delay(1.0, 2.0)
+            self._warmed = True
+            log.info("Прогрев главной Ozon выполнен")
+        except Exception as e:
+            log.warning("Прогрев не удался: %s", e)
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     async def __aexit__(self, *args) -> None:
         try:
@@ -335,6 +376,9 @@ class OzonPlaywrightParser:
         self.stats["search_attempts"] += 1
         url = f"https://www.ozon.ru/search/?text={quote_plus(query)}&from_global=true"
         log.info("Открываю поиск: %s (лимит %d)", url, limit)
+
+        # v27.9.1: прогрев главной страницы (cookies/анти-бот) перед поиском
+        await self._warm_up()
 
         page = await self._context.new_page()
         try:

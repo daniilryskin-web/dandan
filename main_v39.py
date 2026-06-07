@@ -465,7 +465,7 @@ STATUS_TIMEOUT = "ТАЙМАУТ"
 STATUS_ERROR = "ОШИБКА"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-07-v27.9.1-playwright"
+APP_VERSION = "2026-06-07-v27.9.2-playwright"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -1984,31 +1984,30 @@ async def collect_cards(args) -> List[Card]:
     # в ResultRow это попадает как "оригинал" / "не указано".
     if bool(getattr(args, 'check_original', True)) and final_cards:
         try:
-            from wb_enhanced import WBEnhancedClient as _WBEnh
-            _orig_domains = [d.strip() for d in str(getattr(args, 'check_original_domains', 'ru') or 'ru').split(',') if d.strip()]
-            print(f"🔍 Проверяю плашку «Оригинальный товар» для {len(final_cards)} карточек через wb_enhanced (домены: {','.join(_orig_domains)})...")
-            client = _WBEnh(html_domains=_orig_domains)
-            # Сбросим старую "не указано" — иначе enrich_cards_batch пропустит их (truthy-check).
-            for _c in final_cards:
-                try:
-                    _c.is_original = None  # явный флаг «ещё не проверяли»
-                except Exception:
-                    pass
-            await client.enrich_cards_batch(
-                final_cards,
-                workers=int(getattr(args, 'check_original_workers', 10) or 10),
+            # v27.9.1: ОСНОВНОЙ способ — браузерное определение плашки «Оригинал»
+            # (она рендерится на странице карточки через JS; в HTTP/JSON её нет).
+            from wb_enhanced import detect_original_badges_browser
+            _orig_domain = str(getattr(args, 'check_original_domains', 'ru') or 'ru').split(',')[0].strip() or 'ru'
+            _orig_headless = bool(getattr(args, 'registry_headless', True))
+            _orig_workers = int(getattr(args, 'check_original_workers', 4) or 4)
+            print(f"🔍 Проверяю плашку «Оригинал» в браузере для {len(final_cards)} карточек "
+                  f"(домен {_orig_domain}, воркеры {_orig_workers}, headless={_orig_headless})...")
+            nm_list = [int(c.nm_id) for c in final_cards if getattr(c, 'nm_id', 0)]
+            badges = await detect_original_badges_browser(
+                nm_list, headless=_orig_headless, workers=max(2, min(_orig_workers, 6)),
+                domain=_orig_domain,
             )
-            # Перевод bool → рус. строку для xlsx.
             orig_count = 0
             for c in final_cards:
-                val = getattr(c, 'is_original', None)
-                if val is True:
+                v = badges.get(int(c.nm_id)) if getattr(c, 'nm_id', 0) else None
+                if v is True:
                     c.is_original = 'оригинал'
                     orig_count += 1
-                elif val is False:
-                    c.is_original = 'не указано'
-                # если уже строка ("оригинал"/"не указано") — оставляем как есть
-            print(f"   → плашка Оригинал: найдена у {orig_count} из {len(final_cards)} карточек.")
+                elif v is False:
+                    c.is_original = 'нет плашки'  # проверено, бейджа нет (не значит подделка)
+                else:
+                    c.is_original = 'не указано'  # не удалось проверить
+            print(f"   → плашка «Оригинал»: найдена у {orig_count} из {len(final_cards)} карточек.")
         except Exception as _e:
             print(f"   ⚠️ проверка оригинальности не выполнена: {type(_e).__name__}: {str(_e)[:200]}")
         # Чистка None → "не указано" (на случай сбоя).

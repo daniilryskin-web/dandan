@@ -58,7 +58,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026-06-07-v27.9.1-playwright"
+APP_VERSION = "2026-06-07-v27.9.2-playwright"
 APP_DIR = Path(__file__).resolve().parent
 # pywebview на Windows часто запускается через pythonw.exe (без консоли) — это ломает stdout pipe в дочерних
 # процессах. Сила принуждаем использовать python.exe (с консолью) для subprocess.
@@ -2213,7 +2213,7 @@ const FORM_FIELDS = {
     {key:'limit',   lbl:'Лимит товаров',         type:'number',def:1000, min:1, max:50000},
     {key:'workers', lbl:'Воркеры',               type:'number',def:10, min:1, max:30, hint:'Параллельных потоков (5–15)'},
     {key:'expiry_warning_days',lbl:'Скоро истекает (дней)',type:'number',def:30,min:1,max:365},
-    {key:'headless',lbl:'Скрытый браузер',       type:'switch',def:true},
+    {key:'headless',lbl:'Скрытый браузер',       type:'switch',def:false, hint:'Для Ozon оставьте ВЫКЛ — видимый браузер реже блокируется'},
     {key:'make_report_xlsx',lbl:'Расширенный отчёт',type:'switch',def:true},
     {key:'output',  lbl:'Результат XLSX',        type:'text',  def:'ozon_result.xlsx'},
     {key:'ozon_delay_min_ms',lbl:'Мин. задержка (мс)',type:'number',def:200,min:50,max:2000},

@@ -88,6 +88,11 @@ log = logging.getLogger("ozon_parser")
 # Constants — API
 # ---------------------------------------------------------------------------
 OZON_API_BASE = "https://api.ozon.ru/composer-api.bx/page/json/v2"
+# v27.9.x: альтернативная база composer-api на домене www.ozon.ru. По публичным
+# разборам парсеров Ozon (2025–2026) этот эндпоинт зачастую отвечает там, где
+# api.ozon.ru уже отдаёт 403 от Cloudflare. Пробуется как доп. fallback в
+# curl_cffi-пути (TLS-impersonate), не заменяя основной.
+OZON_API_BASE_ALT = "https://www.ozon.ru/api/composer-api.bx/page/json/v2"
 OZON_WEB_BASE = "https://www.ozon.ru"
 APP_VERSION = "2026-06-05-v27-ozon"
 
@@ -893,38 +898,42 @@ class OzonClient:
             headers = self._next_headers()
             # Убираем Content-Type для GET (лишний)
             headers.pop("Content-Type", None)
-            # Пробуем несколько impersonate-вариантов
-            for imp in ("chrome120", "chrome110", "chrome"):
-                try:
-                    r = sess.get(
-                        OZON_API_BASE,
-                        params={"url": url_path},
-                        headers=headers,
-                        timeout=15.0,
-                        impersonate=imp,
-                        allow_redirects=True,
-                    )
-                    sc = int(getattr(r, "status_code", 0) or 0)
-                    if sc == 200:
-                        txt = getattr(r, "text", "") or ""
-                        if not txt:
-                            continue
-                        try:
-                            return r.json()
-                        except Exception:
-                            try:
-                                return json.loads(txt)
-                            except Exception:
+            # Пробуем обе базы composer-api (api.ozon.ru и www.ozon.ru) и
+            # несколько impersonate-вариантов. www.ozon.ru часто отвечает там,
+            # где api.ozon.ru уже блокирует.
+            for base in (OZON_API_BASE, OZON_API_BASE_ALT):
+                for imp in ("chrome120", "chrome110", "chrome"):
+                    try:
+                        r = sess.get(
+                            base,
+                            params={"url": url_path},
+                            headers=headers,
+                            timeout=15.0,
+                            impersonate=imp,
+                            allow_redirects=True,
+                        )
+                        sc = int(getattr(r, "status_code", 0) or 0)
+                        if sc == 200:
+                            txt = getattr(r, "text", "") or ""
+                            if not txt:
                                 continue
-                    elif sc in (403, 429):
-                        # Пробуем следующий impersonate
+                            try:
+                                return r.json()
+                            except Exception:
+                                try:
+                                    return json.loads(txt)
+                                except Exception:
+                                    continue
+                        elif sc in (403, 429):
+                            # Пробуем следующий impersonate
+                            continue
+                        else:
+                            # Иной статус на этой базе — пробуем другую базу
+                            break
+                    except Exception as e:
+                        log.debug("curl_cffi (%s, %s) ошибка для %s: %s",
+                                  base, imp, url_path, e)
                         continue
-                    else:
-                        # Иные ошибки — выходим
-                        return None
-                except Exception as e:
-                    log.debug("curl_cffi (%s) ошибка для %s: %s", imp, url_path, e)
-                    continue
             return None
         except Exception as e:
             log.debug("curl_cffi fatal для %s: %s", url_path, e)
@@ -2370,10 +2379,14 @@ def main() -> None:
                 traceback.print_exc()
             sys.exit(1)
 
-    # Legacy HTTP-путь (оставлен как fallback при --use-playwright=false)
-    print("[Ozon] Режим: HTTP (legacy) — может быть заблокирован CloudFlare")
+    # HTTP-путь (fallback при --use-playwright=false).
+    # v27.9.x: используем run_full_pipeline, а не «голый» run(): он, в отличие от
+    # старого run(), обогащает строки данными реестров (ФСА/SWIS/Belgiss) И
+    # считает финальный вердикт сверки названий. Раньше HTTP-путь молча отдавал
+    # карточки без реестров и без вердикта — главного результата программы.
+    print("[Ozon] Режим: HTTP (composer-api + curl_cffi) — реестры и вердикт включены")
     try:
-        asyncio.run(run(
+        asyncio.run(run_full_pipeline(
             query=args.query,
             limit=args.limit,
             workers=workers,
@@ -3370,6 +3383,43 @@ async def enrich_registry_data(
 # Модуль 5: Утилиты пакетной обработки
 # ---------------------------------------------------------------------------
 
+def apply_verdicts(rows: List["OzonResultRow"]) -> List["OzonResultRow"]:
+    """v27.9.x: финальный вердикт сверки названия карточки с названием из реестра.
+
+    Раньше вердикт считал ТОЛЬКО Playwright-путь (через main_v39.compare_product_names),
+    а HTTP-пайплайн оставлял строки вообще без главного результата программы —
+    сравнения «название в карточке vs название в реестре». Теперь HTTP-путь
+    использует ровно ту же функцию сравнения, что и WB, поэтому вердикт
+    единообразен на обоих маркетплейсах.
+
+    Статус перезаписываем ТОЛЬКО когда есть что сравнивать (вытащили имя
+    продукции из реестра). Если реестровых данных нет — оставляем статус сбора
+    ссылки как есть.
+    """
+    try:
+        from main_v39 import compare_product_names
+    except Exception as e:  # pragma: no cover - зависит от окружения
+        log.warning("compare_product_names недоступна — вердикт не посчитан: %s", e)
+        return rows
+    for r in rows:
+        cert_name = (getattr(r, "certificate_product_name", "") or "").strip()
+        if not cert_name:
+            continue
+        try:
+            verdict, score, _details = compare_product_names(
+                getattr(r, "product_name", "") or "",
+                cert_name,
+                subject=getattr(r, "subject", "") or "",
+                doc_status=getattr(r, "document_status", "") or "",
+            )
+            r.status = verdict
+            r.score = round(float(score), 1)
+        except Exception as e:
+            log.warning("Вердикт не посчитан для sku=%s: %s",
+                        getattr(r, "sku", "?"), e)
+    return rows
+
+
 async def run_full_pipeline(
     query: str,
     limit: int = 100,
@@ -3431,6 +3481,9 @@ async def run_full_pipeline(
             swis=swis_enrich,
             belgiss=belgiss_enrich,
         )
+
+    # Этап 3b: финальный вердикт сверки названий (как в Playwright-пути)
+    results = apply_verdicts(results)
 
     # Этап 4: сохранение
     csv_path = output_path.with_suffix(".csv")

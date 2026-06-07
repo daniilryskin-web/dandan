@@ -215,8 +215,13 @@ def _walk_leaves(obj: Any, path: Tuple[str, ...] = ()) -> List[Tuple[Tuple[str, 
     return out
 
 
-def _find_value(leaves, include_any, include_all=(), exclude_any=()):
-    """Найти первое значение чей путь содержит ключевые слова."""
+def _find_value(leaves, include_any, include_all=(), exclude_any=(), require_text=False):
+    """Найти первое значение чей путь содержит ключевые слова.
+
+    require_text=True: пропускать чисто числовые значения — это почти всегда
+    идентификаторы (idManufacturer, idScheme, idTechReg), а не название/код,
+    которое нужно человеку.
+    """
     inc_any = [s.lower() for s in include_any]
     inc_all = [s.lower() for s in include_all]
     exc_any = [s.lower() for s in exclude_any]
@@ -233,6 +238,8 @@ def _find_value(leaves, include_any, include_all=(), exclude_any=()):
         if isinstance(v, (dict, list)):
             continue
         s = str(v).strip()
+        if require_text and re.fullmatch(r"\d+([.,]\d+)?", s):
+            continue  # чисто числовое — это ID, не название
         if s and len(s) < 2000:
             return s
     return ""
@@ -249,6 +256,73 @@ def _format_date(s: Any) -> str:
     return s[:10]
 
 
+def _fsa_pick_scheme(leaves) -> str:
+    """Схема сертификации/декларирования — это короткий код (1с, 3с, 6д, 2д…),
+    а НЕ длинный текст «Решение Комиссии… N 621…». Берём значение нужной формы."""
+    for path, v in leaves:
+        if isinstance(v, (dict, list)) or v in (None, ""):
+            continue
+        s = str(v).strip()
+        # 1с / 3д / 6 с / 1C и т.п. (кириллица или латиница)
+        if re.fullmatch(r"\d{1,2}\s*[сcдd]", s, re.I):
+            return s.replace(" ", "")
+    return ""
+
+
+def normalize_tech_regulations(text: str) -> str:
+    """Из любого текста про техрегламенты достаёт КОРОТКИЕ обозначения
+    «ТР ТС NNN/YYYY» / «ТР ЕАЭС NNN/YYYY», дедуплицирует и склеивает через «; ».
+
+    Примеры:
+      «…(ТР ТС 004/2011), …(ТР ТС 020/2011)» → «ТР ТС 004/2011; ТР ТС 020/2011»
+      «ТС 037 … ТР ТС 037/2016 (Приложение 2 и 3)» → «ТР ТС 037/2016»
+    """
+    if not text:
+        return ""
+    found: List[str] = []
+    for m in re.finditer(r"ТР\s*(ТС|ЕАЭС|EAEU|EEU)\s*0*(\d{1,3})\s*/\s*(\d{4})", str(text), re.I):
+        union = m.group(1).upper()
+        union = {"EAEU": "ЕАЭС", "EEU": "ЕАЭС", "TC": "ТС"}.get(union, union)
+        norm = f"ТР {union} {int(m.group(2)):03d}/{m.group(3)}"
+        if norm not in found:
+            found.append(norm)
+    return "; ".join(found)
+
+
+def _fsa_pick_techreg(leaves) -> str:
+    """Техрегламент в коротком виде. Сканируем все строковые листья JSON,
+    собираем обозначения ТР ТС/ЕАЭС NNN/YYYY и склеиваем через «; »."""
+    blob = " ".join(
+        str(v) for _p, v in leaves
+        if isinstance(v, str) and len(v) < 600
+    )
+    return normalize_tech_regulations(blob)
+
+
+# Значения, которые НЕ являются именем изготовителя (служебные пометки FSA).
+_FSA_NOT_A_MANUFACTURER_RE = re.compile(
+    r"договор|выполнени[ея]\s+функц|^\s*изготовитель\s*$|уполномоченн", re.I)
+
+
+def _fsa_pick_manufacturer(leaves) -> str:
+    """Имя изготовителя: только текстовые поля name/fullName в контексте
+    manufacturer, исключая служебные пометки («Договор на выполнение функций
+    иностранного изготовителя») и числовые ID."""
+    for path, v in leaves:
+        if isinstance(v, (dict, list)) or v in (None, ""):
+            continue
+        pl = "/".join(path).lower()
+        if "manufacturer" not in pl:
+            continue
+        if not any(t in pl for t in ("name", "fullname", "shortname", "наимен")):
+            continue
+        s = str(v).strip()
+        if not s or re.fullmatch(r"\d+", s) or _FSA_NOT_A_MANUFACTURER_RE.search(s):
+            continue
+        return s
+    return ""
+
+
 def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]:
     """Достаёт ключевые поля из JSON-ответа FSA. Возвращает dict с registry_*."""
     payload = _unwrap_payload(obj)
@@ -263,14 +337,19 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
         "status_basis": _find_value(leaves, ("statusbasis", "status_basis", "decisionnumber"), exclude_any=("date",)),
         "date_start": _format_date(_find_value(leaves, ("certregdate", "regdate", "datestart", "date_start", "issuedate"), exclude_any=("end", "expir"))),
         "date_end": _format_date(_find_value(leaves, ("certenddate", "datetill", "dateend", "date_end", "expirationdate"))),
-        "applicant": _find_value(leaves, ("applicant", "fullname"), include_all=("applicant",)) or _find_value(leaves, ("applicantname",)),
+        "applicant": _find_value(leaves, ("applicant", "fullname"), include_all=("applicant",), require_text=True) or _find_value(leaves, ("applicantname",), require_text=True),
         "applicant_inn": _find_value(leaves, ("applicantinn", "applicant_inn"), include_all=("applicant",)) or _find_value(leaves, ("inn",), include_all=("applicant",)),
-        "manufacturer": _find_value(leaves, ("manufacturer", "fullname"), include_all=("manufacturer",)) or _find_value(leaves, ("manufacturername",)),
-        "product_group": _find_value(leaves, ("productgroup", "product_group")),
-        "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group")),
+        # v27.9: имя изготовителя — только текст name/fullName, без служебных
+        # пометок («Договор на выполнение функций иностранного изготовителя»).
+        "manufacturer": _fsa_pick_manufacturer(leaves) or _find_value(leaves, ("manufacturername",), require_text=True),
+        "product_group": _find_value(leaves, ("productgroup", "product_group"), require_text=True),
+        "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group"), require_text=True),
         "tnved": _find_value(leaves, ("tnved", "tncode", "tn_ved")),
-        "scheme": _find_value(leaves, ("scheme",)),
-        "technical_regulation": _find_value(leaves, ("techreg", "technicalregulation", "technical_regulation")),
+        # v27.8.1: схема — короткий код (1с/3д), техрегламент — с обозначением
+        # «ТР ТС NNN/YYYY». Раньше хватали длинный юридический текст («Решение
+        # Комиссии … N 621») и обобщённое «Технический регламент ТС/ЕАЭС».
+        "scheme": _fsa_pick_scheme(leaves),
+        "technical_regulation": _fsa_pick_techreg(leaves),
         "evidence": _find_value(leaves, ("evidence",)),
         "source": f"curl_cffi:{url}",
     }
@@ -386,7 +465,7 @@ STATUS_TIMEOUT = "ТАЙМАУТ"
 STATUS_ERROR = "ОШИБКА"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-06-v27.6-playwright"
+APP_VERSION = "2026-06-07-v27.9.2-playwright"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -1465,6 +1544,39 @@ DOMAIN_SUBJECT_NAME_KEYWORDS = {
 }
 
 
+def _query_wants_toys(query: str) -> bool:
+    """Пользователь ЯВНО ищет игрушки? Только явные «игрушечные» слова.
+    ВАЖНО: «детск»/«малыш» здесь НЕ считаются — запрос «бытовая техника для
+    малышей» означает реальную технику для детей, а НЕ игрушки."""
+    q = (query or '').lower().replace('ё', 'е')
+    return any(w in q for w in ("игрушк", "игрушеч", "игров", "кукол", "playset"))
+
+
+# WB subject-id игрушечных категорий (по реальным выгрузкам: игрушечная бытовая
+# техника лежит в этих subject). Используется, когда название карточки не
+# содержит слова «игрушечный» (напр. «Детский пылесос»), но это игрушка.
+TOY_SUBJECT_IDS = {"1042", "5945", "267", "5100", "268", "1462", "2095", "2547", "125", "291", "227", "283", "284", "120"}
+
+
+def _card_conflicts_with_query(query: str, product_name: str, subject_name: str = '', subject_id: str = '') -> bool:
+    """v27.8.1: если пользователь НЕ искал игрушки, отбрасываем игрушечные товары.
+
+    Симптом: по запросу «бытовая техника для малышей» в выдачу WB попадали
+    «Утюг детский игрушечный», «Игрушечный миксер», «Детский пылесос» (игрушка)
+    и сверялись с сертификатом на игрушки. Признак игрушки: маркер в названии/
+    категории ЛИБО subject_id из игрушечной категории WB.
+    """
+    if _query_wants_toys(query):
+        return False
+    text = ((product_name or '') + ' ' + (subject_name or '')).lower().replace('ё', 'е')
+    if any(w in text for w in ("игрушеч", "игрушк", "игровой набор", "игровая техника",
+                               "кукол", "кукольн", "для кукл")):
+        return True
+    if (subject_id or '').strip() in TOY_SUBJECT_IDS:
+        return True
+    return False
+
+
 def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '', product_name: str = '') -> bool:
     """v39.10: проверяет относится ли карточка к ожидаемому домену.
 
@@ -1546,9 +1658,14 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
 
     variants: List[str] = [base_query]
 
-    # Стратегия 1: исходный запрос + универсальные модификаторы
-    for m in UNIVERSAL_MODIFIERS:
-        variants.append(f'{base_query} {m}')
+    # Стратегия 1: исходный запрос + универсальные модификаторы.
+    # v27.9.1: UNIVERSAL_MODIFIERS — это ДЕТСКИЕ модификаторы («детские»,
+    # «для малышей», «для мальчиков»…). Применяем их ТОЛЬКО если пользователь
+    # сам ищет детское. Иначе «бытовая техника» превращалась в «бытовая техника
+    # для малышей» и в выдачу лезли игрушки/куклы — главная жалоба.
+    if is_kids:
+        for m in UNIVERSAL_MODIFIERS:
+            variants.append(f'{base_query} {m}')
 
     # Стратегия 2: для одежды/обуви — ещё цветовые/сезонные модификаторы
     if is_apparel_like:
@@ -1563,17 +1680,19 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
             variants.append(t)
 
     # Стратегия 4: тип + модификатор (только для apparel-like, чтобы не размывать игрушки)
-    if is_apparel_like:
+    if is_apparel_like and is_kids:
         for t in types[:20]:
             for m in UNIVERSAL_MODIFIERS[:6]:  # только базовые мод-ры
                 variants.append(f'{t} {m}')
 
-    # Если домен неизвестен — добавляем только базовый и универсальные комбинации.
-    # Это не мусорит выдачу случайными цветами для категорий типа «канцелярия».
+    # Если домен неизвестен — strict: только базовый запрос (+ детские варианты,
+    # если пользователь сам ищет детское). Раньше сюда добавлялись детские
+    # модификаторы всегда, из-за чего «бытовая техника» тянула игрушки/куклы.
     if domain == 'unknown':
         variants = [base_query]
-        for m in UNIVERSAL_MODIFIERS:
-            variants.append(f'{base_query} {m}')
+        if is_kids:
+            for m in UNIVERSAL_MODIFIERS:
+                variants.append(f'{base_query} {m}')
 
     # Дедупликация + ремонт «детские детские» / «детские детская»
     clean: List[str] = []
@@ -1693,6 +1812,11 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                 # Если subjectName пустой (WB иногда не отдаёт его), название карточки
                 # всё равно подскажет правильный домен.
                 if domain and not is_card_relevant_for_domain(subj_id, domain, subj_name, name):
+                    if stats is not None:
+                        stats['filtered_out'] = stats.get('filtered_out', 0) + 1
+                    continue
+                # v27.8: query-aware фильтр игрушек (если запрос не про игрушки)
+                if _card_conflicts_with_query(query, name, subj_name, subj_id):
                     if stats is not None:
                         stats['filtered_out'] = stats.get('filtered_out', 0) + 1
                     continue
@@ -1860,31 +1984,30 @@ async def collect_cards(args) -> List[Card]:
     # в ResultRow это попадает как "оригинал" / "не указано".
     if bool(getattr(args, 'check_original', True)) and final_cards:
         try:
-            from wb_enhanced import WBEnhancedClient as _WBEnh
-            _orig_domains = [d.strip() for d in str(getattr(args, 'check_original_domains', 'ru') or 'ru').split(',') if d.strip()]
-            print(f"🔍 Проверяю плашку «Оригинальный товар» для {len(final_cards)} карточек через wb_enhanced (домены: {','.join(_orig_domains)})...")
-            client = _WBEnh(html_domains=_orig_domains)
-            # Сбросим старую "не указано" — иначе enrich_cards_batch пропустит их (truthy-check).
-            for _c in final_cards:
-                try:
-                    _c.is_original = None  # явный флаг «ещё не проверяли»
-                except Exception:
-                    pass
-            await client.enrich_cards_batch(
-                final_cards,
-                workers=int(getattr(args, 'check_original_workers', 10) or 10),
+            # v27.9.1: ОСНОВНОЙ способ — браузерное определение плашки «Оригинал»
+            # (она рендерится на странице карточки через JS; в HTTP/JSON её нет).
+            from wb_enhanced import detect_original_badges_browser
+            _orig_domain = str(getattr(args, 'check_original_domains', 'ru') or 'ru').split(',')[0].strip() or 'ru'
+            _orig_headless = bool(getattr(args, 'registry_headless', True))
+            _orig_workers = int(getattr(args, 'check_original_workers', 4) or 4)
+            print(f"🔍 Проверяю плашку «Оригинал» в браузере для {len(final_cards)} карточек "
+                  f"(домен {_orig_domain}, воркеры {_orig_workers}, headless={_orig_headless})...")
+            nm_list = [int(c.nm_id) for c in final_cards if getattr(c, 'nm_id', 0)]
+            badges = await detect_original_badges_browser(
+                nm_list, headless=_orig_headless, workers=max(2, min(_orig_workers, 6)),
+                domain=_orig_domain,
             )
-            # Перевод bool → рус. строку для xlsx.
             orig_count = 0
             for c in final_cards:
-                val = getattr(c, 'is_original', None)
-                if val is True:
+                v = badges.get(int(c.nm_id)) if getattr(c, 'nm_id', 0) else None
+                if v is True:
                     c.is_original = 'оригинал'
                     orig_count += 1
-                elif val is False:
-                    c.is_original = 'не указано'
-                # если уже строка ("оригинал"/"не указано") — оставляем как есть
-            print(f"   → плашка Оригинал: найдена у {orig_count} из {len(final_cards)} карточек.")
+                elif v is False:
+                    c.is_original = 'нет плашки'  # проверено, бейджа нет (не значит подделка)
+                else:
+                    c.is_original = 'не указано'  # не удалось проверить
+            print(f"   → плашка «Оригинал»: найдена у {orig_count} из {len(final_cards)} карточек.")
         except Exception as _e:
             print(f"   ⚠️ проверка оригинальности не выполнена: {type(_e).__name__}: {str(_e)[:200]}")
         # Чистка None → "не указано" (на случай сбоя).
@@ -2064,60 +2187,8 @@ def _build_summary_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
     ws.column_dimensions["B"].width = 16
     ws.column_dimensions["C"].width = 12
     ws.freeze_panes = "A7"
-
-    # --- v27.7: нативные графики Excel + условное форматирование ---
-    # Раньше отчёт был полностью статичным (ни графиков, ни data-bar).
-    try:
-        from openpyxl.chart import PieChart, BarChart, Reference
-        from openpyxl.formatting.rule import DataBarRule
-
-        # Пончик по техническому статусу
-        if status_end >= status_hdr + 1:
-            pie = PieChart()
-            pie.title = "Технический статус"
-            pie.height, pie.width = 7.5, 13
-            data = Reference(ws, min_col=2, min_row=status_hdr, max_row=status_end)
-            cats = Reference(ws, min_col=1, min_row=status_hdr + 1, max_row=status_end)
-            pie.add_data(data, titles_from_data=True)
-            pie.set_categories(cats)
-            ws.add_chart(pie, "E7")
-
-        # Пончик по плашке «Оригинал»
-        if orig_end >= orig_hdr + 1:
-            pie2 = PieChart()
-            pie2.title = "Плашка «Оригинал»"
-            pie2.height, pie2.width = 7.5, 13
-            data2 = Reference(ws, min_col=2, min_row=orig_hdr, max_row=orig_end)
-            cats2 = Reference(ws, min_col=1, min_row=orig_hdr + 1, max_row=orig_end)
-            pie2.add_data(data2, titles_from_data=True)
-            pie2.set_categories(cats2)
-            ws.add_chart(pie2, "E24")
-
-        # Столбчатый график по рискам срока действия
-        if risk_end >= risk_hdr + 1:
-            bar = BarChart()
-            bar.type = "col"
-            bar.title = "Риски по сроку действия"
-            bar.height, bar.width = 7.5, 13
-            bar.legend = None
-            data3 = Reference(ws, min_col=2, min_row=risk_hdr, max_row=risk_end)
-            cats3 = Reference(ws, min_col=1, min_row=risk_hdr + 1, max_row=risk_end)
-            bar.add_data(data3, titles_from_data=True)
-            bar.set_categories(cats3)
-            ws.add_chart(bar, "E41")
-
-        # Data-bar на колонку «Количество» по всем трём таблицам
-        rule = DataBarRule(start_type="num", start_value=0,
-                           end_type="max", color="4F81BD", showValue=True)
-        ws.conditional_formatting.add(f"B{status_hdr + 1}:B{status_end}", rule)
-        ws.conditional_formatting.add(f"B{orig_hdr + 1}:B{orig_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="9BBB59", showValue=True))
-        ws.conditional_formatting.add(f"B{risk_hdr + 1}:B{risk_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="C0504D", showValue=True))
-    except Exception as _e:
-        log.warning("Не удалось добавить графики/условное форматирование в Сводку: %s", _e)
+    # Примечание: графики/диаграммы в Excel убраны по требованию —
+    # лист «Сводка» остаётся чисто табличным.
 
 
 def _write_run_log_v39(rows: List["ResultRow"], xlsx_path: Path, warning_days: int,
@@ -5660,7 +5731,7 @@ _ORG_TAIL_LABEL_RE = re.compile(
     r'Номер\s+телефона|'
     r'Адрес\s+электронной\s+почты|'
     r'Адрес\s+мест\s+осуществления|'
-    r'Продукция\s+Обувь|'  # “Продукция Обувь детская...” — форма FSA-лейла
+    r'Продукция\b|'  # «Продукция <описание>» — заголовок соседней секции FSA (раньше ловили только «Продукция Обувь»)
     r'СВЕДЕНИЯ\s+О\s+|'  # заголовки разделов
     r'Идентификатор\s+хозяйствующего|'
     r'Сведения\s+о\s+регистрации'
@@ -5964,6 +6035,34 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     ext_vals: Dict[str, List[str]] = {}  # v44: расширенные поля (схема/изготовитель/ТР ТС/даты) — со всех вкладок
     details: List[str] = []
     number_labels = _fsa_number_labels_for_url(url)
+
+    # v27.8: перехват JSON backend-API FSA прямо в браузере. HTTP fast-path
+    # (curl_cffi) часто заблокирован антиботом, и тогда applicant_inn /
+    # manufacturer_name / scheme / technical_regulation оставались пустыми
+    # (вкладки /applicant, /manufacturer, /document отдавали 0 полей). Браузер
+    # грузит тот же API без блокировки — ловим ответы и разбираем уже готовым
+    # parse_fsa_json (тем же, что и HTTP-путь).
+    _fsa_kind, _fsa_doc_id = extract_fsa_kind_id(url)
+    _captured_fsa_json: List[Any] = []
+
+    async def _on_fsa_response(response):
+        try:
+            ru = response.url or ''
+            if 'pub.fsa.gov.ru' not in ru or '/api/' not in ru:
+                return
+            ctype = (response.headers or {}).get('content-type', '')
+            if 'json' not in ctype.lower():
+                return
+            data = await response.json()
+            if data:
+                _captured_fsa_json.append((ru, data))
+        except Exception:
+            pass
+
+    try:
+        page.on('response', _on_fsa_response)
+    except Exception:
+        pass
     status_labels = _fsa_status_labels_for_url(url)  # v39.5
 
     # Шаг 1: номер документа.
@@ -6129,12 +6228,51 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             details.append(f'product_route_error={type(e).__name__}:{err_msg}')
             continue
 
-    # v44: добираем поля с дополнительных вкладок FSA (изготовитель, ТР ТС, заявитель/ИНН).
-    # Эти данные НЕ на /baseInfo и /product — поэтому раньше manufacturer/tech_reg/date_end были 0%.
-    # Заходим только за теми полями, которых ещё нет.
+    # v27.9: СНАЧАЛА разбираем перехваченный JSON backend-API ФСА — он, как правило,
+    # содержит ВСЕ расширенные поля (заявитель/ИНН/изготовитель/схема/ТР ТС/даты).
+    # Это делается ДО навигации по вкладкам /applicant,/manufacturer,/document,
+    # чтобы вообще не ходить туда (лишние goto = +100 сек и net::ERR_ABORTED).
+    try:
+        page.remove_listener('response', _on_fsa_response)
+    except Exception:
+        pass
+    if _captured_fsa_json:
+        try:
+            json_parsed: Dict[str, str] = {}
+            for ru, data in _captured_fsa_json:
+                p = parse_fsa_json(data, ru, _fsa_kind or '', _fsa_doc_id or '')
+                for k, v in (p or {}).items():
+                    if v and not json_parsed.get(k):
+                        json_parsed[k] = v
+            details.append(f'fsa_json_responses={len(_captured_fsa_json)};fsa_json_fields={len(json_parsed)}')
+            if not cert_vals and json_parsed.get('doc_number'):
+                cert_vals.append(json_parsed['doc_number'])
+            if not prod_vals and json_parsed.get('product_full'):
+                prod_vals.append(json_parsed['product_full'])
+            if not status_vals and json_parsed.get('status'):
+                status_vals.append(json_parsed['status'])
+            _json_to_ext = {
+                'applicant_name': 'applicant',
+                'applicant_inn': 'applicant_inn',
+                'manufacturer_name': 'manufacturer',
+                'tnved': 'tnved',
+                'scheme': 'scheme',
+                'technical_regulation': 'technical_regulation',
+                'document_date_start': 'date_start',
+                'document_date_end': 'date_end',
+            }
+            for ext_key, json_key in _json_to_ext.items():
+                if ext_key not in ext_vals and json_parsed.get(json_key):
+                    ext_vals[ext_key] = [json_parsed[json_key]]
+        except Exception as e:
+            details.append(f'fsa_json_parse_error={type(e).__name__}')
+
+    # v44: добираем поля с дополнительных вкладок FSA, ТОЛЬКО если JSON их не дал.
+    # v27.9: если ключевые поля уже есть из JSON — вкладки НЕ открываем (быстрее,
+    # без net::ERR_ABORTED). Раньше эти goto и тормозили прогон.
     need_more = any(k not in ext_vals for k in
                     ("manufacturer_name", "technical_regulation", "applicant_name", "document_date_end"))
-    if need_more:
+    if need_more and not _captured_fsa_json:
         for ext_route in fsa_extended_routes(url):
             # какие поля ищем на этой вкладке
             still_missing = [k for k in FSA_EXTENDED_LABELS if k not in ext_vals]
@@ -6277,6 +6415,9 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             merged["tnved"] = tnved_val
         for k in ("applicant_inn", "scheme", "technical_regulation"):
             val = _first_clean(k)
+            if k == "technical_regulation" and val:
+                # короткие обозначения «ТР ТС NNN/YYYY», склейка через «; »
+                val = normalize_tech_regulations(val) or val
             if val and not merged.get(k):
                 merged[k] = val
         for k in ("document_date_start", "document_date_end"):
@@ -6368,7 +6509,8 @@ async def _parse_swis_with_existing_page_v386(page, url: str, args) -> Tuple[str
             if cleaned_tnved and not merged.get("tnved"):
                 merged["tnved"] = cleaned_tnved
             if swis_ext_vals.get("technical_regulation") and not merged.get("technical_regulation"):
-                merged["technical_regulation"] = swis_ext_vals["technical_regulation"]
+                _tr = swis_ext_vals["technical_regulation"]
+                merged["technical_regulation"] = normalize_tech_regulations(_tr) or _tr
             for k in ("document_date_start", "document_date_end"):
                 if swis_ext_vals.get(k) and not merged.get(k):
                     merged[k] = _nd(swis_ext_vals[k])
@@ -6540,62 +6682,167 @@ async def _parse_swis_http_v277(session, url: str, args) -> Tuple[str, str, str,
     )
 
 
+# Регэкспы номеров документов ЕАЭС/ТС (общие для текста и JSON Belgiss).
+_BELGISS_NUMBER_PATTERNS = (
+    r'ЕАЭС\s+BY/[0-9.\s]+\s*ТР\d+\s+[0-9.\s]+',  # ЕАЭС BY/112 02.01. ТР007 118.01 02748
+    r'ЕАЭС\s+[NN№]?\s*RU\s*[ДД]-[A-ZА-Я0-9./\-]+',
+    r'ЕАЭС\s+RU\s*[СC]-[A-ZА-Я0-9./\-]+',
+    r'[NN№]\s*BY/[0-9./\-]+',
+    r'ROSS\s+[A-ZА-Я0-9./\-]+',
+)
+
+
+def _walk_json_strings(obj, depth: int = 0):
+    """Рекурсивно перебирает (key, value) для всех строковых листьев JSON."""
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                yield str(k), v
+            else:
+                yield from _walk_json_strings(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json_strings(v, depth + 1)
+
+
+def _belgiss_extract_from_json(objs: List[Any]) -> Dict[str, str]:
+    """Best-effort извлечение полей документа из перехваченного JSON Belgiss.
+
+    Структуру backend-API Belgiss мы не фиксируем — поэтому ищем поля по
+    общим признакам имён ключей. Источник чистый (в отличие от склеенного DOM),
+    поэтому отсюда можно безопасно брать не только номер, но и название
+    продукции/статус/даты, что раньше было недоступно.
+    """
+    out: Dict[str, str] = {}
+    product_candidates: List[str] = []
+    for objs_item in objs:
+        for key, val in _walk_json_strings(objs_item):
+            v = (val or "").strip()
+            if not v:
+                continue
+            kl = key.lower()
+            # Номер документа
+            if not out.get("number"):
+                for pat in _BELGISS_NUMBER_PATTERNS:
+                    mm = re.search(pat, v)
+                    if mm:
+                        out["number"] = re.sub(r'\s+', ' ', mm.group(0)).strip()
+                        break
+            # Название продукции — по имени ключа (product/goods/наимен/товар/объект)
+            if any(t in kl for t in ("productname", "product", "goods", "наимен",
+                                     "товар", "объект", "tovar", "naimen")):
+                # описания продукции — длинные; коды/идентификаторы отсекаем
+                if len(v) >= 10 and not re.fullmatch(r'[A-Za-z0-9._\-]+', v):
+                    product_candidates.append(v)
+            # Статус документа
+            if not out.get("status") and any(t in kl for t in ("status", "статус", "state")):
+                if 3 <= len(v) <= 60:
+                    out["status"] = v
+            # Даты
+            if not out.get("date_start") and any(t in kl for t in ("begin", "start", "datebegin", "дата")) and re.search(r'\d{2}[.\-/]\d{2}[.\-/]\d{4}|\d{4}-\d{2}-\d{2}', v):
+                out["date_start"] = v
+            if not out.get("date_end") and any(t in kl for t in ("end", "expire", "till", "until")) and re.search(r'\d{2}[.\-/]\d{2}[.\-/]\d{4}|\d{4}-\d{2}-\d{2}', v):
+                out["date_end"] = v
+    if product_candidates:
+        # самое длинное описание — почти всегда и есть «наименование продукции»
+        out["product"] = max(product_candidates, key=len)[:1000]
+    return out
+
+
 async def _parse_belgiss_with_existing_page_v42(page, url: str, args) -> Tuple[str, str, str, str, str]:
-    """v27.5: УПРОЩЁННЫЙ парсер реестра ЕАЭС Belgiss (tsouz.belgiss.by).
+    """Парсер реестра ЕАЭС Belgiss (tsouz.belgiss.by) — SPA на Angular.
 
-    По требованию пользователя — с белорусского реестра берём ТОЛЬКО номер
-    сертификата/декларации. Все остальные поля (applicant/manufacturer/product/
-    status/dates) НЕ извлекаем, потому что DOM Belgiss отдаёт их склеенными с
-    заголовками таблиц («Страна (BY)», «Краткое наименование хозяйствующего
-    субъекта», «оценки соответствия», «действия сертификата (декларации)»),
-    и их корректная разборка нерентабельна.
+    v27.8: раньше брали ТОЛЬКО номер из текста DOM, но SPA часто не успевал
+    наполнить DOM (render_text_len≈30 → не извлекалось вообще ничего). Теперь
+    основной источник — перехват JSON-ответов backend-API Belgiss (как у Ozon
+    и FSA): из чистого JSON достаём номер, название продукции, статус и даты.
+    Текстовый regex по DOM остаётся резервом.
 
-    Возвращает (cert_number, '', doc_type, '', detail) — только номер и тип.
+    Возвращает (cert_number, product_name, doc_type, doc_status, detail).
     """
     timeout_ms = int(getattr(args, 'registry_browser_timeout_ms', 30000))
     details: List[str] = []
     cert_vals: List[str] = []
 
-    try:
-        await page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
-    except Exception as e:
-        return '', '', '', '', f'belgiss_goto_error={type(e).__name__}:{str(e)[:120]}'
+    # --- Перехват JSON-ответов backend-API Belgiss ---
+    captured_json: List[Any] = []
 
-    # Ждём пока SPA наполнит DOM.
-    try:
-        await page.wait_for_function(
-            "() => document.body && (document.body.innerText||'').length > 400",
-            timeout=min(timeout_ms, 12000),
-        )
-    except Exception:
-        pass
-    try:
-        text_len = await page.evaluate("() => (document.body ? (document.body.innerText||'').length : 0)")
-    except Exception:
-        text_len = -1
-    details.append(f'belgiss_render_text_len={text_len}')
+    async def _on_response(response):
+        try:
+            ru = response.url or ""
+            if "belgiss.by" not in ru:
+                return
+            ctype = (response.headers or {}).get("content-type", "")
+            if "json" not in ctype.lower():
+                return
+            data = await response.json()
+            if data:
+                captured_json.append(data)
+        except Exception:
+            pass
 
-    # Сначала пробуем взять номер из URL (для /certifs/<id>/view это не работает,
-    # но дальше у нас regex по тексту страницы).
-    # Главное — regex по тексту страницы для номера документа ЕАЭС.
+    page.on("response", _on_response)
     try:
-        body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
-    except Exception:
-        body_text = ''
-    for pat in (
-        r'ЕАЭС\s+BY/[0-9.\s]+\s*ТР\d+\s+[0-9.\s]+',  # ЕАЭС BY/112 02.01. ТР007 118.01 02748
-        r'ЕАЭС\s+[NN№]?\s*RU\s*[ДД]-[A-ZА-Я0-9./\-]+',
-        r'ЕАЭС\s+RU\s*[СC]-[A-ZА-Я0-9./\-]+',
-        r'[NN№]\s*BY/[0-9./\-]+',
-        r'ROSS\s+[A-ZА-Я0-9./\-]+',
-    ):
-        mm = re.search(pat, body_text or '')
-        if mm:
-            cert_vals.append(re.sub(r'\s+', ' ', mm.group(0)).strip())
-            details.append('belgiss_number_from_regex')
-            break
+        try:
+            await page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
+        except Exception as e:
+            return '', '', '', '', f'belgiss_goto_error={type(e).__name__}:{str(e)[:120]}'
 
-    # Если regex не сработал — пробуем по подписям (только номер).
+        # Ждём XHR backend-API (надёжнее, чем ожидание текста в DOM).
+        try:
+            await page.wait_for_response(
+                lambda r: ("belgiss.by" in (r.url or "")) and ("json" in ((r.headers or {}).get("content-type", "")).lower()),
+                timeout=min(timeout_ms, 15000),
+            )
+        except Exception:
+            pass
+        # Дополнительно ждём наполнения DOM (резервный путь).
+        try:
+            await page.wait_for_function(
+                "() => document.body && (document.body.innerText||'').length > 400",
+                timeout=min(timeout_ms, 8000),
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)  # дать дойти последним XHR
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
+
+    # --- ОСНОВНОЙ путь: разбор перехваченного JSON ---
+    json_fields = _belgiss_extract_from_json(captured_json)
+    details.append(f'belgiss_json_responses={len(captured_json)}')
+    prod = json_fields.get("product", "")
+    doc_status = json_fields.get("status", "")
+    if json_fields.get("number"):
+        cert_vals.append(json_fields["number"])
+        details.append('belgiss_number_from_json')
+    if prod:
+        details.append('belgiss_product_from_json')
+
+    # --- РЕЗЕРВ: regex по тексту DOM, если JSON не дал номер ---
+    if not cert_vals:
+        try:
+            text_len = await page.evaluate("() => (document.body ? (document.body.innerText||'').length : 0)")
+        except Exception:
+            text_len = -1
+        details.append(f'belgiss_render_text_len={text_len}')
+        try:
+            body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        except Exception:
+            body_text = ''
+        for pat in _BELGISS_NUMBER_PATTERNS:
+            mm = re.search(pat, body_text or '')
+            if mm:
+                cert_vals.append(re.sub(r'\s+', ' ', mm.group(0)).strip())
+                details.append('belgiss_number_from_regex')
+                break
+
+    # Если номер всё ещё не найден — пробуем по подписям.
     if not cert_vals:
         number_labels = [
             "Регистрационный номер", "Номер документа", "Номер сертификата",
@@ -6614,15 +6861,22 @@ async def _parse_belgiss_with_existing_page_v42(page, url: str, args) -> Tuple[s
     low = url.lower()
     doc_type = 'декларация' if 'declaration' in low or '/decl' in low else ('сертификат' if 'cert' in low else '')
 
-    # ВАЖНО: НЕ заполняем _FSA_EXTENDED_FIELDS_CACHE — у Belgiss поля грязные,
-    # пользователь явно сказал не фиксить, брать только номер.
-    details.append('belgiss_minimal_mode')
+    # Даты из JSON — кладём в общий кэш расширенных полей (как делает FSA-парсер),
+    # чтобы они попали в итоговую строку.
+    if json_fields.get("date_start") or json_fields.get("date_end"):
+        try:
+            _FSA_EXTENDED_FIELDS_CACHE[url] = {
+                'document_date_start': json_fields.get("date_start", ''),
+                'document_date_end': json_fields.get("date_end", ''),
+            }
+        except Exception:
+            pass
 
     return (
         (cert_vals[0] if cert_vals else ''),
-        '',  # product_name — пусто
+        prod,
         doc_type,
-        '',  # doc_status — пусто
+        doc_status,
         'belgiss_browser; ' + ';'.join(details),
     )
 

@@ -47,6 +47,9 @@ try:
         resolve_registry_url_from_documents,
         enrich_registry_data,
         _parse_price,
+        # v27.8: переиспользуем разбор поисковых виджетов (JSON-перехват выдачи)
+        _extract_search_items,
+        _extract_item_from_websale,
     )
 except ImportError as e:
     print(f"[FATAL] Не удалось импортировать ozon_parser: {e}")
@@ -154,6 +157,72 @@ def _attach_widget_capture(page: "Page") -> Dict[str, str]:
     return captured
 
 
+# Имена поисковых виджетов Ozon (в widgetStates), из которых берём список товаров.
+# Совпадает с эвристикой HTTP-парсера (ozon_parser.OzonClient.search).
+_SEARCH_WIDGET_KEYS = (
+    "searchresult", "searchproduct", "catalogresult",
+    "productlist", "searchlist", "productitems",
+    "searchitemslist", "catalog", "tilegrid",
+)
+
+
+def _search_items_from_widgets(captured: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Достаёт товары из перехваченных поисковых widgetStates (JSON).
+
+    v27.8: основной способ собрать выдачу Ozon — раньше парсились только
+    DOM-якоря a[href*='/product/'], которые при ленивой подгрузке/обфускации
+    часто давали 0 товаров (главная причина пустого результата). JSON-виджеты
+    отдают чистый список, как и в HTTP-парсере.
+    """
+    out: List[Dict[str, str]] = []
+    seen_sku: set = set()
+
+    def _add(items: List[Dict[str, Any]]) -> None:
+        for it in items or []:
+            sku = str(it.get("sku") or "")
+            url = str(it.get("url") or "")
+            if not url and sku:
+                url = f"https://www.ozon.ru/product/{sku}/"
+            if not url:
+                continue
+            key = sku or url
+            if key in seen_sku:
+                continue
+            seen_sku.add(key)
+            out.append({
+                "sku": sku,
+                "url": url,
+                "title": str(it.get("title") or ""),
+            })
+
+    # Специализированные поисковые виджеты
+    for wkey, wraw in (captured or {}).items():
+        k = (wkey or "").lower()
+        if not any(x in k for x in _SEARCH_WIDGET_KEYS):
+            continue
+        try:
+            widget = json.loads(wraw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        _add(_extract_search_items(widget))
+
+    # Fallback: webSale-виджеты (по одному товару)
+    if not out:
+        for wkey, wraw in (captured or {}).items():
+            if "websale" not in (wkey or "").lower():
+                continue
+            try:
+                widget = json.loads(wraw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            item = _extract_item_from_websale(widget)
+            if item:
+                _add([item])
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Парсер карточек
 # ---------------------------------------------------------------------------
@@ -221,22 +290,63 @@ class OzonPlaywrightParser:
                 "Playwright не установлен. Выполните: pip install playwright && playwright install chromium"
             )
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            args=BROWSER_ARGS,
-        )
-        self._context = await self._browser.new_context(
-            user_agent=UA_MAC,
-            viewport=VIEWPORT,
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            extra_http_headers={
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-        )
+        # v27.9.1: ПЕРСИСТЕНТНЫЙ профиль браузера. Ozon выдаёт анти-бот доверие
+        # (cookies, __Secure-*, токены challenge) на профиль; в чистом одноразовом
+        # контексте поиск часто возвращал 0 товаров. Сохраняя профиль между
+        # запусками, мы накапливаем «доверие» и проходим проверки как реальный
+        # пользователь (так делают рабочие парсеры Ozon).
+        profile_dir = str(Path(__file__).resolve().parent / ".ozon_profile")
+        try:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                profile_dir,
+                headless=self.headless,
+                args=BROWSER_ARGS,
+                user_agent=UA_MAC,
+                viewport=VIEWPORT,
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+                extra_http_headers={
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+            )
+            self._browser = None  # персистентный контекст сам владеет браузером
+        except Exception as e:
+            # Fallback на обычный launch, если персистентный контекст недоступен
+            log.warning("Персистентный профиль недоступен (%s) — обычный контекст", e)
+            self._browser = await self._playwright.chromium.launch(headless=self.headless, args=BROWSER_ARGS)
+            self._context = await self._browser.new_context(
+                user_agent=UA_MAC, viewport=VIEWPORT, locale="ru-RU", timezone_id="Europe/Moscow",
+                extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},
+            )
         await self._context.add_init_script(STEALTH_JS)
-        log.info("Playwright Chromium запущен (headless=%s)", self.headless)
+        self._warmed = False
+        log.info("Playwright Chromium запущен (headless=%s, профиль=%s)", self.headless, profile_dir)
         return self
+
+    async def _warm_up(self) -> None:
+        """v27.9.1: «прогрев» — заходим на главную Ozon, чтобы получить cookies и
+        пройти первичную проверку анти-бота ДО поискового запроса."""
+        if getattr(self, "_warmed", False):
+            return
+        page = await self._context.new_page()
+        try:
+            await page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=self.search_timeout_ms)
+            await _human_delay(2.0, 4.0)
+            # Прокрутим немного — имитация живого пользователя
+            try:
+                await page.evaluate("window.scrollBy(0, 600)")
+            except Exception:
+                pass
+            await _human_delay(1.0, 2.0)
+            self._warmed = True
+            log.info("Прогрев главной Ozon выполнен")
+        except Exception as e:
+            log.warning("Прогрев не удался: %s", e)
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     async def __aexit__(self, *args) -> None:
         try:
@@ -255,15 +365,25 @@ class OzonPlaywrightParser:
 
     async def search(self, query: str, limit: int = 20) -> List[Dict[str, str]]:
         """
-        Открывает страницу поиска, скроллит, собирает ссылки на товары.
-        Возвращает [{"sku": "...", "url": "...", "title": "..."}].
+        Открывает страницу поиска и собирает товары.
+
+        v27.8: основной источник — перехват JSON-ответов Ozon-API (widgetStates
+        поисковой выдачи), как и для карточек. DOM-якоря a[href*='/product/']
+        остаются дополнением. Раньше парсились ТОЛЬКО якоря — при ленивой
+        подгрузке/обфускации они часто давали 0 товаров (главная причина пустой
+        выдачи).
         """
         self.stats["search_attempts"] += 1
         url = f"https://www.ozon.ru/search/?text={quote_plus(query)}&from_global=true"
         log.info("Открываю поиск: %s (лимит %d)", url, limit)
 
+        # v27.9.1: прогрев главной страницы (cookies/анти-бот) перед поиском
+        await self._warm_up()
+
         page = await self._context.new_page()
         try:
+            # Перехват JSON-виджетов поисковой выдачи (до навигации)
+            captured = _attach_widget_capture(page)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.search_timeout_ms)
             except Exception as e:
@@ -271,7 +391,15 @@ class OzonPlaywrightParser:
                 self.stats["search_fail"] += 1
                 return []
 
-            # Имитируем человеческие движения
+            # Ждём, пока придёт хотя бы один JSON-ответ поисковой выдачи
+            # (надёжнее фиксированной паузы). Если не дождались — продолжаем.
+            try:
+                await page.wait_for_response(
+                    lambda r: any(m in (r.url or "") for m in _OZON_API_MARKERS),
+                    timeout=min(self.search_timeout_ms, 15000),
+                )
+            except Exception:
+                pass
             await _human_delay(self.delay_min_s, self.delay_max_s)
 
             # Проверка CF-блокировки
@@ -286,26 +414,38 @@ class OzonPlaywrightParser:
                     if not any(s in content.lower() for s in ["cloudflare", "captcha"]):
                         break
 
-            # Скроллим вниз, чтобы подгрузились товары
+            # Скроллим вниз, чтобы подгрузились товары (и DOM, и новые XHR-страницы)
             seen_links: Dict[str, Dict[str, str]] = {}
-            for scroll_idx in range(8):  # до 8 раз скроллим
-                links = await self._extract_product_links(page)
-                for lnk in links:
-                    sku = _extract_sku_from_url(lnk["url"])
-                    if sku and sku not in seen_links:
+
+            def _merge(items: List[Dict[str, str]]) -> None:
+                for lnk in items:
+                    sku = lnk.get("sku") or _extract_sku_from_url(lnk.get("url", ""))
+                    key = sku or lnk.get("url", "")
+                    if key and key not in seen_links:
                         lnk["sku"] = sku
-                        seen_links[sku] = lnk
+                        seen_links[key] = lnk
+
+            for scroll_idx in range(10):  # до 10 раз скроллим
+                # 1) JSON-виджеты (основной источник)
+                _merge(_search_items_from_widgets(captured))
+                # 2) DOM-якоря (дополнение/fallback)
+                _merge(await self._extract_product_links(page))
                 if len(seen_links) >= limit:
                     break
-                # Прокрутка
                 try:
                     await page.evaluate("window.scrollBy(0, window.innerHeight * 1.5)")
                 except Exception:
                     pass
                 await _human_delay(0.8, 1.6)
 
+            # Финальный сбор JSON, накопленного во время скролла
+            _merge(_search_items_from_widgets(captured))
+
             result = list(seen_links.values())[:limit]
-            log.info("Найдено товаров: %d (запрошено %d)", len(result), limit)
+            log.info(
+                "Найдено товаров: %d (запрошено %d; JSON-виджетов перехвачено: %d)",
+                len(result), limit, len(captured),
+            )
             if result:
                 self.stats["search_success"] += 1
             else:

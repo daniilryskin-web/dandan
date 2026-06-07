@@ -1286,6 +1286,109 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# v27.9.1: Браузерное определение плашки «Оригинал» (Playwright).
+# Плашка «Оригинал»/«Оригинальный товар» рендерится на странице карточки WB
+# через JS и НЕ присутствует ни в search-API, ни в basket card.json — поэтому
+# HTTP-детектор всегда давал «не указано». Единственный надёжный способ —
+# открыть карточку в браузере и увидеть бейдж так же, как видит пользователь.
+# ---------------------------------------------------------------------------
+
+_WB_ORIGINAL_DETECT_JS = r"""
+() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  // 1) Явный бейдж рядом с брендом: листовой элемент с точным текстом «Оригинал».
+  const nodes = document.querySelectorAll('span, a, div, button, p');
+  for (const n of nodes) {
+    if (n.children && n.children.length === 0) {
+      const t = norm(n.textContent);
+      if (t === 'оригинал' || t === 'оригинальный товар') return true;
+    }
+  }
+  // 2) Служебные атрибуты/классы оригинальности.
+  if (document.querySelector('[class*="original" i], [data-link*="original" i], [aria-label*="ригинал" i]')) {
+    return true;
+  }
+  return false;
+}
+"""
+
+
+async def detect_original_badges_browser(
+    nm_ids: List[int],
+    headless: bool = True,
+    workers: int = 3,
+    timeout_ms: int = 20000,
+    domain: str = "ru",
+) -> Dict[int, bool]:
+    """Открывает карточки WB в браузере и определяет наличие плашки «Оригинал».
+
+    Возвращает {nm_id: True/False}. При недоступности Playwright — пустой dict
+    (вызывающая сторона оставит «не указано»).
+    """
+    result: Dict[int, bool] = {}
+    if not nm_ids:
+        return result
+    try:
+        from playwright.async_api import async_playwright
+    except Exception:
+        log.warning("Playwright недоступен — браузерная проверка оригинальности пропущена")
+        return result
+
+    host = f"www.wildberries.{domain}" if "wildberries." not in domain else domain
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    sem = asyncio.Semaphore(max(1, workers))
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless, args=[
+            "--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage",
+        ])
+        context = await browser.new_context(user_agent=ua, locale="ru-RU",
+                                            viewport={"width": 1366, "height": 900})
+
+        async def check_one(nm: int) -> None:
+            async with sem:
+                page = await context.new_page()
+                try:
+                    url = f"https://{host}/catalog/{nm}/detail.aspx"
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    except Exception:
+                        result[nm] = False
+                        return
+                    # Ждём отрисовки заголовка карточки (бренд+бейдж рядом).
+                    try:
+                        await page.wait_for_selector("h1", timeout=min(timeout_ms, 12000))
+                    except Exception:
+                        pass
+                    is_orig = False
+                    for _ in range(3):
+                        try:
+                            is_orig = bool(await page.evaluate(_WB_ORIGINAL_DETECT_JS))
+                        except Exception:
+                            is_orig = False
+                        if is_orig:
+                            break
+                        await asyncio.sleep(0.7)
+                    result[nm] = is_orig
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+        await asyncio.gather(*[check_one(nm) for nm in nm_ids], return_exceptions=True)
+        try:
+            await context.close()
+            await browser.close()
+        except Exception:
+            pass
+    log.info("Браузерная проверка оригинальности: %d/%d с плашкой",
+             sum(1 for v in result.values() if v), len(result))
+    return result
+
+
 def main() -> None:
     """Точка входа CLI."""
     args = _parse_args()

@@ -58,7 +58,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026-06-06-v27.6-playwright"
+APP_VERSION = "2026-06-07-v27.9.2-playwright"
 APP_DIR = Path(__file__).resolve().parent
 # pywebview на Windows часто запускается через pythonw.exe (без консоли) — это ломает stdout pipe в дочерних
 # процессах. Сила принуждаем использовать python.exe (с консолью) для subprocess.
@@ -950,6 +950,21 @@ class Bridge:
 
     # ---- результаты ----
 
+    def _discover_result_file(self) -> Optional[Path]:
+        """Ищет самый свежий существующий файл отчёта в рабочей папке.
+
+        Используется, когда прогон в текущей сессии не запускался (state пуст),
+        но файлы результата от прошлых запусков уже лежат в APP_DIR.
+        """
+        candidates = [
+            "unified_result.xlsx", "result.xlsx", "wb_result.xlsx",
+            "brand_result.xlsx", "ozon_result.xlsx",
+        ]
+        existing = [APP_DIR / name for name in candidates if (APP_DIR / name).exists()]
+        if not existing:
+            return None
+        return max(existing, key=lambda p: p.stat().st_mtime)
+
     def get_results(self, xlsx_path: Optional[str] = None, limit: int = 2000) -> dict:
         """
         Читает лист «Подробности» из XLSX и возвращает данные для таблицы.
@@ -957,7 +972,16 @@ class Bridge:
         """
         path = Path(xlsx_path or self.state.output_path or "")
         if not path.exists():
-            return {"ok": False, "error": "Файл результата не найден. Запустите прогон."}
+            # Авто-поиск: если прогон в этой сессии не запускался (output_path пуст)
+            # или указанного файла нет — берём самый свежий из известных отчётов в
+            # рабочей папке. Иначе вкладка «Результаты» оставалась пустой, хотя
+            # файлы результата лежат рядом.
+            discovered = self._discover_result_file()
+            if discovered is None:
+                return {"ok": False, "error": "Файл результата не найден. Запустите прогон."}
+            path = discovered
+            if not self.state.output_path:
+                self.state.output_path = str(path)
         try:
             from openpyxl import load_workbook  # type: ignore
             wb = load_workbook(path, read_only=True, data_only=True)
@@ -1007,14 +1031,14 @@ class Bridge:
 
             try:
                 idx_status      = find_col("технический статус", "status", "статус")
-                idx_registry    = find_col("registry_host", "реестр (host)", "registry_url")
+                idx_registry    = find_col("registry_host", "реестр (хост)", "реестр (host)", "реестр", "registry_url")
                 idx_marketplace = find_col("marketplace", "маркетплейс")
-                idx_original    = find_col("is_original", "оригинал")
+                idx_original    = find_col("is_original", "плашка 'оригинал'", "оригинал")
                 idx_docstatus   = find_col("document_status", "статус документа")
                 idx_brand       = find_col("brand", "бренд")
                 idx_risk        = find_col("риск по сроку", "риск", "risk")
                 # Если маркетплейс не в файле — определяем по product_url
-                idx_purl = find_col("product_url")
+                idx_purl = find_col("product_url", "ссылка на товар")
                 for row in rows:
                     if idx_status is not None and idx_status < len(row):
                         v = str(row[idx_status] or "").strip()
@@ -2189,7 +2213,7 @@ const FORM_FIELDS = {
     {key:'limit',   lbl:'Лимит товаров',         type:'number',def:1000, min:1, max:50000},
     {key:'workers', lbl:'Воркеры',               type:'number',def:10, min:1, max:30, hint:'Параллельных потоков (5–15)'},
     {key:'expiry_warning_days',lbl:'Скоро истекает (дней)',type:'number',def:30,min:1,max:365},
-    {key:'headless',lbl:'Скрытый браузер',       type:'switch',def:true},
+    {key:'headless',lbl:'Скрытый браузер',       type:'switch',def:false, hint:'Для Ozon оставьте ВЫКЛ — видимый браузер реже блокируется'},
     {key:'make_report_xlsx',lbl:'Расширенный отчёт',type:'switch',def:true},
     {key:'output',  lbl:'Результат XLSX',        type:'text',  def:'ozon_result.xlsx'},
     {key:'ozon_delay_min_ms',lbl:'Мин. задержка (мс)',type:'number',def:200,min:50,max:2000},
@@ -3058,6 +3082,11 @@ function loadChartJs() {
   // Загружаем Chart.js в фоне — не блокируем UI
   loadChartJs().then(() => {
     tryInitCharts();
+    // v27.8: при старте сразу подтягиваем последний результат (даже если прогон
+    // был в прошлой сессии/через CLI) — иначе графики «Очереди» и вкладка
+    // «Результаты» оставались пустыми, хотя файл result.xlsx есть.
+    refreshQueueCharts().catch(() => {});
+    if (typeof loadResults === 'function') { loadResults().catch(() => {}); }
   }).catch(() => {
     // Без интернета — charts работать не будут, показываем fallback
   });

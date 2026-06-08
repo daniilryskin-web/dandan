@@ -7748,11 +7748,47 @@ async def _parse_other_registry_http_v386(session, url: str, args) -> Tuple[str,
 # =============================================================================
 _FSA_TEST_URL = "https://pub.fsa.gov.ru/rss/certificate/view/3418716/baseInfo"
 _FSA_PROXY_SOURCES = [
+    # API-источники (РФ-приоритет)
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=ru&timeout=10000",
     "https://www.proxy-list.download/api/v1/get?type=http&country=RU",
-    "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=RU&protocols=http%2Chttps",
+    "https://proxylist.geonode.com/api/proxy-list?limit=200&page=1&sort_by=lastChecked&sort_type=desc&country=RU&protocols=http%2Chttps",
+    # HTML-страница proxy5.net (РФ) — парсим ip:port регуляркой (грузим через curl_cffi, обходя Cloudflare)
+    "https://proxy5.net/ru/free-proxy/russia",
+    "https://proxy5.net/free-proxy/russia",
+    # GitHub raw-списки (обновляются часто, простой текст ip:port). Страну отфильтрует
+    # сама проверка прокси на доступность FSA — берём как можно больше кандидатов.
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    # общий (любая страна) — на случай, если РФ-списки пусты
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=10000",
 ]
+
+
+async def _fetch_proxy_source_text(session, url: str) -> str:
+    """Грузит текст источника прокси. Сначала aiohttp; если не вышло (403/Cloudflare,
+    как у proxy5.net) — через curl_cffi с impersonate (обходит TLS-фингерпринт)."""
+    headers = {"User-Agent": DEFAULT_UA, "Accept": "*/*", "Accept-Language": "ru-RU,ru;q=0.9"}
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers=headers) as r:
+            if int(r.status) == 200:
+                return await r.text(errors="replace")
+    except Exception:
+        pass
+    if _curl_requests is not None:
+        try:
+            def _g():
+                s = _curl_requests.Session()
+                try:
+                    rr = s.get(url, impersonate="chrome", timeout=18, verify=False, headers=headers)
+                except TypeError:
+                    rr = s.get(url, timeout=18)
+                return getattr(rr, "text", "") if int(getattr(rr, "status_code", 0) or 0) == 200 else ""
+            return await asyncio.to_thread(_g)
+        except Exception:
+            pass
+    return ""
 
 
 async def _fetch_free_proxies(session, limit: int = 80) -> List[str]:
@@ -7773,13 +7809,7 @@ async def _fetch_free_proxies(session, limit: int = 80) -> List[str]:
     for src in _FSA_PROXY_SOURCES:
         if len(out) >= limit:
             break
-        try:
-            async with session.get(src, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if int(r.status) != 200:
-                    continue
-                txt = await r.text(errors="replace")
-        except Exception:
-            continue
+        txt = await _fetch_proxy_source_text(session, src)
         txt = (txt or "").strip()
         if not txt:
             continue
@@ -7793,14 +7823,11 @@ async def _fetch_free_proxies(session, limit: int = 80) -> List[str]:
             except Exception:
                 pass
         else:
-            # текст: «ip:port» или «http://ip:port» построчно
-            for line in txt.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                m = re.search(r'(?:(\w+)://)?(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})', line)
-                if m:
-                    _add(m.group(2), m.group(3), (m.group(1) or "http"))
+            # текст ИЛИ HTML (proxy5.net): вытаскиваем ВСЕ ip:port из всего документа
+            for mm in re.finditer(r'(?:(\w+)://)?(\d{1,3}(?:\.\d{1,3}){3})\s*[:：]\s*(\d{2,5})', txt):
+                _add(mm.group(2), mm.group(3), (mm.group(1) or "http"))
+                if len(out) >= limit:
+                    break
     return out[:limit]
 
 

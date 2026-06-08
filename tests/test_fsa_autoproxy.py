@@ -44,7 +44,7 @@ class _Session:
     def __init__(self, payloads):
         self.payloads, self.i = payloads, 0
 
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, headers=None, **kw):
         p = self.payloads[self.i] if self.i < len(self.payloads) else ("", 200)
         self.i += 1
         return _Resp(*p)
@@ -64,6 +64,14 @@ def main():
     check("мусор отброшен", all("мусор" not in p for p in proxies))
     check("дубликаты/формат: все вида scheme://ip:port",
           all(p.startswith(("http://", "https://", "socks")) for p in proxies))
+
+    # 1b) парс HTML-страницы (как proxy5.net) — ip:port внутри тегов/с пробелами
+    mv._curl_requests = None  # отключаем curl-фоллбэк в тесте
+    html = ('<table><td class="prx">5.61.51.10:8080</td><td>1.2.3.4 : 3128</td>'
+            '<span>91.243.188.236:1080</span></table>')
+    proxies_h = asyncio.run(mv._fetch_free_proxies(_Session([(html, 200)]), limit=80))
+    check("HTML: ip:port извлечён (5.61.51.10:8080)", "http://5.61.51.10:8080" in proxies_h)
+    check("HTML: ip с пробелами (1.2.3.4:3128)", "http://1.2.3.4:3128" in proxies_h)
 
     # 2) CLI-флаги авто-обхода
     ap = mv.build_parser()

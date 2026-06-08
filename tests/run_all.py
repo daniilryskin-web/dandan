@@ -31,6 +31,7 @@ MODULES = [
     "test_cert_fetch",
     "test_xlsx_safe",
     "test_load_result",
+    "test_speed_indicator",
     "test_empty_report_save",
     "test_ozon_verdict",
     "test_progress",

@@ -304,6 +304,22 @@ class AppState:
     activity_series: List[int] = field(default_factory=list)
     _last_activity_ts: float = field(default=0.0, repr=False)
     _activity_counter: int = field(default=0, repr=False)
+    # v45.7: выборки (время, обработано) для ЧЕСТНОЙ скорости строк/мин — считаем по
+    # реальному приросту progress_done, а не по числу лог-событий.
+    _progress_samples: List = field(default_factory=list, repr=False)
+
+    def record_progress_sample(self) -> None:
+        """Запоминает точку (время, progress_done) для расчёта реальной скорости.
+        При смене этапа (done пошёл назад) — сбрасываем историю, чтобы скорость не
+        прыгала в минус."""
+        now = time.time()
+        if self._progress_samples and self.progress_done < self._progress_samples[-1][1]:
+            self._progress_samples = []
+        self._progress_samples.append((now, self.progress_done))
+        # держим окно ~40 секунд (но не меньше последних 2 точек)
+        cutoff = now - 40.0
+        kept = [(t, d) for (t, d) in self._progress_samples if t >= cutoff]
+        self._progress_samples = kept if len(kept) >= 2 else self._progress_samples[-2:]
 
     def tick_activity(self) -> None:
         """Увеличивает счётчик активности — вызывается на каждую обработанную строку."""
@@ -322,12 +338,17 @@ class AppState:
         if self.started_at:
             end = self.finished_at if (not self.running and self.finished_at) else time.time()
             elapsed = max(0.0, end - self.started_at)
-        # Скорость: строк/мин за последние 30 точек активности
+        # v45.7: ЧЕСТНАЯ скорость строк/мин — по реальному приросту обработанных
+        # строк (progress_done) за последние ~30 сек, как и пишет движок в логе
+        # («460/мин»). Раньше считалось число лог-событий, поэтому показывало
+        # заниженную и непонятную цифру (≈60), не совпадавшую с логом.
         speed = 0.0
-        if len(self.activity_series) >= 2:
-            window = self.activity_series[-30:]
-            total_items = sum(window)
-            speed = round(total_items * 60.0 / len(window), 1)
+        samples = [s for s in self._progress_samples if s[0] >= time.time() - 30.0]
+        if len(samples) >= 2:
+            (t0, d0), (t1, d1) = samples[0], samples[-1]
+            dt, dd = (t1 - t0), (d1 - d0)
+            if dt > 0 and dd >= 0:
+                speed = round(dd / dt * 60.0, 1)
         return {
             "running": self.running,
             "mode": self.mode,
@@ -506,6 +527,7 @@ class EngineRunner:
         s.activity_series = []
         s._last_activity_ts = 0.0
         s._activity_counter = 0
+        s._progress_samples = []
 
     def _run(self, spec: RunSpec) -> None:
         try:
@@ -729,6 +751,7 @@ class EngineRunner:
                     self.state.progress_total = t
                     self.state.progress_pct = min(100.0, 100.0 * d / t)
                     self.state.tick_activity()
+                    self.state.record_progress_sample()
                     return
             except ValueError:
                 pass
@@ -744,6 +767,7 @@ class EngineRunner:
                         self.state.progress_total = t
                         self.state.progress_pct = min(100.0, 100.0 * d / t)
                         self.state.tick_activity()
+                        self.state.record_progress_sample()
                         return
                 except ValueError:
                     pass

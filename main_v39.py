@@ -1405,6 +1405,12 @@ async def run_http_link_prefetch(
     sem = asyncio.Semaphore(workers)
     done_nm: Set[int] = set()
     stats = {"ok": 0, "no_docs": 0, "no_link": 0, "errors": 0, "fallback": 0, "done": 0}
+    # v45.7: АДАПТИВНОЕ ТОРМОЖЕНИЕ. Сетевые ошибки certificate.json = WB троттлит CDN
+    # (wbbasket.ru) за слишком частые запросы. Каждая такая ошибка к тому же ждёт
+    # полный таймаут (cert_timeout) — отсюда и обвал скорости. Когда ошибок много,
+    # сами притормаживаем (пауза перед карточкой растёт с «давлением»), чтобы уйти
+    # под лимит WB; на успехах давление спадает и скорость восстанавливается.
+    pace = {"pressure": 0.0, "warned": False}
     t0 = time.time()
     last_print = t0
 
@@ -1433,6 +1439,10 @@ async def run_http_link_prefetch(
                 if card.nm_id in processed:
                     stats['done'] += 1
                     return
+                # v45.7: если WB троттлит (накопилось «давление» из сетевых ошибок) —
+                # притормаживаем перед карточкой, чтобы уйти под лимит и не копить ошибки.
+                if pace["pressure"] > 4:
+                    await asyncio.sleep(min(2.0, 0.04 * pace["pressure"]))
                 try:
                     urls, detail = await fetch_certificate_json_for_nm(
                         session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
@@ -1477,6 +1487,7 @@ async def run_http_link_prefetch(
                     await store.add(row)
                     done_nm.add(card.nm_id)
                     stats['ok'] += 1
+                    pace["pressure"] = max(0.0, pace["pressure"] - 0.5)  # успех → давление спадает
                 elif detail.startswith("cert_json_no_docs"):
                     # ВСЕ шарды честно вернули 404 → документа НЕТ. Это надёжно по HTTP.
                     row = ResultRow(
@@ -1514,6 +1525,15 @@ async def run_http_link_prefetch(
                         await store.add(row)
                         done_nm.add(card.nm_id)
                         stats['errors'] = stats.get('errors', 0) + 1
+                        # сетевая ошибка → WB троттлит, повышаем давление (тормозим)
+                        pace["pressure"] = min(60.0, pace["pressure"] + 1.5)
+                        if (not pace["warned"] and stats['errors'] >= 40
+                                and stats['errors'] > stats['ok']):
+                            pace["warned"] = True
+                            print("⚠️  Много сетевых ошибок certificate.json — WB троттлит CDN за "
+                                  "частые запросы. Включил авто-торможение. Если медленно — снизь "
+                                  "«Браузер/HTTP-воркеры» (--http-link-workers) до 10–15: меньше "
+                                  "параллельных запросов = меньше троттлинга и БЫСТРЕЕ в сумме.")
                 stats['done'] += 1
 
         prog = asyncio.create_task(progress_loop())

@@ -414,6 +414,7 @@ def fetch_fsa_via_http(
     user_agent: Optional[str] = None,
     aggressive: bool = False,
     skip_warmup: bool = False,
+    proxy: Optional[str] = None,
 ) -> Optional[Dict[str, str]]:
     """Главный публичный API.
 
@@ -447,9 +448,18 @@ def fetch_fsa_via_http(
     seen = set()
     impersonates = [x for x in impersonates if not (x in seen or seen.add(x))]
 
+    # v27.9.x: прокси (как в методе из видео — requests через пул прокси, verify=off).
+    _proxies = {"http": proxy, "https": proxy} if proxy else None
+    _verify = False if proxy else True
     for imp in impersonates:
         try:
             sess = _curl_requests.Session()
+            if _proxies:
+                try:
+                    sess.proxies = _proxies
+                    sess.verify = _verify
+                except Exception:
+                    pass
             # Warm-up — это критично, без него FSA часто отдаёт 403
             if not skip_warmup:
                 for label, warm_url, typ in _fsa_warmup_urls(kind, doc_id, referer):
@@ -457,7 +467,8 @@ def fetch_fsa_via_http(
                         wh = _fsa_html_headers(referer) if typ == "html" else _fsa_browser_headers(referer)
                         wh["User-Agent"] = ua
                         try:
-                            sess.get(warm_url, headers=wh, timeout=timeout, impersonate=imp)
+                            sess.get(warm_url, headers=wh, timeout=timeout, impersonate=imp,
+                                     proxies=_proxies, verify=_verify)
                         except TypeError:
                             sess.get(warm_url, headers=wh, timeout=timeout)
                     except Exception:
@@ -468,7 +479,8 @@ def fetch_fsa_via_http(
                     h = _fsa_browser_headers(referer)
                     h["User-Agent"] = ua
                     try:
-                        r = sess.get(api_url, headers=h, timeout=timeout, impersonate=imp)
+                        r = sess.get(api_url, headers=h, timeout=timeout, impersonate=imp,
+                                     proxies=_proxies, verify=_verify)
                     except TypeError:
                         r = sess.get(api_url, headers=h, timeout=timeout)
                     status = int(getattr(r, "status_code", 0) or 0)
@@ -6784,19 +6796,27 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     HTTP-запросов перед каждым документом.
     """
     global _FSA_HTTP_FAILS, _FSA_HTTP_DISABLED
+    # v27.9.x: активный прокси (ручной или авто-найденный). ЧЕРЕЗ ПРОКСИ FSA отдаёт
+    # данные и по HTTP (метод из видео: requests через пул прокси, verify=off) — это
+    # в разы быстрее браузера. Поэтому при наличии прокси ВКЛючаем HTTP-путь, даже
+    # если fsa_http_fast_path выключен, и не глушим его circuit-breaker'ом.
+    _active_proxy = (getattr(args, 'registry_proxy', '') or '').strip() or _FSA_AUTO_PROXY
     # v40.2: HTTP fast-path через curl_cffi, с circuit breaker
-    if bool(getattr(args, 'fsa_http_fast_path', True)) and not _FSA_HTTP_DISABLED:
+    if (bool(getattr(args, 'fsa_http_fast_path', True)) or _active_proxy) and (not _FSA_HTTP_DISABLED or _active_proxy):
         try:
             if is_curl_cffi_available():
                 impersonate = str(getattr(args, 'fsa_curl_cffi_impersonate', 'chrome') or 'chrome')
-                # v40.2: короткий таймаут для HTTP-попытки — если FSA блокирует, не висим долго
-                http_timeout = min(8.0, max(4.0, int(getattr(args, 'registry_browser_timeout_ms', 30000)) / 1000.0))
+                # через прокси даём чуть больше времени (прокси добавляет задержку)
+                http_timeout = (min(14.0, max(6.0, int(getattr(args, 'registry_browser_timeout_ms', 30000)) / 1000.0))
+                                if _active_proxy
+                                else min(8.0, max(4.0, int(getattr(args, 'registry_browser_timeout_ms', 30000)) / 1000.0)))
                 result = await asyncio.to_thread(
                     fetch_fsa_via_http,
                     url,
                     timeout_sec=http_timeout,
                     impersonate=impersonate,
                     user_agent=getattr(args, 'user_agent', None),
+                    proxy=_active_proxy or None,
                 )
                 if result and result.get('doc_number'):
                     _FSA_HTTP_FAILS = 0  # успех — сбрасываем счётчик

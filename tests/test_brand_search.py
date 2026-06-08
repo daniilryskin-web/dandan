@@ -90,8 +90,8 @@ def main():
     check("бренд: используется НЕСКОЛЬКО сортировок", len(sorts) >= 3)
     check("бренд: ДОБОР по категориям ('reebok обувь')",
           any(q.startswith("reebok ") and q != "reebok" for q in queries))
-    check("бренд: столбец «Запрос» у всех карточек = бренд",
-          bool(cards_brand) and all(c.source_query == "reebok" for c in cards_brand))
+    check("бренд: в «Запросе» видны варианты (не схлопнуто в один)",
+          bool(cards_brand) and len({c.source_query for c in cards_brand}) >= 2)
     check("бренд: все карточки соответствуют бренду",
           all(mv.brand_matches_v39(c.brand, "reebok", "contains") for c in cards_brand))
 

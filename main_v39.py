@@ -1892,6 +1892,12 @@ def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '
     if not domain or domain == 'unknown':
         return True
 
+    # v27.9.x: поддержка НЕСКОЛЬКИХ доменов (мультикатегория бренда) — "clothing,shoes".
+    # Карточка релевантна, если подходит ХОТЯ БЫ ПОД ОДИН из доменов.
+    if ',' in str(domain):
+        return any(is_card_relevant_for_domain(subject, d.strip(), subject_name, product_name)
+                   for d in str(domain).split(',') if d.strip())
+
     keywords = DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain, [])
     wl = DOMAIN_SUBJECT_WHITELIST.get(domain) or set()
 
@@ -2093,6 +2099,37 @@ async def discover_brand_filter_ids(session: aiohttp.ClientSession, brand: str, 
     """Находит числовой brandId(ы) WB для прямого бренд-каталога."""
     q = urllib.parse.quote(brand)
     found: List[str] = []
+    wanted = norm_key_brand(brand)
+
+    # v27.9.x: САМЫЙ НАДЁЖНЫЙ источник — brandId прямо из ТОВАРОВ поисковой выдачи.
+    # У каждого товара WB есть поля brand + brandId. Берём id у товаров, чей бренд
+    # совпадает с искомым. Это работает даже когда resultset=filters/подсказки
+    # отдают пусто или сменили структуру (из-за чего brandId «не находился»).
+    product_urls = [
+        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false",
+        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false",
+    ]
+    _bid_counts: Dict[str, int] = {}
+    for url in product_urls:
+        data = await fetch_json(session, url, timeout=timeout)
+        if not data:
+            continue
+        for p in recursive_find_products(data):
+            bid = p.get("brandId") or p.get("brand_id") or p.get("brandID")
+            pbrand = norm_key_brand(str(p.get("brand") or p.get("brandName") or ""))
+            if not bid or not pbrand:
+                continue
+            if not re.fullmatch(r"\d{1,10}", str(bid).strip()):
+                continue
+            if pbrand == wanted or wanted in pbrand or pbrand in wanted:
+                _bid_counts[str(bid).strip()] = _bid_counts.get(str(bid).strip(), 0) + 1
+        if _bid_counts:
+            break
+    # самые частые brandId — впереди (основной бренд, а не случайные совпадения)
+    for bid, _cnt in sorted(_bid_counts.items(), key=lambda kv: -kv[1]):
+        if bid not in found:
+            found.append(bid)
+
     filter_urls = [
         f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30&suppressSpellcheck=false",
         f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30&suppressSpellcheck=false",
@@ -2350,18 +2387,27 @@ async def collect_cards(args) -> List[Card]:
         'kitchenware': 'kitchenware', 'посуда': 'kitchenware',
         'food': 'food', 'продукты': 'food', 'питание': 'food',
     }
-    _profile_key = (getattr(args, 'query_profile', '') or 'auto').strip().lower()
-    # v27.9.x: КАТЕГОРИЯ ТОВАРОВ для бренда — если выбрана (не auto/любая), сужаем
-    # выдачу до неё. Иначе для бренда — без сужения (берём все товары бренда).
-    _brand_category_domain = profile_to_domain.get(_profile_key) if _profile_key not in ('auto', '', 'any', 'любая') else None
+    # v27.9.x: КАТЕГОРИИ ТОВАРОВ для бренда — можно НЕСКОЛЬКО через запятую
+    # (--query-profile clothing,shoes). Если выбраны — сужаем выдачу до них.
+    _profile_raw = (getattr(args, 'query_profile', '') or 'auto').strip().lower()
+    _profile_keys = [p.strip() for p in _profile_raw.split(',') if p.strip()]
+    _brand_domains = []
+    for _k in _profile_keys:
+        if _k in ('auto', '', 'any', 'любая'):
+            continue
+        _d = profile_to_domain.get(_k)
+        if _d and _d not in _brand_domains:
+            _brand_domains.append(_d)
+    _profile_key = _profile_keys[0] if _profile_keys else 'auto'
 
     variants = generate_query_variants(args.query, args.query_profile, args.max_expanded_queries)
     if _brand_search:
-        # Бренд: чистый бренд + (если выбрана категория) «бренд + тип товара»
-        # из этой категории. Это даёт больше карточек, не выходя за категорию.
-        if _brand_category_domain:
-            _types = DOMAIN_PRODUCT_TYPES.get(_brand_category_domain, [])
-            variants = [args.brand] + [f"{args.brand} {t}" for t in _types]
+        # Бренд: чистый бренд + (если выбраны категории) «бренд + тип товара» из
+        # КАЖДОЙ выбранной категории. Больше карточек, не выходя за категории.
+        if _brand_domains:
+            variants = [args.brand]
+            for _d in _brand_domains:
+                variants += [f"{args.brand} {t}" for t in DOMAIN_PRODUCT_TYPES.get(_d, [])]
         else:
             variants = [args.brand]
     elif args.limit <= args.per_query_limit and not args.auto_expand:
@@ -2374,11 +2420,12 @@ async def collect_cards(args) -> List[Card]:
     has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
     use_filter = strict_filter_enabled and domain and has_signals
     if _brand_search:
-        # Бренд + выбрана категория → ВКЛючаем доменный фильтр (только эта категория).
-        # Бренд без категории → фильтр ВЫКЛючен (все товары бренда).
-        if _brand_category_domain:
-            domain = _brand_category_domain
-            use_filter = bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain)) or bool(DOMAIN_SUBJECT_WHITELIST.get(domain))
+        # Бренд + выбраны категории → ВКЛючаем доменный фильтр (только эти категории,
+        # через запятую). Бренд без категории → фильтр ВЫКЛючен (все товары бренда).
+        if _brand_domains:
+            domain = ','.join(_brand_domains)
+            use_filter = any(DOMAIN_SUBJECT_NAME_KEYWORDS.get(d) or DOMAIN_SUBJECT_WHITELIST.get(d)
+                             for d in _brand_domains)
         else:
             use_filter = False
             domain = ''
@@ -2447,13 +2494,12 @@ async def collect_cards(args) -> List[Card]:
                         for c in cards:
                             # v27.9.x: для бренда ПРЕД-фильтруем по бренду прямо здесь —
                             # иначе варианты «reebok кроссовки» забивают лимит чужими
-                            # товарами, а нужные карточки не попадают. И столбец
-                            # «Запрос» = сам бренд (без служебных вариантов).
+                            # товарами, а нужные карточки не попадают. Столбец «Запрос»
+                            # оставляем = реальному варианту (видно, что вариаций много).
                             if _brand_search:
                                 if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
                                                          getattr(args, 'brand_match', 'contains') or 'contains'):
                                     continue
-                                c.source_query = args.brand or c.source_query
                             cards_map.setdefault(c.nm_id, c)
                         # страница не дала ни одной НОВОЙ карточки — дальше листать смысла нет
                         if len(cards_map) == before or not cards:
@@ -2503,7 +2549,6 @@ async def collect_cards(args) -> List[Card]:
                                 if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
                                                          getattr(args, 'brand_match', 'contains') or 'contains'):
                                     continue
-                                c.source_query = args.brand or c.source_query
                                 cards_map.setdefault(c.nm_id, c)
                             if len(cards_map) == before or not cards:
                                 break

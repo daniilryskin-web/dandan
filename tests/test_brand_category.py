@@ -79,12 +79,15 @@ def main():
                                strict_domain_filter=True, search_sorts="popular",
                                collect_workers=4, user_agent="t")
 
+    _orig_coq = mv.collect_one_query
+    _orig_disc = mv.discover_brand_filter_ids
     mv.collect_one_query = fake
     mv.discover_brand_filter_ids = fakedisc
     try:
         asyncio.run(mv.collect_cards(_args("appliances")))
     finally:
-        pass
+        mv.collect_one_query = _orig_coq
+        mv.discover_brand_filter_ids = _orig_disc
     qs = [q for q, d in seen]
     doms = set(d for q, d in seen)
     check("appliances: есть вариант «indesit стиральные машины»",
@@ -92,6 +95,41 @@ def main():
     check("appliances: доменный фильтр включён", "appliances" in doms)
     check("appliances: НЕ ищет одежду (нет «indesit куртки»)",
           not any("куртк" in q for q in qs))
+
+    # --- НЕСКОЛЬКО категорий: одежда + обувь ---
+    calls.clear()
+    runner._run(wc.RunSpec(mode="brand", brand="reebok", brand_match="exact",
+                           brand_category="одежда,обувь", limit=500, workers=4))
+    am = next(c for c in calls if "--brand" in c)  # stage1 (с брендом)
+    check("мультикатегория -> --query-profile clothing,shoes",
+          "--query-profile" in am and am[am.index("--query-profile") + 1] == "clothing,shoes")
+    check("мультидомен: кроссовки релевантны (clothing,shoes)",
+          mv.is_card_relevant_for_domain("", "clothing,shoes", product_name="Кроссовки"))
+    check("мультидомен: куртка релевантна (clothing,shoes)",
+          mv.is_card_relevant_for_domain("", "clothing,shoes", product_name="Куртка"))
+    check("мультидомен: холодильник НЕ релевантен (clothing,shoes)",
+          not mv.is_card_relevant_for_domain("", "clothing,shoes", product_name="Холодильник"))
+
+    # --- brandId извлекается из ТОВАРОВ поисковой выдачи ---
+    async def _disc():
+        import aiohttp
+        async def fake_fetch(session, url, timeout=12.0):
+            if "resultset=catalog" in url:
+                return {"data": {"products": [
+                    {"id": 111, "brand": "Reebok", "brandId": 777, "name": "x"},
+                    {"id": 222, "brand": "Reebok", "brandId": 777, "name": "y"},
+                    {"id": 333, "brand": "Nike", "brandId": 999, "name": "z"},
+                ]}}
+            return None
+        orig = mv.fetch_json
+        mv.fetch_json = fake_fetch
+        try:
+            return await mv.discover_brand_filter_ids(None, "reebok")
+        finally:
+            mv.fetch_json = orig
+    ids = asyncio.run(_disc())
+    check("brandId из товаров: найден 777 (Reebok), не 999 (Nike)",
+          "777" in ids and "999" not in ids)
 
 
 if __name__ == "__main__":

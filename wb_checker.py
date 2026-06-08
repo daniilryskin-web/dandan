@@ -474,7 +474,10 @@ class EngineRunner:
                     "детские аксессуары": "kids_accessories", "детский транспорт": "baby_gear",
                     "дом и текстиль": "home", "посуда": "kitchenware", "продукты": "food",
                 }
-                _profile = _CAT2PROFILE.get((spec.brand_category or "").strip().lower(), "auto")
+                # несколько категорий через запятую -> профили через запятую
+                _cats = [c.strip().lower() for c in (spec.brand_category or "").split(",") if c.strip()]
+                _profiles = [_CAT2PROFILE[c] for c in _cats if c in _CAT2PROFILE]
+                _profile = ",".join(dict.fromkeys(_profiles)) if _profiles else "auto"
                 s1 = RunSpec(**{**asdict(spec), "mode": "query_stage1",
                                 "query": spec.brand or spec.query,
                                 "strict_brand": spec.brand,
@@ -1805,6 +1808,24 @@ hr.section-sep { border: none; border-top: 1px solid var(--border); margin: 0; }
 
 /* Чуть живее переходы экранов */
 .screen.active { animation: fadeUp 0.22s cubic-bezier(0.16,1,0.3,1); }
+
+/* v27.9.x: мультиселект категорий бренда */
+.ms-group { display:flex; flex-wrap:wrap; gap:6px 14px; padding:6px 0; }
+.ms-item { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text); cursor:pointer; white-space:nowrap; }
+.ms-item input { width:15px; height:15px; cursor:pointer; }
+
+/* v27.9.x: сортируемые заголовки + кликабельные длинные ячейки */
+th.sortable { cursor:pointer; user-select:none; }
+th.sortable:hover { color:#fff; background:rgba(91,140,255,0.12); }
+td.cell-expand { cursor:pointer; text-decoration:underline dotted rgba(255,255,255,0.25); }
+td.cell-expand:hover { color:#fff; background:rgba(91,140,255,0.10); }
+
+/* v27.9.x: модалка полного текста названия */
+#full-text-modal { display:none; position:fixed; inset:0; z-index:9999; }
+#full-text-modal .ftm-backdrop { position:absolute; inset:0; background:rgba(0,0,0,0.55); }
+#full-text-modal .ftm-box { position:relative; max-width:680px; margin:12vh auto 0; background:var(--card,#1b2030); border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:20px; box-shadow:0 20px 60px rgba(0,0,0,0.5); }
+#full-text-modal .ftm-text { color:var(--text,#e8ecf3); font-size:14px; line-height:1.5; white-space:pre-wrap; max-height:60vh; overflow:auto; }
+#full-text-modal .ftm-close { margin-top:16px; padding:8px 18px; border-radius:8px; border:none; background:#5b8cff; color:#fff; cursor:pointer; font-size:13px; }
 </style>
 <!--__CHARTJS_INLINE__-->
 </head>
@@ -2337,9 +2358,9 @@ const FORM_FIELDS = {
   ],
   brand: [
     {key:'brand',       lbl:'Бренд',                   type:'text',  def:'adidas', hint:'Латиницей, как на WB'},
-    {key:'brand_category', lbl:'Категория товаров', type:'select', def:'любая',
-      options:['любая','одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
-      hint:'Сузить поиск до категории бренда (reebok→одежда, indesit→бытовая техника)'},
+    {key:'brand_category', lbl:'Категории товаров (можно несколько)', type:'multiselect', def:'',
+      options:['одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
+      hint:'Сузить поиск до выбранных категорий (reebok→одежда+обувь, indesit→бытовая техника). Ничего не выбрано — все товары бренда'},
     {key:'brand_match', lbl:'Тип совпадения',           type:'select',def:'exact',options:['exact','contains','any']},
     {key:'limit',       lbl:'Лимит карточек',           type:'number',def:5000, min:1, max:200000},
     {key:'workers',     lbl:'Браузер-воркеры',          type:'number',def:4, min:1, max:12},
@@ -2419,6 +2440,19 @@ function renderForm() {
           <select data-key="${f.key}">${opts}</select>
           ${f.hint ? `<span class="field-hint">${escapeHtml(f.hint)}</span>` : ''}
         </div>`;
+    } else if (f.type === 'multiselect') {
+      // v27.9.x: чекбоксы — можно выбрать НЕСКОЛЬКО значений. Хранится строкой
+      // через запятую. Используется для выбора нескольких категорий бренда.
+      const cur = String(val || '').split(',').map(s => s.trim()).filter(Boolean);
+      const boxes = (f.options||[]).map(o =>
+        `<label class="ms-item"><input type="checkbox" data-mskey="${f.key}" value="${escapeHtml(o)}" ${cur.includes(o)?'checked':''}> ${escapeHtml(o)}</label>`
+      ).join('');
+      wrap.innerHTML = `
+        <div class="field">
+          <span class="field-label">${escapeHtml(f.lbl)}</span>
+          <div class="ms-group" data-mswrap="${f.key}">${boxes}</div>
+          ${f.hint ? `<span class="field-hint">${escapeHtml(f.hint)}</span>` : ''}
+        </div>`;
     } else {
       const t = f.type === 'number' ? 'number' : 'text';
       const minattr = f.min !== undefined ? `min="${f.min}"` : '';
@@ -2442,6 +2476,12 @@ function collectSpec() {
     if (el.type === 'checkbox') spec[k] = el.checked;
     else if (el.type === 'number') spec[k] = Number(el.value) || 0;
     else spec[k] = el.value;
+  });
+  // v27.9.x: мультиселект (категории бренда) — собираем отмеченные в строку.
+  $$('#form-grid [data-mswrap]').forEach(group => {
+    const k = group.dataset.mswrap;
+    const vals = Array.from(group.querySelectorAll('input[type=checkbox]:checked')).map(c => c.value);
+    spec[k] = vals.join(',');
   });
   spec.use_wb_enhanced = $('#use-wb-enhanced').checked;
   spec.use_fsa_enhanced = $('#use-fsa-enhanced').checked;
@@ -2863,18 +2903,41 @@ function _tableColIndices() {
   return idx;
 }
 
+let _sortCol = -1;      // индекс колонки сортировки (в _allHeaders)
+let _sortDir = 1;       // 1 = по возрастанию, -1 = по убыванию
+let _lastRenderRows = [];
+
+function _sortRows(rows, ci, dir) {
+  const num = rows.every(r => r[ci] === '' || r[ci] === null || r[ci] === undefined || !isNaN(Number(r[ci])));
+  return rows.slice().sort((a, b) => {
+    let va = a[ci] ?? '', vb = b[ci] ?? '';
+    if (num) { va = Number(va) || 0; vb = Number(vb) || 0; return (va - vb) * dir; }
+    return String(va).localeCompare(String(vb), 'ru') * dir;
+  });
+}
+
 function renderTable(rows) {
   const wrap = $('#tbl-wrap');
   if (!rows.length) {
     wrap.innerHTML = '<div class="empty-state"><div class="empty-ico">🤷</div><p>Ничего не найдено</p></div>';
     return;
   }
+  _lastRenderRows = rows;
   const colIdx = _tableColIndices();
+  // Сортировка (если выбрана колонка)
+  let viewRows = rows;
+  if (_sortCol >= 0) viewRows = _sortRows(rows, _sortCol, _sortDir);
+
   let html = '<table><thead><tr>' +
-    colIdx.map(i => { const h = _allHeaders[i] || ''; return `<th title="${escapeHtml(h)}">${escapeHtml(h.length > 22 ? h.slice(0,20)+'…' : h)}</th>`; }).join('') +
+    colIdx.map(i => {
+      const h = _allHeaders[i] || '';
+      const arrow = (_sortCol === i) ? (_sortDir === 1 ? ' ▲' : ' ▼') : '';
+      const lbl = escapeHtml(h.length > 22 ? h.slice(0,20)+'…' : h) + arrow;
+      return `<th class="sortable" data-col="${i}" title="${escapeHtml(h)} (клик — сортировать)">${lbl}</th>`;
+    }).join('') +
     '</tr></thead><tbody>';
   const hl = _allHeaders.map(x => x.toLowerCase());
-  for (const row of rows.slice(0, 1000)) {
+  for (const row of viewRows.slice(0, 1000)) {
     html += '<tr>';
     colIdx.forEach((ci) => {
       const v = String(row[ci] ?? '');
@@ -2894,14 +2957,47 @@ function renderTable(rows) {
         if (v === 'WB' || v.toLowerCase().includes('wildberries')) badge = 'badge-wb';
         else if (v.toLowerCase().includes('ozon')) badge = 'badge-ozon';
       }
+      // длинные текстовые поля (название товара / название в реестре) — кликабельны
+      const isLong = (head.includes('название') || head.includes('изготовитель') || head.includes('примечан')) && v.length > 28;
+      const cellCls = isLong ? ' class="cell-expand"' : '';
       html += badge
         ? `<td><span class="badge ${badge}">${escapeHtml(v)}</span></td>`
-        : `<td title="${escapeHtml(v)}">${escapeHtml(v)}</td>`;
+        : `<td${cellCls} title="${escapeHtml(v)}" data-full="${escapeHtml(v)}">${escapeHtml(v)}</td>`;
     });
     html += '</tr>';
   }
   html += '</tbody></table>';
   wrap.innerHTML = html;
+
+  // Клик по заголовку — сортировка
+  wrap.querySelectorAll('th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+      const ci = Number(th.dataset.col);
+      if (_sortCol === ci) _sortDir = -_sortDir; else { _sortCol = ci; _sortDir = 1; }
+      renderTable(_lastRenderRows);
+    });
+  });
+  // Клик по длинной ячейке — показать полный текст
+  wrap.querySelectorAll('td.cell-expand').forEach(td => {
+    td.addEventListener('click', () => {
+      const full = td.dataset.full || td.textContent;
+      showFullTextModal(full);
+    });
+  });
+}
+
+function showFullTextModal(text) {
+  let m = document.getElementById('full-text-modal');
+  if (!m) {
+    m = document.createElement('div');
+    m.id = 'full-text-modal';
+    m.innerHTML = '<div class="ftm-backdrop"></div><div class="ftm-box"><div class="ftm-text"></div><button class="ftm-close">Закрыть</button></div>';
+    document.body.appendChild(m);
+    m.querySelector('.ftm-backdrop').addEventListener('click', () => m.style.display = 'none');
+    m.querySelector('.ftm-close').addEventListener('click', () => m.style.display = 'none');
+  }
+  m.querySelector('.ftm-text').textContent = text;
+  m.style.display = 'block';
 }
 
 $('#filter-input').addEventListener('input', e => {

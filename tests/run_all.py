@@ -25,6 +25,7 @@ MODULES = [
     "test_brand_routing",
     "test_brand_search",
     "test_brand_category",
+    "test_brand_limit_topup",
     "test_cert_fetch",
     "test_xlsx_safe",
     "test_empty_report_save",

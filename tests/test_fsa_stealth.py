@@ -66,6 +66,11 @@ def main():
     lo3, hi3 = mv._fsa_human_delay_range(a3)
     check("'0,0' -> без паузы", lo3 == 0.0 and hi3 == 0.0)
 
+    # 5) прогрев главной FSA ВЫКЛЮЧЕН по умолчанию (залп при старте воркеров = блок «с порога»)
+    check("--fsa-warmup по умолчанию FALSE", a.fsa_warmup is False)
+    a4 = ap.parse_args(["--input-links-csv", "x.csv", "--fsa-warmup", "true"])
+    check("--fsa-warmup можно включить", a4.fsa_warmup is True)
+
 
 if __name__ == "__main__":
     main()

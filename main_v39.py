@@ -8280,10 +8280,10 @@ def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", default="", help="Поисковый запрос WB")
     ap.add_argument("--query-profile", default="auto",
-                    choices=["auto", "clothing", "одежда", "shoes", "обувь",
-                             "toys", "игрушки", "cosmetics", "косметика",
-                             "electronics", "электроника", "home"],
-                    help="v39.7: домен товаров для умной генерации запросов. auto = определяется по запросу.")
+                    help="v39.7: домен товаров для умной генерации запросов. auto = определяется по запросу. "
+                         "Можно несколько через запятую (напр. clothing,shoes). Поддержка: clothing/одежда, "
+                         "shoes/обувь, toys/игрушки, kids_accessories, baby_gear, cosmetics/косметика, "
+                         "electronics/электроника, appliances/бытовая техника, home/дом, kitchenware/посуда, food/продукты.")
     ap.add_argument("--strict-domain-filter", type=lambda s: s.lower() in ('1','true','yes','y','on'),
                     default=True,
                     help="v39.7: фильтровать карточки по subject-id WB строго в рамках домена. Лечит ситуацию когда по запросу «детские игрушки» приходят платья. true/false (default true).")

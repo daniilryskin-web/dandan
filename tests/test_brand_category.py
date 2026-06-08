@@ -131,6 +131,23 @@ def main():
     check("brandId из товаров: найден 777 (Reebok), не 999 (Nike)",
           "777" in ids and "999" not in ids)
 
+    # --- argparse принимает несколько профилей через запятую и новые домены ---
+    ap = mv.build_parser()
+    ok_multi = True
+    try:
+        a = ap.parse_args(["--query", "reebok", "--query-profile", "clothing,shoes", "--link-only", "true"])
+        ok_multi = (a.query_profile == "clothing,shoes")
+    except SystemExit:
+        ok_multi = False
+    check("argparse: --query-profile clothing,shoes принят", ok_multi)
+    ok_app = True
+    try:
+        a2 = ap.parse_args(["--query", "x", "--query-profile", "appliances"])
+        ok_app = (a2.query_profile == "appliances")
+    except SystemExit:
+        ok_app = False
+    check("argparse: --query-profile appliances принят", ok_app)
+
 
 if __name__ == "__main__":
     main()

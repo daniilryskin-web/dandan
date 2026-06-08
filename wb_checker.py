@@ -2841,8 +2841,36 @@ $('#btn-clear-log').addEventListener('click', () => {
   $('#log-view').innerHTML = '<span style="color:var(--muted);">— журнал очищен —</span>';
   _logSeen = 0;
 });
+function copyTextRobust(text) {
+  // v27.9.x: navigator.clipboard недоступен в pywebview (не secure-context) —
+  // делаем надёжный fallback через скрытую textarea + execCommand('copy').
+  return new Promise((resolve, reject) => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(resolve).catch(() => fallback());
+      } else { fallback(); }
+    } catch (e) { fallback(); }
+    function fallback() {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top = '0';
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error('execCommand failed'));
+      } catch (e2) { reject(e2); }
+    }
+  });
+}
+
 $('#btn-copy-log').addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText($('#log-view').innerText); toast('Лог скопирован', 'ok'); }
+  const el = $('#log-view');
+  const text = el ? (el.innerText || el.textContent || '') : '';
+  try { await copyTextRobust(text); toast('Лог скопирован', 'ok'); }
   catch (e) { toast('Не удалось скопировать', 'err'); }
 });
 $('#btn-save-log').addEventListener('click', async () => {

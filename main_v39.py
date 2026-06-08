@@ -408,14 +408,18 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
     return {k: v for k, v in out.items() if v}
 
 
-# Словарь статусов ФСА (idStatus). Подтверждён ТОЛЬКО код 6 = «Действует» (живым
-# ответом API и сверкой с прежним браузерным парсингом тех же сертификатов).
-# Остальные коды НЕ угадываем: отдаём как «Статус N», и такие документы
-# дорабатываются браузером (надёжный текст статуса) — чтобы не выдать неверный
-# вердикт. По мере подтверждения коды можно добавлять сюда.
+# Словарь статусов ФСА (idStatus). Коды подтверждены пользователем по карточкам
+# реестра. ВАЖНО для вердикта: действующий — только «Действует» (6); остальные
+# (приостановлен/прекращён/недействителен/архивный) = документ НЕ действует.
 _FSA_STATUS_MAP: Dict[int, str] = {
+    1: "Архивный",
     6: "Действует",
+    11: "Недействителен",
+    14: "Прекращён",
+    15: "Приостановлен",
 }
+# Статусы, при которых документ считается НЕдействующим (для вердикта/окраски).
+_FSA_INACTIVE_STATUS_CODES = {1, 11, 14, 15}
 
 # Словарь технических регламентов ФСА (idTechnicalReglaments). 39 = ТР ТС
 # 007/2011 подтверждён живым ответом (в тексте документов). Остальные —
@@ -2283,6 +2287,16 @@ _FSA_HTTP_FAIL_LIMIT = 5
 _FSA_SESSION_COOKIES: Dict[str, str] = {}
 _FSA_COOKIE_HTTP_OK = 0   # сколько документов добыто быстрым HTTP по кукам
 _FSA_COOKIE_HTTP_FAIL = 0  # сколько раз HTTP по кукам не сработал (куки протухли/нет токена)
+
+# v45.6: АВТО-ВОССТАНОВЛЕНИЕ при блокировке FSA. Когда FSA начинает массово отдавать
+# сетевые ошибки/таймауты (rate-limit/временный бан), программа сама ставит FSA на
+# паузу (cooldown с экспоненциальным ростом), сбрасывает «отравленную» сессию (куки)
+# и потом продолжает. Это снимает временный rate-limit без участия пользователя.
+# Полный сетевой бан IP пауза не лечит — тогда после N циклов FSA отпускается, а
+# недобранное добивается кнопкой «Повторить упавшие FSA».
+_FSA_CONSEC_FAILS = 0       # подряд идущих неудач FSA (сбрасывается успехом)
+_FSA_COOLDOWN_UNTIL = 0.0   # время (epoch), до которого FSA на паузе
+_FSA_COOLDOWN_CYCLES = 0    # сколько раз уже включали паузу за прогон
 
 # v27.9.x: один раз за прогон сохраняем сырой JSON-ответ API ФСА в файл —
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
@@ -8078,6 +8092,7 @@ async def run_registry_stage(args):
             browser = await p.chromium.launch(**_launch_kwargs)
 
             async def worker(wid: int):
+                global _FSA_CONSEC_FAILS, _FSA_COOLDOWN_UNTIL, _FSA_COOLDOWN_CYCLES, _FSA_SESSION_COOKIES
                 # v39: единая функция пересоздания контекста + страницы. Если что-то падает —
                 # вернёт хотя бы пустой page, чтобы worker не умер.
                 async def _fresh_context_and_page(old_ctx):
@@ -8121,6 +8136,15 @@ async def run_registry_stage(args):
                         except asyncio.TimeoutError:
                             if q.empty():
                                 break
+                            continue
+                        # v45.6: АВТО-ПАУЗА FSA. Если включён cooldown (FSA массово
+                        # блокировал) — возвращаем FSA-ссылку в очередь и ждём, не
+                        # трогая её, пока пауза не кончится. Не-FSA ссылки идут как обычно.
+                        if (hostname(url) == 'pub.fsa.gov.ru'
+                                and _FSA_COOLDOWN_UNTIL > time.time()):
+                            await q.put(url)
+                            q.task_done()
+                            await asyncio.sleep(min(3.0, max(0.5, _FSA_COOLDOWN_UNTIL - time.time())))
                             continue
                         active[f'w{wid}'] = (url, time.time())
                         cert = prod = typ = detail = ''
@@ -8195,6 +8219,39 @@ async def run_registry_stage(args):
                                 stats['fsa_done'] += 1
                                 if 'NETWORK_FAILURE_all_goto_failed' in (detail or ''):
                                     stats['fsa_network_failures'] += 1
+                                # v45.6: АВТО-ВОССТАНОВЛЕНИЕ. Считаем неудачи подряд (пусто/
+                                # сетевая ошибка/таймаут). Успех — сбрасываем счётчик. Когда
+                                # неудач подряд накопилось много — ставим FSA на паузу
+                                # (cooldown), чистим отравленную сессию (куки), и после паузы
+                                # FSA пробуется заново. Это снимает временный rate-limit сам.
+                                _cd_base = float(getattr(args, 'fsa_cooldown_sec', 90.0) or 0)
+                                _cd_fails = max(2, int(getattr(args, 'fsa_cooldown_fails', 8)))
+                                _cd_max = max(0, int(getattr(args, 'fsa_max_cooldowns', 3)))
+                                if prod:
+                                    _FSA_CONSEC_FAILS = 0
+                                else:
+                                    _FSA_CONSEC_FAILS += 1
+                                    if (_cd_base > 0 and _FSA_CONSEC_FAILS >= _cd_fails
+                                            and _FSA_COOLDOWN_UNTIL <= time.time()
+                                            and _FSA_COOLDOWN_CYCLES < _cd_max):
+                                        _FSA_COOLDOWN_CYCLES += 1
+                                        _dur = min(900.0, _cd_base * (2 ** (_FSA_COOLDOWN_CYCLES - 1)))
+                                        _FSA_COOLDOWN_UNTIL = time.time() + _dur
+                                        _FSA_CONSEC_FAILS = 0
+                                        _FSA_SESSION_COOKIES = {}  # сбросить отравленную сессию
+                                        print("=" * 80)
+                                        print(f"⏸  FSA массово блокирует ({_cd_fails} неудач подряд). "
+                                              f"АВТО-ПАУЗА {int(_dur)}с — попытка {_FSA_COOLDOWN_CYCLES}/{_cd_max} "
+                                              f"снять rate-limit. Остальные реестры (SWIS и др.) продолжают идти.")
+                                        print(f"   После паузы FSA пробуется заново со свежей сессией.")
+                                        print("=" * 80)
+                                    elif (_cd_base > 0 and _FSA_CONSEC_FAILS >= _cd_fails
+                                          and _FSA_COOLDOWN_CYCLES >= _cd_max
+                                          and not stats.get('fsa_gaveup_shown')):
+                                        stats['fsa_gaveup_shown'] = True
+                                        print(f"🔴 FSA не восстановился после {_cd_max} авто-пауз — похоже на сетевой "
+                                              f"бан IP. Недобранные FSA добей кнопкой «Повторить упавшие FSA» "
+                                              f"(после смены сети / паузы).")
                                 # Раннее предупреждение: если первые 10 FSA — все network failure,
                                 # FSA недоступен в принципе и тратить время дальше бессмысленно
                                 if (not stats['fsa_warning_shown']
@@ -8663,6 +8720,14 @@ def build_parser():
                          "ПО УМОЛЧАНИЮ FALSE: при старте нескольких воркеров одновременная загрузка "
                          "тяжёлой главной = залп запросов, и FSA блокирует сразу. Без прогрева (как в "
                          "старых рабочих версиях) браузер идёт прямо на документ — надёжнее.")
+    ap.add_argument("--fsa-cooldown-sec", type=float, default=90.0,
+                    help="v45.6: АВТО-ВОССТАНОВЛЕНИЕ FSA. Базовая пауза (сек), когда FSA начал "
+                         "массово блокировать; с каждым разом удваивается (90→180→360…). 0 — выключить.")
+    ap.add_argument("--fsa-cooldown-fails", type=int, default=8,
+                    help="v45.6: сколько неудач FSA подряд включают авто-паузу.")
+    ap.add_argument("--fsa-max-cooldowns", type=int, default=3,
+                    help="v45.6: сколько раз максимум авто-паузить FSA за прогон. После — FSA "
+                         "отпускается (недобранное добивается кнопкой «Повторить упавшие FSA»).")
     # v27.6: уменьшен с 45000 до 28000 — раньше FSA-карточка занимала 165с
     ap.add_argument("--registry-browser-timeout-ms", type=int, default=28000)
     ap.add_argument("--registry-browser-wait-ms", type=int, default=8000,

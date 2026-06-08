@@ -78,6 +78,29 @@ def main():
     check("декл: наименование продукции", d.get("product_full") == "Шорли Виноград")
     check("декл: тип документа = Декларация", d.get("doc_type") == "Декларация")
 
+    # --- КОДЫ СТАТУСОВ idStatus (подтверждены пользователем по карточкам) ---
+    status_cases = {6: "Действует", 15: "Приостановлен", 14: "Прекращён",
+                    11: "Недействителен", 1: "Архивный"}
+    for code, want in status_cases.items():
+        pay = {"number": "X-1", "idStatus": code, "product": {"fullName": "Товар"}}
+        rr = mv.parse_fsa_json(pay, "https://pub.fsa.gov.ru/rss/certificate/view/9/baseInfo",
+                               "rss_certificate", "9")
+        check(f"idStatus={code} -> «{want}»", rr.get("status") == want)
+
+    # --- НЕдействующие статусы -> вердикт «НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ» ---
+    for st in ("Прекращён", "Приостановлен", "Недействителен", "Архивный"):
+        verdict, score, _why = mv.compare_product_names(
+            "Куртка детская", "Куртка детская", brand="X", subject="Куртки", doc_status=st)
+        check(f"статус «{st}» -> НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ", verdict == "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ")
+
+    # --- авто-восстановление FSA: CLI-флаги паузы ---
+    ap = mv.build_parser()
+    a = ap.parse_args(["--input-links-csv", "x.csv"])
+    check("--fsa-cooldown-sec по умолчанию 90", abs(a.fsa_cooldown_sec - 90.0) < 1e-6)
+    check("--fsa-cooldown-fails по умолчанию 8", a.fsa_cooldown_fails == 8)
+    check("--fsa-max-cooldowns по умолчанию 3", a.fsa_max_cooldowns == 3)
+    check("есть глобал паузы _FSA_COOLDOWN_UNTIL", hasattr(mv, "_FSA_COOLDOWN_UNTIL"))
+
 
 if __name__ == "__main__":
     main()

@@ -2044,7 +2044,7 @@ _FSA_HTTP_FAIL_LIMIT = 5
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
 _FSA_SAMPLE_DUMPED = False
 
-async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None) -> List[Card]:
+async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1) -> List[Card]:
     """v39.9: subject отдельно от subjectName.
 
     WB API в v18 возвращает оба поля:
@@ -2058,14 +2058,19 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
     v39.11: добавлен опциональный dict stats для подсчёта сколько карточек
     WB вернул всего и сколько было отфильтровано. Это даёт пользователю
     видеть «WB вернул 0» vs «фильтр отбросил».
+
+    v27.9.x: page — номер страницы WB-поиска. Нужно для ПОИСКА ПО БРЕНДУ одним
+    «чистым» запросом (без расширения категориями): листаем страницы, чтобы
+    собрать все товары бренда, а не только первую (~100 шт).
     """
     cards: List[Card] = []
     q = urllib.parse.quote(query)
+    _pg = max(1, int(page or 1))
     # несколько актуальных хостов/версий, первый обычно быстрее
     urls = [
-        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
-        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
-        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=catalog&sort={sort}&spp=30",
+        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
+        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
+        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30",
     ]
     for url in urls:
         data = await fetch_json(session, url)
@@ -2186,8 +2191,15 @@ async def collect_cards(args) -> List[Card]:
                     break
         return cards
 
+    # v27.9.x: ПОИСК ПО БРЕНДУ — это просто товары бренда, БЕЗ приписок категорий.
+    # Раньше запрос «reebok» расширялся в «reebok детские/обувь…» (generate_query_
+    # variants) и доменный subject-фильтр резал часть товаров. Теперь для бренда:
+    # один чистый запрос + листание страниц + без доменного фильтра.
+    _brand_search = bool((getattr(args, 'brand', '') or '').strip()) and \
+        (getattr(args, 'brand_match', 'any') or 'any') != 'any'
+
     variants = generate_query_variants(args.query, args.query_profile, args.max_expanded_queries)
-    if args.limit <= args.per_query_limit and not args.auto_expand:
+    if _brand_search or (args.limit <= args.per_query_limit and not args.auto_expand):
         variants = [args.query]
 
     # v39.7: определяем domain один раз, используем для фильтрации мусорных subject
@@ -2209,6 +2221,11 @@ async def collect_cards(args) -> List[Card]:
     strict_filter_enabled = getattr(args, 'strict_domain_filter', True)
     has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
     use_filter = strict_filter_enabled and domain and has_signals
+    # v27.9.x: при поиске по бренду доменный subject-фильтр ВЫКЛючен — берём все
+    # товары бренда (релевантность обеспечивает строгий бренд-фильтр ниже).
+    if _brand_search:
+        use_filter = False
+        domain = ''
     filter_label = f"domain={domain} subject_filter={'ON' if use_filter else 'OFF'}"
     print(f"Получаю список карточек через JSON-каталог WB: базовый query='{args.query}', вариантов={len(variants)}, общий limit={args.limit}, collect-workers={args.collect_workers}; {filter_label}")
 
@@ -2226,13 +2243,26 @@ async def collect_cards(args) -> List[Card]:
     collect_stats = {'wb_returned': 0, 'filtered_out': 0}
     sem = asyncio.Semaphore(args.collect_workers)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        # v27.9.x: для бренда листаем до нужного лимита (одна «чистая» выдача),
+        # для обычного поиска — 1 страница (охват даёт расширение вариантов).
+        _max_pages = max(1, min(60, (int(args.limit) // 90) + 2)) if _brand_search else 1
+
         async def work(q):
             async with sem:
                 for sort in args.search_sorts.split(","):
                     sort = sort.strip() or "popular"
-                    cards = await collect_one_query(session, q, args.per_query_limit, sort, domain=domain if use_filter else '', stats=collect_stats)
-                    for c in cards:
-                        cards_map.setdefault(c.nm_id, c)
+                    for _page in range(1, _max_pages + 1):
+                        cards = await collect_one_query(
+                            session, q, args.per_query_limit, sort,
+                            domain=domain if use_filter else '', stats=collect_stats, page=_page)
+                        before = len(cards_map)
+                        for c in cards:
+                            cards_map.setdefault(c.nm_id, c)
+                        # страница не дала ни одной НОВОЙ карточки — дальше листать смысла нет
+                        if len(cards_map) == before or not cards:
+                            break
+                        if len(cards_map) >= args.limit:
+                            break
                     if len(cards_map) >= args.limit:
                         break
         tasks = [asyncio.create_task(work(q)) for q in variants]
@@ -7028,6 +7058,7 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
     out: Dict[str, str] = {}
     homogeneous: List[str] = []
     full_products: List[str] = []
+    generic_products: List[str] = []  # v27.9.x: запасной захват наименования продукции
     tnved_codes: List[str] = []
 
     if not BeautifulSoup:
@@ -7083,6 +7114,16 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
             v = _trim_product_value(value)
             if _looks_like_product_value(v) and not _swis_value_is_not_product(v):
                 full_products.append(v)
+        # v27.9.x: ЗАПАСНОЙ захват наименования продукции для других вёрсток SWIS
+        # (KGZ-National / упрощённые декларации), где нет слов «однородное» или
+        # «идентификац». Срабатывает только если выше точные метки не подошли —
+        # это чинит пустое «название из реестра» по части киргизских документов.
+        elif (("наименование продукции" in label or "наименование товара" in label
+               or "наименование объекта" in label)
+              and "однородн" not in label):
+            v = _trim_product_value(value)
+            if _looks_like_product_value(v) and not _swis_value_is_not_product(v):
+                generic_products.append(v)
         elif "схема сертификации" in label and not out.get("scheme"):
             out["scheme"] = value[:40]
         elif ("обозначение тр" in label or "технического регламента" in label or
@@ -7099,6 +7140,9 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
     product_parts: List[str] = []
     product_parts.extend(homogeneous[:5])
     product_parts.extend(full_products[:20])
+    # v27.9.x: если точные метки ничего не дали — берём запасные наименования.
+    if not product_parts and generic_products:
+        product_parts.extend(_unique_keep_order(generic_products)[:10])
     if product_parts:
         out["product"] = "; ".join(_unique_keep_order(product_parts))
     if tnved_codes:

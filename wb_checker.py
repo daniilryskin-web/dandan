@@ -726,6 +726,7 @@ class EngineRunner:
         """Читает лист 'Сводка' из XLSX и заполняет metrics.status/risk/registry."""
         try:
             from openpyxl import load_workbook  # type: ignore
+            xlsx_path = self._freshest_xlsx(Path(xlsx_path))
             wb = load_workbook(xlsx_path, read_only=True, data_only=True)
             if "Сводка" not in wb.sheetnames:
                 return
@@ -1021,12 +1022,30 @@ class Bridge:
 
     # ---- результаты ----
 
+    @staticmethod
+    def _freshest_xlsx(path: Path) -> Path:
+        """v27.9.x: если основной XLSX был занят (открыт в Excel), движок пишет
+        в `<stem>_live.xlsx`. Тогда таблица/графики ДОЛЖНЫ читать именно его, иначе
+        показывали бы устаревшие данные прошлого прогона. Возвращаем самый свежий
+        из (основной, _live)."""
+        try:
+            live = path.with_name(path.stem + "_live" + path.suffix)
+            if live.exists():
+                if not path.exists():
+                    return live
+                if live.stat().st_mtime > path.stat().st_mtime + 0.5:
+                    return live
+        except Exception:
+            pass
+        return path
+
     def get_results(self, xlsx_path: Optional[str] = None, limit: int = 2000) -> dict:
         """
         Читает лист «Подробности» из XLSX и возвращает данные для таблицы.
         Также считает статистику по статусу, реестру и маркетплейсу.
         """
         path = Path(xlsx_path or self.state.output_path or "")
+        path = self._freshest_xlsx(path)
         if not path.exists():
             return {"ok": False, "error": "Файл результата не найден. Запустите прогон."}
         try:

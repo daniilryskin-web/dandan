@@ -20,6 +20,7 @@ MODULES = [
     "test_fsa_fastfail",
     "test_brand_unified_report",
     "test_brand_routing",
+    "test_brand_search",
     "test_cert_fetch",
     "test_xlsx_safe",
     "test_ozon_verdict",

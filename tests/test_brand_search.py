@@ -43,14 +43,14 @@ def _args(**over):
 
 def run_collect(mv, args):
     """Запускает collect_cards с замоканными collect_one_query и discover_brand_
-    filter_ids (без сети); возвращает список (query, page, sort, fbrand_ids)."""
+    filter_ids (без сети); возвращает (seen, final_cards).
+    seen = список (query, page, sort, fbrand_ids)."""
     seen = []
     nm_counter = [1000]
 
     async def fake_collect_one_query(session, query, per_query_limit, sort,
                                      domain='', stats=None, page=1, fbrand_ids=None):
         seen.append((query, page, sort, tuple(fbrand_ids or ())))
-        # на первых двух страницах отдаём карточки, дальше — пусто (конец листания)
         if page <= 2:
             out = []
             for _ in range(3):
@@ -61,38 +61,42 @@ def run_collect(mv, args):
         return []
 
     async def fake_discover(session, brand, timeout=10.0):
-        return ["12345"]  # имитируем найденный brandId
+        return ["12345"]
 
     orig = mv.collect_one_query
     orig_disc = mv.discover_brand_filter_ids
     mv.collect_one_query = fake_collect_one_query
     mv.discover_brand_filter_ids = fake_discover
     try:
-        asyncio.run(mv.collect_cards(args))
+        cards = asyncio.run(mv.collect_cards(args))
     finally:
         mv.collect_one_query = orig
         mv.discover_brand_filter_ids = orig_disc
-    return seen
+    return seen, cards
 
 
 def main():
     import main_v39 as mv
     import wb_checker as wc
 
-    # 1) БРЕНД: только чистый запрос + листание + несколько сортировок + brandId
-    seen_brand = run_collect(mv, _args(brand="reebok", brand_match="contains", query="reebok", limit=1000))
+    # 1) БРЕНД: базовый запрос + brandId-каталог + сортировки + ДОБОР по категориям
+    seen_brand, cards_brand = run_collect(
+        mv, _args(brand="reebok", brand_match="contains", query="reebok", limit=1000))
     queries = {q for q, _p, _s, _b in seen_brand}
-    pages = {p for _q, p, _s, _b in seen_brand}
     sorts = {s for _q, _p, s, _b in seen_brand}
     fbrands = {b for _q, _p, _s, b in seen_brand}
-    check("бренд: запрос ТОЛЬКО 'reebok' (без приписок)", queries == {"reebok"})
-    check("бренд: нет варианта с 'детск'", not any("детск" in q for q in queries))
-    check("бренд: листается несколько страниц", max(pages) >= 2)
+    check("бренд: базовый запрос 'reebok' с brandId-каталогом",
+          ("12345",) in fbrands and "reebok" in queries)
     check("бренд: используется НЕСКОЛЬКО сортировок", len(sorts) >= 3)
-    check("бренд: передаётся brandId в бренд-каталог", ("12345",) in fbrands)
+    check("бренд: ДОБОР по категориям ('reebok обувь')",
+          any(q.startswith("reebok ") and q != "reebok" for q in queries))
+    check("бренд: столбец «Запрос» у всех карточек = бренд",
+          bool(cards_brand) and all(c.source_query == "reebok" for c in cards_brand))
+    check("бренд: все карточки соответствуют бренду",
+          all(mv.brand_matches_v39(c.brand, "reebok", "contains") for c in cards_brand))
 
-    # 2) обычный поиск: page=1, без brandId
-    seen_q = run_collect(mv, _args(brand="", brand_match="any", query="reebok"))
+    # 2) обычный поиск: page=1, без brandId, без добора по категориям
+    seen_q, _cards_q = run_collect(mv, _args(brand="", brand_match="any", query="reebok"))
     check("обычный поиск: только page=1", {p for _q, p, _s, _b in seen_q} == {1})
     check("обычный поиск: без brandId", all(b == () for _q, _p, _s, b in seen_q))
 

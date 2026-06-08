@@ -2820,21 +2820,41 @@ async function loadResults() {
   }
 }
 
+// v27.9.x: КУРИРУЕМЫЙ набор колонок таблицы — включает «Название в реестре»
+// (наименование товара из реестра) и ключевые поля документа, которые раньше
+// были за пределами первых 14 столбцов и не показывались.
+const PREFERRED_COLS = [
+  'Запрос', 'Артикул WB', 'Название товара', 'Бренд', 'Категория WB',
+  'Технический статус', 'Цена со скидкой, ₽', 'Продавец', "Плашка 'Оригинал'",
+  'Название в реестре', 'Статус документа', 'Номер документа', 'Тип документа',
+  'ТН ВЭД', 'Изготовитель', 'Действует до', 'Риск по сроку', 'Ссылка на товар',
+];
+
+function _tableColIndices() {
+  // Сопоставляем предпочтительные заголовки с реальными; чего нет — пропускаем.
+  let idx = [];
+  for (const name of PREFERRED_COLS) {
+    const i = _allHeaders.indexOf(name);
+    if (i >= 0 && !idx.includes(i)) idx.push(i);
+  }
+  if (!idx.length) idx = _allHeaders.map((_, i) => i).slice(0, 16);
+  return idx;
+}
+
 function renderTable(rows) {
   const wrap = $('#tbl-wrap');
   if (!rows.length) {
     wrap.innerHTML = '<div class="empty-state"><div class="empty-ico">🤷</div><p>Ничего не найдено</p></div>';
     return;
   }
-  // Показываем первые 14 колонок
-  const cols = _allHeaders.slice(0, 14);
+  const colIdx = _tableColIndices();
   let html = '<table><thead><tr>' +
-    cols.map(h => `<th title="${escapeHtml(h)}">${escapeHtml(h.length > 22 ? h.slice(0,20)+'…' : h)}</th>`).join('') +
+    colIdx.map(i => { const h = _allHeaders[i] || ''; return `<th title="${escapeHtml(h)}">${escapeHtml(h.length > 22 ? h.slice(0,20)+'…' : h)}</th>`; }).join('') +
     '</tr></thead><tbody>';
   const hl = _allHeaders.map(x => x.toLowerCase());
   for (const row of rows.slice(0, 1000)) {
     html += '<tr>';
-    cols.forEach((_, ci) => {
+    colIdx.forEach((ci) => {
       const v = String(row[ci] ?? '');
       const head = hl[ci] || '';
       let badge = '';

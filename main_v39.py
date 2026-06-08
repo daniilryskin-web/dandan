@@ -2321,7 +2321,12 @@ async def collect_cards(args) -> List[Card]:
         (getattr(args, 'brand_match', 'any') or 'any') != 'any'
 
     variants = generate_query_variants(args.query, args.query_profile, args.max_expanded_queries)
-    if _brand_search or (args.limit <= args.per_query_limit and not args.auto_expand):
+    # v27.9.x: при поиске по бренду РАЗРЕШАЕМ варианты запроса (бренд + типы
+    # товаров) — это даёт БОЛЬШЕ карточек (как в поиске по запросу). Релевантность
+    # обеспечивает строгий бренд-фильтр ниже, а столбец «Запрос» мы переопределяем
+    # на сам бренд (чтобы не было «reebok детские» в выгрузке). Полный бренд-каталог
+    # по brandId добавляется отдельно. Без бренда — прежняя логика.
+    if not _brand_search and args.limit <= args.per_query_limit and not args.auto_expand:
         variants = [args.query]
 
     # v39.7: определяем domain один раз, используем для фильтрации мусорных subject
@@ -2383,17 +2388,43 @@ async def collect_cards(args) -> List[Card]:
             print(f"Бренд-каталог: brandId={_fbrand_ids or 'не найден (работаю по поиску)'}; "
                   f"сортировок={len(_brand_sorts)}, страниц до {_max_pages}")
 
+        _brand_base_q = (args.query or args.brand or "").strip()
+
         async def work(q):
             async with sem:
-                _sorts = _brand_sorts if _brand_search else [s.strip() or "popular" for s in args.search_sorts.split(",")]
+                # Базовый запрос бренда: ПОЛНЫЙ каталог по brandId + все сортировки +
+                # глубокое листание. Остальные варианты («reebok кроссовки» и т.п.):
+                # только текстовый поиск, 1 сортировка, немного страниц — добор охвата.
+                is_base = (not _brand_search) or (q == _brand_base_q)
+                if _brand_search and is_base:
+                    _sorts = _brand_sorts
+                    _pages = _max_pages
+                    _fb = _fbrand_ids
+                elif _brand_search:
+                    _sorts = ["popular"]
+                    _pages = min(_max_pages, 4)
+                    _fb = []
+                else:
+                    _sorts = [s.strip() or "popular" for s in args.search_sorts.split(",")]
+                    _pages = _max_pages
+                    _fb = []
                 for sort in _sorts:
-                    for _page in range(1, _max_pages + 1):
+                    for _page in range(1, _pages + 1):
                         cards = await collect_one_query(
                             session, q, args.per_query_limit, sort,
                             domain=domain if use_filter else '', stats=collect_stats,
-                            page=_page, fbrand_ids=_fbrand_ids)
+                            page=_page, fbrand_ids=_fb)
                         before = len(cards_map)
                         for c in cards:
+                            # v27.9.x: для бренда ПРЕД-фильтруем по бренду прямо здесь —
+                            # иначе варианты «reebok кроссовки» забивают лимит чужими
+                            # товарами, а нужные карточки не попадают. И столбец
+                            # «Запрос» = сам бренд (без служебных вариантов).
+                            if _brand_search:
+                                if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
+                                                         getattr(args, 'brand_match', 'contains') or 'contains'):
+                                    continue
+                                c.source_query = args.brand or c.source_query
                             cards_map.setdefault(c.nm_id, c)
                         # страница не дала ни одной НОВОЙ карточки — дальше листать смысла нет
                         if len(cards_map) == before or not cards:
@@ -2413,6 +2444,55 @@ async def collect_cards(args) -> List[Card]:
                     if not x.done():
                         x.cancel()
                 break
+
+        # v27.9.x: ДОБОР по фактическим категориям бренда. Текстовый поиск по слову
+        # бренда (и каталог, если brandId не нашёлся) даёт ограниченный топ. Берём
+        # категории уже собранных карточек и делаем точечные запросы «<бренд>
+        # <категория>» — это вытаскивает товары бренда из разных разделов. Работает
+        # для ЛЮБОГО бренда (data-driven), без жёстких списков категорий.
+        if _brand_search and len(cards_map) < args.limit:
+            from collections import Counter as _Counter
+            _subj_counter: "_Counter[str]" = _Counter()
+            for c in list(cards_map.values()):
+                sn = (getattr(c, 'subject', '') or '').strip()
+                if sn and not sn.isdigit() and len(sn) <= 60:
+                    _subj_counter[sn] += 1
+            _top_subjects = [s for s, _ in _subj_counter.most_common(25)]
+
+            async def _expand(subj: str):
+                async with sem:
+                    qx = f"{args.brand} {subj}".strip()
+                    for sort in ("popular", "newly"):
+                        for _page in range(1, min(_max_pages, 5) + 1):
+                            if len(cards_map) >= args.limit:
+                                return
+                            cards = await collect_one_query(
+                                session, qx, args.per_query_limit, sort,
+                                domain='', stats=collect_stats, page=_page)
+                            before = len(cards_map)
+                            for c in cards:
+                                if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
+                                                         getattr(args, 'brand_match', 'contains') or 'contains'):
+                                    continue
+                                c.source_query = args.brand or c.source_query
+                                cards_map.setdefault(c.nm_id, c)
+                            if len(cards_map) == before or not cards:
+                                break
+
+            if _top_subjects:
+                print(f"Добор по категориям бренда: {len(_top_subjects)} категорий "
+                      f"({', '.join(_top_subjects[:6])}…)")
+                _ex_tasks = [asyncio.create_task(_expand(s)) for s in _top_subjects]
+                for t in asyncio.as_completed(_ex_tasks):
+                    try:
+                        await t
+                    except Exception:
+                        pass
+                    if len(cards_map) >= args.limit:
+                        for x in _ex_tasks:
+                            if not x.done():
+                                x.cancel()
+                        break
 
     # v39.11: показать статистику сбора. Особенно важно когда найдено мало карточек
     # — пользователь поймёт причина в WB-выдаче или в нашем фильтре.
@@ -6691,19 +6771,31 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                     # все надёжные поля (ИНН, заявитель, изготовитель, схема,
                     # техрегламент, даты).
                     _tech_reg = _parsed.get('technical_regulation', '')
-                    # v27.9.x: если в JSON техрегламент задан неизвестным числовым
-                    # кодом (тогда поле пустое), берём настоящий «ТР ТС NNN/YYYY» /
-                    # «ТР ЕАЭС NNN/YYYY» из текста уже загруженной страницы ФСА.
-                    if not _tech_reg:
-                        try:
-                            _ptxt = await page.evaluate(
-                                "() => (document.body ? (document.body.innerText || '') : '')")
-                            _trm = re.findall(r'ТР\s+(?:ТС|ЕАЭС)\s+\d{3}/\d{4}', _ptxt or '')
-                            if _trm:
-                                _tech_reg = '; '.join(dict.fromkeys(
-                                    re.sub(r'\s+', ' ', x).strip() for x in _trm))
-                        except Exception:
-                            pass
+                    # v27.9.x: ТР ТС и ТН ВЭД в JSON ФСА заданы только внутренними
+                    # числовыми id (idTechnicalReglaments / idTnveds), а не текстом.
+                    # Берём настоящие значения из текста уже загруженной страницы.
+                    _tnved = ''
+                    _ptxt = ''
+                    try:
+                        _ptxt = await page.evaluate(
+                            "() => (document.body ? (document.body.innerText || '') : '')")
+                    except Exception:
+                        _ptxt = ''
+                    if not _tech_reg and _ptxt:
+                        _trm = re.findall(r'ТР\s+(?:ТС|ЕАЭС)\s+\d{3}/\d{4}', _ptxt)
+                        if _trm:
+                            _tech_reg = '; '.join(dict.fromkeys(
+                                re.sub(r'\s+', ' ', x).strip() for x in _trm))
+                    if _ptxt:
+                        # после «ТН ВЭД» идёт 4–10-значный код (возможно с пробелами)
+                        _tnm = re.findall(r'ТН\s?ВЭД[^\d]{0,40}?(\d[\d\s]{2,13}\d)', _ptxt)
+                        _codes = []
+                        for _c in _tnm:
+                            _cc = _clean_tnved_code(_c)
+                            if _cc and _cc not in _codes:
+                                _codes.append(_cc)
+                        if _codes:
+                            _tnved = '; '.join(_codes[:10])
                     _api_ext = {
                         'document_date_start': _parsed.get('date_start', ''),
                         'document_date_end': _parsed.get('date_end', ''),
@@ -6712,6 +6804,7 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                         'manufacturer_name': _clean_org_name(_parsed.get('manufacturer', '')),
                         'scheme': _parsed.get('scheme', ''),
                         'technical_regulation': _tech_reg,
+                        'tnved': _tnved,
                     }
                     _FSA_EXTENDED_FIELDS_CACHE[url] = {k: v for k, v in _api_ext.items() if v}
                     _st = _parsed.get('status', '')

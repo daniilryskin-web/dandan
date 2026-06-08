@@ -414,6 +414,7 @@ def fetch_fsa_via_http(
     user_agent: Optional[str] = None,
     aggressive: bool = False,
     skip_warmup: bool = False,
+    cookies: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, str]]:
     """Главный публичный API.
 
@@ -421,6 +422,12 @@ def fetch_fsa_via_http(
       - URL не FSA-документ
       - curl_cffi не установлен (FSA вернёт 403)
       - все попытки вернули 403/500/пустые ответы
+
+    v45.2: cookies — куки сессии, СНЯТЫЕ С НАСТОЯЩЕГО БРАУЗЕРА (который прошёл
+    JS-антибот ФСА). С ними curl_cffi обращается к /api/v1/.../{id} напрямую и
+    получает тот же JSON, что браузер — но в разы быстрее и одним лёгким запросом
+    вместо полной отрисовки SPA. Это ключ к скорости без блокировок: после первого
+    документа (через браузер) все остальные тянем по HTTP с этими куками.
 
     Использование:
         result = fetch_fsa_via_http("https://pub.fsa.gov.ru/rss/certificate/view/123/baseInfo")
@@ -446,11 +453,21 @@ def fetch_fsa_via_http(
     impersonates = [impersonate, "chrome120", "chrome110"]
     seen = set()
     impersonates = [x for x in impersonates if not (x in seen or seen.add(x))]
+    _ck = {str(k): str(v) for k, v in (cookies or {}).items() if k}
 
     for imp in impersonates:
         try:
             sess = _curl_requests.Session()
+            # v45.2: подкладываем браузерные куки в сессию curl_cffi — с ними API ФСА
+            # отвечает там, где «голый» HTTP получает 403 (антибот ставит куку через JS).
+            if _ck:
+                try:
+                    for _k, _v in _ck.items():
+                        sess.cookies.set(_k, _v, domain="pub.fsa.gov.ru")
+                except Exception:
+                    pass
             # Warm-up — это критично, без него FSA часто отдаёт 403
+
             if not skip_warmup:
                 for label, warm_url, typ in _fsa_warmup_urls(kind, doc_id, referer):
                     try:
@@ -1869,16 +1886,39 @@ DOMAIN_SUBJECT_NAME_KEYWORDS = {
 # попадали чехлы/аксессуары/одежда. Добавляем отдельно, чтобы не трогать большие
 # литералы выше.
 DOMAIN_PRODUCT_TYPES['appliances'] = [
+    # крупная бытовая техника
     'стиральные машины', 'холодильники', 'посудомоечные машины', 'плиты',
     'духовые шкафы', 'варочные панели', 'микроволновые печи', 'вытяжки',
     'морозильные камеры', 'пылесосы', 'водонагреватели', 'кондиционеры',
     'сушильные машины', 'встраиваемые духовые шкафы', 'газовые плиты',
-    'электроплиты', 'винные шкафы',
+    'электроплиты', 'винные шкафы', 'сплит-системы',
+    # мелкая кухонная техника
+    'чайники электрические', 'мультиварки', 'блендеры', 'миксеры', 'тостеры',
+    'кофемашины', 'кофеварки', 'мясорубки', 'соковыжималки', 'кухонные комбайны',
+    'грили', 'аэрогрили', 'фритюрницы', 'хлебопечки', 'электрочайники',
+    'пароварки', 'вафельницы', 'электрогрили', 'кулеры для воды',
+    # климат, уход, мелкая бытовая
+    'увлажнители воздуха', 'очистители воздуха', 'обогреватели', 'конвекторы',
+    'тепловентиляторы', 'вентиляторы', 'фены', 'выпрямители для волос',
+    'утюги', 'отпариватели', 'ирригаторы', 'электробритвы',
+    'машинки для стрижки', 'триммеры', 'весы напольные', 'весы кухонные',
+    'роботы-пылесосы', 'парогенераторы',
 ]
 DOMAIN_SUBJECT_NAME_KEYWORDS['appliances'] = [
+    # крупная
     'стиральн', 'холодильник', 'посудомоечн', 'плита', 'плиты', 'духов',
     'варочн', 'микроволнов', 'вытяжк', 'морозильник', 'морозильн', 'пылесос',
-    'водонагреватель', 'кондиционер', 'сушильн', 'бытовая техник', 'духовой шкаф',
+    'водонагреватель', 'кондиционер', 'сплит-систем', 'сушильн', 'винн', 'шкаф',
+    'бытовая техник', 'духовой шкаф',
+    # мелкая кухонная
+    'чайник', 'мультиварк', 'блендер', 'миксер', 'тостер', 'кофемашин',
+    'кофеварк', 'мясорубк', 'соковыжималк', 'комбайн', 'гриль', 'фритюр',
+    'хлебопечк', 'пароварк', 'вафельниц', 'кулер', 'ростер', 'электропечь',
+    # климат/уход/мелкая
+    'увлажнитель', 'очиститель воздуха', 'обогреватель', 'конвектор',
+    'тепловентилятор', 'вентилятор', 'фен ', 'фены', 'выпрямитель', 'плойк',
+    'утюг', 'отпариватель', 'парогенератор', 'ирригатор', 'электробритв',
+    'машинка для стрижки', 'триммер', 'весы', 'климат', 'обогрев',
 ]
 DOMAIN_SUBJECT_WHITELIST['appliances'] = []  # фильтруем по ключевым словам названия
 
@@ -2211,6 +2251,14 @@ _FSA_EXTENDED_FIELDS_CACHE: Dict[str, Dict[str, str]] = {}
 _FSA_HTTP_FAILS = 0
 _FSA_HTTP_DISABLED = False
 _FSA_HTTP_FAIL_LIMIT = 5
+
+# v45.2: куки сессии ФСА, снятые с настоящего браузера (он проходит JS-антибот,
+# который ставит сессионную куку). С этими куками curl_cffi обращается к API ФСА
+# напрямую — быстро и одним лёгким запросом, без полной отрисовки SPA. Заполняется
+# после первого УСПЕШНОГО браузерного парсинга и обновляется, если куки протухли.
+_FSA_SESSION_COOKIES: Dict[str, str] = {}
+_FSA_COOKIE_HTTP_OK = 0   # сколько документов добыто быстрым HTTP по кукам
+_FSA_COOKIE_HTTP_FAIL = 0  # сколько раз HTTP по кукам не сработал (куки протухли/нет токена)
 
 # v27.9.x: один раз за прогон сохраняем сырой JSON-ответ API ФСА в файл —
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
@@ -6772,6 +6820,26 @@ async def _fetch_fsa_via_browser_page(page, url: str) -> Optional[Dict[str, str]
     return None
 
 
+async def _harvest_fsa_cookies(page) -> None:
+    """v45.2: снимает куки сессии pub.fsa.gov.ru с браузерного контекста в общий
+    кэш _FSA_SESSION_COOKIES. Вызывается после успешной загрузки FSA-документа —
+    браузер к этому моменту уже прошёл JS-антибот и получил валидную сессию.
+    С этими куками curl_cffi обращается к API ФСА напрямую (быстрый путь)."""
+    global _FSA_SESSION_COOKIES
+    try:
+        ck = await page.context.cookies("https://pub.fsa.gov.ru")
+    except Exception:
+        return
+    jar = {}
+    for c in ck or []:
+        name = c.get("name")
+        val = c.get("value")
+        if name and val is not None:
+            jar[str(name)] = str(val)
+    if jar:
+        _FSA_SESSION_COOKIES = jar
+
+
 async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str, str, str, str, str]:
     """v39.5: возвращает (cert_number, product_name, doc_type, doc_status, detail).
 
@@ -6781,54 +6849,77 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     прогон, и парсинг идёт сразу через браузер. Это убирает ~10-20 сек бесполезных
     HTTP-запросов перед каждым документом.
     """
-    global _FSA_HTTP_FAILS, _FSA_HTTP_DISABLED
-    # v40.2: HTTP fast-path через curl_cffi, с circuit breaker. FSA блокирует «голый»
-    # HTTP по TLS-фингерпринту/IP, поэтому если несколько попыток подряд провалились —
-    # отключаем HTTP на весь прогон и идём только через браузер (это быстрее, чем зря
-    # долбиться в HTTP перед каждым документом).
-    if bool(getattr(args, 'fsa_http_fast_path', True)) and not _FSA_HTTP_DISABLED:
+    global _FSA_HTTP_FAILS, _FSA_HTTP_DISABLED, _FSA_COOKIE_HTTP_OK, _FSA_COOKIE_HTTP_FAIL
+
+    def _apply_http_result(result) -> Optional[Tuple[str, str, str, str, str]]:
+        """Раскладывает успешный HTTP-результат в кортеж + кэш расширенных полей."""
+        if not (result and result.get('doc_number')):
+            return None
+        _FSA_EXTENDED_FIELDS_CACHE[url] = {
+            'document_date_start': result.get('date_start', ''),
+            'document_date_end': result.get('date_end', ''),
+            'applicant_name': _clean_org_name(result.get('applicant', '')),
+            'applicant_inn': result.get('applicant_inn', ''),
+            'manufacturer_name': _clean_org_name(result.get('manufacturer', '')),
+            'tnved': _clean_tnved_code(result.get('tnved', '')),
+            'scheme': result.get('scheme', ''),
+            'technical_regulation': result.get('technical_regulation', ''),
+        }
+        return (result.get('doc_number', ''), result.get('product_full', ''),
+                result.get('doc_type', ''), result.get('status', ''),
+                f"fsa_cookie_http_ok; source={result.get('source','')[:120]}")
+
+    # v45.2: БЫСТРЫЙ путь по КУКАМ браузера. Если у нас уже есть сессионные куки ФСА
+    # (сняты с браузера, который прошёл JS-антибот), тянем JSON API напрямую через
+    # curl_cffi — это один лёгкий запрос вместо полной загрузки SPA. Так первый
+    # документ идёт через браузер (и отдаёт куки), а все следующие — мгновенно по HTTP.
+    if (bool(getattr(args, 'fsa_cookie_http', True)) and _FSA_SESSION_COOKIES
+            and is_curl_cffi_available()):
+        try:
+            impersonate = str(getattr(args, 'fsa_curl_cffi_impersonate', 'chrome') or 'chrome')
+            http_timeout = min(8.0, max(4.0, int(getattr(args, 'registry_browser_timeout_ms', 30000)) / 1000.0))
+            result = await asyncio.to_thread(
+                fetch_fsa_via_http, url,
+                timeout_sec=http_timeout, impersonate=impersonate,
+                user_agent=getattr(args, 'user_agent', None),
+                skip_warmup=True, cookies=dict(_FSA_SESSION_COOKIES),
+            )
+            tup = _apply_http_result(result)
+            if tup is not None:
+                _FSA_COOKIE_HTTP_OK += 1
+                return tup
+            # куки не сработали (протухли / API сменил формат) — сбрасываем, дальше
+            # пойдём через браузер, который заодно добудет свежие куки.
+            _FSA_COOKIE_HTTP_FAIL += 1
+            if _FSA_COOKIE_HTTP_FAIL >= 3:
+                _FSA_SESSION_COOKIES.clear()
+                _FSA_COOKIE_HTTP_FAIL = 0
+        except Exception:
+            _FSA_COOKIE_HTTP_FAIL += 1
+
+    # v40.2: «голый» HTTP fast-path без кук (по умолчанию ВЫКЛ — FSA режет по TLS/IP).
+    if bool(getattr(args, 'fsa_http_fast_path', False)) and not _FSA_HTTP_DISABLED:
         try:
             if is_curl_cffi_available():
                 impersonate = str(getattr(args, 'fsa_curl_cffi_impersonate', 'chrome') or 'chrome')
                 http_timeout = min(8.0, max(4.0, int(getattr(args, 'registry_browser_timeout_ms', 30000)) / 1000.0))
                 result = await asyncio.to_thread(
-                    fetch_fsa_via_http,
-                    url,
-                    timeout_sec=http_timeout,
-                    impersonate=impersonate,
+                    fetch_fsa_via_http, url,
+                    timeout_sec=http_timeout, impersonate=impersonate,
                     user_agent=getattr(args, 'user_agent', None),
                 )
-                if result and result.get('doc_number'):
-                    _FSA_HTTP_FAILS = 0  # успех — сбрасываем счётчик
-                    cert_num = result.get('doc_number', '')
-                    product = result.get('product_full', '')
-                    doc_type = result.get('doc_type', '')
-                    status = result.get('status', '')
-                    # v39.14: сохраняем расширенные поля в глобальный кэш для подстановки в ResultRow
-                    # v27.5: applicant_name/manufacturer_name/tnved чистим от прилипших лейблов.
-                    _FSA_EXTENDED_FIELDS_CACHE[url] = {
-                        'document_date_start': result.get('date_start', ''),
-                        'document_date_end': result.get('date_end', ''),
-                        'applicant_name': _clean_org_name(result.get('applicant', '')),
-                        'applicant_inn': result.get('applicant_inn', ''),
-                        'manufacturer_name': _clean_org_name(result.get('manufacturer', '')),
-                        'tnved': _clean_tnved_code(result.get('tnved', '')),
-                        'scheme': result.get('scheme', ''),
-                        'technical_regulation': result.get('technical_regulation', ''),
-                    }
-                    detail = f"fsa_http_fast_path_ok; source={result.get('source','')[:120]}"
-                    return cert_num, product, doc_type, status, detail
-                else:
-                    _FSA_HTTP_FAILS += 1
-                    if _FSA_HTTP_FAILS >= _FSA_HTTP_FAIL_LIMIT and not _FSA_HTTP_DISABLED:
-                        _FSA_HTTP_DISABLED = True
-                        print(f"⚡ HTTP-парсинг FSA отключён после {_FSA_HTTP_FAILS} неудач подряд "
-                              f"(антибот FSA блокирует HTTP в этой сети). Дальше — только браузер, это быстрее чем зря пытаться.")
+                tup = _apply_http_result(result)
+                if tup is not None:
+                    _FSA_HTTP_FAILS = 0
+                    return tup
+                _FSA_HTTP_FAILS += 1
+                if _FSA_HTTP_FAILS >= _FSA_HTTP_FAIL_LIMIT and not _FSA_HTTP_DISABLED:
+                    _FSA_HTTP_DISABLED = True
+                    print(f"⚡ «Голый» HTTP-парсинг FSA отключён после {_FSA_HTTP_FAILS} неудач подряд.")
         except Exception:
             _FSA_HTTP_FAILS += 1
             if _FSA_HTTP_FAILS >= _FSA_HTTP_FAIL_LIMIT and not _FSA_HTTP_DISABLED:
                 _FSA_HTTP_DISABLED = True
-                print(f"⚡ HTTP-парсинг FSA отключён после {_FSA_HTTP_FAILS} неудач подряд. Дальше — только браузер.")
 
     number_routes, product_routes = fsa_exact_routes(url)
     wait_ms = int(getattr(args, 'registry_browser_wait_ms', 12000))
@@ -6866,6 +6957,14 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             any_goto_succeeded = True
             number_route_used = number_routes[0]
             if _resp.ok:
+                # v45.2: страница прошла JS-антибот ФСА и API ответил 200 — снимаем
+                # сессионные куки браузера в общий кэш. Следующие документы пойдут
+                # быстрым HTTP-путём по этим кукам (без полной загрузки SPA).
+                if bool(getattr(args, 'fsa_cookie_http', True)):
+                    try:
+                        await _harvest_fsa_cookies(page)
+                    except Exception:
+                        pass
                 _cap = await _resp.json()
                 # v27.9.x: один раз за прогон сохраняем сырой JSON ФСА для разбора
                 # структуры (status/scheme/название приходят кодами/в др. полях).
@@ -8359,6 +8458,11 @@ async def run_registry_stage(args):
         f"Готово. Excel сохранён: {Path(args.output).resolve()}. "
         f"Извлечено названий по уникальным реестрам: {stats['ok']}/{len(unique_urls)}; пусто={stats['empty']}; ошибки={stats['errors']}"
     )
+    # v45.2: сводка по быстрому HTTP-пути (куки браузера). Показывает, сколько
+    # FSA-документов добыто лёгким HTTP вместо полной загрузки SPA.
+    if _FSA_COOKIE_HTTP_OK > 0:
+        print(f"⚡ FSA: {_FSA_COOKIE_HTTP_OK} документ(ов) добыто быстрым HTTP по кукам браузера "
+              f"(без полной загрузки страницы — кратно быстрее и меньше запросов к FSA).")
     # v39.2: явная сводка по FSA, чтобы было видно — это сетевая проблема или парсинга
     if stats['fsa_done'] > 0:
         fsa_net_pct = 100.0 * stats['fsa_network_failures'] / stats['fsa_done']
@@ -8499,6 +8603,13 @@ def build_parser():
                     help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
                          "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "
                          "автоматический темп. 0,0 — без паузы (быстрее, но рискованнее).")
+    ap.add_argument("--fsa-cookie-http", type=str_to_bool, default=True,
+                    help="v45.2: УСКОРЕНИЕ FSA без блокировок. Первый документ парсится браузером "
+                         "(он проходит JS-антибот и отдаёт сессионные куки), а все следующие тянутся "
+                         "напрямую к JSON API ФСА быстрым HTTP с этими куками — один лёгкий запрос "
+                         "вместо полной загрузки SPA. Это ~5-10× меньше запросов к FSA (меньше риск "
+                         "блокировки) и кратно быстрее. Если куки протухают — авто-возврат к браузеру. "
+                         "false — только браузер (старое поведение).")
     ap.add_argument("--fsa-warmup", type=str_to_bool, default=False,
                     help="v45.1: прогрев сессии заходом на главную pub.fsa.gov.ru перед документами. "
                          "ПО УМОЛЧАНИЮ FALSE: при старте нескольких воркеров одновременная загрузка "

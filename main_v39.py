@@ -2419,22 +2419,23 @@ async def collect_cards(args) -> List[Card]:
     elif args.limit <= args.per_query_limit and not args.auto_expand:
         variants = [args.query]
 
-    domain = profile_to_domain.get(_profile_key)
-    if not domain:
-        domain = detect_query_domain(args.query)
     strict_filter_enabled = getattr(args, 'strict_domain_filter', True)
-    has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
-    use_filter = strict_filter_enabled and domain and has_signals
-    if _brand_search:
-        # Бренд + выбраны категории → ВКЛючаем доменный фильтр (только эти категории,
-        # через запятую). Бренд без категории → фильтр ВЫКЛючен (все товары бренда).
-        if _brand_domains:
-            domain = ','.join(_brand_domains)
-            use_filter = any(DOMAIN_SUBJECT_NAME_KEYWORDS.get(d) or DOMAIN_SUBJECT_WHITELIST.get(d)
-                             for d in _brand_domains)
-        else:
-            use_filter = False
-            domain = ''
+    if _brand_domains:
+        # Категории ВЫБРАНЫ явно (бренд ИЛИ запрос) — фильтруем по ним (несколько
+        # через запятую). Это уточняет выдачу и для поиска по запросу тоже.
+        domain = ','.join(_brand_domains)
+        use_filter = strict_filter_enabled and any(
+            DOMAIN_SUBJECT_NAME_KEYWORDS.get(d) or DOMAIN_SUBJECT_WHITELIST.get(d)
+            for d in _brand_domains)
+    elif _brand_search:
+        # Бренд без категории → фильтр ВЫКЛючен (все товары бренда).
+        domain = ''
+        use_filter = False
+    else:
+        # Обычный поиск без явной категории — авто-домен по тексту запроса.
+        domain = profile_to_domain.get(_profile_key) or detect_query_domain(args.query)
+        has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
+        use_filter = strict_filter_enabled and domain and has_signals
     filter_label = f"domain={domain} subject_filter={'ON' if use_filter else 'OFF'}"
     print(f"Получаю список карточек через JSON-каталог WB: базовый query='{args.query}', вариантов={len(variants)}, общий limit={args.limit}, collect-workers={args.collect_workers}; {filter_label}")
 
@@ -2461,7 +2462,11 @@ async def collect_cards(args) -> List[Card]:
         # перебираем НЕСКОЛЬКО сортировок — это докидывает товары, которые в одной
         # сортировке не попали в первые страницы.
         _fbrand_ids: List[str] = []
-        _brand_sorts = ["popular", "newly", "rate", "priceup", "pricedown"]
+        # v27.9.x: СКОРОСТЬ — для бренда хватает 2 сортировок (popular/newly) с
+        # листанием; 5 сортировок почти не добавляли уникальных, но кратно
+        # замедляли сбор (каждая — отдельная серия запросов). Если brandId найден —
+        # бренд-каталог и так отдаёт всё, сортировки тем более не нужны.
+        _brand_sorts = ["popular", "newly"]
         if _brand_search:
             try:
                 _fbrand_ids = await discover_brand_filter_ids(session, args.brand)
@@ -2526,12 +2531,11 @@ async def collect_cards(args) -> List[Card]:
                         x.cancel()
                 break
 
-        # v27.9.x: ДОБОР по фактическим категориям бренда. Текстовый поиск по слову
-        # бренда (и каталог, если brandId не нашёлся) даёт ограниченный топ. Берём
-        # категории уже собранных карточек и делаем точечные запросы «<бренд>
-        # <категория>» — это вытаскивает товары бренда из разных разделов. Работает
-        # для ЛЮБОГО бренда (data-driven), без жёстких списков категорий.
-        if _brand_search and len(cards_map) < args.limit:
+        # v27.9.x: ДОБОР по фактическим категориям бренда. Нужен ТОЛЬКО когда
+        # категория НЕ выбрана (профиль «любая»): тогда «бренд + тип» вариантов нет,
+        # и добор по реальным subject'ам даёт охват. Если категории ВЫБРАНЫ —
+        # варианты «бренд + тип» уже покрывают их, добор лишний и только замедляет.
+        if _brand_search and not _brand_domains and len(cards_map) < args.limit:
             from collections import Counter as _Counter
             _subj_counter: "_Counter[str]" = _Counter()
             for c in list(cards_map.values()):

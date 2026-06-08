@@ -369,6 +369,22 @@ OUTPUT_RX = re.compile(r"(?:output|output_path|сохранено|saved)[:\s]+([
 # EngineRunner — запуск движков и парсинг stdout
 # ---------------------------------------------------------------------------
 
+_CATEGORY_TO_PROFILE = {
+    "одежда": "clothing", "обувь": "shoes", "бытовая техника": "appliances",
+    "электроника": "electronics", "игрушки": "toys", "косметика": "cosmetics",
+    "детские аксессуары": "kids_accessories", "детский транспорт": "baby_gear",
+    "дом и текстиль": "home", "посуда": "kitchenware", "продукты": "food",
+}
+
+
+def _categories_to_profile(category_value: str) -> str:
+    """v27.9.x: RU-категории (через запятую) -> доменный профиль(и) движка для
+    --query-profile. Пусто -> 'auto'. Используется и брендом, и запросом."""
+    cats = [c.strip().lower() for c in (category_value or "").split(",") if c.strip()]
+    profiles = [_CATEGORY_TO_PROFILE[c] for c in cats if c in _CATEGORY_TO_PROFILE]
+    return ",".join(dict.fromkeys(profiles)) if profiles else "auto"
+
+
 def freshest_xlsx(path: Path) -> Path:
     """v27.9.x: если основной XLSX был занят (открыт в Excel), движок пишет в
     `<stem>_live.xlsx`. Тогда таблица/графики/сводка ДОЛЖНЫ читать именно его,
@@ -448,8 +464,10 @@ class EngineRunner:
             if spec.mode == "unified":
                 self._run_unified(spec)
             elif spec.mode == "query_full":
-                # Цепочка: Stage1 → Stage2
+                # Цепочка: Stage1 → Stage2. v27.9.x: товарная категория (если
+                # выбрана) -> --query-profile, чтобы запрос к WB был точнее.
                 s1 = RunSpec(**{**asdict(spec), "mode": "query_stage1",
+                                "query_profile": _categories_to_profile(spec.brand_category),
                                 "output_links_csv": "registry_links.csv",
                                 "output": "links.xlsx"})
                 rc = self._run_one(s1.wb_args(), "🔍 Этап 1 — сбор ссылок WB")
@@ -467,17 +485,7 @@ class EngineRunner:
                 # надёжным способом. Итог: идентичные столбцы result.xlsx, «Оригинал»
                 # по card.json и корректное извлечение реестров (FSA/SWIS/BelGISS).
                 _bm = spec.brand_match if spec.brand_match and spec.brand_match != "any" else "contains"
-                # v27.9.x: товарная категория бренда (RU) -> доменный профиль движка.
-                _CAT2PROFILE = {
-                    "одежда": "clothing", "обувь": "shoes", "бытовая техника": "appliances",
-                    "электроника": "electronics", "игрушки": "toys", "косметика": "cosmetics",
-                    "детские аксессуары": "kids_accessories", "детский транспорт": "baby_gear",
-                    "дом и текстиль": "home", "посуда": "kitchenware", "продукты": "food",
-                }
-                # несколько категорий через запятую -> профили через запятую
-                _cats = [c.strip().lower() for c in (spec.brand_category or "").split(",") if c.strip()]
-                _profiles = [_CAT2PROFILE[c] for c in _cats if c in _CAT2PROFILE]
-                _profile = ",".join(dict.fromkeys(_profiles)) if _profiles else "auto"
+                _profile = _categories_to_profile(spec.brand_category)
                 s1 = RunSpec(**{**asdict(spec), "mode": "query_stage1",
                                 "query": spec.brand or spec.query,
                                 "strict_brand": spec.brand,
@@ -1212,6 +1220,19 @@ class Bridge:
         """Открывает рабочую папку программы."""
         return self.open_path(str(APP_DIR))
 
+    def open_url(self, url: str) -> dict:
+        """v27.9.x: открывает ссылку (товар WB / реестр документа) в системном
+        браузере. Используется кликами в таблице результатов."""
+        try:
+            u = (url or "").strip()
+            if not (u.startswith("http://") or u.startswith("https://")):
+                return {"ok": False, "error": "Некорректная ссылка"}
+            import webbrowser
+            webbrowser.open(u)
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def export_csv(self, xlsx_path: Optional[str] = None, filter_text: str = "") -> dict:
         """
         Экспортирует отфильтрованные данные из XLSX в CSV.
@@ -1819,6 +1840,8 @@ th.sortable { cursor:pointer; user-select:none; }
 th.sortable:hover { color:#fff; background:rgba(91,140,255,0.12); }
 td.cell-expand { cursor:pointer; text-decoration:underline dotted rgba(255,255,255,0.25); }
 td.cell-expand:hover { color:#fff; background:rgba(91,140,255,0.10); }
+td.cell-link { cursor:pointer; color:#5b8cff; white-space:nowrap; }
+td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decoration:underline; }
 
 /* v27.9.x: модалка полного текста названия */
 #full-text-modal { display:none; position:fixed; inset:0; z-index:9999; }
@@ -2332,6 +2355,9 @@ $$('#wb-mode-row .seg-btn').forEach(b => b.addEventListener('click', () => setWb
 const FORM_FIELDS = {
   query_full: [
     {key:'query',   lbl:'Поисковый запрос',    type:'text',   def:'детская обувь', hint:'Например: «детская обувь»'},
+    {key:'brand_category', lbl:'Категория товаров (уточнить запрос)', type:'multiselect', def:'',
+      options:['одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
+      hint:'Необязательно. Сужает поиск до выбранных категорий — запрос к WB точнее. Ничего не выбрано — авто-определение'},
     {key:'limit',   lbl:'Лимит карточек',       type:'number', def:5000, min:1, max:200000},
     {key:'workers', lbl:'Браузер-воркеры',       type:'number', def:4, min:1, max:12, hint:'Параллельных браузеров (3–6 оптимально)'},
     {key:'expiry_warning_days', lbl:'Скоро истекает (дней)', type:'number', def:30, min:1, max:365},
@@ -2917,8 +2943,10 @@ const PREFERRED_COLS = [
   'Запрос', 'Артикул WB', 'Название товара', 'Бренд', 'Категория WB',
   'Технический статус', 'Цена со скидкой, ₽', 'Продавец', "Плашка 'Оригинал'",
   'Название в реестре', 'Статус документа', 'Номер документа', 'Тип документа',
-  'ТН ВЭД', 'Изготовитель', 'Действует до', 'Риск по сроку', 'Ссылка на товар',
+  'ТН ВЭД', 'Изготовитель', 'Действует до', 'Риск по сроку',
 ];
+// URL-колонки в таблице НЕ показываем (по просьбе), но используем для кликов:
+// «Артикул WB» -> страница товара, «Номер документа» -> страница реестра.
 
 function _tableColIndices() {
   // Сопоставляем предпочтительные заголовки с реальными; чего нет — пропускаем.
@@ -2965,7 +2993,12 @@ function renderTable(rows) {
     }).join('') +
     '</tr></thead><tbody>';
   const hl = _allHeaders.map(x => x.toLowerCase());
+  // Индексы URL-колонок (не показываются, но используются для кликов)
+  const purlIdx = _allHeaders.findIndex(h => /ссылка на товар|product_url/i.test(h));
+  const rurlIdx = _allHeaders.findIndex(h => /ссылка на реестр|registry_url/i.test(h));
   for (const row of viewRows.slice(0, 1000)) {
+    const purl = purlIdx >= 0 ? String(row[purlIdx] ?? '') : '';
+    const rurl = rurlIdx >= 0 ? String(row[rurlIdx] ?? '') : '';
     html += '<tr>';
     colIdx.forEach((ci) => {
       const v = String(row[ci] ?? '');
@@ -2985,7 +3018,16 @@ function renderTable(rows) {
         if (v === 'WB' || v.toLowerCase().includes('wildberries')) badge = 'badge-wb';
         else if (v.toLowerCase().includes('ozon')) badge = 'badge-ozon';
       }
-      // длинные текстовые поля (название товара / название в реестре) — кликабельны
+      // Кликабельные ссылки: «Артикул WB» -> товар, «Номер документа» -> реестр.
+      if ((head.includes('артикул') || head === 'nm_id') && purl) {
+        html += `<td class="cell-link" data-url="${escapeHtml(purl)}" title="Открыть товар на WB">${escapeHtml(v)} ↗</td>`;
+        return;
+      }
+      if ((head.includes('номер документа') || head.includes('certificate_number')) && rurl) {
+        html += `<td class="cell-link" data-url="${escapeHtml(rurl)}" title="Открыть реестр документа">${escapeHtml(v || 'реестр')} ↗</td>`;
+        return;
+      }
+      // длинные текстовые поля (название товара / название в реестре) — кликабельны (полный текст)
       const isLong = (head.includes('название') || head.includes('изготовитель') || head.includes('примечан')) && v.length > 28;
       const cellCls = isLong ? ' class="cell-expand"' : '';
       html += badge
@@ -2996,6 +3038,14 @@ function renderTable(rows) {
   }
   html += '</tbody></table>';
   wrap.innerHTML = html;
+
+  // Клик по ссылочной ячейке — открыть в браузере
+  wrap.querySelectorAll('td.cell-link').forEach(td => {
+    td.addEventListener('click', () => {
+      const u = td.dataset.url;
+      if (u) window.pywebview.api.open_url(u);
+    });
+  });
 
   // Клик по заголовку — сортировка
   wrap.querySelectorAll('th.sortable').forEach(th => {

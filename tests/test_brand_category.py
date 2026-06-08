@@ -148,6 +148,22 @@ def main():
         ok_app = False
     check("argparse: --query-profile appliances принят", ok_app)
 
+    # --- КАТЕГОРИЯ в режиме «по запросу» (query_full) -> --query-profile ---
+    calls.clear()
+    runner._run(wc.RunSpec(mode="query_full", query="детская обувь",
+                           brand_category="обувь", limit=100, workers=4))
+    qa = next((c for c in calls if "--query-profile" in c), None)
+    check("query_full + категория -> --query-profile shoes",
+          qa is not None and qa[qa.index("--query-profile") + 1] == "shoes")
+    calls.clear()
+    runner._run(wc.RunSpec(mode="query_full", query="детская обувь",
+                           brand_category="", limit=100, workers=4))
+    check("query_full без категории -> без --query-profile",
+          all("--query-profile" not in c for c in calls))
+
+    # --- open_url есть в Bridge (клик по ссылке в таблице) ---
+    check("Bridge.open_url существует", hasattr(wc.Bridge, "open_url"))
+
 
 if __name__ == "__main__":
     main()

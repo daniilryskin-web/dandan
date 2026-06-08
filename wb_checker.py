@@ -149,13 +149,6 @@ class RunSpec:
     query_profile: str = "auto"
     """v27.9.x: доменный профиль движка для stage1 (clothing/shoes/appliances/...)."""
 
-    registry_proxy: str = ""
-    """v27.9.x: прокси для этапа 2 (FSA/реестры) — обход блокировки IP на FSA."""
-
-    registry_proxy_list: str = ""
-    """v27.9.x: ПУЛ прокси с ротацией (путь к файлу или список). Каждый FSA-запрос
-    через случайный прокси — нагрузка размазывается, бана нет (метод из видео)."""
-
     registry_fsa_retry: bool = False
     """v27.9.x: второй проход по упавшим FSA (по кнопке)."""
 
@@ -252,10 +245,6 @@ class RunSpec:
                 "--make-report-xlsx", "true" if self.make_report_xlsx else "false",
                 "--registry-fsa-retry", "true" if self.registry_fsa_retry else "false",
             ]
-            if self.registry_proxy.strip():
-                args += ["--registry-proxy", self.registry_proxy.strip()]
-            if self.registry_proxy_list.strip():
-                args += ["--registry-proxy-list", self.registry_proxy_list.strip()]
             if self.strict_brand and self.strict_brand_match != "any":
                 args += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
             return args
@@ -1238,7 +1227,7 @@ class Bridge:
     def retry_failed_fsa(self) -> dict:
         """v27.9.x: ПОВТОР по упавшим FSA-ссылкам (по кнопке). Перезапускает этап 2
         на том же registry_links.csv с включённым вторым проходом FSA. Нажимать,
-        когда pub.fsa.gov.ru снова доступен (или после настройки прокси)."""
+        когда pub.fsa.gov.ru снова доступен."""
         if self.state.running:
             return {"ok": False, "error": "Дождитесь завершения текущего прогона"}
         last = dict(self._last_spec or {})
@@ -1256,7 +1245,6 @@ class Bridge:
             "headless": bool(last.get("headless", True)),
             "expiry_warning_days": int(last.get("expiry_warning_days", 30) or 30),
             "make_report_xlsx": bool(last.get("make_report_xlsx", True)),
-            "registry_proxy": last.get("registry_proxy", "") or "",
             "registry_fsa_retry": True,
             "strict_brand": last.get("strict_brand", "") or "",
             "strict_brand_match": last.get("strict_brand_match", "any") or "any",
@@ -2094,7 +2082,7 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
             <button class="btn btn-ghost btn-sm" id="btn-open-ozon-result" disabled>🛒 Ozon XLSX</button>
             <button class="btn btn-ghost btn-sm" id="btn-open-log" disabled>📝 Лог файл</button>
             <button class="btn btn-ghost btn-sm" id="btn-goto-results">📊 Таблица</button>
-            <button class="btn btn-ghost btn-sm" id="btn-retry-fsa" title="Перезапустить этап 2 по упавшим FSA-ссылкам (когда FSA снова доступен / с прокси)">🔁 Повторить упавшие FSA</button>
+            <button class="btn btn-ghost btn-sm" id="btn-retry-fsa" title="Перезапустить этап 2 по упавшим FSA-ссылкам (когда FSA снова доступен)">🔁 Повторить упавшие FSA</button>
           </div>
         </div>
 
@@ -2407,11 +2395,6 @@ const FORM_FIELDS = {
     {key:'brand_category', lbl:'Категория товаров (уточнить запрос)', type:'multiselect', def:'',
       options:['одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
       hint:'Необязательно. Сужает поиск до выбранных категорий — запрос к WB точнее. Ничего не выбрано — авто-определение'},
-    {key:'registry_proxy', lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
-      hint:'Опционально. http://host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
-    {key:'registry_proxy_list', lbl:'Пул прокси для FSA (ротация — надёжнее)', type:'textarea', rows:4,
-      ph:'по одному на строку: 1.2.3.4:8080  или  http://user:pass@host:port  (можно путь к файлу proxies.txt)',
-      hint:'Список прокси или путь к файлу. Каждый FSA-запрос идёт через СЛУЧАЙНЫЙ прокси — нагрузка размазывается, FSA не банит (метод из видео). Самый надёжный способ.'},
     {key:'limit',   lbl:'Лимит карточек',       type:'number', def:5000, min:1, max:200000},
     {key:'workers', lbl:'Браузер-воркеры',       type:'number', def:5, min:1, max:12, hint:'Параллельных браузеров для парсинга реестров (4–6 оптимально; больше = быстрее FSA, но больше памяти)'},
     {key:'expiry_warning_days', lbl:'Скоро истекает (дней)', type:'number', def:30, min:1, max:365},
@@ -2428,11 +2411,6 @@ const FORM_FIELDS = {
   query_stage2: [
     {key:'input_links_csv',  lbl:'Входной CSV ссылок', type:'text',  def:'registry_links.csv'},
     {key:'output',           lbl:'Результат XLSX',     type:'text',  def:'result.xlsx'},
-    {key:'registry_proxy',   lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
-      hint:'Опционально. http://user:pass@host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
-    {key:'registry_proxy_list', lbl:'Пул прокси для FSA (ротация — надёжнее)', type:'textarea', rows:4,
-      ph:'по одному на строку: 1.2.3.4:8080  или  http://user:pass@host:port  (можно путь к файлу proxies.txt)',
-      hint:'Список прокси или путь к файлу. Каждый FSA-запрос идёт через СЛУЧАЙНЫЙ прокси — нагрузка размазывается, FSA не банит (метод из видео). Самый надёжный способ.'},
     {key:'limit',            lbl:'Лимит',              type:'number',def:10000, min:1, max:200000},
     {key:'workers',          lbl:'Браузер-воркеры',    type:'number',def:5, min:1, max:10, hint:'Параллельных браузеров (4–6 оптимально)'},
     {key:'expiry_warning_days',lbl:'Скоро истекает (дней)',type:'number',def:30,min:1,max:365},
@@ -2446,11 +2424,6 @@ const FORM_FIELDS = {
     {key:'brand_category', lbl:'Категории товаров (можно несколько)', type:'multiselect', def:'',
       options:['одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
       hint:'Сузить поиск до выбранных категорий (reebok→одежда+обувь, indesit→бытовая техника). Ничего не выбрано — все товары бренда'},
-    {key:'registry_proxy', lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
-      hint:'Опционально. http://host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
-    {key:'registry_proxy_list', lbl:'Пул прокси для FSA (ротация — надёжнее)', type:'textarea', rows:4,
-      ph:'по одному на строку: 1.2.3.4:8080  или  http://user:pass@host:port  (можно путь к файлу proxies.txt)',
-      hint:'Список прокси или путь к файлу. Каждый FSA-запрос идёт через СЛУЧАЙНЫЙ прокси — нагрузка размазывается, FSA не банит (метод из видео). Самый надёжный способ.'},
     {key:'brand_match', lbl:'Тип совпадения',           type:'select',def:'exact',options:['exact','contains','any']},
     {key:'limit',       lbl:'Лимит карточек',           type:'number',def:5000, min:1, max:200000},
     {key:'workers',     lbl:'Браузер-воркеры',          type:'number',def:5, min:1, max:12, hint:'Параллельных браузеров для реестров (4–6 оптимально)'},

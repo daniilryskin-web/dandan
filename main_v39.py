@@ -330,13 +330,20 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
         if sch is not None and (isinstance(sch, (int, float)) or str(sch).isdigit()):
             out["scheme"] = f"{int(sch)}{'с' if is_cert else 'д'}"
 
-        # Технические регламенты (idTechnicalReglaments -> текст по словарю)
+        # Технические регламенты (idTechnicalReglaments -> текст по словарю).
+        # v27.9.x: словарь FSA НЕ последовательный (007/2011=id39), поэтому
+        # неизвестные id НЕ выводим как «ТР (код N)» — это путало пользователя.
+        # Известные id маппим; для неизвестных оставляем technical_regulation
+        # пустым, чтобы его заполнил настоящий «ТР ТС NNN/YYYY» из текста
+        # страницы/вкладок (см. вызов в _parse_fsa_with_existing_page_v386).
         tregs = payload.get("idTechnicalReglaments")
         if isinstance(tregs, list) and tregs:
             names = []
             for t in tregs:
                 try:
-                    names.append(_FSA_TECHREG_MAP.get(int(t), f"ТР (код {t})"))
+                    nm = _FSA_TECHREG_MAP.get(int(t))
+                    if nm:
+                        names.append(nm)
                 except Exception:
                     pass
             if names:
@@ -6513,6 +6520,20 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                     # v27.9.x: разбор по реальной структуре JSON ФСА. В кэш кладём
                     # все надёжные поля (ИНН, заявитель, изготовитель, схема,
                     # техрегламент, даты).
+                    _tech_reg = _parsed.get('technical_regulation', '')
+                    # v27.9.x: если в JSON техрегламент задан неизвестным числовым
+                    # кодом (тогда поле пустое), берём настоящий «ТР ТС NNN/YYYY» /
+                    # «ТР ЕАЭС NNN/YYYY» из текста уже загруженной страницы ФСА.
+                    if not _tech_reg:
+                        try:
+                            _ptxt = await page.evaluate(
+                                "() => (document.body ? (document.body.innerText || '') : '')")
+                            _trm = re.findall(r'ТР\s+(?:ТС|ЕАЭС)\s+\d{3}/\d{4}', _ptxt or '')
+                            if _trm:
+                                _tech_reg = '; '.join(dict.fromkeys(
+                                    re.sub(r'\s+', ' ', x).strip() for x in _trm))
+                        except Exception:
+                            pass
                     _api_ext = {
                         'document_date_start': _parsed.get('date_start', ''),
                         'document_date_end': _parsed.get('date_end', ''),
@@ -6520,7 +6541,7 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                         'applicant_inn': _parsed.get('applicant_inn', ''),
                         'manufacturer_name': _clean_org_name(_parsed.get('manufacturer', '')),
                         'scheme': _parsed.get('scheme', ''),
-                        'technical_regulation': _parsed.get('technical_regulation', ''),
+                        'technical_regulation': _tech_reg,
                     }
                     _FSA_EXTENDED_FIELDS_CACHE[url] = {k: v for k, v in _api_ext.items() if v}
                     _st = _parsed.get('status', '')
@@ -7333,6 +7354,8 @@ async def run_registry_stage(args):
         'started_at': time.time(), 'done': 0, 'ok': 0, 'empty': 0, 'errors': 0,
         'fsa': sum(1 for u in unique_urls if hostname(u) == 'pub.fsa.gov.ru'),
         'swis': sum(1 for u in unique_urls if hostname(u) in {'swis.trade.kg', 'trade.kg'}),
+        # v27.9.x: счётчик BelGISS/ЕАЭС — чтобы он попадал в живой график «Реестры».
+        'belgiss': sum(1 for u in unique_urls if hostname(u) in _BELGISS_EAEU_HOSTS),
         'rows_written': 0,
         # v39.2: счётчики для раннего детекта сетевой недоступности FSA
         'fsa_done': 0,
@@ -7420,7 +7443,8 @@ async def run_registry_stage(args):
                     f"Реестры: {stats['done']}/{len(unique_urls)}, скорость≈{speed:.1f}/мин, "
                     f"извлечено={stats['ok']}, пусто={stats['empty']}, ошибки={stats['errors']}, "
                     f"строк_в_xlsx={stats['rows_written']}/{len(rows)}, "
-                    f"очередь={q.qsize()}, FSA={stats['fsa']}, SWIS={stats['swis']}, активные=[{act}]"
+                    f"очередь={q.qsize()}, FSA={stats['fsa']}, SWIS={stats['swis']}, "
+                    f"BELGISS={stats['belgiss']}, активные=[{act}]"
                 )
                 emit_progress("registry", stats['done'], len(unique_urls))
                 await asyncio.sleep(max(5, min(30, int(getattr(args, 'progress_interval_sec', 15)))))
@@ -7695,8 +7719,22 @@ async def run_registry_stage(args):
                         user_agent=args.user_agent, viewport={'width': 1440, 'height': 1000}, locale='ru-RU')
                     rpage = await rctx.new_page()
                     recovered = 0
+                    # v27.9.x: жёсткий ТАЙМБЮДЖЕТ на весь второй проход + ранний обрыв,
+                    # чтобы после 100% окно НЕ «висело» минутами и графики прогрузились.
+                    retry_budget_sec = float(getattr(args, 'registry_fsa_retry_budget_sec', 90) or 90)
+                    retry_started = time.time()
+                    consecutive_fail = 0
                     try:
-                        for ru in retry_urls:
+                        for _i, ru in enumerate(retry_urls, 1):
+                            if time.time() - retry_started > retry_budget_sec:
+                                print(f"🔁 Второй проход FSA остановлен по таймбюджету "
+                                      f"{retry_budget_sec:.0f}с ({_i-1}/{len(retry_urls)} обработано, "
+                                      f"восстановлено {recovered})")
+                                break
+                            if consecutive_fail >= 5:
+                                print("🔁 Второй проход FSA прерван: 5 повторов подряд без результата "
+                                      "(FSA всё ещё недоступен). Ссылки сохранены — перезапустите позже.")
+                                break
                             cert = prod = typ = doc_status = detail = ''
                             try:
                                 cert, prod, typ, doc_status, detail = await asyncio.wait_for(
@@ -7726,6 +7764,12 @@ async def run_registry_stage(args):
                                     ru, cert or '', prod or '', typ or '', doc_status or '',
                                     (detail or '') + ';fsa_retry_ok')
                                 recovered += 1
+                                consecutive_fail = 0
+                            else:
+                                consecutive_fail += 1
+                            # держим живым прогресс/лог, чтобы окно не казалось зависшим
+                            print(f"🔁 Второй проход FSA: {_i}/{len(retry_urls)}, восстановлено {recovered}")
+                            emit_progress("registry", stats['done'], len(unique_urls))
                     finally:
                         try:
                             await rctx.close()

@@ -205,7 +205,7 @@ class RunSpec:
         engine = str(ENGINE_V39)
         if self.mode == "query_stage1":
             out = self.output or "links.xlsx"
-            return [
+            a = [
                 PYTHON, engine,
                 "--query", self.query,
                 "--limit", str(self.limit),
@@ -215,6 +215,10 @@ class RunSpec:
                 "--output", out,
                 "--output-links-csv", self.output_links_csv or "registry_links.csv",
             ]
+            # v27.9.x: поиск по бренду через тот же движок — строгий бренд-фильтр.
+            if self.strict_brand and self.strict_brand_match != "any":
+                a += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
+            return a
         if self.mode == "query_stage2":
             out = self.output or "result.xlsx"
             args = [
@@ -428,6 +432,25 @@ class EngineRunner:
                 self._run_one(s2.wb_args(), "📋 Этап 2 — парсинг реестров WB")
             elif spec.mode == "ozon":
                 self._run_one(spec.ozon_args(), "🛒 Ozon — поиск и проверка")
+            elif spec.mode == "brand":
+                # v27.9.x: «по бренду» теперь работает ЧЕРЕЗ ТОТ ЖЕ движок main_v39,
+                # что и «по запросу». Stage1 ищет карточки бренда (поиск по названию
+                # бренда + строгий бренд-фильтр), Stage2 парсит реестры тем же
+                # надёжным способом. Итог: идентичные столбцы result.xlsx, «Оригинал»
+                # по card.json и корректное извлечение реестров (FSA/SWIS/BelGISS).
+                _bm = spec.brand_match if spec.brand_match and spec.brand_match != "any" else "contains"
+                s1 = RunSpec(**{**asdict(spec), "mode": "query_stage1",
+                                "query": spec.brand or spec.query,
+                                "strict_brand": spec.brand,
+                                "strict_brand_match": _bm,
+                                "output_links_csv": "registry_links.csv",
+                                "output": "links.xlsx"})
+                rc = self._run_one(s1.wb_args(), "🔍 Этап 1 — сбор карточек бренда WB")
+                if rc != 0 or self._stop_flag.is_set():
+                    return
+                s2 = RunSpec(**{**asdict(spec), "mode": "query_stage2",
+                                "input_links_csv": "registry_links.csv"})
+                self._run_one(s2.wb_args(), "📋 Этап 2 — парсинг реестров WB")
             else:
                 label_map = {
                     "query_stage1": "🔍 Этап 1 — сбор ссылок",
@@ -971,8 +994,9 @@ class Bridge:
             return {"ok": False, "error": "Укажите название бренда"}
         if mode in ("query_full", "query_stage1", "query_stage2") and not ENGINE_V39.exists():
             return {"ok": False, "error": f"Движок WB Query не найден: {ENGINE_V39.name}"}
-        if mode == "brand" and not ENGINE_BRAND.exists():
-            return {"ok": False, "error": f"Движок WB Brand не найден: {ENGINE_BRAND.name}"}
+        if mode == "brand" and not ENGINE_V39.exists():
+            # v27.9.x: бренд-режим теперь использует движок main_v39 (как «по запросу»).
+            return {"ok": False, "error": f"Движок WB Query не найден: {ENGINE_V39.name}"}
         if mode in ("ozon", "unified") and not ENGINE_OZON.exists():
             return {"ok": False, "error": f"Движок Ozon не найден: {ENGINE_OZON.name}"}
         if mode == "unified" and not ENGINE_V39.exists():
@@ -2940,6 +2964,11 @@ const REGISTRY_COLORS = {
   'belgiss.by':          '#a78bfa',
   'tsouz.belgiss.by':    '#8b5cf6',
   'portal.eaeunion.org': '#fb923c',
+  // v27.9.x: ключи живого графика (из лога прогресса) — те же цвета, чтобы
+  // BelGISS отображался наравне с ФСА/SWIS, если на него собраны ссылки.
+  'ФСА':                 '#5b8cff',
+  'SWIS':                '#10b981',
+  'BelGISS':             '#8b5cf6',
 };
 const ORIGINAL_COLORS = {
   'Оригинал':     '#10b981',

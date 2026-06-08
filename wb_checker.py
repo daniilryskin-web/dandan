@@ -952,6 +952,8 @@ class Bridge:
         s = load_settings()
         self._last_spec: dict = s.get("last_spec", {})
         self._missing_deps: List[str] = []
+        self._window = None  # ссылка на окно webview (для файловых диалогов)
+        self._loaded_result_path: str = ""  # внешний result.xlsx, загруженный для анализа
 
     def diagnose(self) -> dict:
         """Возвращает диагностику: python, движки, зависимости, последняя команда."""
@@ -1074,15 +1076,55 @@ class Bridge:
 
     # ---- результаты ----
 
+    def browse_result_file(self) -> dict:
+        """Открывает файловый диалог и загружает выбранный result.xlsx (с другого
+        прогона) для анализа во вкладке «Результаты». Возвращает выбранный путь —
+        дальше JS вызывает get_results(path) с ним. Путь запоминается, чтобы
+        «Обновить»/CSV/графики работали с этим же файлом."""
+        try:
+            import webview  # type: ignore
+        except Exception:
+            return {"ok": False, "error": "webview недоступен"}
+        if self._window is None:
+            return {"ok": False, "error": "Окно не готово"}
+        try:
+            file_types = ("Excel (*.xlsx)", "Все файлы (*.*)")
+            res = self._window.create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=False, file_types=file_types)
+        except Exception as exc:
+            return {"ok": False, "error": f"Не удалось открыть диалог: {exc}"}
+        if not res:
+            return {"ok": False, "cancelled": True}
+        path = res[0] if isinstance(res, (list, tuple)) else str(res)
+        p = Path(path)
+        if not p.exists():
+            return {"ok": False, "error": "Файл не найден"}
+        if p.suffix.lower() != ".xlsx":
+            return {"ok": False, "error": "Нужен файл .xlsx"}
+        self._loaded_result_path = str(p)
+        return {"ok": True, "path": str(p), "name": p.name}
+
+    def clear_loaded_result(self) -> dict:
+        """Сбрасывает загруженный внешний файл — вкладка снова показывает результат
+        текущего прогона."""
+        self._loaded_result_path = ""
+        return {"ok": True}
+
     def get_results(self, xlsx_path: Optional[str] = None, limit: int = 2000) -> dict:
         """
         Читает лист «Подробности» из XLSX и возвращает данные для таблицы.
         Также считает статистику по статусу, реестру и маркетплейсу.
         """
-        path = Path(xlsx_path or self.state.output_path or "")
-        path = freshest_xlsx(path)
+        # Приоритет: явный путь из JS → загруженный внешний файл → текущий прогон.
+        chosen = xlsx_path or self._loaded_result_path or self.state.output_path or ""
+        # freshest_xlsx ищет более свежий результат рядом — но для ЯВНО загруженного
+        # пользователем файла этого делать НЕ нужно (показываем именно его).
+        if xlsx_path or self._loaded_result_path:
+            path = Path(chosen)
+        else:
+            path = freshest_xlsx(Path(chosen))
         if not path.exists():
-            return {"ok": False, "error": "Файл результата не найден. Запустите прогон."}
+            return {"ok": False, "error": "Файл результата не найден. Запустите прогон или загрузите файл."}
         try:
             from openpyxl import load_workbook  # type: ignore
             wb = load_workbook(path, read_only=True, data_only=True)
@@ -2185,8 +2227,11 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
             <option value="">Все статусы</option>
           </select>
           <button class="btn btn-ghost btn-sm" id="btn-reload-results">⟳ Обновить</button>
+          <button class="btn btn-ghost btn-sm" id="btn-load-result">📂 Загрузить файл</button>
+          <button class="btn btn-ghost btn-sm" id="btn-clear-loaded" style="display:none">✖ Текущий прогон</button>
           <button class="btn btn-ghost btn-sm" id="btn-export-csv">⬇ CSV</button>
           <span class="text-muted text-sm" id="results-count"></span>
+          <span class="text-muted text-sm" id="loaded-file-badge" style="display:none"></span>
         </div>
 
         <div class="tbl-wrap" id="tbl-wrap">
@@ -3146,6 +3191,31 @@ function applyTableFilter(q, st) {
 }
 
 $('#btn-reload-results').addEventListener('click', loadResults);
+
+// Загрузка внешнего result.xlsx (с другого прогона) для анализа во вкладке.
+$('#btn-load-result').addEventListener('click', async () => {
+  let res;
+  try { res = await window.pywebview.api.browse_result_file(); }
+  catch (e) { toast('Ошибка диалога: ' + e, 'err'); return; }
+  if (!res || res.cancelled) return;
+  if (!res.ok) { toast(res.error || 'Не удалось загрузить файл', 'err'); return; }
+  const badge = $('#loaded-file-badge');
+  badge.textContent = '📂 ' + (res.name || 'файл');
+  badge.style.display = '';
+  $('#btn-clear-loaded').style.display = '';
+  toast('Загружен файл: ' + (res.name || ''), 'ok');
+  await loadResults();
+});
+
+// Вернуться к результату текущего прогона.
+$('#btn-clear-loaded').addEventListener('click', async () => {
+  try { await window.pywebview.api.clear_loaded_result(); } catch (e) {}
+  $('#loaded-file-badge').style.display = 'none';
+  $('#btn-clear-loaded').style.display = 'none';
+  toast('Показан результат текущего прогона', 'ok');
+  await loadResults();
+});
+
 const _btnRetryFsa = $('#btn-retry-fsa');
 if (_btnRetryFsa) _btnRetryFsa.addEventListener('click', async () => {
   const res = await window.pywebview.api.retry_failed_fsa();
@@ -3631,6 +3701,7 @@ def main() -> None:
         min_size=(1100, 720),
         background_color="#0a0a0f",
     )
+    bridge._window = window
     webview.start(debug=False)
 
 

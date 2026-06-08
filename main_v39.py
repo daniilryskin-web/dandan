@@ -8043,6 +8043,10 @@ async def run_registry_stage(args):
             # прогреваем сессию на главной FSA (cookies) и делаем человекоподобные
             # случайные паузы между документами.
             _has_fsa = any(hostname(u) == 'pub.fsa.gov.ru' for u in unique_urls)
+            # v45.4: замок бутстрапа кук FSA — пока кук нет, браузерные FSA-документы
+            # идут по одному (а не залпом из 5 сессий), чтобы первый прошёл антибот и
+            # отдал куки; дальше всё летит быстрым HTTP параллельно.
+            _fsa_bootstrap_sem = asyncio.Semaphore(1)
             _launch_kwargs = dict(
                 headless=getattr(args, 'registry_headless', True),
                 args=['--disable-dev-shm-usage', '--no-sandbox', '--disable-blink-features=AutomationControlled'],
@@ -8110,10 +8114,25 @@ async def run_registry_stage(args):
                                 # снижает риск блокировки за «слишком ровный» автоматический темп.
                                 if _fsa_delay_hi > 0:
                                     await asyncio.sleep(random.uniform(_fsa_delay_lo, _fsa_delay_hi))
-                                cert, prod, typ, doc_status, detail = await asyncio.wait_for(
-                                    _parse_fsa_with_existing_page_v386(page, url, args),
-                                    timeout=per_registry_timeout,
-                                )
+                                # v45.4: БУТСТРАП-СЕРИАЛИЗАЦИЯ. Пока нет сессионных кук,
+                                # FSA-документы парсятся браузером по ОДНОМУ (не 5 сессий
+                                # разом) — так первый запрос с большей вероятностью пройдёт
+                                # антибот и отдаст куки. Как только куки есть — все
+                                # остальные документы летят быстрым HTTP параллельно (без
+                                # этого замка). Это и спасает: 1 аккуратная сессия вместо
+                                # залпа, а дальше — лёгкие HTTP-запросы.
+                                if (bool(getattr(args, 'fsa_cookie_http', True))
+                                        and not _FSA_SESSION_COOKIES):
+                                    async with _fsa_bootstrap_sem:
+                                        cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                            _parse_fsa_with_existing_page_v386(page, url, args),
+                                            timeout=per_registry_timeout,
+                                        )
+                                else:
+                                    cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                        _parse_fsa_with_existing_page_v386(page, url, args),
+                                        timeout=per_registry_timeout,
+                                    )
                             elif h in {'swis.trade.kg', 'trade.kg'}:
                                 # v27.7: киргизский SWIS — ТОЛЬКО HTTP (требование).
                                 # Страница серверного рендеринга, браузер не нужен.

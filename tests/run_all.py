@@ -20,6 +20,7 @@ MODULES = [
     "test_chart_stats",
     "test_fsa_fastfail",
     "test_fsa_retry_proxy",
+    "test_fsa_autoproxy",
     "test_brand_unified_report",
     "test_brand_routing",
     "test_brand_search",

@@ -2211,6 +2211,14 @@ _FSA_EXTENDED_FIELDS_CACHE: Dict[str, Dict[str, str]] = {}
 _FSA_HTTP_FAILS = 0
 _FSA_HTTP_DISABLED = False
 _FSA_HTTP_FAIL_LIMIT = 5
+
+# v27.9.x: ОБХОД БЛОКИРОВКИ FSA. FSA отдаёт данные ТОЛЬКО настоящему браузеру
+# (HTTP/curl_cffi режется по TLS-фингерпринту), поэтому единственный путь, когда
+# IP пользователя забанен — пустить САМ БРАУЗЕР через прокси с рабочим (не-забаненным)
+# IP. Чтобы это было автоматически, программа сама подбирает рабочий прокси из
+# публичных списков (РФ-приоритет) и переключает на него браузер этапа 2.
+_FSA_AUTO_PROXY = None        # найденный рабочий proxy server ("http://ip:port") или None
+_FSA_AUTO_PROXY_DONE = False  # авто-поиск уже выполнялся (не повторяем бесконечно)
 # v27.9.x: один раз за прогон сохраняем сырой JSON-ответ API ФСА в файл —
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
 _FSA_SAMPLE_DUMPED = False
@@ -7651,6 +7659,149 @@ async def _parse_other_registry_http_v386(session, url: str, args) -> Tuple[str,
     return best_cert, best_product, best_type, '', 'other_http_legacy'
 
 
+# =============================================================================
+# v27.9.x: АВТО-ОБХОД БЛОКИРОВКИ FSA. FSA отдаёт данные только настоящему браузеру,
+# поэтому когда IP пользователя забанен, единственный путь — пустить браузер через
+# прокси с рабочим IP. Делаем это автоматически: тянем публичные списки прокси
+# (РФ-приоритет) и проверяем КАЖДЫЙ настоящим браузером на тестовой FSA-странице.
+# Первый, через который FSA реально открылась, используем для всего этапа 2.
+# =============================================================================
+_FSA_TEST_URL = "https://pub.fsa.gov.ru/rss/certificate/view/3418716/baseInfo"
+_FSA_PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=ru&timeout=10000",
+    "https://www.proxy-list.download/api/v1/get?type=http&country=RU",
+    "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=RU&protocols=http%2Chttps",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=10000",
+]
+
+
+async def _fetch_free_proxies(session, limit: int = 80) -> List[str]:
+    """Тянет публичные списки прокси (РФ-приоритет). Возвращает ['http://ip:port', ...]."""
+    out: List[str] = []
+    seen = set()
+
+    def _add(host: str, port: str, scheme: str = "http"):
+        host = (host or "").strip()
+        port = str(port or "").strip()
+        if not host or not port or not port.isdigit():
+            return
+        srv = f"{scheme}://{host}:{port}"
+        if srv not in seen:
+            seen.add(srv)
+            out.append(srv)
+
+    for src in _FSA_PROXY_SOURCES:
+        if len(out) >= limit:
+            break
+        try:
+            async with session.get(src, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if int(r.status) != 200:
+                    continue
+                txt = await r.text(errors="replace")
+        except Exception:
+            continue
+        txt = (txt or "").strip()
+        if not txt:
+            continue
+        if txt[:1] in "[{":
+            # geonode JSON: {"data":[{"ip":..,"port":..,"protocols":[..]}]}
+            try:
+                data = json.loads(txt)
+                rows = data.get("data") if isinstance(data, dict) else data
+                for it in (rows or []):
+                    _add(it.get("ip"), it.get("port"))
+            except Exception:
+                pass
+        else:
+            # текст: «ip:port» или «http://ip:port» построчно
+            for line in txt.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.search(r'(?:(\w+)://)?(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})', line)
+                if m:
+                    _add(m.group(2), m.group(3), (m.group(1) or "http"))
+    return out[:limit]
+
+
+async def _browser_reaches_fsa(p, proxy_server: Optional[str], args, timeout_ms: int = 18000) -> bool:
+    """Запускает временный браузер (опц. через прокси) и проверяет, открывается ли
+    тестовая страница FSA (есть осмысленный контент). True — FSA доступна так."""
+    br = None
+    try:
+        lk = dict(headless=True, args=['--disable-dev-shm-usage', '--no-sandbox',
+                                       '--disable-blink-features=AutomationControlled'])
+        if proxy_server:
+            lk['proxy'] = {'server': proxy_server}
+        br = await p.chromium.launch(**lk)
+        ctx = await br.new_context(user_agent=getattr(args, 'user_agent', None) or DEFAULT_UA,
+                                   viewport={'width': 1366, 'height': 900}, locale='ru-RU')
+        pg = await ctx.new_page()
+        await pg.goto(_FSA_TEST_URL, wait_until='domcontentloaded', timeout=timeout_ms)
+        try:
+            await _wait_until_fsa_rendered(pg, timeout_ms=min(timeout_ms, 9000))
+        except Exception:
+            pass
+        txt = await pg.evaluate("() => (document.body ? (document.body.innerText||'') : '')")
+        return bool(txt) and len(txt) > 400 and 'chrome-error' not in (pg.url or '')
+    except Exception:
+        return False
+    finally:
+        try:
+            if br:
+                await br.close()
+        except Exception:
+            pass
+
+
+async def _auto_find_fsa_proxy(p, args) -> Optional[str]:
+    """Если FSA недоступна напрямую — ищет рабочий прокси из публичных списков,
+    проверяя каждый настоящим браузером. Возвращает 'http://ip:port' или None."""
+    global _FSA_AUTO_PROXY, _FSA_AUTO_PROXY_DONE
+    if _FSA_AUTO_PROXY_DONE:
+        return _FSA_AUTO_PROXY
+    _FSA_AUTO_PROXY_DONE = True
+    # 1) проверяем прямой доступ — если FSA открывается, прокси не нужен
+    print("🔎 Проверяю доступность pub.fsa.gov.ru напрямую…")
+    if await _browser_reaches_fsa(p, None, args):
+        print("✓ FSA доступна напрямую — прокси не нужен.")
+        return None
+    print("🔴 FSA НЕ открывается с твоего IP. Ищу рабочий прокси для обхода (РФ-приоритет)…")
+    # 2) тянем списки прокси
+    try:
+        async with aiohttp.ClientSession(headers={'User-Agent': getattr(args, 'user_agent', None) or DEFAULT_UA}) as s:
+            proxies = await _fetch_free_proxies(s, limit=int(getattr(args, 'fsa_autoproxy_max', 80) or 80))
+    except Exception:
+        proxies = []
+    if not proxies:
+        print("⚠️  Не удалось получить списки публичных прокси. FSA пропустим. "
+              "Можно указать свой прокси в поле «Прокси для FSA».")
+        return None
+    print(f"   Получено {len(proxies)} кандидатов. Проверяю их браузером на тестовой FSA-странице "
+          f"(это может занять 1–3 минуты)…")
+    # 3) проверяем кандидатов пачками, останавливаемся на первом рабочем
+    batch = max(1, int(getattr(args, 'fsa_autoproxy_concurrency', 6) or 6))
+    tested = 0
+    for i in range(0, len(proxies), batch):
+        chunk = proxies[i:i + batch]
+        tasks = [asyncio.create_task(_browser_reaches_fsa(p, px, args, timeout_ms=15000)) for px in chunk]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tested += len(chunk)
+        for px, ok in zip(chunk, results):
+            if ok is True:
+                _FSA_AUTO_PROXY = px
+                print("=" * 80)
+                print(f"✅ Найден рабочий прокси для FSA: {px}")
+                print("   Этап 2 (FSA) пойдёт через него — обход блокировки автоматический.")
+                print("=" * 80)
+                return px
+        print(f"   …проверено {tested}/{len(proxies)}, рабочего пока нет, продолжаю…")
+    print("⚠️  Среди публичных прокси рабочего для FSA не нашлось. FSA пропустим. "
+          "Варианты: указать свой прокси/VPN с РФ-IP в поле «Прокси для FSA», "
+          "или повторить позже (списки прокси обновляются).")
+    return None
+
+
 async def run_registry_stage(args):
     """v38.6: visible-browser registry stage with first-stage-like progress.
 
@@ -7866,6 +8017,16 @@ async def run_registry_stage(args):
         async with async_playwright() as p:
             # v27.9.x: прокси для этапа 2 — обход блокировки IP на pub.fsa.gov.ru.
             _proxy = (getattr(args, 'registry_proxy', '') or '').strip()
+            # АВТО-ОБХОД: если ручной прокси не задан, но есть FSA-ссылки — проверяем
+            # доступность FSA и при блокировке САМИ ищем рабочий прокси (РФ-приоритет).
+            _has_fsa = any(hostname(u) == 'pub.fsa.gov.ru' for u in unique_urls)
+            if not _proxy and _has_fsa and bool(getattr(args, 'fsa_autoproxy', True)):
+                try:
+                    _ap = await _auto_find_fsa_proxy(p, args)
+                    if _ap:
+                        _proxy = _ap
+                except Exception as _e:
+                    print(f"⚠️  Авто-поиск прокси FSA пропущен: {type(_e).__name__}: {str(_e)[:120]}")
             _launch_kwargs = dict(
                 headless=getattr(args, 'registry_headless', True),
                 args=['--disable-dev-shm-usage', '--no-sandbox', '--disable-blink-features=AutomationControlled'],
@@ -8408,7 +8569,15 @@ def build_parser():
     ap.add_argument("--registry-proxy", default="",
                     help="v27.9.x: прокси для этапа 2 (FSA/реестры), напр. http://user:pass@host:port "
                          "или socks5://host:port. Помогает, когда твой IP заблокирован на pub.fsa.gov.ru, "
-                         "а сам реестр работает. Применяется к браузеру и HTTP-запросам реестров.")
+                         "а сам реестр работает. Применяется к браузеру этапа 2.")
+    ap.add_argument("--fsa-autoproxy", type=str_to_bool, default=True,
+                    help="v27.9.x: АВТО-обход блокировки FSA. Если FSA не открывается с твоего IP, "
+                         "программа сама ищет рабочий прокси из публичных списков (РФ-приоритет) и "
+                         "пускает браузер этапа 2 через него. false — отключить авто-поиск.")
+    ap.add_argument("--fsa-autoproxy-max", type=int, default=80,
+                    help="Сколько публичных прокси максимум проверять при авто-обходе FSA.")
+    ap.add_argument("--fsa-autoproxy-concurrency", type=int, default=6,
+                    help="Сколько прокси проверять параллельно при авто-обходе FSA.")
     # v27.6: уменьшен с 45000 до 28000 — раньше FSA-карточка занимала 165с
     ap.add_argument("--registry-browser-timeout-ms", type=int, default=28000)
     ap.add_argument("--registry-browser-wait-ms", type=int, default=8000,

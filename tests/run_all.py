@@ -16,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 MODULES = [
     "test_compare_categories",
     "test_compare_layers",
+    "test_compare_footwear",
     "test_chart_stats",
     "test_fsa_fastfail",
     "test_brand_unified_report",

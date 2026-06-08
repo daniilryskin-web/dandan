@@ -105,9 +105,9 @@ def main():
         main_x.write_text("old")
         time.sleep(0.7)
         live_x.write_text("new")
-        check("freshest: выбирает _live (свежее)", wc.Bridge._freshest_xlsx(main_x).name == "brand_result_live.xlsx")
+        check("freshest: выбирает _live (свежее)", wc.freshest_xlsx(main_x).name == "brand_result_live.xlsx")
         live_x.unlink()
-        check("freshest: без _live -> основной", wc.Bridge._freshest_xlsx(main_x).name == "brand_result.xlsx")
+        check("freshest: без _live -> основной", wc.freshest_xlsx(main_x).name == "brand_result.xlsx")
 
 
 if __name__ == "__main__":

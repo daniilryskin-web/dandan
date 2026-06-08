@@ -359,6 +359,24 @@ OUTPUT_RX = re.compile(r"(?:output|output_path|сохранено|saved)[:\s]+([
 # EngineRunner — запуск движков и парсинг stdout
 # ---------------------------------------------------------------------------
 
+def freshest_xlsx(path: Path) -> Path:
+    """v27.9.x: если основной XLSX был занят (открыт в Excel), движок пишет в
+    `<stem>_live.xlsx`. Тогда таблица/графики/сводка ДОЛЖНЫ читать именно его,
+    иначе показывают устаревшие данные прошлого прогона. Возвращает самый свежий
+    из (основной, _live). Используется и EngineRunner, и Bridge."""
+    try:
+        path = Path(path)
+        live = path.with_name(path.stem + "_live" + path.suffix)
+        if live.exists():
+            if not path.exists():
+                return live
+            if live.stat().st_mtime > path.stat().st_mtime + 0.5:
+                return live
+    except Exception:
+        pass
+    return path
+
+
 class EngineRunner:
     """
     Запускает subprocess-движки, читает stdout в фоновом потоке,
@@ -726,7 +744,7 @@ class EngineRunner:
         """Читает лист 'Сводка' из XLSX и заполняет metrics.status/risk/registry."""
         try:
             from openpyxl import load_workbook  # type: ignore
-            xlsx_path = self._freshest_xlsx(Path(xlsx_path))
+            xlsx_path = freshest_xlsx(Path(xlsx_path))
             wb = load_workbook(xlsx_path, read_only=True, data_only=True)
             if "Сводка" not in wb.sheetnames:
                 return
@@ -1022,30 +1040,13 @@ class Bridge:
 
     # ---- результаты ----
 
-    @staticmethod
-    def _freshest_xlsx(path: Path) -> Path:
-        """v27.9.x: если основной XLSX был занят (открыт в Excel), движок пишет
-        в `<stem>_live.xlsx`. Тогда таблица/графики ДОЛЖНЫ читать именно его, иначе
-        показывали бы устаревшие данные прошлого прогона. Возвращаем самый свежий
-        из (основной, _live)."""
-        try:
-            live = path.with_name(path.stem + "_live" + path.suffix)
-            if live.exists():
-                if not path.exists():
-                    return live
-                if live.stat().st_mtime > path.stat().st_mtime + 0.5:
-                    return live
-        except Exception:
-            pass
-        return path
-
     def get_results(self, xlsx_path: Optional[str] = None, limit: int = 2000) -> dict:
         """
         Читает лист «Подробности» из XLSX и возвращает данные для таблицы.
         Также считает статистику по статусу, реестру и маркетплейсу.
         """
         path = Path(xlsx_path or self.state.output_path or "")
-        path = self._freshest_xlsx(path)
+        path = freshest_xlsx(path)
         if not path.exists():
             return {"ok": False, "error": "Файл результата не найден. Запустите прогон."}
         try:
@@ -2961,16 +2962,19 @@ $$('.theme-btn').forEach(b => {
 // ============================================================
 // Chart.js integration
 // ============================================================
+// v27.9.x: РАЗЛИЧИМЫЕ оттенки — раньше OK и «ССЫЛКА СОБРАНА» были оба зелёными,
+// а НЕСООТВЕТСТВИЕ/ОШИБКА/ТАЙМАУТ — почти одинаково красно-оранжевыми.
 const STATUS_COLORS = {
-  'OK':                                    '#10b981',
-  'ССЫЛКА НА РЕЕСТР СОБРАНА':           '#34d399',
-  'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':                 '#fbbf24',
-  'НЕСООТВЕТСТВИЕ':                        '#fb923c',
-  'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА': '#a78bfa',
-  'ОШИБКА':                                '#ef4444',
-  'ТАЙМАУТ':                               '#f87171',
-  'НЕТ ДОКУМЕНТОВ':                        '#6b7280',
-  'НЕТ ССЫЛКИ НА РЕЕСТР':                 '#94a3b8',
+  'OK':                                    '#10b981', // зелёный
+  'ССЫЛКА НА РЕЕСТР СОБРАНА':           '#0ea5e9', // голубой
+  'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':                 '#f59e0b', // янтарный
+  'НЕСООТВЕТСТВИЕ':                        '#ef4444', // красный
+  'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА': '#a855f7', // фиолетовый
+  'ПРОВЕРИТЬ ВРУЧНУЮ':                     '#eab308', // жёлтый
+  'ОШИБКА':                                '#be123c', // тёмно-розовый
+  'ТАЙМАУТ':                               '#fb923c', // оранжевый
+  'НЕТ ДОКУМЕНТОВ':                        '#6b7280', // серый
+  'НЕТ ССЫЛКИ НА РЕЕСТР':                 '#94a3b8', // светло-серый
 };
 const MKT_COLORS = {
   'WB': '#cb11ab', 'Wildberries': '#cb11ab', 'wildberries': '#cb11ab',
@@ -3006,7 +3010,7 @@ const PALETTE = [
   '#5b8cff','#10b981','#a78bfa','#fb923c','#f87171','#38bdf8',
   '#fbbf24','#34d399','#ec4899','#8b5cf6','#06b6d4','#84cc16',
   '#f59e0b','#14b8a6','#d946ef','#0ea5e9','#22c55e','#eab308',
-  '#f43f5e','#6366f1','#10b981','#f97316','#a855f7','#3b82f6',
+  '#f43f5e','#6366f1','#7c3aed','#f97316','#65a30d','#3b82f6',
 ];
 
 function colorFor(i, total) {

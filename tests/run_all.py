@@ -25,6 +25,7 @@ MODULES = [
     "test_brand_category",
     "test_cert_fetch",
     "test_xlsx_safe",
+    "test_empty_report_save",
     "test_ozon_verdict",
     "test_progress",
     "test_report_e2e",

@@ -31,6 +31,12 @@ import re
 import sys
 import time
 import traceback
+import logging as _logging
+
+# v27.9.x: модульный логгер. Раньше код местами вызывал log.warning(...), но
+# `log` нигде не определялся -> при ЛЮБОМ исключении в построении «Сводки»
+# падало с NameError и рушило сохранение всего файла. Теперь логгер есть.
+log = _logging.getLogger("wb_registry")
 import difflib
 import urllib.parse
 from dataclasses import dataclass, asdict
@@ -2574,6 +2580,17 @@ async def collect_cards(args) -> List[Card]:
     n_total = collect_stats.get('wb_returned', 0)
     n_filtered = collect_stats.get('filtered_out', 0)
     print(f"📊 Статистика сбора: WB вернул всего {n_total} карточек (включая дубли), уникальных собрано {n_kept}, отфильтровано {n_filtered}.")
+    # v27.9.x: WB вернул 0 на ВСЕ запросы — это не баг кода, а ВРЕМЕННЫЙ лимит
+    # запросов WB (часто после серии частых прогонов WB начинает отдавать пусто).
+    if n_total == 0:
+        print("=" * 80)
+        print("🔴 WB вернул 0 карточек на ВСЕ запросы. Это НЕ ошибка программы, а")
+        print("   временный анти-бот лимит Wildberries (срабатывает после серии")
+        print("   частых прогонов с одного IP). Что делать:")
+        print("   • подожди 2–5 минут и запусти снова;")
+        print("   • или смени сеть/IP (мобильный интернет, VPN);")
+        print("   • проверь, что в обычном браузере открывается www.wildberries.ru.")
+        print("=" * 80)
     if use_filter and n_filtered > n_kept * 5 and n_kept < args.limit / 2:
         print(f"   ⚠️  Фильтр отсеял много карточек. Если кажется что отсеиваются нужные товары:")
         print(f"      • попробуй --strict-domain-filter false (выключить фильтр)")
@@ -2837,16 +2854,24 @@ def _build_summary_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
             bar.set_categories(cats3)
             ws.add_chart(bar, "E41")
 
-        # Data-bar на колонку «Количество» по всем трём таблицам
-        rule = DataBarRule(start_type="num", start_value=0,
-                           end_type="max", color="4F81BD", showValue=True)
-        ws.conditional_formatting.add(f"B{status_hdr + 1}:B{status_end}", rule)
-        ws.conditional_formatting.add(f"B{orig_hdr + 1}:B{orig_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="9BBB59", showValue=True))
-        ws.conditional_formatting.add(f"B{risk_hdr + 1}:B{risk_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="C0504D", showValue=True))
+        # Data-bar на колонку «Количество» по всем трём таблицам.
+        # v27.9.x: ПРОПУСКАЕМ если таблица пустая (нет строк данных) — иначе
+        # диапазон «B9:B8» падал ValueError и рушил сохранение всего файла.
+        if status_end >= status_hdr + 1:
+            ws.conditional_formatting.add(
+                f"B{status_hdr + 1}:B{status_end}",
+                DataBarRule(start_type="num", start_value=0, end_type="max",
+                            color="4F81BD", showValue=True))
+        if orig_end >= orig_hdr + 1:
+            ws.conditional_formatting.add(
+                f"B{orig_hdr + 1}:B{orig_end}",
+                DataBarRule(start_type="num", start_value=0, end_type="max",
+                            color="9BBB59", showValue=True))
+        if risk_end >= risk_hdr + 1:
+            ws.conditional_formatting.add(
+                f"B{risk_hdr + 1}:B{risk_end}",
+                DataBarRule(start_type="num", start_value=0, end_type="max",
+                            color="C0504D", showValue=True))
     except Exception as _e:
         log.warning("Не удалось добавить графики/условное форматирование в Сводку: %s", _e)
 

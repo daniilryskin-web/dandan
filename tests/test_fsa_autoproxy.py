@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.modules.setdefault("webview", types.ModuleType("webview"))
 import main_v39 as mv  # noqa: E402
+import wb_checker as wc  # noqa: E402
 
 RESULTS = []
 
@@ -75,6 +76,37 @@ def main():
     # 3) функции авто-обхода существуют
     check("есть _auto_find_fsa_proxy", hasattr(mv, "_auto_find_fsa_proxy"))
     check("есть _browser_reaches_fsa", hasattr(mv, "_browser_reaches_fsa"))
+
+    # 4) ПУЛ прокси: загрузка (inline + форматы) и ротация
+    pool = mv.load_proxy_pool("1.2.3.4:8080, http://u:p@5.6.7.8:3128\nsocks5://9.9.9.9:1080\n# коммент\n")
+    check("пул: ip:port -> http://1.2.3.4:8080", "http://1.2.3.4:8080" in pool)
+    check("пул: с авторизацией сохранён", "http://u:p@5.6.7.8:3128" in pool)
+    check("пул: socks5 сохранён", "socks5://9.9.9.9:1080" in pool)
+    check("пул: комментарии отброшены", not any("коммент" in x for x in pool))
+    # загрузка из файла
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
+        tf.write("11.11.11.11:80\n22.22.22.22:8080\n")
+        tfp = tf.name
+    pool_f = mv.load_proxy_pool(tfp)
+    check("пул из ФАЙЛА загружен", "http://11.11.11.11:80" in pool_f and "http://22.22.22.22:8080" in pool_f)
+    # ротация
+    mv._FSA_PROXY_POOL = pool
+    mv._FSA_PROXY_POOL_BAD = set()
+    picks = set(mv._pick_fsa_proxy() for _ in range(60))
+    check("ротация: выдаёт РАЗНЫЕ прокси", len(picks) >= 2)
+    # исключение «плохого»
+    mv._FSA_PROXY_POOL_BAD = set(pool[1:])
+    picks2 = set(mv._pick_fsa_proxy() for _ in range(20))
+    check("плохие прокси исключаются", picks2 == {pool[0]})
+
+    # 5) флаг и проброс
+    a3 = ap.parse_args(["--input-links-csv", "x.csv"])
+    check("--registry-proxy-list есть, по умолчанию пуст", a3.registry_proxy_list == "")
+    sp = wc.RunSpec(mode="query_stage2", input_links_csv="r.csv",
+                    registry_proxy_list="1.2.3.4:8080,5.6.7.8:3128", workers=5)
+    check("stage2 пробрасывает --registry-proxy-list",
+          "--registry-proxy-list" in sp.wb_args())
 
 
 if __name__ == "__main__":

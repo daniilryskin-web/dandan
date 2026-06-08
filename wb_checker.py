@@ -152,6 +152,10 @@ class RunSpec:
     registry_proxy: str = ""
     """v27.9.x: прокси для этапа 2 (FSA/реестры) — обход блокировки IP на FSA."""
 
+    registry_proxy_list: str = ""
+    """v27.9.x: ПУЛ прокси с ротацией (путь к файлу или список). Каждый FSA-запрос
+    через случайный прокси — нагрузка размазывается, бана нет (метод из видео)."""
+
     registry_fsa_retry: bool = False
     """v27.9.x: второй проход по упавшим FSA (по кнопке)."""
 
@@ -250,6 +254,8 @@ class RunSpec:
             ]
             if self.registry_proxy.strip():
                 args += ["--registry-proxy", self.registry_proxy.strip()]
+            if self.registry_proxy_list.strip():
+                args += ["--registry-proxy-list", self.registry_proxy_list.strip()]
             if self.strict_brand and self.strict_brand_match != "any":
                 args += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
             return args
@@ -2403,6 +2409,9 @@ const FORM_FIELDS = {
       hint:'Необязательно. Сужает поиск до выбранных категорий — запрос к WB точнее. Ничего не выбрано — авто-определение'},
     {key:'registry_proxy', lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
       hint:'Опционально. http://host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
+    {key:'registry_proxy_list', lbl:'Пул прокси для FSA (ротация — надёжнее)', type:'textarea', rows:4,
+      ph:'по одному на строку: 1.2.3.4:8080  или  http://user:pass@host:port  (можно путь к файлу proxies.txt)',
+      hint:'Список прокси или путь к файлу. Каждый FSA-запрос идёт через СЛУЧАЙНЫЙ прокси — нагрузка размазывается, FSA не банит (метод из видео). Самый надёжный способ.'},
     {key:'limit',   lbl:'Лимит карточек',       type:'number', def:5000, min:1, max:200000},
     {key:'workers', lbl:'Браузер-воркеры',       type:'number', def:5, min:1, max:12, hint:'Параллельных браузеров для парсинга реестров (4–6 оптимально; больше = быстрее FSA, но больше памяти)'},
     {key:'expiry_warning_days', lbl:'Скоро истекает (дней)', type:'number', def:30, min:1, max:365},
@@ -2421,6 +2430,9 @@ const FORM_FIELDS = {
     {key:'output',           lbl:'Результат XLSX',     type:'text',  def:'result.xlsx'},
     {key:'registry_proxy',   lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
       hint:'Опционально. http://user:pass@host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
+    {key:'registry_proxy_list', lbl:'Пул прокси для FSA (ротация — надёжнее)', type:'textarea', rows:4,
+      ph:'по одному на строку: 1.2.3.4:8080  или  http://user:pass@host:port  (можно путь к файлу proxies.txt)',
+      hint:'Список прокси или путь к файлу. Каждый FSA-запрос идёт через СЛУЧАЙНЫЙ прокси — нагрузка размазывается, FSA не банит (метод из видео). Самый надёжный способ.'},
     {key:'limit',            lbl:'Лимит',              type:'number',def:10000, min:1, max:200000},
     {key:'workers',          lbl:'Браузер-воркеры',    type:'number',def:5, min:1, max:10, hint:'Параллельных браузеров (4–6 оптимально)'},
     {key:'expiry_warning_days',lbl:'Скоро истекает (дней)',type:'number',def:30,min:1,max:365},
@@ -2436,6 +2448,9 @@ const FORM_FIELDS = {
       hint:'Сузить поиск до выбранных категорий (reebok→одежда+обувь, indesit→бытовая техника). Ничего не выбрано — все товары бренда'},
     {key:'registry_proxy', lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
       hint:'Опционально. http://host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
+    {key:'registry_proxy_list', lbl:'Пул прокси для FSA (ротация — надёжнее)', type:'textarea', rows:4,
+      ph:'по одному на строку: 1.2.3.4:8080  или  http://user:pass@host:port  (можно путь к файлу proxies.txt)',
+      hint:'Список прокси или путь к файлу. Каждый FSA-запрос идёт через СЛУЧАЙНЫЙ прокси — нагрузка размазывается, FSA не банит (метод из видео). Самый надёжный способ.'},
     {key:'brand_match', lbl:'Тип совпадения',           type:'select',def:'exact',options:['exact','contains','any']},
     {key:'limit',       lbl:'Лимит карточек',           type:'number',def:5000, min:1, max:200000},
     {key:'workers',     lbl:'Браузер-воркеры',          type:'number',def:5, min:1, max:12, hint:'Параллельных браузеров для реестров (4–6 оптимально)'},
@@ -2513,6 +2528,14 @@ function renderForm() {
         <div class="field">
           <span class="field-label">${escapeHtml(f.lbl)}</span>
           <select data-key="${f.key}">${opts}</select>
+          ${f.hint ? `<span class="field-hint">${escapeHtml(f.hint)}</span>` : ''}
+        </div>`;
+    } else if (f.type === 'textarea') {
+      const safeVal = String(val).replace(/"/g, '&quot;');
+      wrap.innerHTML = `
+        <div class="field">
+          <span class="field-label">${escapeHtml(f.lbl)}</span>
+          <textarea data-key="${f.key}" rows="${f.rows||4}" placeholder="${escapeHtml(f.ph||'')}" style="width:100%;resize:vertical;font-family:monospace;font-size:12px;">${escapeHtml(String(val))}</textarea>
           ${f.hint ? `<span class="field-hint">${escapeHtml(f.hint)}</span>` : ''}
         </div>`;
     } else if (f.type === 'multiselect') {

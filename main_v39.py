@@ -1854,6 +1854,24 @@ DOMAIN_SUBJECT_NAME_KEYWORDS = {
     ],
 }
 
+# v27.9.x: домен «бытовая техника» (appliances) — для поиска по бренду (напр.
+# indesit, bosch, electrolux), чтобы выдача ограничивалась техникой, а не
+# попадали чехлы/аксессуары/одежда. Добавляем отдельно, чтобы не трогать большие
+# литералы выше.
+DOMAIN_PRODUCT_TYPES['appliances'] = [
+    'стиральные машины', 'холодильники', 'посудомоечные машины', 'плиты',
+    'духовые шкафы', 'варочные панели', 'микроволновые печи', 'вытяжки',
+    'морозильные камеры', 'пылесосы', 'водонагреватели', 'кондиционеры',
+    'сушильные машины', 'встраиваемые духовые шкафы', 'газовые плиты',
+    'электроплиты', 'винные шкафы',
+]
+DOMAIN_SUBJECT_NAME_KEYWORDS['appliances'] = [
+    'стиральн', 'холодильник', 'посудомоечн', 'плита', 'плиты', 'духов',
+    'варочн', 'микроволнов', 'вытяжк', 'морозильник', 'морозильн', 'пылесос',
+    'водонагреватель', 'кондиционер', 'сушильн', 'бытовая техник', 'духовой шкаф',
+]
+DOMAIN_SUBJECT_WHITELIST['appliances'] = []  # фильтруем по ключевым словам названия
+
 
 def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '', product_name: str = '') -> bool:
     """v39.10: проверяет относится ли карточка к ожидаемому домену.
@@ -2313,46 +2331,57 @@ async def collect_cards(args) -> List[Card]:
                     break
         return cards
 
-    # v27.9.x: ПОИСК ПО БРЕНДУ — это просто товары бренда, БЕЗ приписок категорий.
-    # Раньше запрос «reebok» расширялся в «reebok детские/обувь…» (generate_query_
-    # variants) и доменный subject-фильтр резал часть товаров. Теперь для бренда:
-    # один чистый запрос + листание страниц + без доменного фильтра.
     _brand_search = bool((getattr(args, 'brand', '') or '').strip()) and \
         (getattr(args, 'brand_match', 'any') or 'any') != 'any'
 
-    variants = generate_query_variants(args.query, args.query_profile, args.max_expanded_queries)
-    # v27.9.x: при поиске по бренду РАЗРЕШАЕМ варианты запроса (бренд + типы
-    # товаров) — это даёт БОЛЬШЕ карточек (как в поиске по запросу). Релевантность
-    # обеспечивает строгий бренд-фильтр ниже, а столбец «Запрос» мы переопределяем
-    # на сам бренд (чтобы не было «reebok детские» в выгрузке). Полный бренд-каталог
-    # по brandId добавляется отдельно. Без бренда — прежняя логика.
-    if not _brand_search and args.limit <= args.per_query_limit and not args.auto_expand:
-        variants = [args.query]
-
-    # v39.7: определяем domain один раз, используем для фильтрации мусорных subject
+    # v39.7 + v27.9.x: профиль → домен. Расширено: identity для всех доменных
+    # ключей (clothing/shoes/.../appliances) и RU-алиасы. Нужно для ВЫБОРА
+    # КАТЕГОРИИ при поиске по бренду (reebok→одежда, indesit→бытовая техника).
     profile_to_domain = {
         'clothing': 'clothing', 'одежда': 'clothing',
         'shoes': 'shoes', 'обувь': 'shoes',
         'toys': 'toys', 'игрушки': 'toys',
+        'kids_accessories': 'kids_accessories', 'детские аксессуары': 'kids_accessories',
+        'baby_gear': 'baby_gear', 'детский транспорт': 'baby_gear',
         'cosmetics': 'cosmetics', 'косметика': 'cosmetics',
         'electronics': 'electronics', 'электроника': 'electronics',
-        'home': 'home',
+        'appliances': 'appliances', 'бытовая техника': 'appliances', 'техника': 'appliances',
+        'home': 'home', 'дом': 'home', 'дом и текстиль': 'home', 'текстиль': 'home',
+        'kitchenware': 'kitchenware', 'посуда': 'kitchenware',
+        'food': 'food', 'продукты': 'food', 'питание': 'food',
     }
-    domain = profile_to_domain.get((args.query_profile or 'auto').lower())
+    _profile_key = (getattr(args, 'query_profile', '') or 'auto').strip().lower()
+    # v27.9.x: КАТЕГОРИЯ ТОВАРОВ для бренда — если выбрана (не auto/любая), сужаем
+    # выдачу до неё. Иначе для бренда — без сужения (берём все товары бренда).
+    _brand_category_domain = profile_to_domain.get(_profile_key) if _profile_key not in ('auto', '', 'any', 'любая') else None
+
+    variants = generate_query_variants(args.query, args.query_profile, args.max_expanded_queries)
+    if _brand_search:
+        # Бренд: чистый бренд + (если выбрана категория) «бренд + тип товара»
+        # из этой категории. Это даёт больше карточек, не выходя за категорию.
+        if _brand_category_domain:
+            _types = DOMAIN_PRODUCT_TYPES.get(_brand_category_domain, [])
+            variants = [args.brand] + [f"{args.brand} {t}" for t in _types]
+        else:
+            variants = [args.brand]
+    elif args.limit <= args.per_query_limit and not args.auto_expand:
+        variants = [args.query]
+
+    domain = profile_to_domain.get(_profile_key)
     if not domain:
         domain = detect_query_domain(args.query)
-    # v39.11: фильтр включаем если ЕСТЬ хоть какой-то сигнал по домену — либо
-    # whitelist subject ID, либо keywords для названий/категорий.
-    # Раньше требовался только whitelist — это блокировало работу для shoes/home/cosmetics
-    # где whitelist пустой, но keywords есть.
     strict_filter_enabled = getattr(args, 'strict_domain_filter', True)
     has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
     use_filter = strict_filter_enabled and domain and has_signals
-    # v27.9.x: при поиске по бренду доменный subject-фильтр ВЫКЛючен — берём все
-    # товары бренда (релевантность обеспечивает строгий бренд-фильтр ниже).
     if _brand_search:
-        use_filter = False
-        domain = ''
+        # Бренд + выбрана категория → ВКЛючаем доменный фильтр (только эта категория).
+        # Бренд без категории → фильтр ВЫКЛючен (все товары бренда).
+        if _brand_category_domain:
+            domain = _brand_category_domain
+            use_filter = bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain)) or bool(DOMAIN_SUBJECT_WHITELIST.get(domain))
+        else:
+            use_filter = False
+            domain = ''
     filter_label = f"domain={domain} subject_filter={'ON' if use_filter else 'OFF'}"
     print(f"Получаю список карточек через JSON-каталог WB: базовый query='{args.query}', вариантов={len(variants)}, общий limit={args.limit}, collect-workers={args.collect_workers}; {filter_label}")
 
@@ -2468,7 +2497,7 @@ async def collect_cards(args) -> List[Card]:
                                 return
                             cards = await collect_one_query(
                                 session, qx, args.per_query_limit, sort,
-                                domain='', stats=collect_stats, page=_page)
+                                domain=domain if use_filter else '', stats=collect_stats, page=_page)
                             before = len(cards_map)
                             for c in cards:
                                 if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,

@@ -142,6 +142,13 @@ class RunSpec:
     brand_match: str = "exact"
     """Тип совпадения бренда: exact | contains | any."""
 
+    brand_category: str = ""
+    """v27.9.x: товарная категория для поиска по бренду (RU-метка). Пусто/«любая»
+    — без сужения. Маппится на доменный профиль движка (--query-profile)."""
+
+    query_profile: str = "auto"
+    """v27.9.x: доменный профиль движка для stage1 (clothing/shoes/appliances/...)."""
+
     limit: int = 5000
     """Лимит карточек."""
 
@@ -218,6 +225,9 @@ class RunSpec:
             # v27.9.x: поиск по бренду через тот же движок — строгий бренд-фильтр.
             if self.strict_brand and self.strict_brand_match != "any":
                 a += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
+            # v27.9.x: товарная категория бренда -> доменный профиль (сужение выдачи).
+            if self.query_profile and self.query_profile != "auto":
+                a += ["--query-profile", self.query_profile]
             return a
         if self.mode == "query_stage2":
             out = self.output or "result.xlsx"
@@ -457,10 +467,19 @@ class EngineRunner:
                 # надёжным способом. Итог: идентичные столбцы result.xlsx, «Оригинал»
                 # по card.json и корректное извлечение реестров (FSA/SWIS/BelGISS).
                 _bm = spec.brand_match if spec.brand_match and spec.brand_match != "any" else "contains"
+                # v27.9.x: товарная категория бренда (RU) -> доменный профиль движка.
+                _CAT2PROFILE = {
+                    "одежда": "clothing", "обувь": "shoes", "бытовая техника": "appliances",
+                    "электроника": "electronics", "игрушки": "toys", "косметика": "cosmetics",
+                    "детские аксессуары": "kids_accessories", "детский транспорт": "baby_gear",
+                    "дом и текстиль": "home", "посуда": "kitchenware", "продукты": "food",
+                }
+                _profile = _CAT2PROFILE.get((spec.brand_category or "").strip().lower(), "auto")
                 s1 = RunSpec(**{**asdict(spec), "mode": "query_stage1",
                                 "query": spec.brand or spec.query,
                                 "strict_brand": spec.brand,
                                 "strict_brand_match": _bm,
+                                "query_profile": _profile,
                                 "output_links_csv": "registry_links.csv",
                                 "output": "links.xlsx"})
                 rc = self._run_one(s1.wb_args(), "🔍 Этап 1 — сбор карточек бренда WB")
@@ -2318,6 +2337,9 @@ const FORM_FIELDS = {
   ],
   brand: [
     {key:'brand',       lbl:'Бренд',                   type:'text',  def:'adidas', hint:'Латиницей, как на WB'},
+    {key:'brand_category', lbl:'Категория товаров', type:'select', def:'любая',
+      options:['любая','одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
+      hint:'Сузить поиск до категории бренда (reebok→одежда, indesit→бытовая техника)'},
     {key:'brand_match', lbl:'Тип совпадения',           type:'select',def:'exact',options:['exact','contains','any']},
     {key:'limit',       lbl:'Лимит карточек',           type:'number',def:5000, min:1, max:200000},
     {key:'workers',     lbl:'Браузер-воркеры',          type:'number',def:4, min:1, max:12},

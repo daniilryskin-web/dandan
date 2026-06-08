@@ -37,6 +37,10 @@ import logging as _logging
 # `log` нигде не определялся -> при ЛЮБОМ исключении в построении «Сводки»
 # падало с NameError и рушило сохранение всего файла. Теперь логгер есть.
 log = _logging.getLogger("wb_registry")
+
+
+class _SkipSecondPass(Exception):
+    """v27.9.x: внутренний сигнал — пропустить второй проход FSA (он теперь по кнопке)."""
 import difflib
 import urllib.parse
 from dataclasses import dataclass, asdict
@@ -7860,10 +7864,16 @@ async def run_registry_stage(args):
         if async_playwright is None:
             raise RuntimeError('playwright не установлен. Выполните: python -m pip install playwright && python -m playwright install chromium')
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
+            # v27.9.x: прокси для этапа 2 — обход блокировки IP на pub.fsa.gov.ru.
+            _proxy = (getattr(args, 'registry_proxy', '') or '').strip()
+            _launch_kwargs = dict(
                 headless=getattr(args, 'registry_headless', True),
                 args=['--disable-dev-shm-usage', '--no-sandbox', '--disable-blink-features=AutomationControlled'],
             )
+            if _proxy:
+                _launch_kwargs['proxy'] = {'server': _proxy}
+                print(f"🛡  Этап 2 через прокси: {_proxy.split('@')[-1]}")
+            browser = await p.chromium.launch(**_launch_kwargs)
 
             async def worker(wid: int):
                 # v39: единая функция пересоздания контекста + страницы. Если что-то падает —
@@ -8058,12 +8068,20 @@ async def run_registry_stage(args):
             # Ждём завершения воркеров (они должны сами выйти когда очередь пуста)
             await asyncio.gather(*workers, return_exceptions=True)
 
-            # v27.9.x: ВТОРОЙ ПРОХОД для FSA-ссылок, упавших по ТРАНЗИТНОЙ сетевой
-            # ошибке/таймауту. pub.fsa.gov.ru периодически отвечает медленно или
-            # рвёт соединение под нагрузкой; повтор в конце прогона (нагрузка спала)
-            # обычно успешен. Строго ОДИН проход, последовательно, и целиком в
-            # try/except — сбой ретрая не должен портить основной результат.
+            # v27.9.x: ВТОРОЙ ПРОХОД для FSA-ссылок, упавших по сетевой ошибке.
+            # По умолчанию ВЫКЛючен — запускается ТОЛЬКО по кнопке в окне
+            # (--registry-fsa-retry true). Раньше он шёл автоматически и «висел»
+            # после 100%, когда FSA недоступен. Теперь повтор — осознанное действие
+            # пользователя (когда FSA снова заработает).
+            if not bool(getattr(args, 'registry_fsa_retry', False)):
+                _fsa_fail_n = sum(1 for u, v in parsed.items()
+                                  if hostname(u) == 'pub.fsa.gov.ru' and not (v[1] or '').strip())
+                if _fsa_fail_n:
+                    print(f"ℹ️  {_fsa_fail_n} FSA-ссылок не извлеклись (FSA недоступен/таймаут). "
+                          f"Когда FSA снова заработает — нажми в окне «🔁 Повторить упавшие FSA».")
             try:
+                if not bool(getattr(args, 'registry_fsa_retry', False)):
+                    raise _SkipSecondPass()
                 def _is_transient_fsa_fail(detail_str: str) -> bool:
                     d = detail_str or ''
                     return any(k in d for k in (
@@ -8164,6 +8182,8 @@ async def run_registry_stage(args):
                         await out_store.save()
                     except Exception:
                         pass
+            except _SkipSecondPass:
+                pass
             except Exception as _e:
                 print(f"⚠️  Второй проход FSA пропущен: {type(_e).__name__}: {_e}")
 
@@ -8382,6 +8402,13 @@ def build_parser():
     ap.add_argument("--fsa-exact-browser-fallback", type=str_to_bool, default=True, help="Для ФСА по умолчанию открыть /baseInfo|/common и /product браузером, если HTTP не достал точные поля")
     ap.add_argument("--registry-browser-workers", type=int, default=6, help="Сколько Chromium одновременно можно использовать для второго этапа/ФСА browser fallback")
     ap.add_argument("--registry-headless", type=str_to_bool, default=True)
+    ap.add_argument("--registry-fsa-retry", type=str_to_bool, default=False,
+                    help="v27.9.x: второй проход по упавшим FSA-ссылкам. По умолчанию FALSE — "
+                         "запускается ТОЛЬКО по кнопке в окне (когда FSA снова доступен).")
+    ap.add_argument("--registry-proxy", default="",
+                    help="v27.9.x: прокси для этапа 2 (FSA/реестры), напр. http://user:pass@host:port "
+                         "или socks5://host:port. Помогает, когда твой IP заблокирован на pub.fsa.gov.ru, "
+                         "а сам реестр работает. Применяется к браузеру и HTTP-запросам реестров.")
     # v27.6: уменьшен с 45000 до 28000 — раньше FSA-карточка занимала 165с
     ap.add_argument("--registry-browser-timeout-ms", type=int, default=28000)
     ap.add_argument("--registry-browser-wait-ms", type=int, default=8000,

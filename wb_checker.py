@@ -149,6 +149,12 @@ class RunSpec:
     query_profile: str = "auto"
     """v27.9.x: доменный профиль движка для stage1 (clothing/shoes/appliances/...)."""
 
+    registry_proxy: str = ""
+    """v27.9.x: прокси для этапа 2 (FSA/реестры) — обход блокировки IP на FSA."""
+
+    registry_fsa_retry: bool = False
+    """v27.9.x: второй проход по упавшим FSA (по кнопке)."""
+
     limit: int = 5000
     """Лимит карточек."""
 
@@ -240,7 +246,10 @@ class RunSpec:
                 "--output", out,
                 "--expiry-warning-days", str(self.expiry_warning_days),
                 "--make-report-xlsx", "true" if self.make_report_xlsx else "false",
+                "--registry-fsa-retry", "true" if self.registry_fsa_retry else "false",
             ]
+            if self.registry_proxy.strip():
+                args += ["--registry-proxy", self.registry_proxy.strip()]
             if self.strict_brand and self.strict_brand_match != "any":
                 args += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
             return args
@@ -1220,6 +1229,39 @@ class Bridge:
         """Открывает рабочую папку программы."""
         return self.open_path(str(APP_DIR))
 
+    def retry_failed_fsa(self) -> dict:
+        """v27.9.x: ПОВТОР по упавшим FSA-ссылкам (по кнопке). Перезапускает этап 2
+        на том же registry_links.csv с включённым вторым проходом FSA. Нажимать,
+        когда pub.fsa.gov.ru снова доступен (или после настройки прокси)."""
+        if self.state.running:
+            return {"ok": False, "error": "Дождитесь завершения текущего прогона"}
+        last = dict(self._last_spec or {})
+        out = self.state.output_path or last.get("output") or "result.xlsx"
+        out_name = Path(out).name
+        links = last.get("output_links_csv") or last.get("input_links_csv") or "registry_links.csv"
+        if not (APP_DIR / links).exists() and not Path(links).exists():
+            return {"ok": False, "error": f"Не найден файл ссылок {links}. Сначала выполните этап 1."}
+        spec = {
+            "mode": "query_stage2",
+            "input_links_csv": links,
+            "output": out_name,
+            "limit": int(last.get("limit", 10000) or 10000),
+            "workers": int(last.get("workers", 5) or 5),
+            "headless": bool(last.get("headless", True)),
+            "expiry_warning_days": int(last.get("expiry_warning_days", 30) or 30),
+            "make_report_xlsx": bool(last.get("make_report_xlsx", True)),
+            "registry_proxy": last.get("registry_proxy", "") or "",
+            "registry_fsa_retry": True,
+            "strict_brand": last.get("strict_brand", "") or "",
+            "strict_brand_match": last.get("strict_brand_match", "any") or "any",
+        }
+        run_spec = RunSpec(**{k: v for k, v in spec.items() if k in RunSpec.__dataclass_fields__})
+        try:
+            self.runner.start(run_spec)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
     def open_url(self, url: str) -> dict:
         """v27.9.x: открывает ссылку (товар WB / реестр документа) в системном
         браузере. Используется кликами в таблице результатов."""
@@ -2046,6 +2088,7 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
             <button class="btn btn-ghost btn-sm" id="btn-open-ozon-result" disabled>🛒 Ozon XLSX</button>
             <button class="btn btn-ghost btn-sm" id="btn-open-log" disabled>📝 Лог файл</button>
             <button class="btn btn-ghost btn-sm" id="btn-goto-results">📊 Таблица</button>
+            <button class="btn btn-ghost btn-sm" id="btn-retry-fsa" title="Перезапустить этап 2 по упавшим FSA-ссылкам (когда FSA снова доступен / с прокси)">🔁 Повторить упавшие FSA</button>
           </div>
         </div>
 
@@ -2358,6 +2401,8 @@ const FORM_FIELDS = {
     {key:'brand_category', lbl:'Категория товаров (уточнить запрос)', type:'multiselect', def:'',
       options:['одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
       hint:'Необязательно. Сужает поиск до выбранных категорий — запрос к WB точнее. Ничего не выбрано — авто-определение'},
+    {key:'registry_proxy', lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
+      hint:'Опционально. http://host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
     {key:'limit',   lbl:'Лимит карточек',       type:'number', def:5000, min:1, max:200000},
     {key:'workers', lbl:'Браузер-воркеры',       type:'number', def:5, min:1, max:12, hint:'Параллельных браузеров для парсинга реестров (4–6 оптимально; больше = быстрее FSA, но больше памяти)'},
     {key:'expiry_warning_days', lbl:'Скоро истекает (дней)', type:'number', def:30, min:1, max:365},
@@ -2374,6 +2419,8 @@ const FORM_FIELDS = {
   query_stage2: [
     {key:'input_links_csv',  lbl:'Входной CSV ссылок', type:'text',  def:'registry_links.csv'},
     {key:'output',           lbl:'Результат XLSX',     type:'text',  def:'result.xlsx'},
+    {key:'registry_proxy',   lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
+      hint:'Опционально. http://user:pass@host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
     {key:'limit',            lbl:'Лимит',              type:'number',def:10000, min:1, max:200000},
     {key:'workers',          lbl:'Браузер-воркеры',    type:'number',def:5, min:1, max:10, hint:'Параллельных браузеров (4–6 оптимально)'},
     {key:'expiry_warning_days',lbl:'Скоро истекает (дней)',type:'number',def:30,min:1,max:365},
@@ -2387,6 +2434,8 @@ const FORM_FIELDS = {
     {key:'brand_category', lbl:'Категории товаров (можно несколько)', type:'multiselect', def:'',
       options:['одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
       hint:'Сузить поиск до выбранных категорий (reebok→одежда+обувь, indesit→бытовая техника). Ничего не выбрано — все товары бренда'},
+    {key:'registry_proxy', lbl:'Прокси для FSA (если IP заблокирован)', type:'text', def:'',
+      hint:'Опционально. http://host:port или socks5://host:port — когда pub.fsa.gov.ru блокирует твой IP'},
     {key:'brand_match', lbl:'Тип совпадения',           type:'select',def:'exact',options:['exact','contains','any']},
     {key:'limit',       lbl:'Лимит карточек',           type:'number',def:5000, min:1, max:200000},
     {key:'workers',     lbl:'Браузер-воркеры',          type:'number',def:5, min:1, max:12, hint:'Параллельных браузеров для реестров (4–6 оптимально)'},
@@ -3101,6 +3150,16 @@ function applyTableFilter(q, st) {
 }
 
 $('#btn-reload-results').addEventListener('click', loadResults);
+const _btnRetryFsa = $('#btn-retry-fsa');
+if (_btnRetryFsa) _btnRetryFsa.addEventListener('click', async () => {
+  const res = await window.pywebview.api.retry_failed_fsa();
+  if (res && res.ok) {
+    toast('Повтор FSA запущен — этап 2 перезапущен', 'ok');
+    go('queue');
+  } else {
+    toast((res && res.error) || 'Не удалось запустить повтор', 'err');
+  }
+});
 $('#btn-export-csv').addEventListener('click', async () => {
   const q = $('#filter-input').value.trim();
   const res = await window.pywebview.api.export_csv(null, q);

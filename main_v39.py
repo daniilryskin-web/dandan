@@ -1994,6 +1994,112 @@ def recursive_find_products(obj: Any) -> List[Dict[str, Any]]:
                 res.extend(recursive_find_products(x))
     return res
 
+
+# =============================================================================
+# v27.9.x: ПОЛНЫЙ каталог бренда. Текстовый поиск «reebok» обрезается WB на ~сотне
+# карточек. Чтобы собрать ВСЕ товары бренда, находим brandId (через resultset=
+# filters и подсказки WB), затем листаем прямой бренд-каталог
+# catalog.wb.ru/brands/v2/catalog?brand=<id>. Логика портирована из main_brand.py.
+# =============================================================================
+def _recursive_find_brand_filter_ids(obj: Any, brand: str) -> List[str]:
+    wanted = norm_key_brand(brand)
+    ids: List[str] = []
+    def add_id(v: Any):
+        if v is None:
+            return
+        txt = str(v).strip()
+        if txt and re.fullmatch(r"\d{1,10}", txt) and txt not in ids:
+            ids.append(txt)
+    def is_brand_like(x: Any) -> bool:
+        k = norm_key_brand(str(x or ""))
+        return bool(k) and (k == wanted or wanted in k or k in wanted)
+    def walk(x: Any, in_brand_filter: bool = False):
+        if isinstance(x, dict):
+            name = x.get("name") or x.get("title") or x.get("value") or x.get("label")
+            key = norm_key_brand(str(x.get("key") or x.get("type") or x.get("id") or ""))
+            header = norm_key_brand(str(name or ""))
+            brand_filter = in_brand_filter or header in {"бренд", "brand", "brands"} or key in {"fbrand", "brand", "brands"}
+            if is_brand_like(name):
+                for k in ("id", "value", "key"):
+                    if k in x and str(x.get(k)).strip() != str(name).strip():
+                        add_id(x.get(k))
+                for k in ("ids", "values"):
+                    if isinstance(x.get(k), list):
+                        for v in x[k]:
+                            add_id(v)
+            if brand_filter:
+                for arr_key in ("items", "values", "list", "filters"):
+                    arr = x.get(arr_key)
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if isinstance(item, dict) and is_brand_like(item.get("name") or item.get("title") or item.get("value") or item.get("label")):
+                                for k in ("id", "value", "key"):
+                                    add_id(item.get(k))
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v, brand_filter)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, in_brand_filter)
+    walk(obj)
+    return ids[:20]
+
+
+def _find_brand_ids_in_suggestions(obj: Any, brand: str) -> List[str]:
+    wanted = norm_key_brand(brand)
+    ids: List[str] = []
+    def walk(x: Any):
+        if isinstance(x, dict):
+            name = x.get("name") or x.get("text") or x.get("title") or x.get("value")
+            nk = norm_key_brand(str(name or ""))
+            type_hint = norm_key_brand(str(x.get("type") or x.get("entity") or ""))
+            is_brand_entity = ("brand" in type_hint) or bool(x.get("brandId")) or bool(x.get("brand_id"))
+            name_matches = nk and (nk == wanted or wanted in nk or nk in wanted)
+            if is_brand_entity and (name_matches or not name):
+                for k in ("brandId", "brand_id", "id"):
+                    v = x.get(k)
+                    if v is not None and re.fullmatch(r"\d{1,10}", str(v).strip()):
+                        if str(v).strip() not in ids:
+                            ids.append(str(v).strip())
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(obj)
+    return ids
+
+
+async def discover_brand_filter_ids(session: aiohttp.ClientSession, brand: str, timeout: float = 10.0) -> List[str]:
+    """Находит числовой brandId(ы) WB для прямого бренд-каталога."""
+    q = urllib.parse.quote(brand)
+    found: List[str] = []
+    filter_urls = [
+        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30&suppressSpellcheck=false",
+        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30&suppressSpellcheck=false",
+        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30",
+    ]
+    for url in filter_urls:
+        data = await fetch_json(session, url, timeout=timeout)
+        if not data:
+            continue
+        for bid in _recursive_find_brand_filter_ids(data, brand):
+            if bid not in found:
+                found.append(bid)
+    suggest_urls = [
+        f"https://search.wb.ru/exactmatch/common/v5/search?query={q}&resultset=suggestions",
+        f"https://suggests.wb.ru/api/v6/hint?query={q}&gender=common&locale=ru",
+    ]
+    for url in suggest_urls:
+        data = await fetch_json(session, url, timeout=timeout)
+        if not data:
+            continue
+        for bid in _find_brand_ids_in_suggestions(data, brand):
+            if bid not in found:
+                found.append(bid)
+    return found[:10]
+
 async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: float = 12.0) -> Optional[Dict[str, Any]]:
     try:
         async with session.get(url, timeout=timeout) as r:
@@ -2044,7 +2150,7 @@ _FSA_HTTP_FAIL_LIMIT = 5
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
 _FSA_SAMPLE_DUMPED = False
 
-async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1) -> List[Card]:
+async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1, fbrand_ids: Optional[List[str]] = None) -> List[Card]:
     """v39.9: subject отдельно от subjectName.
 
     WB API в v18 возвращает оба поля:
@@ -2067,11 +2173,27 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
     q = urllib.parse.quote(query)
     _pg = max(1, int(page or 1))
     # несколько актуальных хостов/версий, первый обычно быстрее
-    urls = [
+    urls = []
+    # v27.9.x: ПОЛНЫЙ бренд-каталог по brandId — отдаёт ВСЕ товары бренда (а не
+    # топ поисковой выдачи, обрезанный на ~сотне). Ставим ПЕРВЫМ источником.
+    for bid in (fbrand_ids or []):
+        _b = urllib.parse.quote(str(bid))
+        urls.append(
+            f"https://catalog.wb.ru/brands/v2/catalog?ab_testing=false&appType=1&brand={_b}"
+            f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&sort={sort}&spp=30")
+        urls.append(
+            f"https://catalog.wb.ru/brands/catalog?appType=1&brand={_b}"
+            f"&curr=rub&dest=-1257786&lang=ru&page={_pg}&sort={sort}&spp=30")
+    # поисковая выдача (+ опционально фильтр по бренду fbrand)
+    _search_bases = [
         f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
         f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
         f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30",
     ]
+    for _bu in _search_bases:
+        for bid in (fbrand_ids or []):
+            urls.append(_bu + "&fbrand=" + urllib.parse.quote(str(bid)))
+        urls.append(_bu)
     for url in urls:
         data = await fetch_json(session, url)
         if not data:
@@ -2247,14 +2369,29 @@ async def collect_cards(args) -> List[Card]:
         # для обычного поиска — 1 страница (охват даёт расширение вариантов).
         _max_pages = max(1, min(60, (int(args.limit) // 90) + 2)) if _brand_search else 1
 
+        # v27.9.x: для бренда находим brandId и тянем ПОЛНЫЙ бренд-каталог
+        # (catalog.wb.ru/brands/...), а не обрезанную поисковую выдачу. Плюс
+        # перебираем НЕСКОЛЬКО сортировок — это докидывает товары, которые в одной
+        # сортировке не попали в первые страницы.
+        _fbrand_ids: List[str] = []
+        _brand_sorts = ["popular", "newly", "rate", "priceup", "pricedown"]
+        if _brand_search:
+            try:
+                _fbrand_ids = await discover_brand_filter_ids(session, args.brand)
+            except Exception as _e:
+                _fbrand_ids = []
+            print(f"Бренд-каталог: brandId={_fbrand_ids or 'не найден (работаю по поиску)'}; "
+                  f"сортировок={len(_brand_sorts)}, страниц до {_max_pages}")
+
         async def work(q):
             async with sem:
-                for sort in args.search_sorts.split(","):
-                    sort = sort.strip() or "popular"
+                _sorts = _brand_sorts if _brand_search else [s.strip() or "popular" for s in args.search_sorts.split(",")]
+                for sort in _sorts:
                     for _page in range(1, _max_pages + 1):
                         cards = await collect_one_query(
                             session, q, args.per_query_limit, sort,
-                            domain=domain if use_filter else '', stats=collect_stats, page=_page)
+                            domain=domain if use_filter else '', stats=collect_stats,
+                            page=_page, fbrand_ids=_fbrand_ids)
                         before = len(cards_map)
                         for c in cards:
                             cards_map.setdefault(c.nm_id, c)

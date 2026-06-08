@@ -43,12 +43,17 @@ def _make_xlsx(path):
     wb = Workbook()
     ws = wb.active
     ws.title = "results"
-    headers = ["query", "nm_id", "product_name", "brand", "status",
-               "registry_host", "certificate_product_name", "document_status"]
+    headers = ["query", "nm_id", "product_name", "brand", "status", "product_url",
+               "registry_url", "certificate_number", "registry_host",
+               "certificate_product_name", "document_status"]
     ws.append(headers)
     ws.append(["midea", 111, "Чайник", "Midea", "OK",
-               "pub.fsa.gov.ru", "Чайник электрический", "ДЕЙСТВУЕТ"])
+               "https://www.wildberries.ru/catalog/111/detail.aspx",
+               "https://pub.fsa.gov.ru/rss/certificate/view/1/baseInfo",
+               "ЕАЭС RU С-1", "pub.fsa.gov.ru", "Чайник электрический", "ДЕЙСТВУЕТ"])
     ws.append(["midea", 222, "Фен", "Midea", "OK",
+               "https://www.wildberries.ru/catalog/222/detail.aspx",
+               "https://swis.trade.kg/x", "KG-2",
                "swis.trade.kg", "Фен бытовой", "ДЕЙСТВУЕТ"])
     wb.save(path)
 
@@ -79,7 +84,13 @@ def main():
     rows = gr.get("rows") or []
     check("строки прочитаны (2 шт.)", gr.get("total") == 2 or len(rows) == 2)
     cols = gr.get("columns") or []
-    check("колонка registry_host присутствует", "registry_host" in cols)
+    # английские заголовки листа results нормализованы в русские отображаемые имена,
+    # чтобы таблица показала «Название в реестре» и кликабельные ссылки на реестр.
+    check("колонка «Реестр (хост)» (нормализована из registry_host)", "Реестр (хост)" in cols)
+    check("колонка «Название в реестре» присутствует (была пропавшей)",
+          "Название в реестре" in cols)
+    check("колонка «Ссылка на реестр» присутствует (для кликабельности)",
+          "Ссылка на реестр" in cols)
     by_reg = (gr.get("stats") or {}).get("by_registry", {})
     check("статистика по реестрам посчитана (есть fsa)", "pub.fsa.gov.ru" in by_reg)
 

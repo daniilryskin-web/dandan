@@ -389,6 +389,50 @@ def _categories_to_profile(category_value: str) -> str:
     return ",".join(dict.fromkeys(profiles)) if profiles else "auto"
 
 
+# v45.5: алиасы «сырых» английских заголовков листа results -> русские
+# отображаемые имена (как в листе «Подробности»). Нужны, чтобы ЛЮБОЙ result.xlsx
+# (старый с английскими колонками или новый) корректно показывался в таблице:
+# колонка «Название в реестре» и кликабельные ссылки на товар/реестр опираются на
+# русские имена. Ключи — и оригинальные, и в нижнем регистре (для надёжности).
+_RESULT_HEADER_ALIASES = {
+    "query": "Запрос",
+    "nm_id": "Артикул WB",
+    "product_name": "Название товара",
+    "brand": "Бренд",
+    "subject": "Категория WB",
+    "product_url": "Ссылка на товар",
+    "status": "Технический статус",
+    "price_rub": "Цена, ₽",
+    "sale_price_rub": "Цена со скидкой, ₽",
+    "seller_name": "Продавец",
+    "supplier_id": "ID продавца",
+    "rating": "Рейтинг",
+    "feedbacks": "Отзывы",
+    "is_original": "Плашка 'Оригинал'",
+    "colors": "Цвет",
+    "wb_root": "Корневой ID (WB)",
+    "registry_url": "Ссылка на реестр",
+    "registry_host": "Реестр (хост)",
+    "registry_record_id": "ID записи реестра",
+    "certificate_number": "Номер документа",
+    "document_type": "Тип документа",
+    "document_status": "Статус документа",
+    "certificate_product_name": "Название в реестре",
+    "document_date_start": "Действует с",
+    "document_date_end": "Действует до",
+    "applicant_name": "Заявитель",
+    "applicant_inn": "ИНН заявителя",
+    "manufacturer_name": "Изготовитель",
+    "tnved": "ТН ВЭД",
+    "scheme": "Схема оценки",
+    "technical_regulation": "Техрегламент",
+    "score": "Оценка совпадения",
+    "details": "Примечания",
+    "worker": "Worker",
+    "checked_at": "Проверено",
+}
+
+
 def freshest_xlsx(path: Path) -> Path:
     """v27.9.x: если основной XLSX был занят (открыт в Excel), движок пишет в
     `<stem>_live.xlsx`. Тогда таблица/графики/сводка ДОЛЖНЫ читать именно его,
@@ -1063,6 +1107,10 @@ class Bridge:
         s["last_spec"] = spec
         save_settings(s)
 
+        # Новый прогон — вкладка «Результаты» должна показывать ЕГО результат, а не
+        # ранее загруженный внешний файл. Сбрасываем загруженный путь.
+        self._loaded_result_path = ""
+
         try:
             self.runner.start(run_spec)
         except Exception as exc:
@@ -1144,6 +1192,12 @@ class Bridge:
                     rows.append([(c if c is not None else "") for c in row])
                 else:
                     break
+            # Нормализуем «сырые» английские заголовки листа results в русские
+            # отображаемые имена (как в листе «Подробности»). Без этого старые файлы
+            # (или лист results) показывались без «Названия в реестре» и без
+            # кликабельных ссылок на реестр — таблица ориентируется на русские имена.
+            headers = [_RESULT_HEADER_ALIASES.get(h, _RESULT_HEADER_ALIASES.get(h.strip().lower(), h))
+                       for h in headers]
             total_rows = (ws.max_row or 1) - 1
 
             # Статистика
@@ -2617,6 +2671,9 @@ async function startRun() {
     return;
   }
   toast('Прогон запущен!', 'ok');
+  // Новый прогон — снимаем метку ранее загруженного внешнего файла.
+  const _lb = $('#loaded-file-badge'); if (_lb) _lb.style.display = 'none';
+  const _cb = $('#btn-clear-loaded'); if (_cb) _cb.style.display = 'none';
   go('queue');
 }
 

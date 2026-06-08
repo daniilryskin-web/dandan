@@ -378,6 +378,30 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
     if not out.get("technical_regulation"):
         out["technical_regulation"] = _find_value(
             leaves, ("techreg", "technicalregulation", "technical_regulation"), exclude_any=("id",))
+    # v45.5: техрегламент НАДЁЖНО достаём из ТЕКСТА самого JSON (без словаря id).
+    # В ответе ФСА сам код ТР встречается в названиях документов/стандартов и тексте
+    # типа сертификата: «ТР ТС 017/2011», «Технического регламента Таможенного союза
+    # 007/2011», «Евразийского экономического союза 037/2016». Сканируем все строковые
+    # листья и собираем нормализованные «ТР ТС/ЕАЭС NNN/YYYY».
+    if not out.get("technical_regulation"):
+        _tr_found: List[str] = []
+        for _p, _v in leaves:
+            if not isinstance(_v, str) or "/" not in _v:
+                continue
+            for m in re.finditer(r"ТР\s+(ТС|ЕАЭС)\s+(\d{3}/\d{4})", _v):
+                _s = f"ТР {m.group(1)} {m.group(2)}"
+                if _s not in _tr_found:
+                    _tr_found.append(_s)
+            for m in re.finditer(r"регламента\s+Таможенного\s+союза\s+(\d{3}/\d{4})", _v, re.I):
+                _s = f"ТР ТС {m.group(1)}"
+                if _s not in _tr_found:
+                    _tr_found.append(_s)
+            for m in re.finditer(r"(?:Евразийского\s+экономического\s+союза|ЕАЭС)\s+(\d{3}/\d{4})", _v, re.I):
+                _s = f"ТР ЕАЭС {m.group(1)}"
+                if _s not in _tr_found:
+                    _tr_found.append(_s)
+        if _tr_found:
+            out["technical_regulation"] = "; ".join(_tr_found)
     if not out.get("status"):
         out["status"] = _find_value(leaves, ("status",), exclude_any=("id", "change", "history", "date"))
 

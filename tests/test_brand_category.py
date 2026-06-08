@@ -92,7 +92,11 @@ def main():
     doms = set(d for q, d in seen)
     check("appliances: есть вариант «indesit стиральные машины»",
           any(q.startswith("indesit ") and "стиральн" in q for q in qs))
-    check("appliances: доменный фильтр включён", "appliances" in doms)
+    # v45.3: категория при поиске по БРЕНДУ нужна для ДОБОРА карточек (варианты
+    # «бренд + тип»), а НЕ для отсева. Сами карточки бренда по категории не режем —
+    # доменный фильтр для бренда ВЫКЛючен (домен в collect_one_query не передаётся).
+    check("appliances (бренд): карточки НЕ режутся по категории (фильтр выкл)",
+          "appliances" not in doms)
     check("appliances: НЕ ищет одежду (нет «indesit куртки»)",
           not any("куртк" in q for q in qs))
 

@@ -2473,17 +2473,22 @@ async def collect_cards(args) -> List[Card]:
         variants = [args.query]
 
     strict_filter_enabled = getattr(args, 'strict_domain_filter', True)
-    if _brand_domains:
-        # Категории ВЫБРАНЫ явно (бренд ИЛИ запрос) — фильтруем по ним (несколько
-        # через запятую). Это уточняет выдачу и для поиска по запросу тоже.
+    if _brand_search:
+        # v45.3: ПОИСК ПО БРЕНДУ. Категория нужна НЕ чтобы резать выдачу, а чтобы
+        # ДОБРАТЬ больше карточек бренда: по «голому» бренду WB отдаёт одну выдачу
+        # (~сотню), а варианты «бренд + тип товара категории» (стиральные машины,
+        # чайники, фены, …) вытаскивают карточки, которых в первой выдаче не было.
+        # Сами карточки по категории НЕ отсеиваем — бренд-фильтр уже гарантирует, что
+        # это товары нужного бренда, и терять их нельзя. Поэтому доменный фильтр ВЫКЛ.
+        domain = ''
+        use_filter = False
+    elif _brand_domains:
+        # Поиск ПО ЗАПРОСУ с явно выбранной категорией — здесь фильтр уместен
+        # (уточняет выдачу запроса; бренда, который бы гарантировал релевантность, нет).
         domain = ','.join(_brand_domains)
         use_filter = strict_filter_enabled and any(
             DOMAIN_SUBJECT_NAME_KEYWORDS.get(d) or DOMAIN_SUBJECT_WHITELIST.get(d)
             for d in _brand_domains)
-    elif _brand_search:
-        # Бренд без категории → фильтр ВЫКЛючен (все товары бренда).
-        domain = ''
-        use_filter = False
     else:
         # Обычный поиск без явной категории — авто-домен по тексту запроса.
         domain = profile_to_domain.get(_profile_key) or detect_query_domain(args.query)

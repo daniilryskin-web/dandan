@@ -67,7 +67,9 @@ def main():
     check("_harvest_fsa_cookies — корутина", inspect.iscoroutinefunction(mv._harvest_fsa_cookies))
     ap = mv.build_parser()
     a = ap.parse_args(["--input-links-csv", "x.csv"])
-    check("--fsa-cookie-http по умолчанию TRUE", a.fsa_cookie_http is True)
+    check("--fsa-cookie-http по умолчанию FALSE (ФСА только браузер)", a.fsa_cookie_http is False)
+    a_on = ap.parse_args(["--input-links-csv", "x.csv", "--fsa-cookie-http", "true"])
+    check("--fsa-cookie-http можно включить", a_on.fsa_cookie_http is True)
     check("есть глобал _FSA_SESSION_COOKIES", hasattr(mv, "_FSA_SESSION_COOKIES"))
 
     # 2) куки реально кладутся в сессию curl_cffi, домен FSA, прогрев пропущен

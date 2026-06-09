@@ -1395,7 +1395,16 @@ async def run_http_link_prefetch(
     print(f"   Логика: json со ссылкой → СОБРАНА; все 404 → НЕТ ДОКУМЕНТОВ; json без ссылки → НЕТ ССЫЛКИ; сетевая ошибка → {'браузер' if allow_browser_fallback else 'повтор (ERROR)'}.")
 
     timeout = aiohttp.ClientTimeout(total=30, connect=8)
-    connector = aiohttp.TCPConnector(limit=workers * 2, ttl_dns_cache=300, ssl=False)
+    # v45.8: пул соединений ДОЛЖЕН вмещать реальную параллельность: каждая карточка
+    # проверяет до cert_max_hosts basket-шардов одновременно, т.е. одновременных
+    # запросов ~ workers * probe_fanout, а не workers. Раньше пул был workers*2 (=60
+    # при 30 воркерах), и при веере 16 шардов 480 проб дрались за 60 коннектов —
+    # пробы ЖДАЛИ свободный коннект дольше таймаута и ЛОЖНО считались «сетевой
+    # ошибкой». Делаем пул щедрым: 404 от basket быстрые, коннекты быстро освобождаются.
+    _probe_fanout = min(int(cert_max_hosts) or 1, 16)
+    _conn_limit = min(300, max(128, workers * _probe_fanout))
+    connector = aiohttp.TCPConnector(limit=_conn_limit, limit_per_host=0,
+                                     ttl_dns_cache=300, ssl=False)
     headers = {
         "User-Agent": getattr(args, 'user_agent', '') or
                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
@@ -8728,13 +8737,12 @@ def build_parser():
                     help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
                          "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "
                          "автоматический темп. 0,0 — без паузы (быстрее, но рискованнее).")
-    ap.add_argument("--fsa-cookie-http", type=str_to_bool, default=True,
-                    help="v45.2: УСКОРЕНИЕ FSA без блокировок. Первый документ парсится браузером "
-                         "(он проходит JS-антибот и отдаёт сессионные куки), а все следующие тянутся "
-                         "напрямую к JSON API ФСА быстрым HTTP с этими куками — один лёгкий запрос "
-                         "вместо полной загрузки SPA. Это ~5-10× меньше запросов к FSA (меньше риск "
-                         "блокировки) и кратно быстрее. Если куки протухают — авто-возврат к браузеру. "
-                         "false — только браузер (старое поведение).")
+    ap.add_argument("--fsa-cookie-http", type=str_to_bool, default=False,
+                    help="v45.8: ПО УМОЛЧАНИЮ FALSE — ФСА идёт ТОЛЬКО через браузер (по требованию: "
+                         "другие способы пока не помогают). Браузерные документы парсятся ПАРАЛЛЕЛЬНО, "
+                         "как раньше. true — включить быстрый HTTP-путь по кукам браузера (первый "
+                         "документ через браузер отдаёт куки, остальные тянутся лёгким HTTP); при "
+                         "включении первые документы идут по одному (бутстрап кук).")
     ap.add_argument("--fsa-warmup", type=str_to_bool, default=False,
                     help="v45.1: прогрев сессии заходом на главную pub.fsa.gov.ru перед документами. "
                          "ПО УМОЛЧАНИЮ FALSE: при старте нескольких воркеров одновременная загрузка "

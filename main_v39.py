@@ -333,11 +333,15 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
         if prod.get("fullName"):
             out["product_full"] = str(prod["fullName"]).strip()
 
-        # Схема (idCertScheme/idDeclScheme -> «1с»/«1д»)
+        # Схема. У СЕРТИФИКАТОВ idCertScheme = реальный номер схемы (1..7 -> «1с»).
+        # У ДЕКЛАРАЦИЙ idDeclScheme — это ВНУТРЕННИЙ id записи (напр. 3581), а НЕ номер
+        # схемы. Поэтому код берём только если это настоящий однозначный/двузначный
+        # номер схемы (1..9). Для деклараций реальную схему («1д») добираем из ТЕКСТА
+        # страницы (см. _parse_fsa_with_existing_page_v386).
         sch = payload.get("idCertScheme") if is_cert else payload.get("idDeclScheme")
         if sch is None:
             sch = payload.get("idCertScheme") or payload.get("idDeclScheme")
-        if sch is not None and (isinstance(sch, (int, float)) or str(sch).isdigit()):
+        if sch is not None and str(sch).strip().isdigit() and 1 <= int(sch) <= 9:
             out["scheme"] = f"{int(sch)}{'с' if is_cert else 'д'}"
 
         # Технические регламенты (idTechnicalReglaments -> текст по словарю).
@@ -7153,13 +7157,23 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
                                 _codes.append(_cc)
                         if _codes:
                             _tnved = '; '.join(_codes[:10])
+                    # v46: СХЕМА — берём из ТЕКСТА страницы («Схема декларирования: 1д» /
+                    # «Схема сертификации: 1с»). Для деклараций JSON-поле idDeclScheme —
+                    # внутренний id (3581), не номер схемы, поэтому текст надёжнее.
+                    _scheme_val = _parsed.get('scheme', '')
+                    if _ptxt:
+                        _scm = re.search(
+                            r'Схема\s+(?:сертификации|декларирования|подтверждения\s+соответствия)'
+                            r'\D{0,25}?(\d{1,2})\s*([сдСД])', _ptxt)
+                        if _scm:
+                            _scheme_val = f"{_scm.group(1)}{_scm.group(2).lower()}"
                     _api_ext = {
                         'document_date_start': _parsed.get('date_start', ''),
                         'document_date_end': _parsed.get('date_end', ''),
                         'applicant_name': _clean_org_name(_parsed.get('applicant', '')),
                         'applicant_inn': _parsed.get('applicant_inn', ''),
                         'manufacturer_name': _clean_org_name(_parsed.get('manufacturer', '')),
-                        'scheme': _parsed.get('scheme', ''),
+                        'scheme': _scheme_val,
                         'technical_regulation': _tech_reg,
                         'tnved': _tnved,
                     }

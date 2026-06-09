@@ -56,6 +56,19 @@ def main():
     check("серт: наименование продукции", "трикотаж" in (r.get("product_full") or "").lower())
     check("серт: тип документа = Сертификат", r.get("doc_type") == "Сертификат")
 
+    # --- СХЕМА: у деклараций idDeclScheme — внутренний id, НЕ номер схемы ---
+    # JSON НЕ должен давать «3581д»; реальная схема («1д») берётся из текста страницы.
+    decl_big = {"number": "ЕАЭС N RU Д-RU.РА08.В.86459/23", "idStatus": 6,
+                "idDeclScheme": 3581, "product": {"fullName": "Стиральная машина"}}
+    rb = mv.parse_fsa_json(decl_big, "https://pub.fsa.gov.ru/rds/declaration/view/9/common",
+                           "rds_declaration", "9")
+    check("декл: внутренний idDeclScheme=3581 НЕ даёт «3581д»", rb.get("scheme", "") == "")
+    cert_sch = {"number": "ЕАЭС RU С-1", "idStatus": 6, "idCertScheme": 1,
+                "product": {"fullName": "x"}}
+    rcs = mv.parse_fsa_json(cert_sch, "https://pub.fsa.gov.ru/rss/certificate/view/8/baseInfo",
+                            "rss_certificate", "8")
+    check("серт: idCertScheme=1 -> «1с»", rcs.get("scheme") == "1с")
+
     # --- ДЕКЛАРАЦИЯ: схема декларирования + явные «ТР ТС NNN/YYYY» в тексте ---
     decl = {
         "number": "ЕАЭС N RU Д-RU.РА04.В.83843/26",

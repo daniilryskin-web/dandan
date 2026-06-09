@@ -118,6 +118,13 @@ def main():
         check("совпавший КГ-док: вердикт НЕДЕЙСТВУЕТ В РФ", r0[ci_st] == "НЕДЕЙСТВУЕТ В РФ")
         r1 = next((r for r in rows if "99999" in str(r)), None)
         check("не совпавший КГ-док: rf_status пуст", r1 is not None and not str(r1[ci_rf]).strip())
+        # колонка «Реестр (страна)»: swis -> КГ
+        check("колонка «Реестр (страна)» добавлена", "Реестр (страна)" in cols)
+        ci_reg = [c.strip().lower() for c in cols].index("реестр (страна)")
+        check("swis.trade.kg -> КГ", all(r[ci_reg] == "КГ" for r in rows))
+        check("маппинг РФ/КГ/BY", wc.Bridge._registry_country("pub.fsa.gov.ru") == "РФ"
+              and wc.Bridge._registry_country("swis.trade.kg") == "КГ"
+              and wc.Bridge._registry_country("tsouz.belgiss.by") == "BY")
     finally:
         try:
             if kg_app_existed and backup is not None:

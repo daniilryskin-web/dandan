@@ -1190,6 +1190,44 @@ class Bridge:
     def _kg_status_path(self) -> Path:
         return APP_DIR / "kg_rf_status.xlsx"
 
+    @staticmethod
+    def _registry_country(host_or_url: str) -> str:
+        """РФ (ФСА) / КГ (киргизский SWIS) / BY (БелГИСС) / ЕАЭС — по хосту реестра."""
+        s = str(host_or_url or "").lower()
+        if "fsa.gov.ru" in s:
+            return "РФ"
+        if "trade.kg" in s or "swis" in s:
+            return "КГ"
+        if "belgiss" in s:
+            return "BY"
+        if "eaeunion" in s:
+            return "ЕАЭС"
+        return ""
+
+    def _add_registry_country(self, headers: List[str], rows: List[List]) -> None:
+        """v46: добавляет колонку «Реестр (страна)» (РФ/КГ/BY) по хосту реестра —
+        и для свежего прогона, и для загруженного файла."""
+        low = [h.strip().lower() for h in headers]
+        ci_host = next((i for i, h in enumerate(low) if h in ("реестр (хост)", "registry_host")), -1)
+        ci_url = next((i for i, h in enumerate(low) if h in ("ссылка на реестр", "registry_url")), -1)
+        if ci_host < 0 and ci_url < 0:
+            return
+        ci_reg = next((i for i, h in enumerate(low) if h in ("реестр (страна)", "registry_country")), -1)
+        if ci_reg < 0:
+            headers.append("Реестр (страна)")
+            ci_reg = len(headers) - 1
+            for r in rows:
+                r.append("")
+        for r in rows:
+            while len(r) < len(headers):
+                r.append("")
+            src = ""
+            if ci_host >= 0 and ci_host < len(r) and str(r[ci_host]).strip():
+                src = str(r[ci_host])
+            elif ci_url >= 0 and ci_url < len(r):
+                src = str(r[ci_url])
+            r[ci_reg] = self._registry_country(src)
+
     def kg_status_info(self) -> dict:
         """Сколько записей в загруженной таблице статусов КГ-документов в РФ."""
         p = next((q for q in (APP_DIR / "kg_rf_status.xlsx", APP_DIR / "kg_rf_status.csv")
@@ -1333,6 +1371,11 @@ class Bridge:
             # документы получают «Статус на территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ».
             try:
                 self._apply_kg_rf_status(headers, rows)
+            except Exception:
+                pass
+            # v46: колонка «Реестр (страна)» — РФ/КГ/BY по хосту реестра.
+            try:
+                self._add_registry_country(headers, rows)
             except Exception:
                 pass
 
@@ -3239,7 +3282,7 @@ async function loadResults() {
 const PREFERRED_COLS = [
   'Запрос', 'Артикул WB', 'Название товара', 'Бренд', 'Категория WB',
   'Технический статус', 'Цена со скидкой, ₽', 'Продавец', "Плашка 'Оригинал'",
-  'Название в реестре', 'Статус документа', 'Статус на территории РФ',
+  'Реестр (страна)', 'Название в реестре', 'Статус документа', 'Статус на территории РФ',
   'Номер документа', 'Тип документа',
   'ТН ВЭД', 'Изготовитель', 'Действует до', 'Риск по сроку',
 ];

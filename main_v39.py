@@ -7386,7 +7386,11 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     _fsa_skip_org = bool(getattr(args, 'fsa_skip_org_fields', True))
     _ext_want = (("technical_regulation", "document_date_end") if _fsa_skip_org
                  else ("manufacturer_name", "technical_regulation", "applicant_name", "document_date_end"))
-    need_more = any(k not in ext_vals for k in _ext_want)
+    # v46: при skip-org НЕ ходим на доп. вкладки ФСА (/manufacturer, /applicant и т.п.)
+    # ВООБЩЕ. Изготовитель/заявитель не нужны, а техрегламент/даты берутся из JSON и
+    # baseInfo. Раньше движок всё равно лез на /manufacturer искать недостающие поля —
+    # именно там воркеры подвисали по 100с и шли ошибки/блокировки на больших прогонах.
+    need_more = (not _fsa_skip_org) and any(k not in ext_vals for k in _ext_want)
     if need_more:
         for ext_route in fsa_extended_routes(url):
             # какие поля ищем на этой вкладке
@@ -8234,22 +8238,47 @@ async def run_registry_stage(args):
                 args=['--disable-dev-shm-usage', '--no-sandbox', '--disable-blink-features=AutomationControlled'],
             )
             browser = await p.chromium.launch(**_launch_kwargs)
+            _browser_restart = [0.0]  # v46: метка последнего перезапуска браузера (анти-дребезг)
 
             async def worker(wid: int):
                 global _FSA_CONSEC_FAILS, _FSA_COOLDOWN_UNTIL, _FSA_COOLDOWN_CYCLES, _FSA_SESSION_COOKIES
                 # v39: единая функция пересоздания контекста + страницы. Если что-то падает —
                 # вернёт хотя бы пустой page, чтобы worker не умер.
                 async def _fresh_context_and_page(old_ctx):
+                    nonlocal browser
                     try:
                         if old_ctx is not None:
                             await old_ctx.close()
                     except Exception:
                         pass
-                    new_ctx = await browser.new_context(
-                        user_agent=args.user_agent,
-                        viewport={'width': 1440, 'height': 1000},
-                        locale='ru-RU',
-                    )
+                    try:
+                        new_ctx = await browser.new_context(
+                            user_agent=args.user_agent,
+                            viewport={'width': 1440, 'height': 1000},
+                            locale='ru-RU',
+                        )
+                    except Exception:
+                        # v46: Chromium мог упасть (OOM на длинных FSA-прогонах). Раньше это
+                        # валило всех воркеров и прогон завершался кодом 1. Перезапускаем
+                        # браузер и продолжаем — частичный результат уже сохранён.
+                        if time.time() - _browser_restart[0] > 8:
+                            _browser_restart[0] = time.time()
+                            try:
+                                await browser.close()
+                            except Exception:
+                                pass
+                            try:
+                                browser = await p.chromium.launch(**_launch_kwargs)
+                                print("⚠️  Браузер этапа 2 перезапущен (Chromium упал) — прогон продолжается.")
+                            except Exception:
+                                pass
+                        else:
+                            await asyncio.sleep(1.0)
+                        new_ctx = await browser.new_context(
+                            user_agent=args.user_agent,
+                            viewport={'width': 1440, 'height': 1000},
+                            locale='ru-RU',
+                        )
                     # v45: stealth — прячем признаки headless/автоматизации, чтобы FSA
                     # не отдавал капчу/блок. Навешиваем ДО первой навигации.
                     await _apply_stealth(new_ctx)
@@ -8295,10 +8324,18 @@ async def run_registry_stage(args):
                         doc_status = ''  # v39.5
                         # v39: жёсткий timeout на один реестр. До этого если playwright/FSA
                         # подвисал на bizarre input — worker мог стоять бесконечно.
-                        per_registry_timeout = max(
-                            30,
-                            int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30,
-                        )
+                        # v46: для ФСА таймаут КОРОЧЕ (≤60с): без захода на доп. вкладки
+                        # один документ — это ~1 загрузка + перехват API (≤30с). 100-секундные
+                        # зависания на больших прогонах душили прогресс и валили watchdog.
+                        _h0 = hostname(url)
+                        if _h0 == 'pub.fsa.gov.ru':
+                            per_registry_timeout = max(
+                                30, min(60, int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 2 + 10))
+                        else:
+                            per_registry_timeout = max(
+                                30,
+                                int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30,
+                            )
                         try:
                             h = hostname(url)
                             if h == 'pub.fsa.gov.ru':
@@ -8448,6 +8485,11 @@ async def run_registry_stage(args):
                 try:
                     while stats['done'] < len(unique_urls):
                         await asyncio.sleep(10)
+                        # v46: во время АВТО-ПАУЗЫ FSA (cooldown) прогресс намеренно стоит —
+                        # это не зависание, поэтому watchdog не должен дёргать рестарт.
+                        if _FSA_COOLDOWN_UNTIL > time.time():
+                            last_change = time.time()
+                            continue
                         current = stats['done']
                         if current != last_done:
                             last_done = current

@@ -1444,15 +1444,13 @@ async def run_http_link_prefetch(
                     urls, detail = await fetch_certificate_json_for_nm(
                         session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
                     )
-                    # v45.11: сетевые ошибки (reset/timeout) у WB CDN почти всегда
-                    # ВРЕМЕННЫЕ — повторная попытка через короткую паузу обычно проходит.
-                    # Раньше карточку сразу писали как ОШИБКУ. Теперь до 2 повторов с
-                    # небольшим бэкоффом — итог почти без ошибок (как и должно быть).
-                    _retries = 0
-                    while (not urls and detail.startswith("cert_json_neterror")
-                           and _retries < 2):
-                        _retries += 1
-                        await asyncio.sleep(0.25 * _retries + random.uniform(0, 0.2))
+                    # v45.12: ОДИН повтор временной сетевой ошибки — но ТОЛЬКО пока
+                    # ошибок мало. Если ошибок уже много, значит WB троттлит IP — тогда
+                    # повторы лишь УСИЛИВАЮТ нагрузку и углубляют бан, поэтому НЕ повторяем
+                    # (карточка пойдёт в ОШИБКУ, повторный запуск/resume её доберёт позже).
+                    if (not urls and detail.startswith("cert_json_neterror")
+                            and stats['errors'] < 15):
+                        await asyncio.sleep(0.4 + random.uniform(0, 0.3))
                         try:
                             urls, detail = await fetch_certificate_json_for_nm(
                                 session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts

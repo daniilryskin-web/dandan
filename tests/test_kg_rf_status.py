@@ -72,12 +72,60 @@ def main():
     a = ap.parse_args(["--input-links-csv", "x.csv"])
     check("--kg-rf-status-file есть, по умолчанию пуст", a.kg_rf_status_file == "")
 
+    # FSA: флаг отказа от орг-полей (меньше запросов к ФСА)
+    check("--fsa-skip-org-fields по умолчанию TRUE", a.fsa_skip_org_fields is True)
+
     # GUI
     import wb_checker as wc
     check("GUI алиас rf_status -> Статус на территории РФ",
           wc._RESULT_HEADER_ALIASES.get("rf_status") == "Статус на территории РФ")
     check("Bridge.browse_kg_status_file есть", hasattr(wc.Bridge, "browse_kg_status_file"))
     check("Bridge.kg_status_info есть", hasattr(wc.Bridge, "kg_status_info"))
+
+    # ЗАГРУЖЕННЫЙ файл тоже проверяется по таблице КГ (Bridge._apply_kg_rf_status)
+    import shutil
+    from openpyxl import Workbook as _WB
+    kg_app = wc.APP_DIR / "kg_rf_status.xlsx"
+    kg_app_existed = kg_app.exists()
+    backup = None
+    if kg_app_existed:
+        backup = kg_app.with_suffix(".bak")
+        shutil.copyfile(kg_app, backup)
+    try:
+        shutil.copyfile(tmp, kg_app)  # 2 записи: …18233 (14), …06994 (15)
+        # результат-файл со «старыми» английскими заголовками и КГ-номером из таблицы
+        rd = Path(tempfile.mkdtemp()) / "old_run.xlsx"
+        wbx = _WB(); wsx = wbx.active; wsx.title = "results"
+        wsx.append(["query", "nm_id", "product_name", "status", "registry_host",
+                    "certificate_number", "certificate_product_name"])
+        wsx.append(["x", 1, "Куртка", "OK", "swis.trade.kg",
+                    "ЕАЭС KG 417/052.BY.02.18233", "Куртка"])  # 14 -> прекращён
+        wsx.append(["x", 2, "Шорты", "OK", "swis.trade.kg",
+                    "ЕАЭС KG 417/099.XX.99.99999", "Шорты"])   # нет в таблице
+        wbx.save(rd)
+        import main_v39 as _mv2
+        _mv2._KG_RF_STATUS_MAP = {}  # заставим перечитать из APP_DIR
+        bridge = wc.Bridge()
+        gr = bridge.get_results(str(rd))
+        cols = gr.get("columns") or []
+        rows = gr.get("rows") or []
+        check("загруженный файл: добавлена колонка «Статус на территории РФ»",
+              "Статус на территории РФ" in cols)
+        ci_rf = [c.strip().lower() for c in cols].index("статус на территории рф")
+        ci_st = [c.strip().lower() for c in cols].index("технический статус")
+        r0 = next((r for r in rows if str(r[5]).find("18233") >= 0 or "18233" in str(r)), rows[0])
+        check("совпавший КГ-док: rf_status = Прекращён", r0[ci_rf] == "Прекращён")
+        check("совпавший КГ-док: вердикт НЕДЕЙСТВУЕТ В РФ", r0[ci_st] == "НЕДЕЙСТВУЕТ В РФ")
+        r1 = next((r for r in rows if "99999" in str(r)), None)
+        check("не совпавший КГ-док: rf_status пуст", r1 is not None and not str(r1[ci_rf]).strip())
+    finally:
+        try:
+            if kg_app_existed and backup is not None:
+                shutil.copyfile(backup, kg_app); backup.unlink()
+            elif not kg_app_existed:
+                kg_app.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -7365,12 +7365,18 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     # v44: добираем поля с дополнительных вкладок FSA (изготовитель, ТР ТС, заявитель/ИНН).
     # Эти данные НЕ на /baseInfo и /product — поэтому раньше manufacturer/tech_reg/date_end были 0%.
     # Заходим только за теми полями, которых ещё нет.
-    need_more = any(k not in ext_vals for k in
-                    ("manufacturer_name", "technical_regulation", "applicant_name", "document_date_end"))
+    # v46: по требованию НЕ собираем заявителя/изготовителя/ИНН/ТН ВЭД. Это убирает
+    # ЗАХОД НА ДОПОЛНИТЕЛЬНЫЕ ВКЛАДКИ ФСА (изготовитель/заявитель лежат не на
+    # /baseInfo и /product) — меньше запросов к ФСА, ниже риск блокировки. Номер,
+    # статус, даты, схема, техрегламент и название продукции остаются.
+    _fsa_skip_org = bool(getattr(args, 'fsa_skip_org_fields', True))
+    _ext_want = (("technical_regulation", "document_date_end") if _fsa_skip_org
+                 else ("manufacturer_name", "technical_regulation", "applicant_name", "document_date_end"))
+    need_more = any(k not in ext_vals for k in _ext_want)
     if need_more:
         for ext_route in fsa_extended_routes(url):
             # какие поля ищем на этой вкладке
-            still_missing = [k for k in FSA_EXTENDED_LABELS if k not in ext_vals]
+            still_missing = [k for k in FSA_EXTENDED_LABELS if k not in ext_vals and k in _ext_want]
             if not still_missing:
                 break
             try:
@@ -8092,6 +8098,7 @@ async def run_registry_stage(args):
         # v39.14: достаём расширенные поля документа из глобального кэша
         ext = _FSA_EXTENDED_FIELDS_CACHE.get(url, {})
         _host = hostname(url)
+        _skip_org_fields = bool(getattr(args, 'fsa_skip_org_fields', True))
         for row in rows_by_url.get(url, []):
             # v27.9.x: BelGISS/ЕАЭС по требованию НЕ парсим — просто оставляем
             # ссылку на реестр (статус «собрана»), без вердикта «не удалось».
@@ -8138,10 +8145,10 @@ async def run_registry_stage(args):
                 # v27.5: двойная защита — дожимаем орг-поля и ТН ВЭД, если в кэше остался мусор.
                 document_date_start=ext.get('document_date_start', ''),
                 document_date_end=ext.get('document_date_end', ''),
-                applicant_name=_clean_org_name(ext.get('applicant_name', '')),
-                applicant_inn=ext.get('applicant_inn', ''),
-                manufacturer_name=_clean_org_name(ext.get('manufacturer_name', '')),
-                tnved=_clean_tnved_code(ext.get('tnved', '')),
+                applicant_name=('' if _skip_org_fields else _clean_org_name(ext.get('applicant_name', ''))),
+                applicant_inn=('' if _skip_org_fields else ext.get('applicant_inn', '')),
+                manufacturer_name=('' if _skip_org_fields else _clean_org_name(ext.get('manufacturer_name', ''))),
+                tnved=('' if _skip_org_fields else _clean_tnved_code(ext.get('tnved', ''))),
                 scheme=ext.get('scheme', ''),
                 technical_regulation=ext.get('technical_regulation', ''),
                 score=score,
@@ -8671,11 +8678,11 @@ async def run_registry_stage(args):
             certificate_product_name=prod,
             document_date_start=ext.get('document_date_start', ''),
             document_date_end=ext.get('document_date_end', ''),
-            # v27.5: двойная защита от мусора в орг-полях.
-            applicant_name=_clean_org_name(ext.get('applicant_name', '')),
-            applicant_inn=ext.get('applicant_inn', ''),
-            manufacturer_name=_clean_org_name(ext.get('manufacturer_name', '')),
-            tnved=_clean_tnved_code(ext.get('tnved', '')),
+            # v46: по требованию орг-поля и ТН ВЭД можно не собирать (по умолчанию не собираем).
+            applicant_name=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else _clean_org_name(ext.get('applicant_name', ''))),
+            applicant_inn=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else ext.get('applicant_inn', '')),
+            manufacturer_name=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else _clean_org_name(ext.get('manufacturer_name', ''))),
+            tnved=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else _clean_tnved_code(ext.get('tnved', ''))),
             scheme=ext.get('scheme', ''),
             technical_regulation=ext.get('technical_regulation', ''),
             score=score,
@@ -8841,6 +8848,11 @@ def build_parser():
                          "РФ (колонки number + id_status_in_rf: 14=прекращён, 15=приостановлен). Если не "
                          "задан, ищется kg_rf_status.xlsx рядом с программой. Совпавшие по номеру "
                          "документы получают колонку «Статус на территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ».")
+    ap.add_argument("--fsa-skip-org-fields", type=str_to_bool, default=True,
+                    help="v46: НЕ собирать заявителя/изготовителя/ИНН/ТН ВЭД из ФСА. По умолчанию TRUE: "
+                         "это убирает заход на ДОПОЛНИТЕЛЬНЫЕ вкладки ФСА (где лежат изготовитель/заявитель) "
+                         "— меньше запросов к ФСА и ниже риск блокировки. Номер, статус, даты, схема, "
+                         "техрегламент и название продукции собираются как обычно.")
     ap.add_argument("--fsa-cookie-http", type=str_to_bool, default=False,
                     help="v45.8: ПО УМОЛЧАНИЮ FALSE — ФСА идёт ТОЛЬКО через браузер (по требованию: "
                          "другие способы пока не помогают). Браузерные документы парсятся ПАРАЛЛЕЛЬНО, "

@@ -1241,6 +1241,51 @@ class Bridge:
         info = self.kg_status_info()
         return {"ok": True, "name": src.name, "count": info.get("count", 0)}
 
+    def _apply_kg_rf_status(self, headers: List[str], rows: List[List]) -> None:
+        """v46: для уже прочитанных строк (загруженный файл) проставляет «Статус на
+        территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ» по таблице КГ-документов.
+        Колонку добавляет, если её ещё нет."""
+        kg_path = next((q for q in (APP_DIR / "kg_rf_status.xlsx", APP_DIR / "kg_rf_status.csv")
+                        if q.exists()), None)
+        if kg_path is None:
+            return
+        try:
+            import main_v39 as _mv
+            if not getattr(_mv, "_KG_RF_STATUS_MAP", None):
+                _mv.load_kg_rf_status(str(kg_path))
+            if not _mv._KG_RF_STATUS_MAP:
+                return
+        except Exception:
+            return
+
+        def _col(*names):
+            low = [h.strip().lower() for h in headers]
+            for n in names:
+                if n in low:
+                    return low.index(n)
+            return -1
+
+        ci_num = _col("номер документа", "certificate_number")
+        ci_status = _col("технический статус", "status")
+        if ci_num < 0:
+            return
+        ci_rf = _col("статус на территории рф", "rf_status")
+        if ci_rf < 0:
+            headers.append("Статус на территории РФ")
+            ci_rf = len(headers) - 1
+            for r in rows:
+                r.append("")
+        for r in rows:
+            # выравниваем длину строки под заголовки
+            while len(r) < len(headers):
+                r.append("")
+            num = r[ci_num] if ci_num < len(r) else ""
+            rf = _mv.kg_rf_status_text(num)
+            if rf:
+                r[ci_rf] = rf
+                if 0 <= ci_status < len(r):
+                    r[ci_status] = _mv.STATUS_INVALID_IN_RF
+
     def get_results(self, xlsx_path: Optional[str] = None, limit: int = 100000) -> dict:
         """
         Читает лист «Подробности» из XLSX и возвращает данные для таблицы.
@@ -1282,6 +1327,14 @@ class Bridge:
             headers = [_RESULT_HEADER_ALIASES.get(h, _RESULT_HEADER_ALIASES.get(h.strip().lower(), h))
                        for h in headers]
             total_rows = (ws.max_row or 1) - 1
+
+            # v46: применяем таблицу статусов КГ-документов в РФ и к ЗАГРУЖЕННОМУ
+            # файлу (не только к свежему прогону). Совпавшие по номеру киргизские
+            # документы получают «Статус на территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ».
+            try:
+                self._apply_kg_rf_status(headers, rows)
+            except Exception:
+                pass
 
             # Статистика
             stats: Dict[str, Any] = {
@@ -3488,6 +3541,7 @@ const STATUS_COLORS = {
   'OK':                                    '#10b981', // зелёный
   'ССЫЛКА НА РЕЕСТР СОБРАНА':           '#0ea5e9', // голубой
   'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':                 '#f59e0b', // янтарный
+  'НЕДЕЙСТВУЕТ В РФ':                       '#9f1239', // тёмно-вишнёвый (уникальный)
   'НЕСООТВЕТСТВИЕ':                        '#ef4444', // красный
   'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА': '#a855f7', // фиолетовый
   'ПРОВЕРИТЬ ВРУЧНУЮ':                     '#eab308', // жёлтый
@@ -3579,8 +3633,22 @@ function updateDonutChart(canvasId, fallbackId, data, colorMap, opts) {
   const fullLabels = entries.map(([k]) => k);
   const labels = fullLabels.map(k => _truncateLabel(k, opts.maxLabel || 28));
   const values = entries.map(([, v]) => v);
-  const colors = fullLabels.map((k, i) =>
-    (colorMap && colorMap[k]) || colorFor(i, fullLabels.length));
+  // v46: цвета в пределах ОДНОГО графика не повторяются. Сначала берём
+  // фиксированный цвет из colorMap; для остальных — следующий НЕзанятый из палитры.
+  const _used = new Set();
+  const colors = fullLabels.map(k => {
+    const c = colorMap && colorMap[k];
+    if (c) { _used.add(c); return c; }
+    return null;
+  });
+  let _pi = 0;
+  for (let i = 0; i < colors.length; i++) {
+    if (colors[i]) continue;
+    let tries = 0;
+    while (_used.has(PALETTE[_pi % PALETTE.length]) && tries < PALETTE.length) { _pi++; tries++; }
+    const c = PALETTE[_pi % PALETTE.length];
+    _used.add(c); colors[i] = c; _pi++;
+  }
 
   const chartType = opts.type || 'doughnut';
 

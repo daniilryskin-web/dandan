@@ -221,7 +221,11 @@ class RunSpec:
                 "--limit", str(self.limit),
                 "--link-only", "true",
                 "--link-mode", "http_only",
-                "--http-link-workers", str(self.workers * 10),
+                # v45.11: было workers*10 (=30) — слишком много одновременных
+                # запросов к wbbasket.ru, WB начинал троттлить IP (растущие «сетевые
+                # ошибки»). Шарды теперь пробуются по одному (1 запрос/карточку),
+                # поэтому 12-16 воркеров достаточно для скорости и НЕ ловят троттлинг.
+                "--http-link-workers", str(max(8, min(16, self.workers * 4))),
                 "--output", out,
                 "--output-links-csv", self.output_links_csv or "registry_links.csv",
             ]

@@ -8498,11 +8498,16 @@ async def run_registry_stage(args):
             # после 100%, когда FSA недоступен. Теперь повтор — осознанное действие
             # пользователя (когда FSA снова заработает).
             if not bool(getattr(args, 'registry_fsa_retry', False)):
+                # считаем и совсем не извлечённые, и ЧАСТИЧНЫЕ (есть название, но нет
+                # номера/статуса) — кнопка «Повторить упавшие FSA» дозаберёт и те, и те.
                 _fsa_fail_n = sum(1 for u, v in parsed.items()
-                                  if hostname(u) == 'pub.fsa.gov.ru' and not (v[1] or '').strip())
+                                  if hostname(u) == 'pub.fsa.gov.ru'
+                                  and (not (v[1] or '').strip()
+                                       or not (v[0] or '').strip()
+                                       or not (v[3] or '').strip()))
                 if _fsa_fail_n:
-                    print(f"ℹ️  {_fsa_fail_n} FSA-ссылок не извлеклись (FSA недоступен/таймаут). "
-                          f"Когда FSA снова заработает — нажми в окне «🔁 Повторить упавшие FSA».")
+                    print(f"ℹ️  {_fsa_fail_n} FSA-документ(ов) извлеклись не полностью (нет названия/номера/статуса). "
+                          f"Когда FSA снова заработает — нажми в окне «🔁 Повторить упавшие FSA» (дозаберёт).")
             try:
                 if not bool(getattr(args, 'registry_fsa_retry', False)):
                     raise _SkipSecondPass()
@@ -8513,11 +8518,21 @@ async def run_registry_stage(args):
                         'ERR_NETWORK', 'ERR_ABORTED', 'registry_hard_timeout',
                         'NETWORK_FAILURE_all_goto_failed', 'TimeoutError',
                     ))
+
+                def _fsa_partial(val) -> bool:
+                    # v46: ЧАСТИЧНО извлечённый документ — название продукции есть,
+                    # но не добрались номер ИЛИ статус (медленная загрузка/таймаут).
+                    # Такие тоже дозабираем повторным заходом.
+                    return bool((val[1] or '').strip()) and (
+                        not (val[0] or '').strip() or not (val[3] or '').strip())
+
                 retry_urls = [
                     u for u, val in list(parsed.items())
                     if hostname(u) == 'pub.fsa.gov.ru'
-                    and not (val[1] or '').strip()        # нет названия продукции
-                    and _is_transient_fsa_fail(val[4])    # упал по сети/таймауту
+                    and (
+                        (not (val[1] or '').strip() and _is_transient_fsa_fail(val[4]))  # совсем не извлеклось
+                        or _fsa_partial(val)  # частично: есть название, но нет номера/статуса
+                    )
                 ]
                 # v27.9.x: РАЗЛИЧАЕМ «FSA недоступен» и «FSA нестабилен».
                 #  • если НИ ОДНА FSA-ссылка не извлеклась (fsa_ok==0) — host реально
@@ -8537,7 +8552,7 @@ async def run_registry_stage(args):
                 if retry_urls and max_retry > 0:
                     retry_urls = retry_urls[:max_retry]
                     print("=" * 80)
-                    print(f"🔁 Второй проход FSA: повтор {len(retry_urls)} ссылок, упавших по сетевой ошибке/таймауту")
+                    print(f"🔁 Второй проход FSA: повтор {len(retry_urls)} ссылок (упавшие + частично извлечённые: нет номера/статуса)")
                     print("=" * 80)
                     per_registry_timeout = max(
                         30, int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30)

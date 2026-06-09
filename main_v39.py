@@ -8283,7 +8283,7 @@ async def run_registry_stage(args):
             _fsa_serial_sem = asyncio.Semaphore(1)  # ФСА строго по одному при slow-mode
             _fsa_last_req = [0.0]  # время последнего запроса к ФСА (для РЕАЛЬНОЙ паузы между запросами)
             _fsa_slow_lo, _fsa_slow_hi = _fsa_human_delay_range_ms(
-                getattr(args, 'fsa_slow_delay_ms', '4000,8000') or '4000,8000')
+                getattr(args, 'fsa_slow_delay_ms', '2500,5000') or '2500,5000')
             if _fsa_slow_mode and _has_fsa:
                 print(f"🐢 МЕДЛЕННЫЙ режим ФСА: документы по одному, пауза "
                       f"{_fsa_slow_lo:.1f}-{_fsa_slow_hi:.1f}с + адаптивный бэкофф. "
@@ -9001,9 +9001,10 @@ def build_parser():
                          "ФСА парсится строго ПО ОДНОМУ документу с паузой (--fsa-slow-delay-ms) и "
                          "адаптивным бэкоффом. SWIS/прочие реестры идут параллельно. Медленно (часы для "
                          "10k), но ФСА не банит IP.")
-    ap.add_argument("--fsa-slow-delay-ms", default="4000,8000",
+    ap.add_argument("--fsa-slow-delay-ms", default="2500,5000",
                     help="v46: пауза между документами ФСА в медленном режиме, мс, «min,max» "
-                         "(по умолчанию 4000,8000 ≈ 10 док/мин). Меньше — быстрее, но выше риск бана.")
+                         "(по умолчанию 2500,5000 ≈ 16 док/мин). Меньше — быстрее, но выше риск бана; "
+                         "при блокировках пауза сама растёт (адаптивный бэкофф).")
     ap.add_argument("--fsa-skip-org-fields", type=str_to_bool, default=True,
                     help="v46: НЕ собирать заявителя/изготовителя/ИНН/ТН ВЭД из ФСА. По умолчанию TRUE: "
                          "это убирает заход на ДОПОЛНИТЕЛЬНЫЕ вкладки ФСА (где лежат изготовитель/заявитель) "

@@ -164,6 +164,9 @@ class RunSpec:
     fsa_slow_mode: bool = False
     """v46: медленный режим ФСА (без блокировок) — для больших прогонов."""
 
+    fsa_slow_delay_sec: float = 0
+    """v46: пауза между ФСА-документами в медл. режиме, сек. 0 = по умолчанию (~2.5–5с)."""
+
     make_report_xlsx: bool = True
     """Создавать листы Сводка/Подробности в XLSX."""
 
@@ -253,6 +256,9 @@ class RunSpec:
                 "--registry-fsa-retry", "true" if self.registry_fsa_retry else "false",
                 "--fsa-slow-mode", "true" if self.fsa_slow_mode else "false",
             ]
+            if self.fsa_slow_mode and float(self.fsa_slow_delay_sec or 0) > 0:
+                _v = float(self.fsa_slow_delay_sec)
+                args += ["--fsa-slow-delay-ms", f"{int(_v*1000)},{int(_v*2000)}"]
             if self.strict_brand and self.strict_brand_match != "any":
                 args += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
             return args
@@ -2698,6 +2704,8 @@ const FORM_FIELDS = {
     {key:'make_report_xlsx',lbl:'Расширенный отчёт',   type:'switch', def:true, hint:'Листы «Сводка» + «Подробности»'},
     {key:'fsa_slow_mode',   lbl:'Медленный режим ФСА (без блокировок)', type:'switch', def:false,
       hint:'Для больших прогонов: ФСА по одному документу с паузой — IP не банится, но медленно (часы для тысяч ссылок). SWIS/прочие реестры идут параллельно.'},
+    {key:'fsa_slow_delay_sec', lbl:'Пауза ФСА, сек (медл. режим)', type:'number', def:0, min:0, max:30,
+      hint:'0 = авто (~2.5–5с). Меньше — быстрее, но выше риск бана; при блокировках пауза сама растёт.'},
   ],
   query_stage1: [
     {key:'query',            lbl:'Поисковый запрос',  type:'text',   def:'детская обувь'},
@@ -2716,6 +2724,8 @@ const FORM_FIELDS = {
     {key:'make_report_xlsx', lbl:'Расширенный отчёт', type:'switch', def:true},
     {key:'fsa_slow_mode',    lbl:'Медленный режим ФСА (без блокировок)', type:'switch', def:false,
       hint:'ФСА по одному документу с паузой — IP не банится на больших прогонах, но медленно. SWIS/прочие параллельно.'},
+    {key:'fsa_slow_delay_sec', lbl:'Пауза ФСА, сек (медл. режим)', type:'number', def:0, min:0, max:30,
+      hint:'0 = авто (~2.5–5с). Меньше — быстрее, но выше риск бана.'},
     {key:'strict_brand',     lbl:'Строгий бренд',     type:'text',  def:'', hint:'Опционально'},
     {key:'strict_brand_match',lbl:'Тип совпадения',   type:'select',def:'any', options:['any','exact','contains']},
   ],
@@ -2732,6 +2742,8 @@ const FORM_FIELDS = {
     {key:'make_report_xlsx',lbl:'Расширенный отчёт',    type:'switch',def:true},
     {key:'fsa_slow_mode',   lbl:'Медленный режим ФСА (без блокировок)', type:'switch', def:false,
       hint:'ФСА по одному документу с паузой — IP не банится на больших прогонах, но медленно. SWIS/прочие параллельно.'},
+    {key:'fsa_slow_delay_sec', lbl:'Пауза ФСА, сек (медл. режим)', type:'number', def:0, min:0, max:30,
+      hint:'0 = авто (~2.5–5с). Меньше — быстрее, но выше риск бана.'},
   ],
   ozon: [
     {key:'query',   lbl:'Поисковый запрос Ozon', type:'text',  def:'детская обувь', hint:'Как в поиске Ozon.ru'},

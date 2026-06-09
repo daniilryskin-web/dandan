@@ -442,6 +442,7 @@ _RESULT_HEADER_ALIASES = {
     "certificate_number": "Номер документа",
     "document_type": "Тип документа",
     "document_status": "Статус документа",
+    "rf_status": "Статус на территории РФ",
     "certificate_product_name": "Название в реестре",
     "document_date_start": "Действует с",
     "document_date_end": "Действует до",
@@ -1186,7 +1187,61 @@ class Bridge:
         self._loaded_result_path = ""
         return {"ok": True}
 
-    def get_results(self, xlsx_path: Optional[str] = None, limit: int = 2000) -> dict:
+    def _kg_status_path(self) -> Path:
+        return APP_DIR / "kg_rf_status.xlsx"
+
+    def kg_status_info(self) -> dict:
+        """Сколько записей в загруженной таблице статусов КГ-документов в РФ."""
+        p = next((q for q in (APP_DIR / "kg_rf_status.xlsx", APP_DIR / "kg_rf_status.csv")
+                  if q.exists()), None)
+        if p is None:
+            return {"ok": True, "loaded": False, "count": 0}
+        try:
+            import main_v39 as _mv
+            n = _mv.load_kg_rf_status(str(p))
+            return {"ok": True, "loaded": n > 0, "count": int(n)}
+        except Exception:
+            return {"ok": True, "loaded": True, "count": 0}
+
+    def browse_kg_status_file(self) -> dict:
+        """Открывает файловый диалог, копирует выбранную таблицу (xlsx/csv) статусов
+        КГ-документов в РФ в kg_rf_status.xlsx рядом с программой. Дальше движок
+        автоматически её использует: совпавшие по номеру киргизские документы
+        получают «Статус на территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ»."""
+        try:
+            import webview  # type: ignore
+        except Exception:
+            return {"ok": False, "error": "webview недоступен"}
+        if self._window is None:
+            return {"ok": False, "error": "Окно не готово"}
+        try:
+            res = self._window.create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=False,
+                file_types=("Таблицы (*.xlsx;*.csv)", "Все файлы (*.*)"))
+        except Exception as exc:
+            return {"ok": False, "error": f"Не удалось открыть диалог: {exc}"}
+        if not res:
+            return {"ok": False, "cancelled": True}
+        src = Path(res[0] if isinstance(res, (list, tuple)) else str(res))
+        if not src.exists():
+            return {"ok": False, "error": "Файл не найден"}
+        try:
+            import shutil
+            dst = self._kg_status_path()
+            # .csv тоже принимаем — кладём как kg_rf_status.csv, движок ищет оба
+            if src.suffix.lower() == ".csv":
+                dst = APP_DIR / "kg_rf_status.csv"
+                try:
+                    (APP_DIR / "kg_rf_status.xlsx").unlink()
+                except Exception:
+                    pass
+            shutil.copyfile(src, dst)
+        except Exception as exc:
+            return {"ok": False, "error": f"Не удалось скопировать файл: {exc}"}
+        info = self.kg_status_info()
+        return {"ok": True, "name": src.name, "count": info.get("count", 0)}
+
+    def get_results(self, xlsx_path: Optional[str] = None, limit: int = 100000) -> dict:
         """
         Читает лист «Подробности» из XLSX и возвращает данные для таблицы.
         Также считает статистику по статусу, реестру и маркетплейсу.
@@ -2357,6 +2412,20 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
         </div>
 
         <div class="card">
+          <div class="card-title">🇰🇬 Статусы киргизских документов в РФ</div>
+          <div style="font-size:13px; color:var(--fg2); line-height:1.6; margin-bottom:10px;">
+            Загрузите таблицу (xlsx/csv) с колонками <b>number</b> и <b>id_status_in_rf</b>
+            (14 = прекращён, 15 = приостановлен). Совпавшие по номеру киргизские документы
+            получат колонку «Статус на территории РФ» и итоговый вердикт
+            «<b style="color:#e06666;">НЕДЕЙСТВУЕТ В РФ</b>».
+          </div>
+          <div class="actions-row">
+            <button class="btn btn-ghost btn-sm" id="btn-load-kg">📋 Загрузить таблицу КГ-статусов</button>
+            <span class="text-muted text-sm" id="kg-status-info"></span>
+          </div>
+        </div>
+
+        <div class="card">
           <div class="card-title">🗂 Рабочая папка</div>
           <div id="settings-dir" style="font-family:monospace; font-size:12.5px; color:var(--accent); word-break:break-all;"></div>
           <div class="actions-row" style="margin-top:12px;">
@@ -3117,7 +3186,8 @@ async function loadResults() {
 const PREFERRED_COLS = [
   'Запрос', 'Артикул WB', 'Название товара', 'Бренд', 'Категория WB',
   'Технический статус', 'Цена со скидкой, ₽', 'Продавец', "Плашка 'Оригинал'",
-  'Название в реестре', 'Статус документа', 'Номер документа', 'Тип документа',
+  'Название в реестре', 'Статус документа', 'Статус на территории РФ',
+  'Номер документа', 'Тип документа',
   'ТН ВЭД', 'Изготовитель', 'Действует до', 'Риск по сроку',
 ];
 // URL-колонки в таблице НЕ показываем (по просьбе), но используем для кликов:
@@ -3171,7 +3241,7 @@ function renderTable(rows) {
   // Индексы URL-колонок (не показываются, но используются для кликов)
   const purlIdx = _allHeaders.findIndex(h => /ссылка на товар|product_url/i.test(h));
   const rurlIdx = _allHeaders.findIndex(h => /ссылка на реестр|registry_url/i.test(h));
-  for (const row of viewRows.slice(0, 1000)) {
+  for (const row of viewRows.slice(0, 5000)) {
     const purl = purlIdx >= 0 ? String(row[purlIdx] ?? '') : '';
     const rurl = rurlIdx >= 0 ? String(row[rurlIdx] ?? '') : '';
     html += '<tr>';
@@ -3185,9 +3255,12 @@ function renderTable(rows) {
         else if (v === 'Истёк')          badge = 'badge-error';
         else if (v)                      badge = 'badge-muted';
       } else if (head.includes('статус') || head.includes('status')) {
-        if (v.includes('OK') || v.includes('СОБРАНА')) badge = 'badge-ok';
-        else if (v.includes('ОШИБКА') || v.includes('ТАЙМАУТ')) badge = 'badge-error';
-        else if (v.includes('ПРОВЕРИТЬ') || v.includes('НЕ УДАЛОСЬ')) badge = 'badge-warn';
+        // Технический статус + Статус документа + Статус на территории РФ.
+        if (v.includes('OK') || v.includes('СОБРАНА') || v === 'Действует') badge = 'badge-ok';
+        else if (v.includes('НЕДЕЙСТВ') || v.includes('НЕСООТВЕТ') || v.includes('ОШИБКА')
+                 || v.includes('ТАЙМАУТ') || v.includes('Прекращ') || v.includes('Аннулир')) badge = 'badge-error';
+        else if (v.includes('ПРОВЕРИТЬ') || v.includes('НЕ УДАЛОСЬ')
+                 || v.includes('Приостановл') || v.includes('Архивн')) badge = 'badge-warn';
         else if (v) badge = 'badge-muted';
       } else if (head.includes('маркетплейс') || head.includes('marketplace')) {
         if (v === 'WB' || v.toLowerCase().includes('wildberries')) badge = 'badge-wb';
@@ -3362,6 +3435,7 @@ async function fillSettings() {
     if (s.defaults.expiry_warning_days) $('#s-expiry').value = s.defaults.expiry_warning_days;
     if (s.defaults.workers) $('#s-workers').value = s.defaults.workers;
   }
+  refreshKgInfo();
 }
 
 $('#btn-save-defaults').addEventListener('click', async () => {
@@ -3373,6 +3447,26 @@ $('#btn-save-defaults').addEventListener('click', async () => {
   };
   const res = await window.pywebview.api.save_settings(data);
   toast(res.ok ? 'Настройки сохранены' : 'Ошибка сохранения', res.ok ? 'ok' : 'err');
+});
+
+// Таблица статусов КГ-документов в РФ
+async function refreshKgInfo() {
+  try {
+    const r = await window.pywebview.api.kg_status_info();
+    const el = $('#kg-status-info');
+    if (el) el.textContent = (r && r.loaded)
+      ? `✓ загружено: ${r.count} записей` : 'таблица не загружена';
+  } catch (e) {}
+}
+const _btnKg = $('#btn-load-kg');
+if (_btnKg) _btnKg.addEventListener('click', async () => {
+  let r;
+  try { r = await window.pywebview.api.browse_kg_status_file(); }
+  catch (e) { toast('Ошибка диалога: ' + e, 'err'); return; }
+  if (!r || r.cancelled) return;
+  if (!r.ok) { toast(r.error || 'Не удалось загрузить', 'err'); return; }
+  toast(`Таблица КГ загружена: ${r.count} записей`, 'ok');
+  refreshKgInfo();
 });
 
 // Theme toggle

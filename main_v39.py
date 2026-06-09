@@ -421,6 +421,85 @@ _FSA_STATUS_MAP: Dict[int, str] = {
 # Статусы, при которых документ считается НЕдействующим (для вердикта/окраски).
 _FSA_INACTIVE_STATUS_CODES = {1, 11, 14, 15}
 
+
+# =============================================================================
+# v46: Статус КИРГИЗСКИХ документов на территории РФ
+# =============================================================================
+# Пользователь ведёт таблицу (xlsx) с киргизскими (ЕАЭС KG…) документами, которые
+# приостановлены/прекращены именно на территории РФ. Колонки: number, [reg_date],
+# id_status_in_rf (14 = прекращён, 15 = приостановлен). Программа сверяет номер
+# документа из реестра с этой таблицей и, если документ там есть, выставляет
+# колонку «Статус на территории РФ» и итоговый вердикт «НЕДЕЙСТВУЕТ В РФ».
+STATUS_INVALID_IN_RF = "НЕДЕЙСТВУЕТ В РФ"
+_KG_RF_STATUS_MAP: Dict[str, int] = {}     # norm_number -> код (14/15/…)
+_KG_RF_CODE_TEXT = {14: "Прекращён", 15: "Приостановлен"}
+
+
+def _norm_doc_number(s: Any) -> str:
+    """Нормализация номера документа для сверки: убираем всё кроме букв/цифр,
+    приводим к нижнему регистру. «ЕАЭС KG 417/043.RU.02.09525» и
+    «ЕАЭС KG417/043.RU.02.09525.» дают одинаковый ключ."""
+    return re.sub(r'[^0-9a-zA-Zа-яА-ЯёЁ]', '', str(s or '')).lower()
+
+
+def load_kg_rf_status(path: Any) -> int:
+    """Загружает таблицу статусов КГ-документов в РФ в _KG_RF_STATUS_MAP.
+    Поддерживает .xlsx (колонки number/…/id_status_in_rf — по именам или по
+    позиции 0 и последняя) и .csv. Возвращает число загруженных записей."""
+    global _KG_RF_STATUS_MAP
+    p = Path(str(path))
+    if not p.exists():
+        return 0
+    rows_iter = []
+    try:
+        if p.suffix.lower() in ('.xlsx', '.xlsm'):
+            from openpyxl import load_workbook
+            wb = load_workbook(p, read_only=True, data_only=True)
+            ws = wb.worksheets[0]
+            rows_iter = list(ws.iter_rows(values_only=True))
+        else:
+            import csv as _csv
+            with open(p, 'r', encoding='utf-8-sig', newline='') as f:
+                rows_iter = [tuple(r) for r in _csv.reader(f)]
+    except Exception as e:
+        print(f"⚠️  Не удалось прочитать таблицу статусов КГ-РФ ({p.name}): {type(e).__name__}: {e}")
+        return 0
+    if not rows_iter:
+        return 0
+    header = [str(c).strip().lower() if c is not None else '' for c in rows_iter[0]]
+    # ищем колонки number и id_status_in_rf по именам; иначе 0 и последняя
+    num_i = next((i for i, h in enumerate(header) if 'number' in h or 'номер' in h), 0)
+    st_i = next((i for i, h in enumerate(header)
+                 if 'status' in h or 'статус' in h), len(header) - 1)
+    has_header = ('number' in header[num_i]) or ('номер' in header[num_i]) or \
+                 ('status' in header[st_i]) or ('статус' in header[st_i])
+    data = rows_iter[1:] if has_header else rows_iter
+    m: Dict[str, int] = {}
+    for r in data:
+        if not r or num_i >= len(r) or st_i >= len(r):
+            continue
+        key = _norm_doc_number(r[num_i])
+        if not key:
+            continue
+        try:
+            code = int(str(r[st_i]).strip())
+        except Exception:
+            continue
+        m[key] = code
+    _KG_RF_STATUS_MAP = m
+    return len(m)
+
+
+def kg_rf_status_text(cert_number: Any) -> str:
+    """Если номер документа есть в таблице КГ-РФ — возвращает русский статус
+    («Прекращён»/«Приостановлен»/«Статус N»), иначе пустую строку."""
+    if not _KG_RF_STATUS_MAP or not cert_number:
+        return ""
+    code = _KG_RF_STATUS_MAP.get(_norm_doc_number(cert_number))
+    if code is None:
+        return ""
+    return _KG_RF_CODE_TEXT.get(code, f"Статус {code}")
+
 # Словарь технических регламентов ФСА (idTechnicalReglaments). 39 = ТР ТС
 # 007/2011 подтверждён живым ответом (в тексте документов). Остальные —
 # по мере подтверждения; неизвестные отдаются как «ТР (код N)».
@@ -652,6 +731,7 @@ class ResultRow:
     certificate_number: str = ""
     document_type: str = ""
     document_status: str = ""  # v39.5: "Действует" / "Прекращён" / "Приостановлен" и т.п.
+    rf_status: str = ""         # v46: статус киргизского документа на территории РФ
     certificate_product_name: str = ""
     # v39.14: расширенные поля из реестра (если HTTP-парсер их нашёл)
     document_date_start: str = ""
@@ -2806,6 +2886,7 @@ DETAILS_HEADERS_RU_V39: Dict[str, str] = {
     "certificate_number": "Номер документа",
     "document_type": "Тип документа",
     "document_status": "Статус документа",
+    "rf_status": "Статус на территории РФ",
     "certificate_product_name": "Название в реестре",
     "document_date_start": "Действует с",
     "document_date_end": "Действует до",
@@ -3080,7 +3161,7 @@ CORE_DETAILS_ORDER_V39: Tuple[str, ...] = (
     "query", "nm_id", "product_name", "brand", "subject", "product_url",
     "status", "price_rub", "sale_price_rub", "seller_name", "supplier_id",
     "is_original", "registry_url", "document_type", "document_status",
-    "certificate_number", "document_date_start", "document_date_end",
+    "rf_status", "certificate_number", "document_date_start", "document_date_end",
 )
 
 
@@ -7891,6 +7972,23 @@ async def run_registry_stage(args):
     """
     _run_started_at = time.time()
 
+    # v46: загружаем таблицу статусов киргизских документов на территории РФ.
+    # Явный путь из --kg-rf-status-file, иначе kg_rf_status.xlsx рядом с программой.
+    _kg_file = (getattr(args, 'kg_rf_status_file', '') or '').strip()
+    if not _kg_file:
+        for _cand in ('kg_rf_status.xlsx', 'kg_rf_status.csv'):
+            if Path(_cand).exists():
+                _kg_file = _cand
+                break
+    if _kg_file:
+        try:
+            _kg_n = load_kg_rf_status(_kg_file)
+            if _kg_n:
+                print(f"🇰🇬 Таблица статусов КГ-документов в РФ загружена: {_kg_n} записей "
+                      f"(совпавшие получат «Статус на территории РФ» и вердикт «{STATUS_INVALID_IN_RF}»).")
+        except Exception as _e:
+            print(f"⚠️  Таблица статусов КГ-РФ не загружена: {type(_e).__name__}: {_e}")
+
     # v27.9.x: глушим КОСМЕТИЧЕСКИЕ ошибки event-loop'а вида «Future exception was
     # never retrieved» с net::ERR_ABORTED / «frame was detached». Они возникают,
     # когда жёсткий per-record timeout отменяет навигацию Playwright в момент
@@ -8008,6 +8106,10 @@ async def run_registry_stage(args):
                 if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                     verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'
                     score = 0.0
+            # v46: киргизский документ из таблицы статусов РФ — отдельный вердикт
+            rf_status = kg_rf_status_text(cert)
+            if rf_status:
+                verdict = STATUS_INVALID_IN_RF
             rr = ResultRow(
                 query=row.get('query', ''),
                 nm_id=safe_int(row.get('nm_id')),
@@ -8030,6 +8132,7 @@ async def run_registry_stage(args):
                 certificate_number=cert,
                 document_type=typ,
                 document_status=doc_status,
+                rf_status=rf_status,
                 certificate_product_name=prod,
                 # v39.14: расширенные поля FSA-документа
                 # v27.5: двойная защита — дожимаем орг-поля и ТН ВЭД, если в кэше остался мусор.
@@ -8537,6 +8640,10 @@ async def run_registry_stage(args):
             if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                 verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'
                 score = 0.0
+        # v46: киргизский документ из таблицы статусов РФ — отдельный вердикт
+        rf_status = kg_rf_status_text(cert)
+        if rf_status:
+            verdict = STATUS_INVALID_IN_RF
         # v39.14: достаём расширенные поля FSA из глобального кэша
         ext = _FSA_EXTENDED_FIELDS_CACHE.get(url, {})
         rr = ResultRow(
@@ -8560,6 +8667,7 @@ async def run_registry_stage(args):
             certificate_number=cert,
             document_type=typ,
             document_status=doc_status,
+            rf_status=rf_status,
             certificate_product_name=prod,
             document_date_start=ext.get('document_date_start', ''),
             document_date_end=ext.get('document_date_end', ''),
@@ -8728,6 +8836,11 @@ def build_parser():
                     help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
                          "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "
                          "автоматический темп. 0,0 — без паузы (быстрее, но рискованнее).")
+    ap.add_argument("--kg-rf-status-file", default="",
+                    help="v46: путь к таблице (xlsx/csv) статусов КИРГИЗСКИХ документов на территории "
+                         "РФ (колонки number + id_status_in_rf: 14=прекращён, 15=приостановлен). Если не "
+                         "задан, ищется kg_rf_status.xlsx рядом с программой. Совпавшие по номеру "
+                         "документы получают колонку «Статус на территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ».")
     ap.add_argument("--fsa-cookie-http", type=str_to_bool, default=False,
                     help="v45.8: ПО УМОЛЧАНИЮ FALSE — ФСА идёт ТОЛЬКО через браузер (по требованию: "
                          "другие способы пока не помогают). Браузерные документы парсятся ПАРАЛЛЕЛЬНО, "

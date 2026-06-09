@@ -161,6 +161,9 @@ class RunSpec:
     expiry_warning_days: int = 30
     """Порог (в днях) для метки «Скоро истекает»."""
 
+    fsa_slow_mode: bool = False
+    """v46: медленный режим ФСА (без блокировок) — для больших прогонов."""
+
     make_report_xlsx: bool = True
     """Создавать листы Сводка/Подробности в XLSX."""
 
@@ -248,6 +251,7 @@ class RunSpec:
                 "--expiry-warning-days", str(self.expiry_warning_days),
                 "--make-report-xlsx", "true" if self.make_report_xlsx else "false",
                 "--registry-fsa-retry", "true" if self.registry_fsa_retry else "false",
+                "--fsa-slow-mode", "true" if self.fsa_slow_mode else "false",
             ]
             if self.strict_brand and self.strict_brand_match != "any":
                 args += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
@@ -2692,6 +2696,8 @@ const FORM_FIELDS = {
     {key:'expiry_warning_days', lbl:'Скоро истекает (дней)', type:'number', def:30, min:1, max:365},
     {key:'headless',        lbl:'Скрытый браузер',    type:'switch', def:true},
     {key:'make_report_xlsx',lbl:'Расширенный отчёт',   type:'switch', def:true, hint:'Листы «Сводка» + «Подробности»'},
+    {key:'fsa_slow_mode',   lbl:'Медленный режим ФСА (без блокировок)', type:'switch', def:false,
+      hint:'Для больших прогонов: ФСА по одному документу с паузой — IP не банится, но медленно (часы для тысяч ссылок). SWIS/прочие реестры идут параллельно.'},
   ],
   query_stage1: [
     {key:'query',            lbl:'Поисковый запрос',  type:'text',   def:'детская обувь'},
@@ -2708,6 +2714,8 @@ const FORM_FIELDS = {
     {key:'expiry_warning_days',lbl:'Скоро истекает (дней)',type:'number',def:30,min:1,max:365},
     {key:'headless',         lbl:'Скрытый браузер',   type:'switch', def:true},
     {key:'make_report_xlsx', lbl:'Расширенный отчёт', type:'switch', def:true},
+    {key:'fsa_slow_mode',    lbl:'Медленный режим ФСА (без блокировок)', type:'switch', def:false,
+      hint:'ФСА по одному документу с паузой — IP не банится на больших прогонах, но медленно. SWIS/прочие параллельно.'},
     {key:'strict_brand',     lbl:'Строгий бренд',     type:'text',  def:'', hint:'Опционально'},
     {key:'strict_brand_match',lbl:'Тип совпадения',   type:'select',def:'any', options:['any','exact','contains']},
   ],
@@ -2722,6 +2730,8 @@ const FORM_FIELDS = {
     {key:'expiry_warning_days',lbl:'Скоро истекает (дней)',type:'number',def:30,min:1,max:365},
     {key:'output',      lbl:'Результат XLSX',           type:'text',  def:'brand_result.xlsx'},
     {key:'make_report_xlsx',lbl:'Расширенный отчёт',    type:'switch',def:true},
+    {key:'fsa_slow_mode',   lbl:'Медленный режим ФСА (без блокировок)', type:'switch', def:false,
+      hint:'ФСА по одному документу с паузой — IP не банится на больших прогонах, но медленно. SWIS/прочие параллельно.'},
   ],
   ozon: [
     {key:'query',   lbl:'Поисковый запрос Ozon', type:'text',  def:'детская обувь', hint:'Как в поиске Ozon.ru'},

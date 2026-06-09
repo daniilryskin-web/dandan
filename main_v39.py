@@ -7976,16 +7976,20 @@ async def _fsa_warmup_context(page, timeout_ms: int = 15000) -> None:
         pass
 
 
-def _fsa_human_delay_range(args) -> Tuple[float, float]:
-    """Диапазон случайной паузы между FSA-документами (сек). --fsa-human-delay-ms «min,max»."""
-    raw = str(getattr(args, 'fsa_human_delay_ms', '300,1400') or '300,1400')
+def _fsa_human_delay_range_ms(raw: str, default=(300, 1400)) -> Tuple[float, float]:
+    """Разбирает строку «min,max» (мс) в диапазон секунд (lo, hi)."""
     try:
-        parts = [int(x) for x in re.split(r'[,\s]+', raw.strip()) if x]
-        lo = parts[0] if parts else 300
+        parts = [int(x) for x in re.split(r'[,\s]+', str(raw).strip()) if x]
+        lo = parts[0] if parts else default[0]
         hi = parts[1] if len(parts) > 1 else lo
         return max(0, lo) / 1000.0, max(lo, hi) / 1000.0
     except Exception:
-        return 0.3, 1.4
+        return default[0] / 1000.0, default[1] / 1000.0
+
+
+def _fsa_human_delay_range(args) -> Tuple[float, float]:
+    """Диапазон случайной паузы между FSA-документами (сек). --fsa-human-delay-ms «min,max»."""
+    return _fsa_human_delay_range_ms(getattr(args, 'fsa_human_delay_ms', '300,1400') or '300,1400')
 
 
 async def run_registry_stage(args):
@@ -8233,6 +8237,16 @@ async def run_registry_stage(args):
             # идут по одному (а не залпом из 5 сессий), чтобы первый прошёл антибот и
             # отдал куки; дальше всё летит быстрым HTTP параллельно.
             _fsa_bootstrap_sem = asyncio.Semaphore(1)
+            # v46: МЕДЛЕННЫЙ РЕЖИМ ФСА — для больших прогонов (до 10k) без блокировок.
+            _fsa_slow_mode = bool(getattr(args, 'fsa_slow_mode', False))
+            _fsa_serial_sem = asyncio.Semaphore(1)  # ФСА строго по одному при slow-mode
+            _fsa_slow_lo, _fsa_slow_hi = _fsa_human_delay_range_ms(
+                getattr(args, 'fsa_slow_delay_ms', '4000,8000') or '4000,8000')
+            if _fsa_slow_mode and _has_fsa:
+                print(f"🐢 МЕДЛЕННЫЙ режим ФСА: документы по одному, пауза "
+                      f"{_fsa_slow_lo:.1f}-{_fsa_slow_hi:.1f}с + адаптивный бэкофф. "
+                      f"Без блокировок, но небыстро (≈{60.0/max(0.1,(_fsa_slow_lo+_fsa_slow_hi)/2):.0f} док/мин). "
+                      f"SWIS/прочие реестры идут параллельно.")
             _launch_kwargs = dict(
                 headless=getattr(args, 'registry_headless', True),
                 args=['--disable-dev-shm-usage', '--no-sandbox', '--disable-blink-features=AutomationControlled'],
@@ -8339,29 +8353,34 @@ async def run_registry_stage(args):
                         try:
                             h = hostname(url)
                             if h == 'pub.fsa.gov.ru':
-                                # v45: человекоподобная случайная пауза между документами FSA —
-                                # снижает риск блокировки за «слишком ровный» автоматический темп.
-                                if _fsa_delay_hi > 0:
-                                    await asyncio.sleep(random.uniform(_fsa_delay_lo, _fsa_delay_hi))
-                                # v45.4: БУТСТРАП-СЕРИАЛИЗАЦИЯ. Пока нет сессионных кук,
-                                # FSA-документы парсятся браузером по ОДНОМУ (не 5 сессий
-                                # разом) — так первый запрос с большей вероятностью пройдёт
-                                # антибот и отдаст куки. Как только куки есть — все
-                                # остальные документы летят быстрым HTTP параллельно (без
-                                # этого замка). Это и спасает: 1 аккуратная сессия вместо
-                                # залпа, а дальше — лёгкие HTTP-запросы.
-                                if (bool(getattr(args, 'fsa_cookie_http', True))
-                                        and not _FSA_SESSION_COOKIES):
-                                    async with _fsa_bootstrap_sem:
+                                # v46: МЕДЛЕННЫЙ РЕЖИМ — держим темп ниже лимита ФСА.
+                                # Пауза между документами + АДАПТИВНЫЙ бэкофф (после каждой
+                                # авто-паузы темп снижается ×(1+циклы)). Парсинг ФСА —
+                                # СЕРИЙНО (Semaphore 1), чтобы не было всплеска из 4 сессий.
+                                if _fsa_slow_mode:
+                                    _mult = 1.0 + 0.6 * _FSA_COOLDOWN_CYCLES
+                                    await asyncio.sleep(random.uniform(_fsa_slow_lo, _fsa_slow_hi) * _mult)
+                                    async with _fsa_serial_sem:
                                         cert, prod, typ, doc_status, detail = await asyncio.wait_for(
                                             _parse_fsa_with_existing_page_v386(page, url, args),
                                             timeout=per_registry_timeout,
                                         )
                                 else:
-                                    cert, prod, typ, doc_status, detail = await asyncio.wait_for(
-                                        _parse_fsa_with_existing_page_v386(page, url, args),
-                                        timeout=per_registry_timeout,
-                                    )
+                                    # обычный режим: человекоподобная пауза + бутстрап-замок кук
+                                    if _fsa_delay_hi > 0:
+                                        await asyncio.sleep(random.uniform(_fsa_delay_lo, _fsa_delay_hi))
+                                    if (bool(getattr(args, 'fsa_cookie_http', True))
+                                            and not _FSA_SESSION_COOKIES):
+                                        async with _fsa_bootstrap_sem:
+                                            cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                                _parse_fsa_with_existing_page_v386(page, url, args),
+                                                timeout=per_registry_timeout,
+                                            )
+                                    else:
+                                        cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                            _parse_fsa_with_existing_page_v386(page, url, args),
+                                            timeout=per_registry_timeout,
+                                        )
                             elif h in {'swis.trade.kg', 'trade.kg'}:
                                 # v27.7: киргизский SWIS — ТОЛЬКО HTTP (требование).
                                 # Страница серверного рендеринга, браузер не нужен.
@@ -8919,6 +8938,14 @@ def build_parser():
                          "РФ (колонки number + id_status_in_rf: 14=прекращён, 15=приостановлен). Если не "
                          "задан, ищется kg_rf_status.xlsx рядом с программой. Совпавшие по номеру "
                          "документы получают колонку «Статус на территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ».")
+    ap.add_argument("--fsa-slow-mode", type=str_to_bool, default=False,
+                    help="v46: МЕДЛЕННЫЙ режим ФСА для больших прогонов (до 10k) без блокировок. "
+                         "ФСА парсится строго ПО ОДНОМУ документу с паузой (--fsa-slow-delay-ms) и "
+                         "адаптивным бэкоффом. SWIS/прочие реестры идут параллельно. Медленно (часы для "
+                         "10k), но ФСА не банит IP.")
+    ap.add_argument("--fsa-slow-delay-ms", default="4000,8000",
+                    help="v46: пауза между документами ФСА в медленном режиме, мс, «min,max» "
+                         "(по умолчанию 4000,8000 ≈ 10 док/мин). Меньше — быстрее, но выше риск бана.")
     ap.add_argument("--fsa-skip-org-fields", type=str_to_bool, default=True,
                     help="v46: НЕ собирать заявителя/изготовителя/ИНН/ТН ВЭД из ФСА. По умолчанию TRUE: "
                          "это убирает заход на ДОПОЛНИТЕЛЬНЫЕ вкладки ФСА (где лежат изготовитель/заявитель) "

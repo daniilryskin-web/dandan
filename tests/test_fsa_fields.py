@@ -114,6 +114,24 @@ def main():
     check("--fsa-max-cooldowns по умолчанию 3", a.fsa_max_cooldowns == 3)
     check("есть глобал паузы _FSA_COOLDOWN_UNTIL", hasattr(mv, "_FSA_COOLDOWN_UNTIL"))
 
+    # --- медленный режим ФСА (без блокировок) ---
+    check("--fsa-slow-mode по умолчанию FALSE", a.fsa_slow_mode is False)
+    check("--fsa-slow-delay-ms по умолчанию 4000,8000", a.fsa_slow_delay_ms == "4000,8000")
+    check("разбор паузы slow-mode -> 4..8 сек", mv._fsa_human_delay_range_ms("4000,8000") == (4.0, 8.0))
+    import wb_checker as wc
+    sp = wc.RunSpec(mode="query_stage2", input_links_csv="r.csv", fsa_slow_mode=True, workers=4)
+    aa = sp.wb_args()
+    check("stage2 пробрасывает --fsa-slow-mode true",
+          "--fsa-slow-mode" in aa and aa[aa.index("--fsa-slow-mode") + 1] == "true")
+    runner = wc.EngineRunner(wc.AppState())
+    calls = []
+    runner._run_one = lambda ar, l: (calls.append((l, list(ar))) or 0)
+    runner._run(wc.RunSpec(mode="brand", brand="indesit", brand_match="exact",
+                           fsa_slow_mode=True, workers=4))
+    s2 = [ar for l, ar in calls if "реестр" in l.lower()][0]
+    check("бренд -> этап 2 несёт медленный режим",
+          "--fsa-slow-mode" in s2 and s2[s2.index("--fsa-slow-mode") + 1] == "true")
+
 
 if __name__ == "__main__":
     main()

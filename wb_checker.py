@@ -3278,10 +3278,14 @@ async function loadResults() {
   statSel.innerHTML = '<option value="">Все статусы</option>' +
     statuses.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
 
-  const _cfc = $('#chart-filter-chip'); if (_cfc) _cfc.style.display = 'none';
+  // v46: новый файл/обновление — сбрасываем все активные фильтры.
+  clearAllFilters();
+  const _fi = $('#filter-input'); if (_fi) _fi.value = '';
+  const _fs = $('#filter-status'); if (_fs) _fs.value = '';
+  const _chips = $('#filter-chips'); if (_chips) _chips.innerHTML = '';
   renderTable(_allRows);
 
-  // Charts
+  // Charts — из статистики Python по всем строкам (authoritative).
   if (_chartjs) {
     buildResultsCharts(res.stats);
   }
@@ -3434,28 +3438,22 @@ function showFullTextModal(text) {
   m.style.display = 'block';
 }
 
+// v46: текстовый поиск и выпадающий статус — тоже часть ЕДИНОЙ системы фильтров
+// (комбинируются с фильтрами диаграмм и пересчитывают все диаграммы).
 $('#filter-input').addEventListener('input', e => {
-  const q = e.target.value.toLowerCase().trim();
-  const st = $('#filter-status').value.toLowerCase();
-  applyTableFilter(q, st);
+  const q = e.target.value.trim();
+  if (q) setFilter('text', 'Поиск: ' + q,
+                   r => r.some(c => String(c).toLowerCase().includes(q.toLowerCase())));
+  else removeFilter('text');
 });
 $('#filter-status').addEventListener('change', e => {
-  const q = $('#filter-input').value.toLowerCase().trim();
-  applyTableFilter(q, e.target.value.toLowerCase());
-});
-
-function applyTableFilter(q, st) {
-  const _cfc = $('#chart-filter-chip'); if (_cfc) _cfc.style.display = 'none';  // снимаем фильтр диаграммы
-  let rows = _allRows;
-  if (q) rows = rows.filter(r => r.some(c => String(c).toLowerCase().includes(q)));
+  const st = e.target.value;
   if (st) {
-    const hl = _allHeaders.map(x => x.toLowerCase());
-    const si = hl.findIndex(h => h.includes('статус') || h.includes('status'));
-    if (si >= 0) rows = rows.filter(r => String(r[si]).toLowerCase().includes(st));
-  }
-  renderTable(rows);
-  $('#results-count').textContent = `${rows.length} строк (фильтр)`;
-}
+    const si = _colIdxByName('технический статус', 'status', 'статус');
+    setFilter('status-dd', 'Статус: ' + st,
+              r => si >= 0 && String(r[si] ?? '').toLowerCase().includes(st.toLowerCase()));
+  } else removeFilter('status-dd');
+});
 
 $('#btn-reload-results').addEventListener('click', loadResults);
 
@@ -3785,31 +3783,90 @@ function _colIdxByName() {
   for (const n of arguments) { const i = low.indexOf(n); if (i >= 0) return i; }
   return -1;
 }
-function applyChartFilter(label, matcher) {
-  if (!_allRows || !_allRows.length) return;
-  const rows = _allRows.filter(matcher);
-  renderTable(rows);
-  $('#results-count').textContent = `${rows.length} строк · фильтр`;
-  let chip = $('#chart-filter-chip');
-  if (!chip) {
-    chip = document.createElement('span');
-    chip.id = 'chart-filter-chip';
-    chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-left:8px;'
-      + 'padding:3px 10px;border-radius:12px;background:var(--accent,#5b8cff);color:#fff;'
-      + 'font-size:12px;cursor:pointer;';
-    chip.title = 'Сбросить фильтр';
-    const cnt = $('#results-count');
-    if (cnt && cnt.parentNode) cnt.parentNode.insertBefore(chip, cnt.nextSibling);
-    chip.addEventListener('click', clearChartFilter);
-  }
-  chip.innerHTML = '🔎 ' + escapeHtml(String(label)) + ' ✕';
-  chip.style.display = '';
+// v46: ЕДИНАЯ СИСТЕМА ФИЛЬТРОВ. Любой фильтр (клик по диаграмме, текст, статус)
+// пересчитывает И таблицу, И ВСЕ остальные диаграммы по отфильтрованному набору.
+// Фильтры КОМБИНИРУЮТСЯ (AND): клик по нескольким сегментам = пересечение.
+let _activeFilters = {};   // ключ -> {label, matcher}
+
+function _filteredRows() {
+  const fs = Object.values(_activeFilters);
+  if (!fs.length) return _allRows || [];
+  return (_allRows || []).filter(r => fs.every(f => f.matcher(r)));
 }
-function clearChartFilter() {
-  const chip = $('#chart-filter-chip');
-  if (chip) chip.style.display = 'none';
-  renderTable(_allRows);
-  if (_allRows) $('#results-count').textContent = `${_allRows.length} строк`;
+function recomputeView() {
+  const rows = _filteredRows();
+  renderTable(rows);
+  const total = (_allRows || []).length;
+  $('#results-count').textContent = Object.keys(_activeFilters).length
+    ? `${rows.length} из ${total} строк (фильтр)` : `${total} строк`;
+  if (_chartjs) buildResultsCharts(computeStatsFromRows(rows));
+  renderFilterChips();
+}
+function setFilter(key, label, matcher) {
+  _activeFilters[key] = { label, matcher };
+  recomputeView();
+}
+function removeFilter(key) {
+  delete _activeFilters[key];
+  recomputeView();
+}
+function clearAllFilters() {
+  _activeFilters = {};
+}
+function renderFilterChips() {
+  let box = $('#filter-chips');
+  if (!box) {
+    box = document.createElement('span');
+    box.id = 'filter-chips';
+    box.style.cssText = 'display:inline-flex;flex-wrap:wrap;gap:6px;margin-left:8px;vertical-align:middle;';
+    const cnt = $('#results-count');
+    if (cnt && cnt.parentNode) cnt.parentNode.insertBefore(box, cnt.nextSibling);
+  }
+  const keys = Object.keys(_activeFilters);
+  box.innerHTML = keys.map(k =>
+    `<span class="flt-chip" data-key="${escapeHtml(k)}" title="Убрать фильтр"
+       style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:12px;
+       background:var(--accent,#5b8cff);color:#fff;font-size:12px;cursor:pointer;">
+       🔎 ${escapeHtml(_activeFilters[k].label)} ✕</span>`).join('') +
+    (keys.length > 1 ? `<span class="flt-chip" data-key="__all__"
+       style="display:inline-flex;align-items:center;padding:3px 10px;border-radius:12px;
+       background:#6b7280;color:#fff;font-size:12px;cursor:pointer;">Сбросить всё ✕</span>` : '');
+  box.querySelectorAll('.flt-chip').forEach(el => el.addEventListener('click', () => {
+    const k = el.getAttribute('data-key');
+    if (k === '__all__') { clearAllFilters(); recomputeView(); }
+    else removeFilter(k);
+  }));
+}
+// Пересчёт статистики для диаграмм из набора строк (как в Python get_results).
+function computeStatsFromRows(rows) {
+  const st = { by_status:{}, by_registry:{}, by_marketplace:{}, by_original:{},
+               by_doc_status:{}, by_brand:{}, by_risk:{} };
+  const ci = (...n) => _colIdxByName.apply(null, n);
+  const iStatus = ci('технический статус','status','статус');
+  const iHost   = ci('реестр (хост)','registry_host');
+  const iRurl   = ci('ссылка на реестр','registry_url');
+  const iMkt    = ci('marketplace','маркетплейс');
+  const iPurl   = ci('ссылка на товар','product_url');
+  const iOrig   = ci("плашка 'оригинал'",'is_original','оригинал');
+  const iDoc    = ci('статус документа','document_status');
+  const iBrand  = ci('бренд','brand');
+  const iRisk   = ci('риск по сроку','риск','risk');
+  const inc = (o,k) => { if (k) o[k] = (o[k]||0)+1; };
+  const hostOf = u => { try { return new URL(u).hostname.replace('www.',''); } catch(e){ return u; } };
+  for (const r of rows) {
+    if (iStatus>=0) inc(st.by_status, String(r[iStatus]??'').trim());
+    if (iHost>=0 && String(r[iHost]??'').trim()) { let v=String(r[iHost]).trim(); if(v.startsWith('http'))v=hostOf(v); inc(st.by_registry,v); }
+    else if (iRurl>=0 && String(r[iRurl]??'').trim()) inc(st.by_registry, hostOf(String(r[iRurl])));
+    if (iMkt>=0 && String(r[iMkt]??'').trim()) inc(st.by_marketplace, String(r[iMkt]).trim());
+    else if (iPurl>=0) { const u=String(r[iPurl]??'').toLowerCase(); inc(st.by_marketplace, u.includes('wildberries')?'Wildberries':(u.includes('ozon')?'Ozon':'Не определен')); }
+    if (iOrig>=0) { const v=String(r[iOrig]??'').toLowerCase().trim(); let k; if(['true','да','оригинал'].includes(v))k='Оригинал'; else if(['false','нет'].includes(v)||v.includes('не ориг'))k='Не оригинал'; else if(!v||v.includes('не указан')||v==='none')k='Не указано'; else k=String(r[iOrig]); inc(st.by_original,k); }
+    if (iDoc>=0) inc(st.by_doc_status, String(r[iDoc]??'').trim());
+    if (iBrand>=0) inc(st.by_brand, String(r[iBrand]??'').trim());
+    if (iRisk>=0) inc(st.by_risk, String(r[iRisk]??'').trim());
+  }
+  const be = Object.entries(st.by_brand).sort((a,b)=>b[1]-a[1]);
+  if (be.length > 12) { const top={}; be.slice(0,11).forEach(([k,v])=>top[k]=v); const rest=be.slice(11).reduce((s,[,v])=>s+v,0); if(rest>0)top['Прочее']=rest; st.by_brand=top; }
+  return st;
 }
 function _matchExact(names, lbl) {
   const ci = _colIdxByName.apply(null, names);
@@ -3854,17 +3911,17 @@ function buildResultsCharts(stats) {
   tryInitCharts();
   if (!_chartjs) return;
   updateDonutChart('res-chart-status', 'res-chart-status-fb', stats.by_status || {}, STATUS_COLORS,
-    { onSegmentClick: l => applyChartFilter('Статус: ' + l, _matchExact(['технический статус', 'status'], l)) });
+    { onSegmentClick: l => setFilter('chart:status', 'Статус: ' + l, _matchExact(['технический статус', 'status'], l)) });
   updateDonutChart('res-chart-registry', 'res-chart-registry-fb', stats.by_registry || {}, REGISTRY_COLORS,
-    { onSegmentClick: l => applyChartFilter('Реестр: ' + l, _matchRegistry(l)) });
+    { onSegmentClick: l => setFilter('chart:registry', 'Реестр: ' + l, _matchRegistry(l)) });
   updateDonutChart('res-chart-marketplace', 'res-chart-marketplace-fb', stats.by_marketplace || {}, MKT_COLORS,
-    { onSegmentClick: l => applyChartFilter('Маркетплейс: ' + l, _matchMarketplace(l)) });
+    { onSegmentClick: l => setFilter('chart:marketplace', 'Маркетплейс: ' + l, _matchMarketplace(l)) });
   updateDonutChart('res-chart-original', 'res-chart-original-fb', stats.by_original || {}, ORIGINAL_COLORS,
-    { onSegmentClick: l => applyChartFilter('Оригинал: ' + l, _matchOriginal(l)) });
+    { onSegmentClick: l => setFilter('chart:original', 'Оригинал: ' + l, _matchOriginal(l)) });
   updateDonutChart('res-chart-risk', 'res-chart-risk-fb', stats.by_risk || {}, RISK_COLORS,
-    { onSegmentClick: l => applyChartFilter('Риск: ' + l, _matchExact(['риск по сроку'], l)) });
+    { onSegmentClick: l => setFilter('chart:risk', 'Риск: ' + l, _matchExact(['риск по сроку'], l)) });
   updateDonutChart('res-chart-brand', 'res-chart-brand-fb', stats.by_brand || {}, null,
-    { type: 'bar', maxLabel: 24, onSegmentClick: l => applyChartFilter('Бренд: ' + l, _matchExact(['бренд', 'brand'], l)) });
+    { type: 'bar', maxLabel: 24, onSegmentClick: l => setFilter('chart:brand', 'Бренд: ' + l, _matchExact(['бренд', 'brand'], l)) });
 }
 
 // Кэш последней статистики для вкладки «Очередь»

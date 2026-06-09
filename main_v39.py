@@ -8281,6 +8281,7 @@ async def run_registry_stage(args):
             # v46: МЕДЛЕННЫЙ РЕЖИМ ФСА — для больших прогонов (до 10k) без блокировок.
             _fsa_slow_mode = bool(getattr(args, 'fsa_slow_mode', False))
             _fsa_serial_sem = asyncio.Semaphore(1)  # ФСА строго по одному при slow-mode
+            _fsa_last_req = [0.0]  # время последнего запроса к ФСА (для РЕАЛЬНОЙ паузы между запросами)
             _fsa_slow_lo, _fsa_slow_hi = _fsa_human_delay_range_ms(
                 getattr(args, 'fsa_slow_delay_ms', '4000,8000') or '4000,8000')
             if _fsa_slow_mode and _has_fsa:
@@ -8374,6 +8375,16 @@ async def run_registry_stage(args):
                             q.task_done()
                             await asyncio.sleep(min(3.0, max(0.5, _FSA_COOLDOWN_UNTIL - time.time())))
                             continue
+                        # v46: МЕДЛЕННЫЙ режим — ФСА реально ПО ОДНОМУ. Если ФСА сейчас
+                        # занят другим воркером, НЕ ждём в очереди (иначе все 5 воркеров
+                        # встанут на ФСА залпом) — возвращаем ссылку и берём НЕ-ФСА (SWIS
+                        # и пр. идут параллельно). Так ФСА строго последовательный, без залпа.
+                        if (_fsa_slow_mode and hostname(url) == 'pub.fsa.gov.ru'
+                                and _fsa_serial_sem.locked()):
+                            await q.put(url)
+                            q.task_done()
+                            await asyncio.sleep(0.4)
+                            continue
                         active[f'w{wid}'] = (url, time.time())
                         cert = prod = typ = detail = ''
                         doc_status = ''  # v39.5
@@ -8399,9 +8410,15 @@ async def run_registry_stage(args):
                                 # авто-паузы темп снижается ×(1+циклы)). Парсинг ФСА —
                                 # СЕРИЙНО (Semaphore 1), чтобы не было всплеска из 4 сессий.
                                 if _fsa_slow_mode:
-                                    _mult = 1.0 + 0.6 * _FSA_COOLDOWN_CYCLES
-                                    await asyncio.sleep(random.uniform(_fsa_slow_lo, _fsa_slow_hi) * _mult)
                                     async with _fsa_serial_sem:
+                                        # РЕАЛЬНАЯ пауза МЕЖДУ запросами к ФСА (а не параллельно
+                                        # в каждом воркере). Адаптивно растёт после авто-пауз.
+                                        _mult = 1.0 + 0.6 * _FSA_COOLDOWN_CYCLES
+                                        _gap = random.uniform(_fsa_slow_lo, _fsa_slow_hi) * _mult
+                                        _wait = (_fsa_last_req[0] + _gap) - time.time()
+                                        if _wait > 0:
+                                            await asyncio.sleep(_wait)
+                                        _fsa_last_req[0] = time.time()
                                         cert, prod, typ, doc_status, detail = await asyncio.wait_for(
                                             _parse_fsa_with_existing_page_v386(page, url, args),
                                             timeout=per_registry_timeout,

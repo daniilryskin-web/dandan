@@ -3278,6 +3278,7 @@ async function loadResults() {
   statSel.innerHTML = '<option value="">Все статусы</option>' +
     statuses.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
 
+  const _cfc = $('#chart-filter-chip'); if (_cfc) _cfc.style.display = 'none';
   renderTable(_allRows);
 
   // Charts
@@ -3443,6 +3444,7 @@ $('#filter-status').addEventListener('change', e => {
 });
 
 function applyTableFilter(q, st) {
+  const _cfc = $('#chart-filter-chip'); if (_cfc) _cfc.style.display = 'none';  // снимаем фильтр диаграммы
   let rows = _allRows;
   if (q) rows = rows.filter(r => r.some(c => String(c).toLowerCase().includes(q)));
   if (st) {
@@ -3732,6 +3734,16 @@ function updateDonutChart(canvasId, fallbackId, data, colorMap, opts) {
     options: {
       responsive: true, maintainAspectRatio: false,
       animation: { duration: 200 },
+      // v46: клик по сегменту -> фильтр таблицы по этому значению.
+      onClick: (evt, elements, chart) => {
+        if (!opts.onSegmentClick || !elements || !elements.length) return;
+        const full = (chart.$fullLabels || [])[elements[0].index];
+        if (full != null) opts.onSegmentClick(full);
+      },
+      onHover: (evt, elements) => {
+        try { evt.native.target.style.cursor =
+          (opts.onSegmentClick && elements && elements.length) ? 'pointer' : 'default'; } catch(e){}
+      },
       cutout: opts.type === 'bar' ? undefined : '62%',
       indexAxis: opts.type === 'bar' ? 'y' : undefined,
       plugins: {
@@ -3766,15 +3778,92 @@ function updateDonutChart(canvasId, fallbackId, data, colorMap, opts) {
   _charts[canvasId].$chartType = chartType;
 }
 
+// v46: фильтр таблицы по клику на сегмент диаграммы.
+function _colIdxByName() {
+  const low = _allHeaders.map(h => String(h).toLowerCase());
+  for (const n of arguments) { const i = low.indexOf(n); if (i >= 0) return i; }
+  return -1;
+}
+function applyChartFilter(label, matcher) {
+  if (!_allRows || !_allRows.length) return;
+  const rows = _allRows.filter(matcher);
+  renderTable(rows);
+  $('#results-count').textContent = `${rows.length} строк · фильтр`;
+  let chip = $('#chart-filter-chip');
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.id = 'chart-filter-chip';
+    chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-left:8px;'
+      + 'padding:3px 10px;border-radius:12px;background:var(--accent,#5b8cff);color:#fff;'
+      + 'font-size:12px;cursor:pointer;';
+    chip.title = 'Сбросить фильтр';
+    const cnt = $('#results-count');
+    if (cnt && cnt.parentNode) cnt.parentNode.insertBefore(chip, cnt.nextSibling);
+    chip.addEventListener('click', clearChartFilter);
+  }
+  chip.innerHTML = '🔎 ' + escapeHtml(String(label)) + ' ✕';
+  chip.style.display = '';
+}
+function clearChartFilter() {
+  const chip = $('#chart-filter-chip');
+  if (chip) chip.style.display = 'none';
+  renderTable(_allRows);
+  if (_allRows) $('#results-count').textContent = `${_allRows.length} строк`;
+}
+function _matchExact(names, lbl) {
+  const ci = _colIdxByName.apply(null, names);
+  const t = String(lbl).trim();
+  return r => ci >= 0 && String(r[ci] ?? '').trim() === t;
+}
+function _matchOriginal(lbl) {
+  const ci = _colIdxByName("плашка 'оригинал'", 'is_original', 'оригинал');
+  const L = String(lbl).toLowerCase();
+  return r => {
+    if (ci < 0) return false;
+    const v = String(r[ci] ?? '').toLowerCase().trim();
+    if (L.includes('не указан') || L === 'none') return !v || v.includes('не указан') || v === 'none';
+    if (L.includes('не ориг')) return v.includes('не ') ;
+    if (L.includes('ориг')) return v.includes('ориг') && !v.includes('не ');
+    return v === L;
+  };
+}
+function _matchRegistry(lbl) {
+  const ciHost = _colIdxByName('реестр (хост)', 'registry_host');
+  const ciUrl  = _colIdxByName('ссылка на реестр', 'registry_url');
+  const t = String(lbl).trim();
+  return r => {
+    if (ciHost >= 0 && String(r[ciHost] ?? '').trim()) return String(r[ciHost]).trim() === t;
+    if (ciUrl >= 0) return String(r[ciUrl] ?? '').includes(t);
+    return false;
+  };
+}
+function _matchMarketplace(lbl) {
+  const ciM = _colIdxByName('marketplace', 'маркетплейс');
+  const ciU = _colIdxByName('ссылка на товар', 'product_url');
+  const L = String(lbl).toLowerCase();
+  const key = L.includes('ozon') ? 'ozon' : (L.includes('wild') || L === 'wb' ? 'wildberries' : L);
+  return r => {
+    if (ciM >= 0 && String(r[ciM] ?? '').trim()) return String(r[ciM]).toLowerCase().includes(L);
+    if (ciU >= 0) return String(r[ciU] ?? '').toLowerCase().includes(key);
+    return false;
+  };
+}
+
 function buildResultsCharts(stats) {
   tryInitCharts();
   if (!_chartjs) return;
-  updateDonutChart('res-chart-status',      'res-chart-status-fb',      stats.by_status      || {}, STATUS_COLORS);
-  updateDonutChart('res-chart-registry',    'res-chart-registry-fb',    stats.by_registry    || {}, REGISTRY_COLORS);
-  updateDonutChart('res-chart-marketplace', 'res-chart-marketplace-fb', stats.by_marketplace || {}, MKT_COLORS);
-  updateDonutChart('res-chart-original',    'res-chart-original-fb',    stats.by_original    || {}, ORIGINAL_COLORS);
-  updateDonutChart('res-chart-risk',        'res-chart-risk-fb',        stats.by_risk        || {}, RISK_COLORS);
-  updateDonutChart('res-chart-brand',       'res-chart-brand-fb',       stats.by_brand       || {}, null, { type: 'bar', maxLabel: 24 });
+  updateDonutChart('res-chart-status', 'res-chart-status-fb', stats.by_status || {}, STATUS_COLORS,
+    { onSegmentClick: l => applyChartFilter('Статус: ' + l, _matchExact(['технический статус', 'status'], l)) });
+  updateDonutChart('res-chart-registry', 'res-chart-registry-fb', stats.by_registry || {}, REGISTRY_COLORS,
+    { onSegmentClick: l => applyChartFilter('Реестр: ' + l, _matchRegistry(l)) });
+  updateDonutChart('res-chart-marketplace', 'res-chart-marketplace-fb', stats.by_marketplace || {}, MKT_COLORS,
+    { onSegmentClick: l => applyChartFilter('Маркетплейс: ' + l, _matchMarketplace(l)) });
+  updateDonutChart('res-chart-original', 'res-chart-original-fb', stats.by_original || {}, ORIGINAL_COLORS,
+    { onSegmentClick: l => applyChartFilter('Оригинал: ' + l, _matchOriginal(l)) });
+  updateDonutChart('res-chart-risk', 'res-chart-risk-fb', stats.by_risk || {}, RISK_COLORS,
+    { onSegmentClick: l => applyChartFilter('Риск: ' + l, _matchExact(['риск по сроку'], l)) });
+  updateDonutChart('res-chart-brand', 'res-chart-brand-fb', stats.by_brand || {}, null,
+    { type: 'bar', maxLabel: 24, onSegmentClick: l => applyChartFilter('Бренд: ' + l, _matchExact(['бренд', 'brand'], l)) });
 }
 
 // Кэш последней статистики для вкладки «Очередь»

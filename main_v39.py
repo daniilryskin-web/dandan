@@ -977,19 +977,19 @@ async def fetch_certificate_json_for_nm(
     urls = certificate_json_urls(nm_id, max_hosts=max_hosts)
     tried = len(urls)
 
-    # v45.9: пробуем basket-шарды НЕБОЛЬШИМИ пачками в порядке «самый вероятный
-    # первым» (шард считается детерминированно по vol). Раньше тут запускались ВСЕ
-    # ~16 шардов СРАЗУ — но у карточки с документом он почти всегда на расчётном
-    # шарде (или соседнем), поэтому 15 из 16 запросов были лишними. При 30 воркерах
-    # это давало ЗАЛП ~480 одновременных соединений к wbbasket.ru — WB CDN включал
-    # троттлинг, и пробы начинали отваливаться по таймауту («сетевые ошибки»).
-    # Маленькая пачка (по умолчанию 4) находит документ за 1-2 запроса в типичном
-    # случае и в разы снижает нагрузку — сбор снова быстрый и без ошибок. Как только
-    # ссылка найдена, остальные пробы немедленно отменяются (found.set()).
+    # v45.10: ВОЗВРАТ К СТАРОМУ РАБОЧЕМУ ПОВЕДЕНИЮ. basket-шарды пробуются ПО ОДНОМУ
+    # в порядке «самый вероятный первым» (шард считается детерминированно по vol), и
+    # как только найден json со ссылкой — остальные пробы мгновенно отменяются. У
+    # карточки с документом он почти всегда на расчётном шарде, поэтому это 1 запрос
+    # на карточку — ровно как в старых версиях, где сбор шёл за секунды.
+    # Параллельный «залп» всех 16 шардов (его добавили позже ради скорости no-doc
+    # карточек) на деле ЛОМАЛ сбор: 30 воркеров × 16 = ~480 соединений к wbbasket.ru
+    # разом → WB CDN включал троттлинг → пробы отваливались по таймауту («сетевые
+    # ошибки») и скорость падала. Один запрос на карточку нагрузку убирает.
     if concurrency and concurrency > 0:
         probe_concurrency = int(concurrency)
     else:
-        probe_concurrency = min(len(urls), 4)
+        probe_concurrency = 1
     probe_concurrency = max(1, probe_concurrency)
     sem = asyncio.Semaphore(probe_concurrency)
 
@@ -1399,16 +1399,10 @@ async def run_http_link_prefetch(
     print(f"   Логика: json со ссылкой → СОБРАНА; все 404 → НЕТ ДОКУМЕНТОВ; json без ссылки → НЕТ ССЫЛКИ; сетевая ошибка → {'браузер' if allow_browser_fallback else 'повтор (ERROR)'}.")
 
     timeout = aiohttp.ClientTimeout(total=30, connect=8)
-    # v45.8: пул соединений ДОЛЖЕН вмещать реальную параллельность: каждая карточка
-    # проверяет до cert_max_hosts basket-шардов одновременно, т.е. одновременных
-    # запросов ~ workers * probe_fanout, а не workers. Раньше пул был workers*2 (=60
-    # при 30 воркерах), и при веере 16 шардов 480 проб дрались за 60 коннектов —
-    # пробы ЖДАЛИ свободный коннект дольше таймаута и ЛОЖНО считались «сетевой
-    # ошибкой». Делаем пул щедрым: 404 от basket быстрые, коннекты быстро освобождаются.
-    _probe_fanout = min(int(cert_max_hosts) or 1, 16)
-    _conn_limit = min(300, max(128, workers * _probe_fanout))
-    connector = aiohttp.TCPConnector(limit=_conn_limit, limit_per_host=0,
-                                     ttl_dns_cache=300, ssl=False)
+    # v45.10: шарды пробуются по одному (см. fetch_certificate_json_for_nm), значит
+    # одновременных соединений ~ числу воркеров. Пул workers*2 (как в старых версиях)
+    # достаточно — никакого «залпа» больше нет.
+    connector = aiohttp.TCPConnector(limit=max(32, workers * 2), ttl_dns_cache=300, ssl=False)
     headers = {
         "User-Agent": getattr(args, 'user_agent', '') or
                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
@@ -1418,12 +1412,6 @@ async def run_http_link_prefetch(
     sem = asyncio.Semaphore(workers)
     done_nm: Set[int] = set()
     stats = {"ok": 0, "no_docs": 0, "no_link": 0, "errors": 0, "fallback": 0, "done": 0}
-    # v45.7: АДАПТИВНОЕ ТОРМОЖЕНИЕ. Сетевые ошибки certificate.json = WB троттлит CDN
-    # (wbbasket.ru) за слишком частые запросы. Каждая такая ошибка к тому же ждёт
-    # полный таймаут (cert_timeout) — отсюда и обвал скорости. Когда ошибок много,
-    # сами притормаживаем (пауза перед карточкой растёт с «давлением»), чтобы уйти
-    # под лимит WB; на успехах давление спадает и скорость восстанавливается.
-    pace = {"pressure": 0.0, "warned": False}
     t0 = time.time()
     last_print = t0
 
@@ -1452,10 +1440,6 @@ async def run_http_link_prefetch(
                 if card.nm_id in processed:
                     stats['done'] += 1
                     return
-                # v45.7: если WB троттлит (накопилось «давление» из сетевых ошибок) —
-                # притормаживаем перед карточкой, чтобы уйти под лимит и не копить ошибки.
-                if pace["pressure"] > 4:
-                    await asyncio.sleep(min(2.0, 0.04 * pace["pressure"]))
                 try:
                     urls, detail = await fetch_certificate_json_for_nm(
                         session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
@@ -1500,7 +1484,6 @@ async def run_http_link_prefetch(
                     await store.add(row)
                     done_nm.add(card.nm_id)
                     stats['ok'] += 1
-                    pace["pressure"] = max(0.0, pace["pressure"] - 0.5)  # успех → давление спадает
                 elif detail.startswith("cert_json_no_docs"):
                     # ВСЕ шарды честно вернули 404 → документа НЕТ. Это надёжно по HTTP.
                     row = ResultRow(
@@ -1538,15 +1521,6 @@ async def run_http_link_prefetch(
                         await store.add(row)
                         done_nm.add(card.nm_id)
                         stats['errors'] = stats.get('errors', 0) + 1
-                        # сетевая ошибка → WB троттлит, повышаем давление (тормозим)
-                        pace["pressure"] = min(60.0, pace["pressure"] + 1.5)
-                        if (not pace["warned"] and stats['errors'] >= 40
-                                and stats['errors'] > stats['ok']):
-                            pace["warned"] = True
-                            print("⚠️  Много сетевых ошибок certificate.json — WB троттлит CDN за "
-                                  "частые запросы. Включил авто-торможение. Если медленно — снизь "
-                                  "«Браузер/HTTP-воркеры» (--http-link-workers) до 10–15: меньше "
-                                  "параллельных запросов = меньше троттлинга и БЫСТРЕЕ в сумме.")
                 stats['done'] += 1
 
         prog = asyncio.create_task(progress_loop())

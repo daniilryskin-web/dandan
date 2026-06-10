@@ -28,6 +28,7 @@ MODULES = [
     "test_brand_search",
     "test_brand_category",
     "test_brand_limit_topup",
+    "test_appliance_no_toys",
     "test_cert_fetch",
     "test_xlsx_safe",
     "test_load_result",

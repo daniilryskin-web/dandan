@@ -705,6 +705,7 @@ class Card:
     pics_count: int = 0
     in_stock: int = 0
     is_original: str = ""  # v43: признак оригинальности из карточки WB
+    view_flags: int = 0     # v46: сырой viewFlags из поиска WB (для вывода бита «Документы проверены»)
     colors: str = ""        # v27.9.x: цвет(а) товара из карточки WB
     wb_root: str = ""       # v27.9.x: корневой ID карточки WB (группировка вариантов)
 
@@ -2112,6 +2113,17 @@ def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '
     keywords = DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain, [])
     wl = DOMAIN_SUBJECT_WHITELIST.get(domain) or set()
 
+    # v46: НЕГАТИВНЫЙ фильтр для «взрослых» категорий (техника/электроника/посуда/дом):
+    # отсеиваем ИГРУШЕЧНЫЕ товары. WB по «стиральные машины» иногда возвращает
+    # «детская стиральная машина игрушечная» — в названии есть «стиральн», поэтому
+    # обычный фильтр её пропускал. Если subject/название = игрушка — это не техника.
+    if domain in ('appliances', 'electronics', 'kitchenware', 'home'):
+        _toy = ('игрушк', 'игрушеч', 'игрушечн')
+        sn = norm_text(subject_name or '')
+        pn = norm_text(product_name or '')
+        if any(t in sn for t in _toy) or any(t in pn for t in _toy):
+            return False
+
     # Если нет ни ключевых слов ни whitelist'а для этого домена — фильтр не применяем
     if not keywords and not wl:
         return True
@@ -2177,12 +2189,18 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
     types = DOMAIN_PRODUCT_TYPES.get(domain, [])
     is_kids = any(w in base_query.lower() for w in ('детск', 'для детей', 'для малыш', 'малышам'))
     is_apparel_like = domain in ('clothing', 'shoes', 'kids_accessories')
+    # v46: «взрослые» категории — техника/электроника/посуда/дом. К ним НЕЛЬЗЯ
+    # применять детские/возрастные модификаторы: «стиральные машины детские» тянет
+    # ИГРУШЕЧНЫЕ стиральные машины, «бытовая техника для мальчиков» — детские товары.
+    _appliance_like = domain in ('appliances', 'electronics', 'kitchenware', 'home')
 
     variants: List[str] = [base_query]
 
-    # Стратегия 1: исходный запрос + универсальные модификаторы
-    for m in UNIVERSAL_MODIFIERS:
-        variants.append(f'{base_query} {m}')
+    # Стратегия 1: исходный запрос + универсальные (возрастные/гендерные) модификаторы.
+    # Только если категория НЕ «взрослая» (иначе мусор: «бытовая техника детские»).
+    if not _appliance_like:
+        for m in UNIVERSAL_MODIFIERS:
+            variants.append(f'{base_query} {m}')
 
     # Стратегия 2: для одежды/обуви — ещё цветовые/сезонные модификаторы
     if is_apparel_like:
@@ -2196,11 +2214,11 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
         else:
             variants.append(t)
 
-    # Стратегия 4: ТИП + возрастной/гендерный модификатор. v46: РАНЬШЕ применялось
-    # ТОЛЬКО к одежде/обуви (поэтому у них было ~150 вариантов, а у электроники/еды/
-    # посуды ~18). Теперь — для ВСЕХ категорий: кратно больше запросов и карточек.
-    # Берём возраст/пол (UNIVERSAL_MODIFIERS), НЕ цвета — категории не «размываются».
-    if domain and domain != 'unknown':
+    # Стратегия 4: ТИП + возрастной/гендерный модификатор. Для «детских» категорий
+    # это кратно увеличивает охват. Для «взрослых» (техника/электроника/посуда/дом)
+    # НЕ применяем — иначе «стиральные машины детские» = игрушки. Там охват берём
+    # из расширенного списка ТИПОВ (стратегия 3).
+    if domain and domain != 'unknown' and not _appliance_like:
         for t in types[:25]:
             for m in UNIVERSAL_MODIFIERS[:6]:
                 variants.append(f'{t} {m}')
@@ -2442,6 +2460,11 @@ _FSA_COOKIE_HTTP_FAIL = 0  # сколько раз HTTP по кукам не с�
 _FSA_CONSEC_FAILS = 0       # подряд идущих неудач FSA (сбрасывается успехом)
 _FSA_COOLDOWN_UNTIL = 0.0   # время (epoch), до которого FSA на паузе
 _FSA_COOLDOWN_CYCLES = 0    # сколько раз уже включали паузу за прогон
+# v46: САМОНАСТРОЙКА темпа в медленном режиме. Множитель к базовой паузе: растёт при
+# сбоях ФСА (тормозим), снижается при череде успехов (ускоряемся) — программа сама
+# нащупывает самый быстрый безопасный темп вокруг 20-30 док/мин.
+_FSA_SLOW_MULT = 1.0
+_FSA_SLOW_OK = 0
 
 # v27.9.x: один раз за прогон сохраняем сырой JSON-ответ API ФСА в файл —
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
@@ -2586,6 +2609,7 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                     seller_name=seller_name, supplier_id=supplier_id,
                     rating=rating, feedbacks=feedbacks, pics_count=pics_count, in_stock=in_stock,
                     is_original=is_original, colors=colors_str, wb_root=wb_root,
+                    view_flags=(int(p.get("viewFlags")) if isinstance(p.get("viewFlags"), int) else 0),
                 ))
             break
     return cards
@@ -2846,6 +2870,27 @@ async def collect_cards(args) -> List[Card]:
         print(f"      • попробуй --strict-domain-filter false (выключить фильтр)")
         print(f"      • или дай мне xlsx с примерами — расширю списки для домена '{domain}'")
     final_cards = list(cards_map.values())[:args.limit]
+
+    # v46: ДИАГНОСТИКА для вывода бита «Документы проверены». viewFlags WB — битовая
+    # маска бейджей (плашка «Оригинал» = бит 8). Бит «Документы проверены» неизвестен,
+    # поэтому выводим сырой viewFlags по собранным карточкам в файл: пользователь
+    # открывает несколько товаров, смотрит где есть/нет кнопки «Документы проверены»,
+    # и по разнице viewFlags вычисляем бит. Лёгкий CSV, пишется один раз.
+    if bool(getattr(args, 'dump_viewflags', True)) and final_cards:
+        try:
+            import csv as _csv
+            with open("wb_viewflags.csv", "w", encoding="utf-8-sig", newline="") as _vf:
+                _w = _csv.writer(_vf)
+                _w.writerow(["nm_id", "viewFlags", "is_original(bit8)", "name", "product_url"])
+                for _c in final_cards:
+                    _vfv = int(getattr(_c, "view_flags", 0) or 0)
+                    _w.writerow([_c.nm_id, _vfv, "да" if (_vfv & WB_ORIGINAL_VIEWFLAG_BIT) else "",
+                                 (_c.product_name or "")[:80], product_url(_c.nm_id)])
+            print("📝 [diag] viewFlags карточек сохранён в wb_viewflags.csv — открой 2-3 товара "
+                  "С кнопкой «Документы проверены» и 2-3 БЕЗ неё, найди их nm_id в файле и пришли "
+                  "мне их viewFlags: по разнице вычислю бит для колонки «Документы проверены».")
+        except Exception:
+            pass
 
     # v27.5: проверка плашки «Оригинальный товар» через wb_enhanced.
     # Поля .is_original проставляются внутри enrich_cards_batch в формате bool;
@@ -8283,7 +8328,7 @@ async def run_registry_stage(args):
             _fsa_serial_sem = asyncio.Semaphore(1)  # ФСА строго по одному при slow-mode
             _fsa_last_req = [0.0]  # время последнего запроса к ФСА (для РЕАЛЬНОЙ паузы между запросами)
             _fsa_slow_lo, _fsa_slow_hi = _fsa_human_delay_range_ms(
-                getattr(args, 'fsa_slow_delay_ms', '2500,5000') or '2500,5000')
+                getattr(args, 'fsa_slow_delay_ms', '2000,3500') or '2000,3500')
             if _fsa_slow_mode and _has_fsa:
                 print(f"🐢 МЕДЛЕННЫЙ режим ФСА: документы по одному, пауза "
                       f"{_fsa_slow_lo:.1f}-{_fsa_slow_hi:.1f}с + адаптивный бэкофф. "
@@ -8298,6 +8343,7 @@ async def run_registry_stage(args):
 
             async def worker(wid: int):
                 global _FSA_CONSEC_FAILS, _FSA_COOLDOWN_UNTIL, _FSA_COOLDOWN_CYCLES, _FSA_SESSION_COOKIES
+                global _FSA_SLOW_MULT, _FSA_SLOW_OK
                 # v39: единая функция пересоздания контекста + страницы. Если что-то падает —
                 # вернёт хотя бы пустой page, чтобы worker не умер.
                 async def _fresh_context_and_page(old_ctx):
@@ -8412,9 +8458,9 @@ async def run_registry_stage(args):
                                 if _fsa_slow_mode:
                                     async with _fsa_serial_sem:
                                         # РЕАЛЬНАЯ пауза МЕЖДУ запросами к ФСА (а не параллельно
-                                        # в каждом воркере). Адаптивно растёт после авто-пауз.
-                                        _mult = 1.0 + 0.6 * _FSA_COOLDOWN_CYCLES
-                                        _gap = random.uniform(_fsa_slow_lo, _fsa_slow_hi) * _mult
+                                        # в каждом воркере). Множитель самонастраивается:
+                                        # 1.0 при чистом темпе, растёт при сбоях, спадает при успехах.
+                                        _gap = random.uniform(_fsa_slow_lo, _fsa_slow_hi) * _FSA_SLOW_MULT
                                         _wait = (_fsa_last_req[0] + _gap) - time.time()
                                         if _wait > 0:
                                             await asyncio.sleep(_wait)
@@ -8487,8 +8533,20 @@ async def run_registry_stage(args):
                                 _cd_max = max(0, int(getattr(args, 'fsa_max_cooldowns', 3)))
                                 if prod:
                                     _FSA_CONSEC_FAILS = 0
+                                    # v46: самонастройка медленного режима — череда успехов
+                                    # => осторожно ускоряемся (множитель паузы к базовому).
+                                    if _fsa_slow_mode:
+                                        _FSA_SLOW_OK += 1
+                                        if _FSA_SLOW_OK >= 20 and _FSA_SLOW_MULT > 1.0:
+                                            _FSA_SLOW_MULT = max(1.0, _FSA_SLOW_MULT - 0.3)
+                                            _FSA_SLOW_OK = 0
                                 else:
                                     _FSA_CONSEC_FAILS += 1
+                                    # v46: сбой ФСА в медл. режиме => тормозим заранее (ещё до
+                                    # полной авто-паузы), увеличивая паузу между запросами.
+                                    if _fsa_slow_mode:
+                                        _FSA_SLOW_MULT = min(5.0, _FSA_SLOW_MULT + 0.4)
+                                        _FSA_SLOW_OK = 0
                                     if (_cd_base > 0 and _FSA_CONSEC_FAILS >= _cd_fails
                                             and _FSA_COOLDOWN_UNTIL <= time.time()
                                             and _FSA_COOLDOWN_CYCLES < _cd_max):
@@ -8934,6 +8992,9 @@ def build_parser():
     # v27.5: проверка плашки «Оригинальный товар» через wb_enhanced. По умолчанию включено.
     ap.add_argument("--check-original", type=str_to_bool, default=True,
                     help="Проверять плашку «Оригинальный товар» через HTML-страницу WB и basket card.json (wb_enhanced).")
+    ap.add_argument("--dump-viewflags", type=str_to_bool, default=True,
+                    help="v46: диагностика — сохранять viewFlags собранных карточек в wb_viewflags.csv "
+                         "(для вычисления бита «Документы проверены»). Лёгкий CSV, не влияет на скорость.")
     ap.add_argument("--check-original-workers", type=int, default=20,
                     help="Сколько параллельных воркеров для проверки оригинальности. v27.7: поднято 10→20 — после сведения проверки к одному домену (ru) нагрузка на карточку упала ~4×, можно больше параллелизма.")
     ap.add_argument("--check-original-domains", default="ru",
@@ -9001,9 +9062,9 @@ def build_parser():
                          "ФСА парсится строго ПО ОДНОМУ документу с паузой (--fsa-slow-delay-ms) и "
                          "адаптивным бэкоффом. SWIS/прочие реестры идут параллельно. Медленно (часы для "
                          "10k), но ФСА не банит IP.")
-    ap.add_argument("--fsa-slow-delay-ms", default="2500,5000",
+    ap.add_argument("--fsa-slow-delay-ms", default="2000,3500",
                     help="v46: пауза между документами ФСА в медленном режиме, мс, «min,max» "
-                         "(по умолчанию 2500,5000 ≈ 16 док/мин). Меньше — быстрее, но выше риск бана; "
+                         "(по умолчанию 2000,3500 ≈ 22 док/мин). Меньше — быстрее, но выше риск бана; "
                          "при блокировках пауза сама растёт (адаптивный бэкофф).")
     ap.add_argument("--fsa-skip-org-fields", type=str_to_bool, default=True,
                     help="v46: НЕ собирать заявителя/изготовителя/ИНН/ТН ВЭД из ФСА. По умолчанию TRUE: "

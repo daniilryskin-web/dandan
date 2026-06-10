@@ -58,10 +58,17 @@ def main():
     # порядок ядра содержит docs_verified рядом с is_original
     check("docs_verified в порядке колонок", "docs_verified" in mv.CORE_DETAILS_ORDER_V39)
     # _card_fields_for_result прокидывает поле
-    c = mv.Card(query="x", nm_id=1, product_name="p", brand="b", subject="s")
+    c = mv.Card(nm_id=1, product_name="p", brand="b", subject="s")
     c.docs_verified = "Да"
     check("_card_fields_for_result отдаёт docs_verified",
           mv._card_fields_for_result(c).get("docs_verified") == "Да")
+
+    # отдельный проход-обогащение покрывает ВСЕ пути сбора (HTTP + браузер)
+    check("enrich_docs_verified_batch есть", hasattr(mv, "enrich_docs_verified_batch"))
+    check("fetch_docs_verified_via_card_json есть", hasattr(mv, "fetch_docs_verified_via_card_json"))
+    ap = mv.build_parser()
+    a = ap.parse_args(["--query", "x", "--link-only", "true"])
+    check("--check-docs-verified по умолчанию TRUE", a.check_docs_verified is True)
 
     # GUI: колонка в курируемом наборе
     gui = (Path(__file__).resolve().parents[1] / "wb_checker.py").read_text(encoding="utf-8")

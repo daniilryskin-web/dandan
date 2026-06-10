@@ -329,9 +329,28 @@ def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]
         if _org_inn(manufacturer):
             out["manufacturer_inn"] = _org_inn(manufacturer)
 
-        # Название продукции
+        # Название продукции. ФСА держит ДВА названия:
+        #   • product.fullName — «Общее наименование продукции» (часто общее, напр.
+        #     «Электрические приборы бытового назначения»);
+        #   • product.identifications[].name — «Наименование (обозначение) продукции»
+        #     (конкретика: «электрические чайники, торговой марки …, модель …»).
+        # Раньше брали только fullName → общее имя не совпадало с названием WB и
+        # давало ложное «НЕСООТВЕТСТВИЕ». Собираем ОБА поля в одно через «; »
+        # (с дедупликацией: если они совпадают — не дублируем).
+        _name_parts: List[str] = []
         if prod.get("fullName"):
-            out["product_full"] = str(prod["fullName"]).strip()
+            _name_parts.append(str(prod["fullName"]).strip())
+        _idents = prod.get("identifications")
+        if isinstance(_idents, list):
+            for _it in _idents:
+                if isinstance(_it, dict) and _it.get("name"):
+                    _name_parts.append(str(_it["name"]).strip())
+        _seen_names: List[str] = []
+        for _p in _name_parts:
+            if _p and _p not in _seen_names:
+                _seen_names.append(_p)
+        if _seen_names:
+            out["product_full"] = "; ".join(_seen_names)
 
         # Схема. У СЕРТИФИКАТОВ idCertScheme = реальный номер схемы (1..7 -> «1с»).
         # У ДЕКЛАРАЦИЙ idDeclScheme — это ВНУТРЕННИЙ id записи (напр. 3581), а НЕ номер
@@ -1556,6 +1575,57 @@ async def enrich_sellers_batch(cards: List[Card], args) -> None:
     print(f"✓ Имена продавцов: заполнено {filled['n']}/{len(need)} за {time.time()-t0:.1f}с")
 
 
+async def enrich_docs_verified_batch(cards: List[Card], args) -> None:
+    """v46: массово проставляет card.docs_verified («Да»/«Нет») — бейдж
+    «Документ проверен WB» из статического card.json (certificate.verified == true).
+
+    Делается ОТДЕЛЬНЫМ проходом ДО сбора ссылок, чтобы признак попал в строку
+    независимо от того, каким путём собрана карточка (HTTP fast-path ИЛИ браузер).
+    Иначе карточки, собранные браузером, оставались с пустым значением.
+    Тот же basket-CDN, что и certificate.json; обычный HTTP, без антибота.
+    card.json не найден / бейджа нет → «Нет» (кнопки «Документы проверены» нет)."""
+    if not cards:
+        return
+    need = [c for c in cards if not getattr(c, 'docs_verified', '')]
+    if not need:
+        return
+    workers = max(2, int(getattr(args, 'http_link_workers', 30)))
+    cert_timeout = float(getattr(args, 'cert_timeout_sec', 6.0))
+    cert_max_hosts = int(getattr(args, 'cert_max_hosts', 30))
+    headers = {
+        "User-Agent": getattr(args, 'user_agent', '') or
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+    timeout = aiohttp.ClientTimeout(total=30, connect=8)
+    connector = aiohttp.TCPConnector(limit=max(32, workers * 2), ttl_dns_cache=300, ssl=False)
+    sem = asyncio.Semaphore(workers)
+    stats = {"yes": 0, "no": 0, "done": 0}
+    t0 = time.time()
+    print(f"🛡  Определяю бейдж «Документ проверен WB» для {len(need)} карточек (card.json)...")
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector) as session:
+        async def work(card: Card):
+            async with sem:
+                try:
+                    ver, _det = await fetch_docs_verified_via_card_json(
+                        session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
+                    )
+                except Exception:
+                    ver = None
+                card.docs_verified = "Да" if ver is True else "Нет"
+                if ver is True:
+                    stats["yes"] += 1
+                else:
+                    stats["no"] += 1
+                stats["done"] += 1
+        tasks = [asyncio.create_task(work(c)) for c in need]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    print(f"✓ «Документ проверен WB»: Да={stats['yes']}, Нет={stats['no']} за {time.time()-t0:.1f}с")
+
+
 async def run_http_link_prefetch(
     cards: List[Card], args, store: "ResultStore", processed: Set[int]
 ) -> Set[int]:
@@ -1663,23 +1733,16 @@ async def run_http_link_prefetch(
                     except Exception:
                         pass
 
-                # v46: бейдж «Документ проверен WB» = card.json.certificate.verified.
-                # verified не может быть true без сертификата, поэтому card.json
-                # тянем ТОЛЬКО когда документ реально есть (json со ссылкой или
-                # json без ссылки). Для карточек без документа — сразу «Нет», без
-                # лишнего запроса. Тот же basket-шард, что и certificate.json.
-                _has_doc = bool(urls) or detail.startswith("cert_json_ok") \
-                    or detail.startswith("cert_json_has_doc_no_url")
-                if _has_doc:
-                    try:
-                        _ver, _vdet = await fetch_docs_verified_via_card_json(
-                            session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
-                        )
-                        card.docs_verified = "Да" if _ver is True else "Нет"
-                    except Exception:
+                # v46: бейдж «Документ проверен WB» (card.docs_verified) проставляется
+                # ОТДЕЛЬНЫМ проходом enrich_docs_verified_batch ДО сбора ссылок —
+                # чтобы признак попал в строку независимо от пути сбора (HTTP/браузер).
+                # Здесь, как защита, для карточек без документа фиксируем «Нет», если
+                # проход почему-то не отработал (verified невозможен без сертификата).
+                if not getattr(card, 'docs_verified', ''):
+                    _has_doc = bool(urls) or detail.startswith("cert_json_ok") \
+                        or detail.startswith("cert_json_has_doc_no_url")
+                    if not _has_doc:
                         card.docs_verified = "Нет"
-                else:
-                    card.docs_verified = "Нет"
 
                 base_fields = dict(
                     query=card.source_query or args.query,
@@ -4461,6 +4524,15 @@ async def run_link_collection(args):
             await enrich_sellers_batch(remaining, args)
         except Exception as e:
             print(f"⚠️  Обогащение продавцами не удалось (не критично): {type(e).__name__}: {e}")
+
+    # v46: бейдж «Документ проверен WB» — отдельным проходом для ВСЕХ карточек
+    # текущей выборки, чтобы значение попало в строку независимо от пути сбора
+    # (HTTP fast-path или браузер). Раньше браузерные карточки оставались пустыми.
+    if getattr(args, 'check_docs_verified', True) and remaining:
+        try:
+            await enrich_docs_verified_batch(remaining, args)
+        except Exception as e:
+            print(f"⚠️  Определение «Документ проверен WB» не удалось (не критично): {type(e).__name__}: {e}")
 
     # =============================================================================
     # v40: HTTP сбор ссылок через certificate.json. БЕЗ браузера на 1 этапе.
@@ -8361,7 +8433,8 @@ async def run_registry_stage(args):
                 sale_price_rub=safe_float(row.get('sale_price_rub')),
                 seller_name=row.get('seller_name', ''),
                 is_original=row.get('is_original', ''),
-                docs_verified=row.get('docs_verified', ''),
+                # пусто (старый CSV без признака) → «Нет»: бейдж не зафиксирован
+                docs_verified=row.get('docs_verified') or 'Нет',
                 supplier_id=row.get('supplier_id', ''),
                 rating=safe_float(row.get('rating')),
                 feedbacks=safe_int(row.get('feedbacks')),
@@ -8995,7 +9068,8 @@ async def run_registry_stage(args):
             sale_price_rub=safe_float(row.get('sale_price_rub')),
             seller_name=row.get('seller_name', ''),
             is_original=row.get('is_original', ''),
-            docs_verified=row.get('docs_verified', ''),
+            # пусто (старый CSV без признака) → «Нет»: бейдж не зафиксирован
+            docs_verified=row.get('docs_verified') or 'Нет',
             supplier_id=row.get('supplier_id', ''),
             rating=safe_float(row.get('rating')),
             feedbacks=safe_int(row.get('feedbacks')),
@@ -9120,6 +9194,9 @@ def build_parser():
     ap.add_argument("--dump-viewflags", type=str_to_bool, default=True,
                     help="v46: диагностика — сохранять viewFlags собранных карточек в wb_viewflags.csv "
                          "(для вычисления бита «Документы проверены»). Лёгкий CSV, не влияет на скорость.")
+    ap.add_argument("--check-docs-verified", type=str_to_bool, default=True,
+                    help="v46: собирать бейдж «Документ проверен WB» (Да/Нет) из card.json "
+                         "(certificate.verified). Отдельный лёгкий HTTP-проход по basket-CDN.")
     ap.add_argument("--check-original-workers", type=int, default=20,
                     help="Сколько параллельных воркеров для проверки оригинальности. v27.7: поднято 10→20 — после сведения проверки к одному домену (ru) нагрузка на карточку упала ~4×, можно больше параллелизма.")
     ap.add_argument("--check-original-domains", default="ru",

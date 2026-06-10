@@ -46,6 +46,37 @@ check("technical_regulation = ТР ТС 007/2011",
 check("date_start = 18.03.2024", out.get("date_start") == "18.03.2024", repr(out.get("date_start")))
 check("date_end = 17.03.2027", out.get("date_end") == "17.03.2027", repr(out.get("date_end")))
 
+# v46: ФСА держит ДВА названия — общее (product.fullName) и конкретное
+# (product.identifications[].name = «Наименование (обозначение) продукции»).
+# Должны собираться ОБА через «; » (это чинит ложное «НЕСООТВЕТСТВИЕ», когда
+# общее имя generic, а конкретика — про чайник/модель).
+syn = {
+    "number": "ЕАЭС N RU Д-CN.РА10.В.87861/23",
+    "idStatus": 6,
+    "product": {
+        "fullName": "Электрические приборы бытового назначения",
+        "identifications": [
+            {"name": "Электрические приборы бытового назначения: электрические чайники, "
+                     "торговой марки \"Envitec\", модель EK-601"},
+        ],
+    },
+}
+syn_out = m.parse_fsa_json(syn, "https://pub.fsa.gov.ru/rds/declaration/view/1/baseInfo",
+                           "rds_declaration", "1")
+pf = syn_out.get("product_full", "")
+check("оба названия объединены через '; '", "; " in pf, repr(pf)[:80])
+check("общее наименование присутствует",
+      pf.startswith("Электрические приборы бытового назначения;"), repr(pf)[:60])
+check("конкретное наименование (чайник) присутствует",
+      "чайники" in pf and "EK-601" in pf, repr(pf)[:120])
+
+# дубль (fullName == identification.name) не должен дублироваться
+syn2 = {"idStatus": 6, "product": {
+    "fullName": "Портативная газовая плита на бутане,",
+    "identifications": [{"name": "Портативная газовая плита на бутане,"}]}}
+pf2 = m.parse_fsa_json(syn2, "u", "rds_declaration", "1").get("product_full", "")
+check("одинаковые названия не дублируются", pf2 == "Портативная газовая плита на бутане,", repr(pf2)[:60])
+
 if __name__ == "__main__":
     p, t = sum(RESULTS), len(RESULTS)
     print("-" * 60)

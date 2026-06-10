@@ -705,6 +705,7 @@ class Card:
     pics_count: int = 0
     in_stock: int = 0
     is_original: str = ""  # v43: признак оригинальности из карточки WB
+    docs_verified: str = ""  # v46: бейдж «Документ проверен WB» (Да/Нет) из card.json
     view_flags: int = 0     # v46: сырой viewFlags из поиска WB (для вывода бита «Документы проверены»)
     colors: str = ""        # v27.9.x: цвет(а) товара из карточки WB
     wb_root: str = ""       # v27.9.x: корневой ID карточки WB (группировка вариантов)
@@ -726,6 +727,7 @@ class ResultRow:
     rating: float = 0.0
     feedbacks: int = 0
     is_original: str = ""  # v43: признак оригинальности
+    docs_verified: str = ""  # v46: бейдж «Документ проверен WB» (Да/Нет)
     colors: str = ""        # v27.9.x: цвет(а) товара из карточки WB
     wb_root: str = ""       # v27.9.x: корневой ID карточки WB
     # Реестровая ссылка
@@ -1311,6 +1313,107 @@ async def fetch_original_via_card_json(
 
 
 # =============================================================================
+# v46: БЕЙДЖ «Документ проверен WB» через статический card.json.
+# Эмпирически (по живым карточкам, 7 «с кнопкой» / 7 «без»): признак наличия
+# кнопки «Документы проверены» = card.json.certificate.verified == true.
+# Карточки С кнопкой: {"certificate": {"verified": true}}; БЕЗ: {"certificate": {}}
+# либо поля нет. Лежит в том же card.json (та же basket-CDN), что и «Оригинал».
+# Бейджа НЕТ в viewFlags/supplierFlags/promotions динамического API (проверено).
+# =============================================================================
+
+def card_json_docs_verified(parsed: Any) -> bool:
+    """True, если в card.json есть бейдж «Документ проверен WB»
+    (certificate.verified == true)."""
+    def _cert_verified(cert: Any) -> bool:
+        return isinstance(cert, dict) and cert.get("verified") is True
+
+    if isinstance(parsed, dict) and _cert_verified(parsed.get("certificate")):
+        return True
+    # защитный обход: certificate.verified==true в любом вложенном объекте
+    found = False
+
+    def walk(o: Any) -> None:
+        nonlocal found
+        if found:
+            return
+        if isinstance(o, dict):
+            if _cert_verified(o.get("certificate")):
+                found = True
+                return
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(parsed)
+    return found
+
+
+async def fetch_docs_verified_via_card_json(
+    session: "aiohttp.ClientSession", nm_id: int, timeout_sec: float = 6.0,
+    max_hosts: int = 16, concurrency: int = 0
+) -> Tuple[Optional[bool], str]:
+    """Тянет card.json по basket-шардам (первый 200 выигрывает) и определяет
+    бейдж «Документ проверен WB» (certificate.verified). Возвращает
+    (verified|None, detail). None = card.json не нашли (не знаем)."""
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+    }
+    timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec)))
+    urls = card_json_urls(nm_id, max_hosts=max_hosts)
+    probe_concurrency = max(1, int(concurrency) if concurrency else min(len(urls), 16))
+    sem = asyncio.Semaphore(probe_concurrency)
+    state = {"result": None, "host": ""}
+    done = asyncio.Event()
+
+    async def probe(url: str) -> None:
+        if done.is_set():
+            return
+        async with sem:
+            if done.is_set():
+                return
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as r:
+                    if int(r.status) != 200:
+                        return
+                    raw = (await r.text(errors="replace")).strip()
+                    if not raw:
+                        return
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        parsed = raw
+                    state["result"] = card_json_docs_verified(parsed)
+                    state["host"] = hostname(url)
+                    done.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    tasks = [asyncio.create_task(probe(u)) for u in urls]
+    try:
+        pending = set(tasks)
+        while pending:
+            _d, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if done.is_set():
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    if state["result"] is None:
+        return None, "card_json_not_found"
+    return bool(state["result"]), f"card_json_ok:{state['host']}:{'verified' if state['result'] else 'no'}"
+
+
+# =============================================================================
 # v40.3: дотягивание имени продавца (seller_name).
 # WB API v18 в поисковой выдаче отдаёт supplierId, но НЕ имя продавца.
 # Имя берём батчами через card.wb.ru/cards/v2/detail?nm=id1;id2;... (до 100 nm за раз).
@@ -1559,6 +1662,24 @@ async def run_http_link_prefetch(
                             card.is_original = 'оригинал'
                     except Exception:
                         pass
+
+                # v46: бейдж «Документ проверен WB» = card.json.certificate.verified.
+                # verified не может быть true без сертификата, поэтому card.json
+                # тянем ТОЛЬКО когда документ реально есть (json со ссылкой или
+                # json без ссылки). Для карточек без документа — сразу «Нет», без
+                # лишнего запроса. Тот же basket-шард, что и certificate.json.
+                _has_doc = bool(urls) or detail.startswith("cert_json_ok") \
+                    or detail.startswith("cert_json_has_doc_no_url")
+                if _has_doc:
+                    try:
+                        _ver, _vdet = await fetch_docs_verified_via_card_json(
+                            session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
+                        )
+                        card.docs_verified = "Да" if _ver is True else "Нет"
+                    except Exception:
+                        card.docs_verified = "Нет"
+                else:
+                    card.docs_verified = "Нет"
 
                 base_fields = dict(
                     query=card.source_query or args.query,
@@ -2424,6 +2545,7 @@ def _card_fields_for_result(card: Card) -> Dict[str, Any]:
         "rating": getattr(card, "rating", 0.0),
         "feedbacks": getattr(card, "feedbacks", 0),
         "is_original": getattr(card, "is_original", ""),
+        "docs_verified": getattr(card, "docs_verified", ""),
         "colors": getattr(card, "colors", ""),
         "wb_root": getattr(card, "wb_root", ""),
     }
@@ -2968,6 +3090,7 @@ DETAILS_HEADERS_RU_V39: Dict[str, str] = {
     "rating": "Рейтинг",
     "feedbacks": "Отзывы",
     "is_original": "Плашка 'Оригинал'",
+    "docs_verified": "Документ проверен WB",
     "colors": "Цвет",
     "wb_root": "Корневой ID (WB)",
     "registry_url": "Ссылка на реестр",
@@ -3250,7 +3373,7 @@ def _xlsx_safe(value: Any, max_len: int = 32000):
 CORE_DETAILS_ORDER_V39: Tuple[str, ...] = (
     "query", "nm_id", "product_name", "brand", "subject", "product_url",
     "status", "price_rub", "sale_price_rub", "seller_name", "supplier_id",
-    "is_original", "registry_url", "document_type", "document_status",
+    "is_original", "docs_verified", "registry_url", "document_type", "document_status",
     "rf_status", "certificate_number", "document_date_start", "document_date_end",
 )
 
@@ -8238,6 +8361,7 @@ async def run_registry_stage(args):
                 sale_price_rub=safe_float(row.get('sale_price_rub')),
                 seller_name=row.get('seller_name', ''),
                 is_original=row.get('is_original', ''),
+                docs_verified=row.get('docs_verified', ''),
                 supplier_id=row.get('supplier_id', ''),
                 rating=safe_float(row.get('rating')),
                 feedbacks=safe_int(row.get('feedbacks')),
@@ -8871,6 +8995,7 @@ async def run_registry_stage(args):
             sale_price_rub=safe_float(row.get('sale_price_rub')),
             seller_name=row.get('seller_name', ''),
             is_original=row.get('is_original', ''),
+            docs_verified=row.get('docs_verified', ''),
             supplier_id=row.get('supplier_id', ''),
             rating=safe_float(row.get('rating')),
             feedbacks=safe_int(row.get('feedbacks')),

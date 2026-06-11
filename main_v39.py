@@ -6009,13 +6009,18 @@ CATEGORY_TERMS = {
     # v27.7: НОВЫЕ категории — расширение на любые товарные группы (не только лёгкая промышленность).
     "electronics": {
         "электроника", "наушники", "наушник", "гарнитура", "колонка", "колонки",
-        "акустика", "акустическая система", "смартфон", "смартфоны", "телефон",
+        "акустика", "акустическая система", "акустическ", "саундбар", "смартфон", "смартфоны", "телефон",
         "телефоны", "телефоны мобильные", "планшет", "планшеты", "ноутбук",
         "ноутбуки", "монитор", "мониторы", "клавиатура", "мышь компьютерная",
+        "мышь", "мышка", "мышки", "устройство ввода", "устройства ввода",
+        "манипулятор", "манипулятор компьютерный",
         "телевизор", "телевизоры", "повербанк", "повербанки", "пауэрбанк",
         "power bank", "powerbank", "внешний аккумулятор", "батареи аккумуляторные",
         "аккумуляторная батарея",
-        "зарядное устройство", "зарядное", "кабель", "кабели", "адаптер", "адаптеры",
+        "зарядное устройство", "зарядные устройства", "зарядное", "зарядка", "зарядки",
+        "сетевое зарядное", "блок питания", "адаптер питания",
+        "кабель", "кабели", "адаптер", "адаптеры", "переходник", "переходники",
+        "штекер", "штекеры", "коннектор", "разъём", "разъем", "usb", "type-c", "hdmi", "otg",
         "роутер", "маршрутизатор", "флешка", "флеш-накопитель", "карта памяти",
         "фотоаппарат", "видеокамера", "веб-камера", "магнитола", "радиоприёмник",
         "проектор", "приставка игровая", "геймпад", "джойстик", "умные часы",
@@ -6250,6 +6255,28 @@ def _detect_categories(text: str) -> Set[str]:
                     cats.add(cat)
                     break
     return cats
+
+
+# v46: «родственные» товарные группы — категории, которые в реестрах ФСА часто
+# смешаны и НЕ должны считаться конфликтом. Бытовая электроника и «приборы
+# бытового назначения» (appliances) — одна предметная область: реестровый
+# сертификат «Аппараты электрические бытового назначения: сетевые зарядные
+# устройства/акустические системы» (appliances по префиксу) покрывает WB-карточку
+# «зарядка/колонка» (electronics). Раньше это давало ложное «НЕСООТВЕТСТВИЕ».
+RELATED_CATEGORY_GROUPS: List[frozenset] = [
+    frozenset({"electronics", "appliances"}),
+]
+
+
+def _categories_related(a: Set[str], b: Set[str]) -> bool:
+    """True, если категории из a и b лежат в одной «родственной» группе
+    (например electronics и appliances) — тогда несовпадение категорий НЕ конфликт."""
+    if not a or not b:
+        return False
+    for g in RELATED_CATEGORY_GROUPS:
+        if (a & g) and (b & g):
+            return True
+    return False
 
 
 def _contains_word_token(text_low: str, term_low: str) -> bool:
@@ -6493,7 +6520,8 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
     # Hard domain conflicts: e.g. WB clothing card vs toy/electronics certificate.
     if 'clothing' in card_cats and cert_conflict_domains:
         conflicts.append(f'сертификат относится к другой группе: {sorted(cert_conflict_domains)}')
-    if card_cats and cert_cats and card_cats.isdisjoint(cert_cats):
+    if (card_cats and cert_cats and card_cats.isdisjoint(cert_cats)
+            and not _categories_related(card_cats, cert_cats)):
         conflicts.append(f'категория карточки {sorted(card_cats)} не совпадает с категорией сертификата {sorted(cert_cats)}')
     if card_age == 'child' and cert_age == 'adult':
         conflicts.append('карточка детская, а сертификат явно для взрослых')
@@ -6640,6 +6668,14 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
         if card_sub & cert_sub:
             return 'OK', max(score, 82.0), f'Совпал вид + категория {sorted(shared_any)}; ' + detail_base
         return 'OK', max(score, 72.0), f'Совпадает товарная категория {sorted(shared_any)}, конфликтов нет; ' + detail_base
+
+    # v46: «родственные» категории (electronics ↔ appliances) — одна предметная
+    # область. Реестр часто пишет общий префикс «приборы бытового назначения»
+    # (appliances), а WB — конкретику «зарядка/колонка/мышь» (electronics).
+    if _categories_related(card_cats, cert_cats) and not conflicts:
+        if card_sub & cert_sub:
+            return 'OK', max(score, 80.0), f'Совпал вид; родственные категории {sorted(card_cats)}/{sorted(cert_cats)}; ' + detail_base
+        return 'OK', max(score, 70.0), f'Родственные товарные категории {sorted(card_cats)}/{sorted(cert_cats)}, конфликтов нет; ' + detail_base
 
     if score >= 78:
         return 'OK', score, 'Высокое суммарное совпадение без конфликтов; ' + detail_base
@@ -8273,6 +8309,56 @@ def _fsa_human_delay_range(args) -> Tuple[float, float]:
     return _fsa_human_delay_range_ms(getattr(args, 'fsa_human_delay_ms', '300,1400') or '300,1400')
 
 
+def _load_prior_registry_parsed(xlsx_path: Path) -> Dict[str, Tuple[str, str, str, str, str]]:
+    """v46: читает предыдущий result.xlsx (лист «Подробности») и возвращает
+    {registry_url: (cert, prod, typ, doc_status, detail)} — чтобы «Повторить
+    упавшие FSA» НЕ пере-парсил уже успешно собранные реестры, а переносил их
+    как есть и трогал только упавшие FSA-ссылки."""
+    out: Dict[str, Tuple[str, str, str, str, str]] = {}
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return out
+    if not xlsx_path.exists():
+        return out
+    try:
+        wb = load_workbook(str(xlsx_path), read_only=True, data_only=True)
+    except Exception:
+        return out
+    try:
+        ws = wb['Подробности'] if 'Подробности' in wb.sheetnames else wb[wb.sheetnames[-1]]
+        rows_iter = ws.iter_rows(values_only=True)
+        hdr = list(next(rows_iter))
+        ru2field = {v: k for k, v in DETAILS_HEADERS_RU_V39.items()}
+        idx: Dict[str, int] = {}
+        for n, h in enumerate(hdr):
+            f = ru2field.get(h)
+            if f is not None:
+                idx[f] = n
+        if 'registry_url' not in idx:
+            return out
+        def _cell(r, field):
+            j = idx.get(field)
+            return '' if j is None or j >= len(r) or r[j] is None else str(r[j])
+        for r in rows_iter:
+            url = clean_url(_cell(r, 'registry_url'))
+            if not url or url in out:
+                continue
+            out[url] = (
+                _cell(r, 'certificate_number'), _cell(r, 'certificate_product_name'),
+                _cell(r, 'document_type'), _cell(r, 'document_status'),
+                _cell(r, 'details') or 'prior_result',
+            )
+    except Exception:
+        return out
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return out
+
+
 async def run_registry_stage(args):
     """v38.6: visible-browser registry stage with first-stage-like progress.
 
@@ -8354,6 +8440,36 @@ async def run_registry_stage(args):
         print('Нет строк с registry_url для второго этапа.')
         return
 
+    # v46: режим «Повторить упавшие FSA». Раньше второй этап ПОЛНОСТЬЮ
+    # перезапускался — пере-парсил ВСЕ реестры (включая уже успешные). Теперь в
+    # этом режиме из предыдущего result.xlsx переносятся все успешные документы,
+    # а пере-проверяются ТОЛЬКО упавшие FSA-ссылки (нет номера/названия/статуса).
+    _retry_seed: Dict[str, Tuple[str, str, str, str, str]] = {}
+    if bool(getattr(args, 'registry_fsa_retry', False)):
+        prior = _load_prior_registry_parsed(Path(args.output))
+        if not prior:
+            print("🔁 Повтор FSA: предыдущий result.xlsx не найден/не прочитан — выполняю обычный полный второй этап.")
+        else:
+            def _fsa_failed_prior(u: str) -> bool:
+                if hostname(u) != 'pub.fsa.gov.ru':
+                    return False
+                cert, prod, typ, dst, det = prior.get(u, ('', '', '', '', ''))
+                return not (cert or '').strip() or not (prod or '').strip() or not (dst or '').strip()
+            failed = [u for u in unique_urls if _fsa_failed_prior(u)]
+            if not failed:
+                print(f"🔁 Повтор FSA: упавших FSA-ссылок в предыдущем result.xlsx не найдено — "
+                      f"перепроверять нечего. Файл будет пересобран из прежних данных.")
+            else:
+                print(f"🔁 Повтор FSA: из {len(unique_urls)} реестров будут пере-проверены только "
+                      f"{len(failed)} упавших FSA-ссылок; остальные перенесены из предыдущего result.xlsx.")
+            # Сидируем прежними значениями ВСЁ, кроме упавших (их соберём заново).
+            _failed_set = set(failed)
+            for u, val in prior.items():
+                if u not in _failed_set:
+                    _retry_seed[u] = val
+            # Первый проход трогает только упавшие FSA-ссылки.
+            unique_urls = failed
+
     # Default second stage to browser-visible parsing for main registries. It is slower, but substantially more reliable for FSA SPA.
     browser_workers = max(1, int(getattr(args, 'registry_browser_workers', 2)))
     args.registry_headless = getattr(args, 'registry_headless', True)
@@ -8361,6 +8477,10 @@ async def run_registry_stage(args):
     args.registry_browser_timeout_ms = int(getattr(args, 'registry_browser_timeout_ms', 30000))
 
     parsed: Dict[str, Tuple[str, str, str, str]] = {}
+    # v46: переносим успешные документы из предыдущего прогона (режим повтора FSA),
+    # чтобы их строки записались без повторного парсинга реестра.
+    for _u, _val in _retry_seed.items():
+        parsed.setdefault(_u, _val)
     q: asyncio.Queue[str] = asyncio.Queue()
     for u in unique_urls:
         q.put_nowait(u)

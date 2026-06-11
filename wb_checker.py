@@ -1511,9 +1511,11 @@ class Bridge:
         return self.open_path(str(APP_DIR))
 
     def retry_failed_fsa(self) -> dict:
-        """v27.9.x: ПОВТОР по упавшим FSA-ссылкам (по кнопке). Перезапускает этап 2
-        на том же registry_links.csv с включённым вторым проходом FSA. Нажимать,
-        когда pub.fsa.gov.ru снова доступен."""
+        """v27.9.x: ПОВТОР по упавшим FSA-ссылкам (по кнопке). Запускает этап 2
+        на том же registry_links.csv с включённым режимом повтора FSA. Движок
+        переносит успешные документы из предыдущего result.xlsx как есть и
+        пере-проверяет ТОЛЬКО упавшие FSA-ссылки (нет номера/названия/статуса).
+        Нажимать, когда pub.fsa.gov.ru снова доступен."""
         if self.state.running:
             return {"ok": False, "error": "Дождитесь завершения текущего прогона"}
         last = dict(self._last_spec or {})
@@ -3498,7 +3500,7 @@ const _btnRetryFsa = $('#btn-retry-fsa');
 if (_btnRetryFsa) _btnRetryFsa.addEventListener('click', async () => {
   const res = await window.pywebview.api.retry_failed_fsa();
   if (res && res.ok) {
-    toast('Повтор FSA запущен — этап 2 перезапущен', 'ok');
+    toast('Повтор FSA запущен — пере-проверяются только упавшие ссылки', 'ok');
     go('queue');
   } else {
     toast((res && res.error) || 'Не удалось запустить повтор', 'err');

@@ -1369,13 +1369,20 @@ def card_json_docs_verified(parsed: Any) -> bool:
     return found
 
 
-async def fetch_docs_verified_via_card_json(
-    session: "aiohttp.ClientSession", nm_id: int, timeout_sec: float = 6.0,
-    max_hosts: int = 16, concurrency: int = 0
-) -> Tuple[Optional[bool], str]:
-    """Тянет card.json по basket-шардам (первый 200 выигрывает) и определяет
-    бейдж «Документ проверен WB» (certificate.verified). Возвращает
-    (verified|None, detail). None = card.json не нашли (не знаем)."""
+async def fetch_docs_verified_at_host(
+    session: "aiohttp.ClientSession", nm_id: int, host: str, timeout_sec: float = 6.0
+) -> Optional[bool]:
+    """v46: тянет card.json с КОНКРЕТНОГО basket-шарда (того, где уже найден
+    certificate.json) и определяет бейдж «Документ проверен WB»
+    (certificate.verified). ОДИН запрос, БЕЗ перебора шардов — иначе массовый
+    перебор несуществующих basket-хостов заваливает лог DNS-ошибками (gaierror)
+    и грузит сеть. Возвращает True/False, либо None если card.json не отдался."""
+    if not host:
+        return None
+    # строим URL card.json для ИМЕННО этого шарда (тот же путь, что у certificate.json)
+    url = next((u for u in card_json_urls(nm_id, max_hosts=40) if hostname(u) == host), None)
+    if not url:
+        return None
     headers = {
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
@@ -1383,53 +1390,22 @@ async def fetch_docs_verified_via_card_json(
         "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
     }
     timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec)))
-    urls = card_json_urls(nm_id, max_hosts=max_hosts)
-    probe_concurrency = max(1, int(concurrency) if concurrency else min(len(urls), 16))
-    sem = asyncio.Semaphore(probe_concurrency)
-    state = {"result": None, "host": ""}
-    done = asyncio.Event()
-
-    async def probe(url: str) -> None:
-        if done.is_set():
-            return
-        async with sem:
-            if done.is_set():
-                return
-            try:
-                async with session.get(url, headers=headers, timeout=timeout) as r:
-                    if int(r.status) != 200:
-                        return
-                    raw = (await r.text(errors="replace")).strip()
-                    if not raw:
-                        return
-                    try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        parsed = raw
-                    state["result"] = card_json_docs_verified(parsed)
-                    state["host"] = hostname(url)
-                    done.set()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-
-    tasks = [asyncio.create_task(probe(u)) for u in urls]
     try:
-        pending = set(tasks)
-        while pending:
-            _d, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if done.is_set():
-                break
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    if state["result"] is None:
-        return None, "card_json_not_found"
-    return bool(state["result"]), f"card_json_ok:{state['host']}:{'verified' if state['result'] else 'no'}"
+        async with session.get(url, headers=headers, timeout=timeout) as r:
+            if int(r.status) != 200:
+                return None
+            raw = (await r.text(errors="replace")).strip()
+            if not raw:
+                return None
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = raw
+            return card_json_docs_verified(parsed)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -1575,55 +1551,45 @@ async def enrich_sellers_batch(cards: List[Card], args) -> None:
     print(f"✓ Имена продавцов: заполнено {filled['n']}/{len(need)} за {time.time()-t0:.1f}с")
 
 
-async def enrich_docs_verified_batch(cards: List[Card], args) -> None:
-    """v46: массово проставляет card.docs_verified («Да»/«Нет») — бейдж
-    «Документ проверен WB» из статического card.json (certificate.verified == true).
+def _install_quiet_dns_exc_handler():
+    """v46: глушит КОСМЕТИЧЕСКИЙ шум event-loop'а вида «gaierror exception in
+    shielded future» / «getaddrinfo failed». aiohttp при переборе basket-шардов
+    делает DNS-резолв через asyncio.shield; когда несуществующий basket-хост не
+    резолвится и на него висит несколько запросов, «лишние» исключения никто не
+    забирает → asyncio печатает их трейсбеки тоннами. На результат это не влияет
+    (несуществующий шард = как 404), поэтому такие сообщения молча гасим.
+    Возвращает (loop, prev_handler) для последующего восстановления, либо None."""
+    try:
+        loop = asyncio.get_event_loop()
+    except Exception:
+        return None
+    prev = loop.get_exception_handler()
 
-    Делается ОТДЕЛЬНЫМ проходом ДО сбора ссылок, чтобы признак попал в строку
-    независимо от того, каким путём собрана карточка (HTTP fast-path ИЛИ браузер).
-    Иначе карточки, собранные браузером, оставались с пустым значением.
-    Тот же basket-CDN, что и certificate.json; обычный HTTP, без антибота.
-    card.json не найден / бейджа нет → «Нет» (кнопки «Документы проверены» нет)."""
-    if not cards:
+    def _h(l, ctx):
+        exc = ctx.get('exception')
+        txt = f"{ctx.get('message', '')} {type(exc).__name__ if exc else ''}: {exc if exc else ''}"
+        for marker in ('getaddrinfo', 'gaierror', 'shielded future',
+                       'Temporary failure in name resolution',
+                       'Name or service not known', 'getaddr'):
+            if marker in txt:
+                return  # DNS-шум перебора шардов — гасим
+        if prev is not None:
+            prev(l, ctx)
+        else:
+            l.default_exception_handler(ctx)
+
+    loop.set_exception_handler(_h)
+    return (loop, prev)
+
+
+def _restore_exc_handler(saved) -> None:
+    if not saved:
         return
-    need = [c for c in cards if not getattr(c, 'docs_verified', '')]
-    if not need:
-        return
-    workers = max(2, int(getattr(args, 'http_link_workers', 30)))
-    cert_timeout = float(getattr(args, 'cert_timeout_sec', 6.0))
-    cert_max_hosts = int(getattr(args, 'cert_max_hosts', 30))
-    headers = {
-        "User-Agent": getattr(args, 'user_agent', '') or
-                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    }
-    timeout = aiohttp.ClientTimeout(total=30, connect=8)
-    connector = aiohttp.TCPConnector(limit=max(32, workers * 2), ttl_dns_cache=300, ssl=False)
-    sem = asyncio.Semaphore(workers)
-    stats = {"yes": 0, "no": 0, "done": 0}
-    t0 = time.time()
-    print(f"🛡  Определяю бейдж «Документ проверен WB» для {len(need)} карточек (card.json)...")
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector) as session:
-        async def work(card: Card):
-            async with sem:
-                try:
-                    ver, _det = await fetch_docs_verified_via_card_json(
-                        session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
-                    )
-                except Exception:
-                    ver = None
-                card.docs_verified = "Да" if ver is True else "Нет"
-                if ver is True:
-                    stats["yes"] += 1
-                else:
-                    stats["no"] += 1
-                stats["done"] += 1
-        tasks = [asyncio.create_task(work(c)) for c in need]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    print(f"✓ «Документ проверен WB»: Да={stats['yes']}, Нет={stats['no']} за {time.time()-t0:.1f}с")
+    loop, prev = saved
+    try:
+        loop.set_exception_handler(prev)
+    except Exception:
+        pass
 
 
 async def run_http_link_prefetch(
@@ -1643,6 +1609,7 @@ async def run_http_link_prefetch(
     """
     if not cards:
         return set()
+    _quiet_saved = _install_quiet_dns_exc_handler()
     workers = max(1, int(getattr(args, 'http_link_workers', 30)))
     cert_timeout = float(getattr(args, 'cert_timeout_sec', 6.0))
     cert_max_hosts = int(getattr(args, 'cert_max_hosts', 30))
@@ -1733,15 +1700,28 @@ async def run_http_link_prefetch(
                     except Exception:
                         pass
 
-                # v46: бейдж «Документ проверен WB» (card.docs_verified) проставляется
-                # ОТДЕЛЬНЫМ проходом enrich_docs_verified_batch ДО сбора ссылок —
-                # чтобы признак попал в строку независимо от пути сбора (HTTP/браузер).
-                # Здесь, как защита, для карточек без документа фиксируем «Нет», если
-                # проход почему-то не отработал (verified невозможен без сертификата).
-                if not getattr(card, 'docs_verified', ''):
+                # v46: бейдж «Документ проверен WB» (card.json.certificate.verified).
+                # verified невозможен без сертификата, поэтому card.json тянем ТОЛЬКО
+                # когда документ найден — и с ТОГО ЖЕ basket-шарда, где лежит
+                # certificate.json (хост известен из detail). Это 1 запрос на карточку
+                # без перебора шардов — иначе массовый перебор несуществующих basket-
+                # хостов заваливал лог DNS-ошибками (gaierror) и грузил сеть.
+                if getattr(args, 'check_docs_verified', True) and not getattr(card, 'docs_verified', ''):
                     _has_doc = bool(urls) or detail.startswith("cert_json_ok") \
                         or detail.startswith("cert_json_has_doc_no_url")
-                    if not _has_doc:
+                    if _has_doc:
+                        _m = re.search(r'basket-\d+\.wbbasket\.ru', detail or '')
+                        _cert_host = _m.group(0) if _m else ''
+                        if _cert_host:
+                            try:
+                                _ver = await fetch_docs_verified_at_host(
+                                    session, card.nm_id, _cert_host, timeout_sec=cert_timeout)
+                                card.docs_verified = "Да" if _ver is True else "Нет"
+                            except Exception:
+                                card.docs_verified = "Нет"
+                        else:
+                            card.docs_verified = "Нет"
+                    else:
                         card.docs_verified = "Нет"
 
                 base_fields = dict(
@@ -1831,6 +1811,7 @@ async def run_http_link_prefetch(
         await store.save()
     except Exception as e:
         print(f"⚠️  Сохранение после HTTP prefetch: {e}")
+    _restore_exc_handler(_quiet_saved)
     return done_nm
 
 
@@ -4525,14 +4506,10 @@ async def run_link_collection(args):
         except Exception as e:
             print(f"⚠️  Обогащение продавцами не удалось (не критично): {type(e).__name__}: {e}")
 
-    # v46: бейдж «Документ проверен WB» — отдельным проходом для ВСЕХ карточек
-    # текущей выборки, чтобы значение попало в строку независимо от пути сбора
-    # (HTTP fast-path или браузер). Раньше браузерные карточки оставались пустыми.
-    if getattr(args, 'check_docs_verified', True) and remaining:
-        try:
-            await enrich_docs_verified_batch(remaining, args)
-        except Exception as e:
-            print(f"⚠️  Определение «Документ проверен WB» не удалось (не критично): {type(e).__name__}: {e}")
+    # v46: бейдж «Документ проверен WB» (card.json.certificate.verified) собирается
+    # ВНУТРИ HTTP fast-path (run_http_link_prefetch) — там уже известен basket-шард
+    # с certificate.json, поэтому card.json берётся 1 запросом с того же шарда (без
+    # перебора несуществующих хостов, который заваливал лог DNS-ошибками).
 
     # =============================================================================
     # v40: HTTP сбор ссылок через certificate.json. БЕЗ браузера на 1 этапе.

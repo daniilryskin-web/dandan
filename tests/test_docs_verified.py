@@ -63,9 +63,11 @@ def main():
     check("_card_fields_for_result отдаёт docs_verified",
           mv._card_fields_for_result(c).get("docs_verified") == "Да")
 
-    # отдельный проход-обогащение покрывает ВСЕ пути сбора (HTTP + браузер)
-    check("enrich_docs_verified_batch есть", hasattr(mv, "enrich_docs_verified_batch"))
-    check("fetch_docs_verified_via_card_json есть", hasattr(mv, "fetch_docs_verified_via_card_json"))
+    # бейдж собирается ВНУТРИ HTTP fast-path 1 запросом с известного basket-шарда
+    check("fetch_docs_verified_at_host есть", hasattr(mv, "fetch_docs_verified_at_host"))
+    # старый перебор-всех-шардов убран (он заваливал лог DNS-ошибками)
+    check("старый probe-перебор удалён", not hasattr(mv, "fetch_docs_verified_via_card_json"))
+    check("глушитель DNS-шума есть", hasattr(mv, "_install_quiet_dns_exc_handler"))
     ap = mv.build_parser()
     a = ap.parse_args(["--query", "x", "--link-only", "true"])
     check("--check-docs-verified по умолчанию TRUE", a.check_docs_verified is True)

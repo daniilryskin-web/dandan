@@ -2626,11 +2626,22 @@ _FSA_COOKIE_HTTP_FAIL = 0  # сколько раз HTTP по кукам не с�
 _FSA_CONSEC_FAILS = 0       # подряд идущих неудач FSA (сбрасывается успехом)
 _FSA_COOLDOWN_UNTIL = 0.0   # время (epoch), до которого FSA на паузе
 _FSA_COOLDOWN_CYCLES = 0    # сколько раз уже включали паузу за прогон
+# v47: ВОЗВРАТ БЮДЖЕТА ПАУЗ. Раньше _FSA_COOLDOWN_CYCLES только рос и после N пауз
+# FSA отпускался НАВСЕГДА — на больших прогонах FSA «обрывался спустя какое-то
+# время», даже если между блокировками успешно восстанавливался. Теперь череда
+# успехов «возвращает» потраченную паузу: FSA может пережить много циклов
+# блокировка→пауза→восстановление и не бросается, пока реально собирает данные.
+_FSA_RECOVER_STREAK = 0     # успехов FSA подряд после последней паузы
 # v46: САМОНАСТРОЙКА темпа в медленном режиме. Множитель к базовой паузе: растёт при
 # сбоях ФСА (тормозим), снижается при череде успехов (ускоряемся) — программа сама
 # нащупывает самый быстрый безопасный темп вокруг 20-30 док/мин.
 _FSA_SLOW_MULT = 1.0
 _FSA_SLOW_OK = 0
+# v47: «залипающий» паузо-режим. Как только FSA впервые заблокировал и сработала
+# авто-пауза — дальше FSA идёт строго последовательно с паузой между запросами
+# (как медленный режим), даже если пользователь его НЕ включал. Это превращает
+# «стандартный» прогон, который блокируется, в устойчивый темп без срывов.
+_FSA_FORCE_PACE = False
 
 # v27.9.x: один раз за прогон сохраняем сырой JSON-ответ API ФСА в файл —
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
@@ -3524,6 +3535,9 @@ class ResultStore:
                     data = {k: row.get(k, "") for k in ResultRow.__dataclass_fields__.keys()}
                     data["nm_id"] = nm
                     data["score"] = float(data.get("score") or 0)
+                    # v47: бейдж — строго Да/Нет (старый CSV мог не иметь признака)
+                    if not data.get("docs_verified"):
+                        data["docs_verified"] = "Нет"
                     latest[nm] = ResultRow(**data)
         except Exception:
             return ids, ignored
@@ -3532,6 +3546,11 @@ class ResultStore:
         return ids, ignored
 
     async def add(self, row: ResultRow):
+        # v47: «Документ проверен WB» — строго Да/Нет, без пустых ячеек. Пусто
+        # бывает у resume-карточек (собраны старой сборкой) и у редких путей
+        # записи, не проставивших признак. Бейдж не зафиксирован = «Нет».
+        if not getattr(row, 'docs_verified', ''):
+            row.docs_verified = 'Нет'
         async with self.lock:
             self.rows.append(row)
 
@@ -8637,7 +8656,7 @@ async def run_registry_stage(args):
 
             async def worker(wid: int):
                 global _FSA_CONSEC_FAILS, _FSA_COOLDOWN_UNTIL, _FSA_COOLDOWN_CYCLES, _FSA_SESSION_COOKIES
-                global _FSA_SLOW_MULT, _FSA_SLOW_OK
+                global _FSA_SLOW_MULT, _FSA_SLOW_OK, _FSA_RECOVER_STREAK, _FSA_FORCE_PACE
                 # v39: единая функция пересоздания контекста + страницы. Если что-то падает —
                 # вернёт хотя бы пустой page, чтобы worker не умер.
                 async def _fresh_context_and_page(old_ctx):
@@ -8719,7 +8738,10 @@ async def run_registry_stage(args):
                         # занят другим воркером, НЕ ждём в очереди (иначе все 5 воркеров
                         # встанут на ФСА залпом) — возвращаем ссылку и берём НЕ-ФСА (SWIS
                         # и пр. идут параллельно). Так ФСА строго последовательный, без залпа.
-                        if (_fsa_slow_mode and hostname(url) == 'pub.fsa.gov.ru'
+                        # v47: «темп» включён, если пользователь выбрал медленный режим
+                        # ИЛИ FSA уже блокировал и режим самозалип (_FSA_FORCE_PACE).
+                        _fsa_paced = _fsa_slow_mode or _FSA_FORCE_PACE
+                        if (_fsa_paced and hostname(url) == 'pub.fsa.gov.ru'
                                 and _fsa_serial_sem.locked()):
                             await q.put(url)
                             q.task_done()
@@ -8745,11 +8767,12 @@ async def run_registry_stage(args):
                         try:
                             h = hostname(url)
                             if h == 'pub.fsa.gov.ru':
-                                # v46: МЕДЛЕННЫЙ РЕЖИМ — держим темп ниже лимита ФСА.
-                                # Пауза между документами + АДАПТИВНЫЙ бэкофф (после каждой
-                                # авто-паузы темп снижается ×(1+циклы)). Парсинг ФСА —
-                                # СЕРИЙНО (Semaphore 1), чтобы не было всплеска из 4 сессий.
-                                if _fsa_slow_mode:
+                                # v46/47: ТЕМПОВЫЙ РЕЖИМ — держим темп ниже лимита ФСА.
+                                # Пауза между документами + АДАПТИВНЫЙ бэкофф. Парсинг ФСА —
+                                # СЕРИЙНО (Semaphore 1), чтобы не было всплеска из нескольких
+                                # сессий. Включается медленным режимом ИЛИ авто-залипанием
+                                # после первой блокировки (_FSA_FORCE_PACE).
+                                if _fsa_paced:
                                     async with _fsa_serial_sem:
                                         # РЕАЛЬНАЯ пауза МЕЖДУ запросами к ФСА (а не параллельно
                                         # в каждом воркере). Множитель самонастраивается:
@@ -8827,18 +8850,29 @@ async def run_registry_stage(args):
                                 _cd_max = max(0, int(getattr(args, 'fsa_max_cooldowns', 3)))
                                 if prod:
                                     _FSA_CONSEC_FAILS = 0
-                                    # v46: самонастройка медленного режима — череда успехов
+                                    # v47: FSA восстановился — «возвращаем» бюджет пауз.
+                                    # Череда успехов после паузы уменьшает счётчик циклов,
+                                    # чтобы FSA не бросался навсегда на длинных прогонах, где
+                                    # блокировки чередуются с восстановлением.
+                                    if _FSA_COOLDOWN_CYCLES > 0:
+                                        _FSA_RECOVER_STREAK += 1
+                                        if _FSA_RECOVER_STREAK >= 12:
+                                            _FSA_COOLDOWN_CYCLES = max(0, _FSA_COOLDOWN_CYCLES - 1)
+                                            _FSA_RECOVER_STREAK = 0
+                                            stats['fsa_gaveup_shown'] = False
+                                    # v46/47: самонастройка темпа — череда успехов
                                     # => осторожно ускоряемся (множитель паузы к базовому).
-                                    if _fsa_slow_mode:
+                                    if _fsa_paced:
                                         _FSA_SLOW_OK += 1
                                         if _FSA_SLOW_OK >= 20 and _FSA_SLOW_MULT > 1.0:
                                             _FSA_SLOW_MULT = max(1.0, _FSA_SLOW_MULT - 0.3)
                                             _FSA_SLOW_OK = 0
                                 else:
+                                    _FSA_RECOVER_STREAK = 0
                                     _FSA_CONSEC_FAILS += 1
-                                    # v46: сбой ФСА в медл. режиме => тормозим заранее (ещё до
-                                    # полной авто-паузы), увеличивая паузу между запросами.
-                                    if _fsa_slow_mode:
+                                    # v46/47: сбой ФСА в темповом режиме => тормозим заранее
+                                    # (ещё до полной авто-паузы), увеличивая паузу между запросами.
+                                    if _fsa_paced:
                                         _FSA_SLOW_MULT = min(5.0, _FSA_SLOW_MULT + 0.4)
                                         _FSA_SLOW_OK = 0
                                     if (_cd_base > 0 and _FSA_CONSEC_FAILS >= _cd_fails
@@ -8849,11 +8883,14 @@ async def run_registry_stage(args):
                                         _FSA_COOLDOWN_UNTIL = time.time() + _dur
                                         _FSA_CONSEC_FAILS = 0
                                         _FSA_SESSION_COOKIES = {}  # сбросить отравленную сессию
+                                        _FSA_FORCE_PACE = True      # v47: дальше FSA строго с паузой
+                                        _FSA_SLOW_MULT = min(5.0, _FSA_SLOW_MULT + 0.6)
                                         print("=" * 80)
                                         print(f"⏸  FSA массово блокирует ({_cd_fails} неудач подряд). "
                                               f"АВТО-ПАУЗА {int(_dur)}с — попытка {_FSA_COOLDOWN_CYCLES}/{_cd_max} "
                                               f"снять rate-limit. Остальные реестры (SWIS и др.) продолжают идти.")
-                                        print(f"   После паузы FSA пробуется заново со свежей сессией.")
+                                        print(f"   После паузы FSA идёт строго по одному с паузой между запросами "
+                                              f"(устойчивый темп). Череда успехов вернёт бюджет пауз.")
                                         print("=" * 80)
                                     elif (_cd_base > 0 and _FSA_CONSEC_FAILS >= _cd_fails
                                           and _FSA_COOLDOWN_CYCLES >= _cd_max
@@ -9386,8 +9423,10 @@ def build_parser():
                          "массово блокировать; с каждым разом удваивается (90→180→360…). 0 — выключить.")
     ap.add_argument("--fsa-cooldown-fails", type=int, default=8,
                     help="v45.6: сколько неудач FSA подряд включают авто-паузу.")
-    ap.add_argument("--fsa-max-cooldowns", type=int, default=3,
-                    help="v45.6: сколько раз максимум авто-паузить FSA за прогон. После — FSA "
+    ap.add_argument("--fsa-max-cooldowns", type=int, default=6,
+                    help="v45.6/47: сколько авто-пауз FSA подряд БЕЗ восстановления допускается. "
+                         "Череда успехов возвращает бюджет пауз (FSA не бросается на длинных "
+                         "прогонах). После исчерпания без восстановления — FSA "
                          "отпускается (недобранное добивается кнопкой «Повторить упавшие FSA»).")
     # v27.6: уменьшен с 45000 до 28000 — раньше FSA-карточка занимала 165с
     ap.add_argument("--registry-browser-timeout-ms", type=int, default=28000)

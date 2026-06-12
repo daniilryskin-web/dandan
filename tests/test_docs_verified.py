@@ -72,6 +72,19 @@ def main():
     a = ap.parse_args(["--query", "x", "--link-only", "true"])
     check("--check-docs-verified по умолчанию TRUE", a.check_docs_verified is True)
 
+    # v47: пустой docs_verified нормализуется в «Нет» при записи в ResultStore —
+    # колонка никогда не бывает пустой (resume/редкие пути → «Нет»).
+    import asyncio
+    store = mv.ResultStore(Path("/tmp/_t_docs.xlsx"), None, make_report_xlsx=False)
+    rr = mv.ResultRow(query="q", nm_id=1, product_name="p", brand="", subject="",
+                      product_url="", status="OK")  # docs_verified не задан → ""
+    asyncio.get_event_loop().run_until_complete(store.add(rr))
+    check("ResultStore.add: пусто -> «Нет»", store.rows[-1].docs_verified == "Нет")
+    rr2 = mv.ResultRow(query="q", nm_id=2, product_name="p", brand="", subject="",
+                       product_url="", status="OK", docs_verified="Да")
+    asyncio.get_event_loop().run_until_complete(store.add(rr2))
+    check("ResultStore.add: «Да» не перетирается", store.rows[-1].docs_verified == "Да")
+
     # GUI: колонка в курируемом наборе
     gui = (Path(__file__).resolve().parents[1] / "wb_checker.py").read_text(encoding="utf-8")
     check("PREFERRED_COLS содержит 'Документ проверен WB'",

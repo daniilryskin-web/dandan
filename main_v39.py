@@ -1642,6 +1642,7 @@ async def run_http_link_prefetch(
 
     async def progress_loop():
         nonlocal last_print
+        _last_autosave = time.time()
         try:
             while stats['done'] < len(cards):
                 await asyncio.sleep(3.0)
@@ -1656,6 +1657,15 @@ async def run_http_link_prefetch(
                 )
                 emit_progress("links", stats['done'], len(cards))
                 last_print = time.time()
+                # v47: периодический автосейв ВНУТРИ prefetch. Раньше CSV/XLSX писались
+                # только в конце — обрыв на 15k/20k карточек терял весь прогресс
+                # (resume нечего было читать). Пишем раз в ~60с в отдельном потоке.
+                if time.time() - _last_autosave >= 60:
+                    _last_autosave = time.time()
+                    try:
+                        await store.save()
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             return
 
@@ -2314,6 +2324,25 @@ def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '
     return False
 
 
+def scaled_search_pages(limit: int, n_variants: int) -> int:
+    """v47: глубина листания обычного поиска (страниц на вариант запроса).
+    Раньше всегда 1 — сбор упирался в ~4-8k уникальных карточек при любом
+    лимите. Растёт с лимитом, капится 10 (WB глубже редко отдаёт новое);
+    страницы без новых карточек обрываются досрочно в цикле сбора."""
+    need_per_variant = int(limit) / max(1, int(n_variants))
+    return max(1, min(10, int(need_per_variant / 45) + 1))
+
+
+def scaled_max_queries(limit: int, max_expanded_queries: int) -> int:
+    """v47: на больших лимитах (20k+) глубина выдачи WB на ОДИН запрос ограничена
+    (~несколько тысяч карточек), поэтому число вариантов запроса должно расти с
+    лимитом — иначе сбор упирается в потолок задолго до limit. Явно заданное
+    (не дефолтное 250) значение --max-expanded-queries уважаем как есть."""
+    if limit > 10000 and max_expanded_queries == 250:
+        return min(800, 250 + limit // 50)
+    return max_expanded_queries
+
+
 def generate_query_variants(base_query: str, profile: str = "auto", max_variants: int = 250) -> List[str]:
     """v39.7: универсальная генерация запросов под любую категорию.
 
@@ -2843,7 +2872,11 @@ async def collect_cards(args) -> List[Card]:
             _brand_domains.append(_d)
     _profile_key = _profile_keys[0] if _profile_keys else 'auto'
 
-    variants = generate_query_variants(args.query, args.query_profile, args.max_expanded_queries)
+    _max_q = scaled_max_queries(int(args.limit), int(args.max_expanded_queries))
+    if _max_q != int(args.max_expanded_queries):
+        print(f"📈 Большой лимит ({args.limit}): расширяю число вариантов запроса до {_max_q} "
+              f"(WB ограничивает глубину выдачи на один запрос).")
+    variants = generate_query_variants(args.query, args.query_profile, _max_q)
     if _brand_search:
         # Бренд: чистый бренд + (если выбраны категории) «бренд + тип товара» из
         # КАЖДОЙ выбранной категории. Больше карточек, не выходя за категории.
@@ -2897,7 +2930,15 @@ async def collect_cards(args) -> List[Card]:
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         # v27.9.x: для бренда листаем до нужного лимита (одна «чистая» выдача),
         # для обычного поиска — 1 страница (охват даёт расширение вариантов).
-        _max_pages = max(1, min(60, (int(args.limit) // 90) + 2)) if _brand_search else 1
+        if _brand_search:
+            _max_pages = max(1, min(60, (int(args.limit) // 90) + 2))
+        else:
+            # v47: обычный поиск раньше листал ТОЛЬКО 1-ю страницу каждого варианта —
+            # сбор упирался в ~4-8k уникальных карточек при ЛЮБОМ лимите (для 20k+
+            # это был жёсткий потолок). Теперь глубина листания растёт с лимитом;
+            # страница без новых карточек обрывает листание сама (см. break ниже),
+            # поэтому лишних запросов на малых лимитах не появляется.
+            _max_pages = scaled_search_pages(int(args.limit), len(variants))
 
         # v27.9.x: для бренда находим brandId и тянем ПОЛНЫЙ бренд-каталог
         # (catalog.wb.ru/brands/...), а не обрезанную поисковую выдачу. Плюс
@@ -3482,13 +3523,20 @@ def _build_details_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
         EXPIRY_RISK_EXPIRED: PatternFill("solid", fgColor="F4CCCC"),
         EXPIRY_RISK_UNKNOWN: PatternFill("solid", fgColor="EFEFEF"),
     }
+    # v47: per-cell стилизация на больших объёмах НЕПОДЪЁМНА: 20k строк × 39
+    # колонок = ~800k объектов стиля → запись раздувается на десятки секунд и
+    # сотни МБ. Для прогонов >8000 строк красим ТОЛЬКО колонку риска (она и несёт
+    # смысл), без выравнивания каждой ячейки. Малые отчёты — как раньше.
+    _full_style = ws.max_row <= 8001
+    _align = Alignment(vertical="top", wrap_text=True)
     for row in ws.iter_rows(min_row=2):
         risk_val = str(row[risk_col_idx - 1].value or "")
         fill = fills.get(risk_val)
         if fill is not None:
             row[risk_col_idx - 1].fill = fill
-        for c in row:
-            c.alignment = Alignment(vertical="top", wrap_text=True)
+        if _full_style:
+            for c in row:
+                c.alignment = _align
 
 
 class ResultStore:
@@ -3501,6 +3549,7 @@ class ResultStore:
         self.make_report_xlsx = bool(make_report_xlsx)
         self.rows: List[ResultRow] = []
         self.lock = asyncio.Lock()
+        self._save_lock = asyncio.Lock()  # v47: сериализация фоновых сохранений
         self.last_save_count = 0
 
     def processed_ids_from_csv(self, valid_ids: Optional[Set[int]] = None) -> Tuple[Set[int], int]:
@@ -3555,12 +3604,24 @@ class ResultStore:
             self.rows.append(row)
 
     async def save(self):
-        async with self.lock:
-            rows = list(self.rows)
-        if self.csv_path:
-            self._save_csv(rows, self.csv_path)
-        self._save_xlsx(rows, self.xlsx_path)
-        self.last_save_count = len(rows)
+        # v47: НЕБЛОКИРУЮЩЕЕ сохранение для больших прогонов (20k+ строк).
+        # Синхронная запись openpyxl на десятках тысяч строк занимает секунды и
+        # раньше блокировала event loop: воркеры замирали, watchdog считал прогон
+        # зависшим и перезапускал воркеры. Теперь запись идёт в отдельном потоке,
+        # а параллельные вызовы сериализуются отдельным локом (каждый забирает
+        # актуальный снимок строк — финальное сохранение ничего не теряет).
+        if not hasattr(self, "_save_lock"):
+            self._save_lock = asyncio.Lock()
+        async with self._save_lock:
+            async with self.lock:
+                rows = list(self.rows)
+
+            def _write():
+                if self.csv_path:
+                    self._save_csv(rows, self.csv_path)
+                self._save_xlsx(rows, self.xlsx_path)
+            await asyncio.to_thread(_write)
+            self.last_save_count = len(rows)
 
     def _save_csv(self, rows: List[ResultRow], path: Path):
         fields = list(ResultRow.__dataclass_fields__.keys())
@@ -4330,8 +4391,12 @@ async def link_worker(worker_id: int, pool: BrowserPool, queue: asyncio.Queue, s
                     await close_context_quiet(context)
                     context, page = await make_page(pool, pool_idx, args)
 
-                if args.autosave_every > 0 and progress["done"] % args.autosave_every == 0:
-                    await store.save()
+                if args.autosave_every > 0:
+                    # v47: на больших прогонах автосейв реже — каждая запись xlsx
+                    # переписывает ВЕСЬ файл, на 20k+ строк это десятки секунд.
+                    _as_every = max(args.autosave_every, len(store.rows) // 100)
+                    if progress["done"] % _as_every == 0:
+                        await store.save()
             except Exception as e:
                 progress["tech"] += 1
                 err_row = ResultRow(
@@ -8345,6 +8410,16 @@ def _load_prior_registry_parsed(xlsx_path: Path) -> Dict[str, Tuple[str, str, st
                 _cell(r, 'document_type'), _cell(r, 'document_status'),
                 _cell(r, 'details') or 'prior_result',
             )
+            # v47: восстанавливаем расширенные поля документа в глобальный кэш —
+            # иначе перенесённые при resume строки теряли «Действует с/до», схему
+            # и техрегламент (они подставляются в ResultRow из этого кэша).
+            _ext = {k: _cell(r, k) for k in (
+                'document_date_start', 'document_date_end', 'applicant_name',
+                'applicant_inn', 'manufacturer_name', 'tnved', 'scheme',
+                'technical_regulation')}
+            _ext = {k: v for k, v in _ext.items() if v}
+            if _ext and url not in _FSA_EXTENDED_FIELDS_CACHE:
+                _FSA_EXTENDED_FIELDS_CACHE[url] = _ext
     except Exception:
         return out
     finally:
@@ -8465,6 +8540,33 @@ async def run_registry_stage(args):
                     _retry_seed[u] = val
             # Первый проход трогает только упавшие FSA-ссылки.
             unique_urls = failed
+    elif bool(getattr(args, 'registry_resume', True)):
+        # v47: RESUME этапа 2 — фундамент больших прогонов (20 000+ карточек).
+        # Если прогон оборвался (свет/сеть/перезагрузка) — при перезапуске НЕ
+        # парсим заново уже собранные реестры: переносим их из существующего
+        # result.xlsx и парсим только остаток. Берём только СВЕЖИЙ файл
+        # (по умолчанию до 72ч) и только ПОЛНОЦЕННО собранные документы
+        # (номер + название + статус). Отключение: --registry-resume false.
+        _out_p = Path(args.output)
+        _max_age_h = float(getattr(args, 'registry_resume_max_age_hours', 72) or 0)
+        _fresh = (_out_p.exists() and _max_age_h > 0
+                  and (time.time() - _out_p.stat().st_mtime) <= _max_age_h * 3600)
+        if _fresh:
+            prior = _load_prior_registry_parsed(_out_p)
+            _cur = set(unique_urls)
+
+            def _complete(val) -> bool:
+                cert, prod, typ, dst, det = val
+                return bool((cert or '').strip()) and bool((prod or '').strip()) \
+                    and bool((dst or '').strip())
+            done_urls = {u for u, v in prior.items() if u in _cur and _complete(v)}
+            if done_urls:
+                for u in done_urls:
+                    _retry_seed[u] = prior[u]
+                unique_urls = [u for u in unique_urls if u not in done_urls]
+                print(f"⏯  Resume этапа 2: {len(done_urls)} из {len(_cur)} реестров уже "
+                      f"собраны в {_out_p.name} — переношу как есть, парсить осталось "
+                      f"{len(unique_urls)}. (Полный пере-парсинг: --registry-resume false)")
 
     # Default second stage to browser-visible parsing for main registries. It is slower, but substantially more reliable for FSA SPA.
     browser_workers = max(1, int(getattr(args, 'registry_browser_workers', 2)))
@@ -8601,10 +8703,14 @@ async def run_registry_stage(args):
     # v39.1: отдельная фоновая задача — периодически сохраняет xlsx.
     # Это критично: без него файл появляется только в конце прогона.
     async def saver_loop():
-        save_interval = max(30, min(120, int(getattr(args, 'progress_interval_sec', 15)) * 2))
+        base_interval = max(30, min(120, int(getattr(args, 'progress_interval_sec', 15)) * 2))
         last_saved = 0
         try:
             while stats['done'] < len(unique_urls):
+                # v47: интервал растёт с объёмом — на 20k+ строк каждая запись xlsx
+                # занимает десятки секунд (в отдельном потоке), сохранять каждые 30с
+                # бессмысленно: пишем реже, теряем при сбое не больше пары минут работы.
+                save_interval = min(300, base_interval + stats['rows_written'] // 200)
                 await asyncio.sleep(save_interval)
                 if stats['rows_written'] > last_saved:
                     try:
@@ -9384,6 +9490,13 @@ def build_parser():
     ap.add_argument("--registry-fsa-retry", type=str_to_bool, default=False,
                     help="v27.9.x: второй проход по упавшим FSA-ссылкам. По умолчанию FALSE — "
                          "запускается ТОЛЬКО по кнопке в окне (когда FSA снова доступен).")
+    ap.add_argument("--registry-resume", type=str_to_bool, default=True,
+                    help="v47: продолжение этапа 2 после обрыва — реестры, полноценно собранные "
+                         "в существующем result.xlsx (номер+название+статус), переносятся как есть, "
+                         "парсится только остаток. Фундамент больших прогонов (20k+).")
+    ap.add_argument("--registry-resume-max-age-hours", type=float, default=72.0,
+                    help="v47: максимальный возраст result.xlsx для resume этапа 2, часов. Старше — "
+                         "полный пере-парсинг (статусы документов могли поменяться).")
     ap.add_argument("--fsa-human-delay-ms", default="300,1400",
                     help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
                          "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "

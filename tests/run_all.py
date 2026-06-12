@@ -21,6 +21,7 @@ MODULES = [
     "test_fsa_fastfail",
     "test_fsa_retry",
     "test_fsa_retry_scope",
+    "test_scale_20k",
     "test_fsa_stealth",
     "test_fsa_cookie_http",
     "test_fsa_fields",

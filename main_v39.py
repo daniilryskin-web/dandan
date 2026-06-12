@@ -8579,9 +8579,14 @@ async def run_registry_stage(args):
     # чтобы их строки записались без повторного парсинга реестра.
     for _u, _val in _retry_seed.items():
         parsed.setdefault(_u, _val)
-    q: asyncio.Queue[str] = asyncio.Queue()
+    # v47: ДВЕ очереди. ФСА — браузерным воркерам (антибот/темп), а SWIS/BelGISS/
+    # прочие HTTP-реестры — отдельному HTTP-пулу. Раньше ВСЁ шло через
+    # registry_browser_workers (по умолчанию 2), и SWIS-тяжёлые прогоны (тысячи
+    # киргизских документов на 20k карточек) ползли часами через узкое горло.
+    q: asyncio.Queue[str] = asyncio.Queue()       # ФСА (браузер)
+    q_http: asyncio.Queue[str] = asyncio.Queue()  # SWIS/BelGISS/прочие (HTTP)
     for u in unique_urls:
-        q.put_nowait(u)
+        (q if hostname(u) == 'pub.fsa.gov.ru' else q_http).put_nowait(u)
 
     # v39.1: группируем rows по registry_url, чтобы сразу как только реестр распарсен
     # записать в out_store все ResultRow для всех товаров с этим реестром.
@@ -8692,7 +8697,8 @@ async def run_registry_stage(args):
                     f"Реестры: {stats['done']}/{len(unique_urls)}, скорость≈{speed:.1f}/мин, "
                     f"извлечено={stats['ok']}, пусто={stats['empty']}, ошибки={stats['errors']}, "
                     f"строк_в_xlsx={stats['rows_written']}/{len(rows)}, "
-                    f"очередь={q.qsize()}, FSA={stats['fsa']}, SWIS={stats['swis']}, "
+                    f"очередь_фса={q.qsize()}, очередь_http={q_http.qsize()}, "
+                    f"FSA={stats['fsa']}, SWIS={stats['swis']}, "
                     f"BELGISS={stats['belgiss']}, активные=[{act}]"
                 )
                 emit_progress("registry", stats['done'], len(unique_urls))
@@ -9093,22 +9099,75 @@ async def run_registry_stage(args):
                 except asyncio.CancelledError:
                     return
 
+            async def http_worker(hwid: int):
+                """v47: HTTP-воркер — SWIS/BelGISS/прочие НЕ-ФСА реестры без браузера.
+                Лёгкий HTTP-парсинг, можно много параллельно (антибот ФСА не при чём).
+                Кратно ускоряет SWIS-тяжёлые прогоны (тысячи киргизских документов)."""
+                while True:
+                    try:
+                        url = await asyncio.wait_for(q_http.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if q_http.empty():
+                            break
+                        continue
+                    active[f'h{hwid}'] = (url, time.time())
+                    cert = prod = typ = doc_status = detail = ''
+                    _per_to = max(30, int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30)
+                    try:
+                        h = hostname(url)
+                        if h in {'swis.trade.kg', 'trade.kg'}:
+                            cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                _parse_swis_http_v277(session, url, args), timeout=_per_to)
+                        elif h in _BELGISS_EAEU_HOSTS:
+                            cert, prod, typ, doc_status, detail = '', '', '', '', 'belgiss_link_only'
+                        else:
+                            cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                _parse_other_registry_http_v386(session, url, args), timeout=_per_to)
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        detail = f'registry_hard_timeout_{_per_to}s'
+                        stats['errors'] += 1
+                    except Exception as e:
+                        detail = f'registry_worker_error={type(e).__name__}: {str(e)[:180]}'
+                        stats['errors'] += 1
+                    finally:
+                        parsed[url] = (cert or '', prod or '', typ or '', doc_status or '', detail or '')
+                        stats['done'] += 1
+                        if prod:
+                            stats['ok'] += 1
+                        else:
+                            stats['empty'] += 1
+                        try:
+                            await _flush_url_to_store(url, cert or '', prod or '', typ or '',
+                                                      doc_status or '', detail or '')
+                        except Exception as e:
+                            print(f"⚠️  flush_url_to_store ошибка: {type(e).__name__}: {e}")
+                        active.pop(f'h{hwid}', None)
+                        q_http.task_done()
+
             if stall_restart_sec_stage2 > 0:
                 print(f"🛡  Watchdog 2 этапа активен: рестарт воркеров при отсутствии прогресса > {stall_restart_sec_stage2}с")
             watchdog_task = asyncio.create_task(watchdog_loop())
 
             workers = [asyncio.create_task(worker(i + 1)) for i in range(browser_workers)]
+            _n_http_workers = max(1, int(getattr(args, 'registry_http_workers', 6)))
+            http_tasks = [asyncio.create_task(http_worker(i + 1)) for i in range(_n_http_workers)]
+            if q_http.qsize() > 0:
+                print(f"⚡ HTTP-пул этапа 2: {_n_http_workers} воркеров на {q_http.qsize()} "
+                      f"НЕ-ФСА реестров (SWIS/BelGISS/прочие) — параллельно с ФСА.")
 
             # Ждём пока все реестры обработаны ИЛИ все воркеры умерли
             while stats['done'] < len(unique_urls):
                 await asyncio.sleep(1.0)
-                if all(w.done() for w in workers):
+                if all(w.done() for w in workers) and all(t.done() for t in http_tasks):
                     # Воркеры могли быть перезапущены watchdog'ом — проверим через 1 сек
                     await asyncio.sleep(1.0)
-                    if all(w.done() for w in workers):
-                        # Реально все умерли. Если очередь не пуста — лог и выход
-                        if not q.empty():
-                            print(f"⚠️  Все воркеры завершились, но в очереди ещё {q.qsize()} реестров")
+                    if all(w.done() for w in workers) and all(t.done() for t in http_tasks):
+                        # Реально все умерли. Если очереди не пусты — лог и выход
+                        if not q.empty() or not q_http.empty():
+                            print(f"⚠️  Все воркеры завершились, но в очередях ещё "
+                                  f"{q.qsize() + q_http.qsize()} реестров")
                         break
 
             # Отменяем watchdog
@@ -9117,8 +9176,8 @@ async def run_registry_stage(args):
                 await watchdog_task
             except asyncio.CancelledError:
                 pass
-            # Ждём завершения воркеров (они должны сами выйти когда очередь пуста)
-            await asyncio.gather(*workers, return_exceptions=True)
+            # Ждём завершения воркеров (они должны сами выйти когда очереди пусты)
+            await asyncio.gather(*workers, *http_tasks, return_exceptions=True)
 
             # v27.9.x: ВТОРОЙ ПРОХОД для FSA-ссылок, упавших по сетевой ошибке.
             # По умолчанию ВЫКЛючен — запускается ТОЛЬКО по кнопке в окне
@@ -9486,6 +9545,10 @@ def build_parser():
     ap.add_argument("--registry-browser-only", type=str_to_bool, default=False, help="Открывать поддерживаемые реестры браузером и извлекать данные только из видимой страницы; для ФСА и SWIS это самый точный режим, но медленнее HTTP")
     ap.add_argument("--fsa-exact-browser-fallback", type=str_to_bool, default=True, help="Для ФСА по умолчанию открыть /baseInfo|/common и /product браузером, если HTTP не достал точные поля")
     ap.add_argument("--registry-browser-workers", type=int, default=6, help="Сколько Chromium одновременно можно использовать для второго этапа/ФСА browser fallback")
+    ap.add_argument("--registry-http-workers", type=int, default=6,
+                    help="v47: отдельный HTTP-пул этапа 2 для НЕ-ФСА реестров (SWIS/BelGISS/прочие). "
+                         "Работает параллельно с браузерными воркерами ФСА — кратно ускоряет "
+                         "SWIS-тяжёлые прогоны на больших объёмах.")
     ap.add_argument("--registry-headless", type=str_to_bool, default=True)
     ap.add_argument("--registry-fsa-retry", type=str_to_bool, default=False,
                     help="v27.9.x: второй проход по упавшим FSA-ссылкам. По умолчанию FALSE — "

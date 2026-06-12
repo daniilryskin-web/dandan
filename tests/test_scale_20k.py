@@ -97,6 +97,21 @@ def main():
     check("автосейв prefetch есть (обрыв 20k не теряет прогресс)",
           "периодический автосейв ВНУТРИ prefetch" in src)
 
+    # --- этап 2: отдельный HTTP-пул для НЕ-ФСА реестров ---
+    check("--registry-http-workers по умолчанию 6", a.registry_http_workers == 6)
+    check("очереди этапа 2 разделены (ФСА/HTTP)", "q_http" in src and "async def http_worker" in src)
+    check("ожидание учитывает оба пула воркеров",
+          "all(t.done() for t in http_tasks)" in src)
+
+    # --- GUI: кэш результатов + порционный рендер таблицы ---
+    gui = (Path(__file__).resolve().parents[1] / "wb_checker.py").read_text(encoding="utf-8")
+    check("get_results кэшируется по (path, mtime, size)", "_results_cache" in gui
+          and "st_mtime_ns" in gui)
+    check("таблица рендерится порциями (TABLE_CHUNK)", "TABLE_CHUNK" in gui
+          and "_nextChunkHtml" in gui)
+    check("кнопка «Показать ещё» есть", "tbl-more" in gui)
+    check("клики делегированы (не тысячи обработчиков)", "wrap.onclick" in gui)
+
 
 if __name__ == "__main__":
     main()

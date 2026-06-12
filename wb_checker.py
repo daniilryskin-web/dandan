@@ -1350,6 +1350,17 @@ class Bridge:
             path = freshest_xlsx(Path(chosen))
         if not path.exists():
             return {"ok": False, "error": "Файл результата не найден. Запустите прогон или загрузите файл."}
+        # v47: КЭШ для больших файлов. На 20k+ строк чтение xlsx + статистика
+        # занимает секунды — без кэша КАЖДОЕ переключение на экран «Результаты»
+        # замораживало окно. Перечитываем только если файл реально изменился.
+        try:
+            st = path.stat()
+            cache_key = (str(path), st.st_mtime_ns, st.st_size)
+        except Exception:
+            cache_key = None
+        cached = getattr(self, "_results_cache", None)
+        if cache_key and cached and cached.get("key") == cache_key:
+            return cached["payload"]
         try:
             from openpyxl import load_workbook  # type: ignore
             wb = load_workbook(path, read_only=True, data_only=True)
@@ -1478,7 +1489,7 @@ class Bridge:
             except Exception as exc:
                 log.warning("Сборка статистики не удалась: %s", exc)
 
-            return {
+            payload = {
                 "ok": True,
                 "sheet": sheet_name,
                 "columns": headers,
@@ -1487,6 +1498,9 @@ class Bridge:
                 "stats": stats,
                 "xlsx_path": str(path),
             }
+            if cache_key:
+                self._results_cache = {"key": cache_key, "payload": payload}
+            return payload
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -3344,6 +3358,76 @@ function _sortRows(rows, ci, dir) {
   });
 }
 
+// v47: ПОРЦИОННЫЙ рендер таблицы. На 20k+ строк построение DOM одним куском
+// (раньше 5000 строк × ~20 колонок) замораживало окно на секунды. Теперь
+// рендерим порциями по TABLE_CHUNK с кнопкой «Показать ещё»; фильтры,
+// сортировка и диаграммы по-прежнему работают по ПОЛНОМУ набору строк.
+const TABLE_CHUNK = 800;
+let _tblView = [];   // строки текущего вида (после сортировки)
+let _tblShown = 0;   // сколько строк уже в DOM
+let _tblCtx = null;  // {colIdx, hl, purlIdx, rurlIdx}
+
+function _rowHtml(row) {
+  const { colIdx, hl, purlIdx, rurlIdx } = _tblCtx;
+  const purl = purlIdx >= 0 ? String(row[purlIdx] ?? '') : '';
+  const rurl = rurlIdx >= 0 ? String(row[rurlIdx] ?? '') : '';
+  let html = '<tr>';
+  colIdx.forEach((ci) => {
+    const v = String(row[ci] ?? '');
+    const head = hl[ci] || '';
+    let badge = '';
+    if (head.includes('риск')) {
+      if (v === 'Действует')         badge = 'badge-ok';
+      else if (v === 'Скоро истекает') badge = 'badge-warn';
+      else if (v === 'Истёк')          badge = 'badge-error';
+      else if (v)                      badge = 'badge-muted';
+    } else if (head.includes('статус') || head.includes('status')) {
+      // Технический статус + Статус документа + Статус на территории РФ.
+      if (v.includes('OK') || v.includes('СОБРАНА') || v === 'Действует') badge = 'badge-ok';
+      else if (v.includes('НЕДЕЙСТВ') || v.includes('НЕСООТВЕТ') || v.includes('ОШИБКА')
+               || v.includes('ТАЙМАУТ') || v.includes('Прекращ') || v.includes('Аннулир')) badge = 'badge-error';
+      else if (v.includes('ПРОВЕРИТЬ') || v.includes('НЕ УДАЛОСЬ')
+               || v.includes('Приостановл') || v.includes('Архивн')) badge = 'badge-warn';
+      else if (v) badge = 'badge-muted';
+    } else if (head.includes('маркетплейс') || head.includes('marketplace')) {
+      if (v === 'WB' || v.toLowerCase().includes('wildberries')) badge = 'badge-wb';
+      else if (v.toLowerCase().includes('ozon')) badge = 'badge-ozon';
+    }
+    // Кликабельные ссылки: «Артикул WB» -> товар, «Номер документа» -> реестр.
+    if ((head.includes('артикул') || head === 'nm_id') && purl) {
+      html += `<td class="cell-link" data-url="${escapeHtml(purl)}" title="Открыть товар на WB">${escapeHtml(v)} ↗</td>`;
+      return;
+    }
+    if ((head.includes('номер документа') || head.includes('certificate_number')) && rurl) {
+      html += `<td class="cell-link" data-url="${escapeHtml(rurl)}" title="Открыть реестр документа">${escapeHtml(v || 'реестр')} ↗</td>`;
+      return;
+    }
+    // длинные текстовые поля (название товара / название в реестре) — кликабельны (полный текст)
+    const isLong = (head.includes('название') || head.includes('изготовитель') || head.includes('примечан')) && v.length > 28;
+    const cellCls = isLong ? ' class="cell-expand"' : '';
+    html += badge
+      ? `<td><span class="badge ${badge}">${escapeHtml(v)}</span></td>`
+      : `<td${cellCls} title="${escapeHtml(v)}" data-full="${escapeHtml(v)}">${escapeHtml(v)}</td>`;
+  });
+  return html + '</tr>';
+}
+
+function _nextChunkHtml() {
+  const slice = _tblView.slice(_tblShown, _tblShown + TABLE_CHUNK);
+  _tblShown += slice.length;
+  return slice.map(_rowHtml).join('');
+}
+
+function _updateMoreBtn(wrap) {
+  const more = wrap.querySelector('#tbl-more');
+  if (!more) return;
+  const left = _tblView.length - _tblShown;
+  if (left <= 0) { more.style.display = 'none'; return; }
+  more.style.display = '';
+  more.querySelector('button').textContent =
+    `Показать ещё ${Math.min(TABLE_CHUNK, left)} (показано ${_tblShown} из ${_tblView.length})`;
+}
+
 function renderTable(rows) {
   const wrap = $('#tbl-wrap');
   if (!rows.length) {
@@ -3355,6 +3439,14 @@ function renderTable(rows) {
   // Сортировка (если выбрана колонка)
   let viewRows = rows;
   if (_sortCol >= 0) viewRows = _sortRows(rows, _sortCol, _sortDir);
+  _tblView = viewRows;
+  _tblShown = 0;
+  _tblCtx = {
+    colIdx,
+    hl: _allHeaders.map(x => x.toLowerCase()),
+    purlIdx: _allHeaders.findIndex(h => /ссылка на товар|product_url/i.test(h)),
+    rurlIdx: _allHeaders.findIndex(h => /ссылка на реестр|registry_url/i.test(h)),
+  };
 
   let html = '<table><thead><tr>' +
     colIdx.map(i => {
@@ -3363,80 +3455,36 @@ function renderTable(rows) {
       const lbl = escapeHtml(h.length > 22 ? h.slice(0,20)+'…' : h) + arrow;
       return `<th class="sortable" data-col="${i}" title="${escapeHtml(h)} (клик — сортировать)">${lbl}</th>`;
     }).join('') +
-    '</tr></thead><tbody>';
-  const hl = _allHeaders.map(x => x.toLowerCase());
-  // Индексы URL-колонок (не показываются, но используются для кликов)
-  const purlIdx = _allHeaders.findIndex(h => /ссылка на товар|product_url/i.test(h));
-  const rurlIdx = _allHeaders.findIndex(h => /ссылка на реестр|registry_url/i.test(h));
-  for (const row of viewRows.slice(0, 5000)) {
-    const purl = purlIdx >= 0 ? String(row[purlIdx] ?? '') : '';
-    const rurl = rurlIdx >= 0 ? String(row[rurlIdx] ?? '') : '';
-    html += '<tr>';
-    colIdx.forEach((ci) => {
-      const v = String(row[ci] ?? '');
-      const head = hl[ci] || '';
-      let badge = '';
-      if (head.includes('риск')) {
-        if (v === 'Действует')         badge = 'badge-ok';
-        else if (v === 'Скоро истекает') badge = 'badge-warn';
-        else if (v === 'Истёк')          badge = 'badge-error';
-        else if (v)                      badge = 'badge-muted';
-      } else if (head.includes('статус') || head.includes('status')) {
-        // Технический статус + Статус документа + Статус на территории РФ.
-        if (v.includes('OK') || v.includes('СОБРАНА') || v === 'Действует') badge = 'badge-ok';
-        else if (v.includes('НЕДЕЙСТВ') || v.includes('НЕСООТВЕТ') || v.includes('ОШИБКА')
-                 || v.includes('ТАЙМАУТ') || v.includes('Прекращ') || v.includes('Аннулир')) badge = 'badge-error';
-        else if (v.includes('ПРОВЕРИТЬ') || v.includes('НЕ УДАЛОСЬ')
-                 || v.includes('Приостановл') || v.includes('Архивн')) badge = 'badge-warn';
-        else if (v) badge = 'badge-muted';
-      } else if (head.includes('маркетплейс') || head.includes('marketplace')) {
-        if (v === 'WB' || v.toLowerCase().includes('wildberries')) badge = 'badge-wb';
-        else if (v.toLowerCase().includes('ozon')) badge = 'badge-ozon';
-      }
-      // Кликабельные ссылки: «Артикул WB» -> товар, «Номер документа» -> реестр.
-      if ((head.includes('артикул') || head === 'nm_id') && purl) {
-        html += `<td class="cell-link" data-url="${escapeHtml(purl)}" title="Открыть товар на WB">${escapeHtml(v)} ↗</td>`;
-        return;
-      }
-      if ((head.includes('номер документа') || head.includes('certificate_number')) && rurl) {
-        html += `<td class="cell-link" data-url="${escapeHtml(rurl)}" title="Открыть реестр документа">${escapeHtml(v || 'реестр')} ↗</td>`;
-        return;
-      }
-      // длинные текстовые поля (название товара / название в реестре) — кликабельны (полный текст)
-      const isLong = (head.includes('название') || head.includes('изготовитель') || head.includes('примечан')) && v.length > 28;
-      const cellCls = isLong ? ' class="cell-expand"' : '';
-      html += badge
-        ? `<td><span class="badge ${badge}">${escapeHtml(v)}</span></td>`
-        : `<td${cellCls} title="${escapeHtml(v)}" data-full="${escapeHtml(v)}">${escapeHtml(v)}</td>`;
-    });
-    html += '</tr>';
-  }
-  html += '</tbody></table>';
+    '</tr></thead><tbody>' + _nextChunkHtml() + '</tbody></table>' +
+    '<div id="tbl-more" style="text-align:center;padding:10px"><button class="btn btn-ghost btn-sm"></button></div>';
   wrap.innerHTML = html;
+  _updateMoreBtn(wrap);
 
-  // Клик по ссылочной ячейке — открыть в браузере
-  wrap.querySelectorAll('td.cell-link').forEach(td => {
-    td.addEventListener('click', () => {
-      const u = td.dataset.url;
-      if (u) window.pywebview.api.open_url(u);
-    });
-  });
-
-  // Клик по заголовку — сортировка
-  wrap.querySelectorAll('th.sortable').forEach(th => {
-    th.addEventListener('click', () => {
+  // v47: ДЕЛЕГИРОВАНИЕ кликов (один обработчик вместо тысяч на ячейках) —
+  // дешевле на больших таблицах и автоматически работает для дорендеренных порций.
+  wrap.onclick = (e) => {
+    const moreBtn = e.target.closest('#tbl-more button');
+    if (moreBtn) {
+      const tbody = wrap.querySelector('tbody');
+      if (tbody) tbody.insertAdjacentHTML('beforeend', _nextChunkHtml());
+      _updateMoreBtn(wrap);
+      return;
+    }
+    const link = e.target.closest('td.cell-link');
+    if (link) {
+      if (link.dataset.url) window.pywebview.api.open_url(link.dataset.url);
+      return;
+    }
+    const th = e.target.closest('th.sortable');
+    if (th) {
       const ci = Number(th.dataset.col);
       if (_sortCol === ci) _sortDir = -_sortDir; else { _sortCol = ci; _sortDir = 1; }
       renderTable(_lastRenderRows);
-    });
-  });
-  // Клик по длинной ячейке — показать полный текст
-  wrap.querySelectorAll('td.cell-expand').forEach(td => {
-    td.addEventListener('click', () => {
-      const full = td.dataset.full || td.textContent;
-      showFullTextModal(full);
-    });
-  });
+      return;
+    }
+    const exp = e.target.closest('td.cell-expand');
+    if (exp) showFullTextModal(exp.dataset.full || exp.textContent);
+  };
 }
 
 function showFullTextModal(text) {

@@ -149,6 +149,12 @@ class RunSpec:
     query_profile: str = "auto"
     """v27.9.x: доменный профиль движка для stage1 (clothing/shoes/appliances/...)."""
 
+    catalog_sweep: bool = False
+    """v48: «поиск без запроса» — программа сама сметает каталог WB по типам товаров."""
+
+    catalog_categories: str = ""
+    """v48: RU-категории (через запятую) для сметания каталога. Пусто = ВСЕ категории."""
+
     registry_fsa_retry: bool = False
     """v27.9.x: второй проход по упавшим FSA (по кнопке)."""
 
@@ -226,6 +232,13 @@ class RunSpec:
                 "--query", self.query,
                 "--limit", str(self.limit),
                 "--link-only", "true",
+            ]
+            # v48: «поиск без запроса» — сметание каталога вместо одного запроса.
+            if self.catalog_sweep:
+                a += ["--catalog-sweep", "true"]
+                if self.catalog_categories:
+                    a += ["--catalog-categories", self.catalog_categories]
+            a += [
                 "--link-mode", "http_only",
                 # v45.11: было workers*10 (=30) — слишком много одновременных
                 # запросов к wbbasket.ru, WB начинал троттлить IP (растущие «сетевые
@@ -549,14 +562,19 @@ class EngineRunner:
         try:
             if spec.mode == "unified":
                 self._run_unified(spec)
-            elif spec.mode == "query_full":
+            elif spec.mode in ("query_full", "query_auto"):
                 # Цепочка: Stage1 → Stage2. v27.9.x: товарная категория (если
                 # выбрана) -> --query-profile, чтобы запрос к WB был точнее.
+                # v48: query_auto — «поиск без запроса» (сметание каталога WB).
+                _is_auto = spec.mode == "query_auto"
                 s1 = RunSpec(**{**asdict(spec), "mode": "query_stage1",
                                 "query_profile": _categories_to_profile(spec.brand_category),
+                                "catalog_sweep": _is_auto,
+                                "catalog_categories": (spec.catalog_categories if _is_auto else ""),
                                 "output_links_csv": "registry_links.csv",
                                 "output": "links.xlsx"})
-                rc = self._run_one(s1.wb_args(), "🔍 Этап 1 — сбор ссылок WB")
+                _lbl1 = "🧭 Этап 1 — сбор каталога WB (без запроса)" if _is_auto else "🔍 Этап 1 — сбор ссылок WB"
+                rc = self._run_one(s1.wb_args(), _lbl1)
                 if rc != 0 or self._stop_flag.is_set():
                     return
                 s2 = RunSpec(**{**asdict(spec), "mode": "query_stage2",
@@ -1131,7 +1149,7 @@ class Bridge:
             return {"ok": False, "error": "Укажите поисковый запрос"}
         if mode == "brand" and not run_spec.brand.strip():
             return {"ok": False, "error": "Укажите название бренда"}
-        if mode in ("query_full", "query_stage1", "query_stage2") and not ENGINE_V39.exists():
+        if mode in ("query_full", "query_auto", "query_stage1", "query_stage2") and not ENGINE_V39.exists():
             return {"ok": False, "error": f"Движок WB Query не найден: {ENGINE_V39.name}"}
         if mode == "brand" and not ENGINE_V39.exists():
             # v27.9.x: бренд-режим теперь использует движок main_v39 (как «по запросу»).
@@ -2271,6 +2289,7 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
         <!-- WB mode tabs — скрывается при ozon/both -->
         <div id="wb-mode-row" class="seg-ctrl" style="margin-left:12px; margin-bottom:16px;">
           <button class="seg-btn active" data-mode="query_full">По запросу (полный)</button>
+          <button class="seg-btn" data-mode="query_auto">Без запроса (каталог)</button>
           <button class="seg-btn" data-mode="query_stage1">Только ссылки</button>
           <button class="seg-btn" data-mode="query_stage2">Только реестры (CSV)</button>
           <button class="seg-btn" data-mode="brand">По бренду</button>
@@ -2724,6 +2743,21 @@ const FORM_FIELDS = {
     {key:'fsa_slow_delay_sec', lbl:'Пауза ФСА, сек (медл. режим)', type:'number', def:0, min:0, max:30,
       hint:'0 = авто (~2.5–5с). Меньше — быстрее, но выше риск бана; при блокировках пауза сама растёт.'},
   ],
+  query_auto: [
+    {key:'limit',   lbl:'Сколько карточек собрать',  type:'number', def:50000, min:1, max:500000,
+      hint:'Программа сама подберёт запросы и сметёт каталог WB до этого числа карточек'},
+    {key:'catalog_categories', lbl:'Категории (необязательно)', type:'multiselect', def:'',
+      options:['одежда','обувь','бытовая техника','электроника','игрушки','косметика','детские аксессуары','детский транспорт','дом и текстиль','посуда','продукты'],
+      hint:'Ничего не выбрано — сметаются ВСЕ категории. Выбор сужает сбор до них.'},
+    {key:'workers', lbl:'Браузер-воркеры',       type:'number', def:5, min:1, max:12, hint:'Параллельных браузеров для парсинга реестров (4–6 оптимально)'},
+    {key:'expiry_warning_days', lbl:'Скоро истекает (дней)', type:'number', def:30, min:1, max:365},
+    {key:'headless',        lbl:'Скрытый браузер',    type:'switch', def:true},
+    {key:'make_report_xlsx',lbl:'Расширенный отчёт',   type:'switch', def:true, hint:'Листы «Сводка» + «Подробности»'},
+    {key:'fsa_slow_mode',   lbl:'Медленный режим ФСА (без блокировок)', type:'switch', def:true,
+      hint:'Для больших прогонов 50k+ рекомендуется ВКЛ: ФСА по одному документу с паузой — IP не банится. SWIS/прочие идут параллельно.'},
+    {key:'fsa_slow_delay_sec', lbl:'Пауза ФСА, сек (медл. режим)', type:'number', def:0, min:0, max:30,
+      hint:'0 = авто (~2.5–5с). При блокировках пауза сама растёт.'},
+  ],
   query_stage1: [
     {key:'query',            lbl:'Поисковый запрос',  type:'text',   def:'детская обувь'},
     {key:'limit',            lbl:'Лимит карточек',    type:'number', def:10000, min:1, max:200000},
@@ -2787,6 +2821,7 @@ const FORM_FIELDS = {
 
 const MODE_LABELS = {
   query_full:   '🔍 По запросу — полный прогон',
+  query_auto:   '🧭 Без запроса — сметание каталога WB',
   query_stage1: '🔗 Только сбор ссылок (Этап 1)',
   query_stage2: '📋 Только реестры из CSV (Этап 2)',
   brand:        '🏷️ По бренду WB',
@@ -2795,7 +2830,7 @@ const MODE_LABELS = {
 };
 
 const MKT_TAGS = {
-  query_full: 'WB', query_stage1: 'WB', query_stage2: 'WB',
+  query_full: 'WB', query_auto: 'WB', query_stage1: 'WB', query_stage2: 'WB',
   brand: 'WB', ozon: 'Ozon', unified: 'WB+Ozon'
 };
 

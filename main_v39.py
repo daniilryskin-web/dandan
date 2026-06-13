@@ -2437,6 +2437,95 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
             break
     return clean
 
+# v48: «ПОИСК БЕЗ ЗАПРОСА» — программа сама формирует запросы, сметая каталог WB
+# по типам товаров всех (или выбранных) категорий. Порядок доменов: массовые/
+# ходовые категории первыми, чтобы охват рос максимально быстро.
+CATALOG_SWEEP_DOMAINS = [
+    'clothing', 'shoes', 'toys', 'kids_accessories', 'home', 'kitchenware',
+    'appliances', 'electronics', 'cosmetics', 'baby_gear', 'food',
+]
+
+# Несколько обобщённых «категорийных» сидов на домен — широкие выдачи WB, дающие
+# большой пул карточек ещё до перебора конкретных типов товаров.
+CATALOG_DOMAIN_SEEDS = {
+    'clothing': ['одежда детская', 'одежда женская', 'одежда мужская'],
+    'shoes': ['обувь детская', 'обувь женская', 'обувь мужская'],
+    'toys': ['игрушки', 'развивающие игрушки'],
+    'kids_accessories': ['детские аксессуары', 'головные уборы детские'],
+    'home': ['постельное белье', 'домашний текстиль'],
+    'kitchenware': ['посуда', 'посуда кухонная'],
+    'appliances': ['бытовая техника', 'техника для кухни'],
+    'electronics': ['электроника', 'аксессуары для телефонов'],
+    'cosmetics': ['косметика', 'уход за кожей'],
+    'baby_gear': ['товары для новорожденных', 'детский транспорт'],
+    'food': ['детское питание', 'продукты питания'],
+}
+
+_CATALOG_RU_TO_DOMAIN = {
+    'clothing': 'clothing', 'одежда': 'clothing',
+    'shoes': 'shoes', 'обувь': 'shoes',
+    'toys': 'toys', 'игрушки': 'toys',
+    'cosmetics': 'cosmetics', 'косметика': 'cosmetics',
+    'electronics': 'electronics', 'электроника': 'electronics',
+    'home': 'home', 'дом': 'home', 'дом и текстиль': 'home', 'текстиль': 'home',
+    'kitchenware': 'kitchenware', 'посуда': 'kitchenware',
+    'food': 'food', 'продукты': 'food', 'питание': 'food',
+    'baby_gear': 'baby_gear', 'детский транспорт': 'baby_gear',
+    'kids_accessories': 'kids_accessories', 'детские аксессуары': 'kids_accessories',
+    'appliances': 'appliances', 'бытовая техника': 'appliances', 'техника': 'appliances',
+}
+
+
+def catalog_domains_for(profile_keys: Optional[List[str]]) -> List[str]:
+    """RU/en метки категорий -> список доменов (в порядке поступления)."""
+    out: List[str] = []
+    for k in (profile_keys or []):
+        d = _CATALOG_RU_TO_DOMAIN.get((k or '').strip().lower())
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def generate_catalog_queries(profile_keys: Optional[List[str]] = None,
+                             max_variants: int = 1200, kids: bool = False) -> List[str]:
+    """v48: «поиск без запроса» — программа сама формирует запросы, сметая каталог
+    WB по типам товаров всех (или выбранных) категорий. Возвращает широкий,
+    breadth-first (по кругу между категориями) список запросов: сначала обобщённые
+    сиды по каждой категории, затем конкретные типы товаров вперемешку."""
+    domains = catalog_domains_for(profile_keys) or list(CATALOG_SWEEP_DOMAINS)
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(q: str) -> None:
+        q = re.sub(r"\s+", " ", str(q)).strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+
+    # 1) обобщённые сиды — широкий пул сразу (по одному кругу между категориями)
+    _seed_lists = {d: list(CATALOG_DOMAIN_SEEDS.get(d, [])) for d in domains}
+    _j = 0
+    while any(_j < len(_seed_lists[d]) for d in domains):
+        for d in domains:
+            if _j < len(_seed_lists[d]):
+                _add(_seed_lists[d][_j])
+        _j += 1
+    # 2) конкретные типы — интерливинг по доменам (breadth-first)
+    per = {d: list(DOMAIN_PRODUCT_TYPES.get(d, [])) for d in domains}
+    i = 0
+    while len(out) < max_variants and any(i < len(per[d]) for d in domains):
+        for d in domains:
+            if i < len(per[d]) and len(out) < max_variants:
+                t = per[d][i]
+                if kids and not any(w in t.lower() for w in
+                                    ('детск', 'для', 'малыш', 'новорожд', 'школьн', 'подрост')):
+                    _add(f'детские {t}')
+                else:
+                    _add(t)
+        i += 1
+    return out[:max_variants]
+
+
 def recursive_find_products(obj: Any) -> List[Dict[str, Any]]:
     res = []
     if isinstance(obj, dict):
@@ -2872,25 +2961,43 @@ async def collect_cards(args) -> List[Card]:
             _brand_domains.append(_d)
     _profile_key = _profile_keys[0] if _profile_keys else 'auto'
 
-    _max_q = scaled_max_queries(int(args.limit), int(args.max_expanded_queries))
-    if _max_q != int(args.max_expanded_queries):
-        print(f"📈 Большой лимит ({args.limit}): расширяю число вариантов запроса до {_max_q} "
-              f"(WB ограничивает глубину выдачи на один запрос).")
-    variants = generate_query_variants(args.query, args.query_profile, _max_q)
-    if _brand_search:
-        # Бренд: чистый бренд + (если выбраны категории) «бренд + тип товара» из
-        # КАЖДОЙ выбранной категории. Больше карточек, не выходя за категории.
-        if _brand_domains:
-            variants = [args.brand]
-            for _d in _brand_domains:
-                variants += [f"{args.brand} {t}" for t in DOMAIN_PRODUCT_TYPES.get(_d, [])]
-        else:
-            variants = [args.brand]
-    elif args.limit <= args.per_query_limit and not args.auto_expand:
-        variants = [args.query]
+    # v48: «ПОИСК БЕЗ ЗАПРОСА» — пользователь задал только число карточек, программа
+    # сама сметает каталог WB по типам товаров (всех или выбранных категорий).
+    _catalog_sweep = bool(getattr(args, 'catalog_sweep', False)) and not _brand_search
+    _cat_keys = [s.strip() for s in (getattr(args, 'catalog_categories', '') or '').split(',') if s.strip()]
+    if _catalog_sweep:
+        _sweep_max = min(2000, max(300, int(args.limit) // 25))
+        variants = generate_catalog_queries(_cat_keys, _sweep_max)
+        print(f"🧭 Поиск БЕЗ запроса (сметание каталога WB): категории={_cat_keys or 'ВСЕ'}, "
+              f"вариантов запросов={len(variants)}, лимит={args.limit}.")
+    else:
+        _max_q = scaled_max_queries(int(args.limit), int(args.max_expanded_queries))
+        if _max_q != int(args.max_expanded_queries):
+            print(f"📈 Большой лимит ({args.limit}): расширяю число вариантов запроса до {_max_q} "
+                  f"(WB ограничивает глубину выдачи на один запрос).")
+        variants = generate_query_variants(args.query, args.query_profile, _max_q)
+        if _brand_search:
+            # Бренд: чистый бренд + (если выбраны категории) «бренд + тип товара» из
+            # КАЖДОЙ выбранной категории. Больше карточек, не выходя за категории.
+            if _brand_domains:
+                variants = [args.brand]
+                for _d in _brand_domains:
+                    variants += [f"{args.brand} {t}" for t in DOMAIN_PRODUCT_TYPES.get(_d, [])]
+            else:
+                variants = [args.brand]
+        elif args.limit <= args.per_query_limit and not args.auto_expand:
+            variants = [args.query]
 
     strict_filter_enabled = getattr(args, 'strict_domain_filter', True)
-    if _brand_search:
+    if _catalog_sweep:
+        # Сметание каталога: если выбраны конкретные категории — фильтруем выдачу по
+        # ним (точнее); если категорий нет (ВСЕ) — фильтр выключен (берём всё подряд).
+        _sw_domains = catalog_domains_for(_cat_keys)
+        domain = ','.join(_sw_domains) if _sw_domains else ''
+        use_filter = bool(_sw_domains) and strict_filter_enabled and any(
+            DOMAIN_SUBJECT_NAME_KEYWORDS.get(d) or DOMAIN_SUBJECT_WHITELIST.get(d)
+            for d in _sw_domains)
+    elif _brand_search:
         # v45.3: ПОИСК ПО БРЕНДУ. Категория нужна НЕ чтобы резать выдачу, а чтобы
         # ДОБРАТЬ больше карточек бренда: по «голому» бренду WB отдаёт одну выдачу
         # (~сотню), а варианты «бренд + тип товара категории» (стиральные машины,
@@ -2912,7 +3019,8 @@ async def collect_cards(args) -> List[Card]:
         has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
         use_filter = strict_filter_enabled and domain and has_signals
     filter_label = f"domain={domain} subject_filter={'ON' if use_filter else 'OFF'}"
-    print(f"Получаю список карточек через JSON-каталог WB: базовый query='{args.query}', вариантов={len(variants)}, общий limit={args.limit}, collect-workers={args.collect_workers}; {filter_label}")
+    _q_label = (args.query or '').strip() or ('БЕЗ ЗАПРОСА (каталог)' if _catalog_sweep else '')
+    print(f"Получаю список карточек через JSON-каталог WB: базовый query='{_q_label}', вариантов={len(variants)}, общий limit={args.limit}, collect-workers={args.collect_workers}; {filter_label}")
 
     timeout = aiohttp.ClientTimeout(total=18)
     headers = {
@@ -3603,25 +3711,34 @@ class ResultStore:
         async with self.lock:
             self.rows.append(row)
 
-    async def save(self):
-        # v47: НЕБЛОКИРУЮЩЕЕ сохранение для больших прогонов (20k+ строк).
+    async def save(self, final: bool = False):
+        # v47/48: НЕБЛОКИРУЮЩЕЕ сохранение для больших прогонов (20k–50k+ строк).
         # Синхронная запись openpyxl на десятках тысяч строк занимает секунды и
         # раньше блокировала event loop: воркеры замирали, watchdog считал прогон
         # зависшим и перезапускал воркеры. Теперь запись идёт в отдельном потоке,
-        # а параллельные вызовы сериализуются отдельным локом (каждый забирает
-        # актуальный снимок строк — финальное сохранение ничего не теряет).
+        # а параллельные вызовы сериализуются отдельным локом.
+        # v48: CSV (resume-критичный, дешёвый) пишем ВСЕГДА; дорогой xlsx-отчёт на
+        # БОЛЬШИХ наборах строим РЕЖЕ (каждый 6-й промежуточный + всегда финальный),
+        # иначе на 50k каждое автосохранение пересобирало многолистовой xlsx секунды.
         if not hasattr(self, "_save_lock"):
             self._save_lock = asyncio.Lock()
         async with self._save_lock:
             async with self.lock:
                 rows = list(self.rows)
+            n = len(rows)
+            self._save_calls = getattr(self, "_save_calls", 0) + 1
+            big = n >= 12000
+            # xlsx можно прореживать ТОЛЬКО когда есть дешёвый CSV (resume/данные не
+            # теряются). Без CSV (например out_store этапа 2) xlsx пишем всегда.
+            write_xlsx = final or (not big) or (self.csv_path is None) or (self._save_calls % 6 == 0)
 
             def _write():
                 if self.csv_path:
                     self._save_csv(rows, self.csv_path)
-                self._save_xlsx(rows, self.xlsx_path)
+                if write_xlsx:
+                    self._save_xlsx(rows, self.xlsx_path)
             await asyncio.to_thread(_write)
-            self.last_save_count = len(rows)
+            self.last_save_count = n
 
     def _save_csv(self, rows: List[ResultRow], path: Path):
         fields = list(ResultRow.__dataclass_fields__.keys())
@@ -4630,7 +4747,7 @@ async def run_link_collection(args):
     }
     print(f"К обработке в этом запуске: осталось={len(remaining)}, уже есть={len(processed)}")
     if not remaining:
-        await store.save()
+        await store.save(final=True)
         print(f"Все карточки текущей выборки уже есть в CSV/XLSX: {len(processed)}/{len(cards)}")
         return
 
@@ -4650,7 +4767,7 @@ async def run_link_collection(args):
                 worker="http", checked_at=now_iso(),
             )
             await store.add(row)
-        await store.save()
+        await store.save(final=True)
         return
 
     print(f"Параллельность: browsers={args.browser_count}, workers={args.workers}, headless={args.headless}, registry-mode=strict")
@@ -4762,7 +4879,7 @@ async def run_link_collection(args):
         finally:
             await pool.close_all()
 
-    await store.save()
+    await store.save(final=True)
     print(
         f"Финальный прогресс: обработано={progress['done']}/{len(cards)}, ссылок={progress['links']}, "
         f"нет документов={progress['no_docs']}, нет ссылки={progress['no_link']}, тех.статусы={progress['tech']}"
@@ -9397,7 +9514,7 @@ async def run_registry_stage(args):
         missed_count += 1
     if missed_count:
         print(f"Допишу {missed_count} строк, которые не успели сохраниться при парсинге.")
-    await out_store.save()
+    await out_store.save(final=True)
     print(
         f"Готово. Excel сохранён: {Path(args.output).resolve()}. "
         f"Извлечено названий по уникальным реестрам: {stats['ok']}/{len(unique_urls)}; пусто={stats['empty']}; ошибки={stats['errors']}"
@@ -9466,6 +9583,13 @@ def apply_speed_profile(args):
 def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", default="", help="Поисковый запрос WB")
+    ap.add_argument("--catalog-sweep", type=str_to_bool, default=False,
+                    help="v48: ПОИСК БЕЗ ЗАПРОСА. Программа сама формирует запросы, сметая "
+                         "каталог WB по типам товаров. Укажи только --limit (и опционально "
+                         "--catalog-categories). Идеально для массового сбора 50k+ карточек.")
+    ap.add_argument("--catalog-categories", default="",
+                    help="v48: категории для сметания каталога через запятую (одежда,обувь,"
+                         "игрушки,…). Пусто = ВСЕ категории.")
     ap.add_argument("--query-profile", default="auto",
                     help="v39.7: домен товаров для умной генерации запросов. auto = определяется по запросу. "
                          "Можно несколько через запятую (напр. clothing,shoes). Поддержка: clothing/одежда, "
@@ -9668,10 +9792,11 @@ async def main_async():
         await run_registry_stage(args)
         return
 
-    if not args.query and not args.input_csv:
+    # v48: режим «без запроса» (catalog sweep) не требует query.
+    if not args.query and not args.input_csv and not getattr(args, 'catalog_sweep', False):
         args.query = input("Введите поисковый запрос: ").strip()
-    if not args.query and not args.input_csv:
-        raise SystemExit("Не указан query или input-csv")
+    if not args.query and not args.input_csv and not getattr(args, 'catalog_sweep', False):
+        raise SystemExit("Не указан query, catalog-sweep или input-csv")
 
     await run_link_collection(args)
 

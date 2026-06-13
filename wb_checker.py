@@ -3538,11 +3538,18 @@ function showFullTextModal(text) {
 
 // v46: текстовый поиск и выпадающий статус — тоже часть ЕДИНОЙ системы фильтров
 // (комбинируются с фильтрами диаграмм и пересчитывают все диаграммы).
+// v48: ДЕБАУНС поиска — на 50k+ строк пересчёт фильтра+диаграмм на каждое нажатие
+// клавиши заметно лагал; ждём 220мс тишины и считаем один раз.
+let _filterDebounce = null;
 $('#filter-input').addEventListener('input', e => {
   const q = e.target.value.trim();
-  if (q) setFilter('text', 'Поиск: ' + q,
-                   r => r.some(c => String(c).toLowerCase().includes(q.toLowerCase())));
-  else removeFilter('text');
+  if (_filterDebounce) clearTimeout(_filterDebounce);
+  _filterDebounce = setTimeout(() => {
+    const ql = q.toLowerCase();
+    if (q) setFilter('text', 'Поиск: ' + q,
+                     r => r.some(c => String(c).toLowerCase().includes(ql)));
+    else removeFilter('text');
+  }, 220);
 });
 $('#filter-status').addEventListener('change', e => {
   const st = e.target.value;

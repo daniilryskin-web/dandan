@@ -662,7 +662,7 @@ STATUS_TIMEOUT = "ТАЙМАУТ"
 STATUS_ERROR = "ОШИБКА"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-06-v27.6-playwright"
+APP_VERSION = "2026-06-13-v48"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",

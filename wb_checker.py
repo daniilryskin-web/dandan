@@ -58,7 +58,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026-06-06-v27.6-playwright"
+APP_VERSION = "2026-06-13-v48"
 APP_DIR = Path(__file__).resolve().parent
 # pywebview на Windows часто запускается через pythonw.exe (без консоли) — это ломает stdout pipe в дочерних
 # процессах. Сила принуждаем использовать python.exe (с консолью) для subprocess.
@@ -2081,6 +2081,25 @@ tbody tr:last-child td { border-bottom: none; }
 }
 .filter-bar input:focus { border-color: var(--accent); }
 
+/* ===================== Column picker (v48) ===================== */
+.col-picker {
+  position: fixed; z-index: 1000; width: 300px; max-height: 60vh; overflow: auto;
+  background: var(--card); border: 1px solid var(--border2); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.35); padding: 10px 12px;
+}
+.col-picker .cp-head {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; margin-bottom: 8px; font-size: 13px;
+}
+.col-picker .cp-actions { font-size: 12px; }
+.col-picker .cp-actions a { color: var(--accent); cursor: pointer; }
+.col-picker .cp-list { display: flex; flex-direction: column; gap: 4px; }
+.col-picker label {
+  display: flex; align-items: center; gap: 8px; font-size: 13px;
+  padding: 3px 4px; border-radius: 6px; cursor: pointer;
+}
+.col-picker label:hover { background: var(--border); }
+
 /* ===================== Empty state ===================== */
 .empty-state {
   padding: 60px 20px; text-align: center; color: var(--muted);
@@ -2509,6 +2528,7 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
           <button class="btn btn-ghost btn-sm" id="btn-load-result">📂 Загрузить файл</button>
           <button class="btn btn-ghost btn-sm" id="btn-clear-loaded" style="display:none">✖ Текущий прогон</button>
           <button class="btn btn-ghost btn-sm" id="btn-export-csv">⬇ CSV</button>
+          <button class="btn btn-ghost btn-sm" id="btn-columns">⚙ Колонки</button>
           <span class="text-muted text-sm" id="results-count"></span>
           <span class="text-muted text-sm" id="loaded-file-badge" style="display:none"></span>
         </div>
@@ -3327,14 +3347,18 @@ $('#btn-save-log').addEventListener('click', async () => {
 async function loadResults() {
   const wrap = $('#tbl-wrap');
   wrap.innerHTML = '<div class="empty-state"><div class="empty-ico">⏳</div><p>Загрузка…</p></div>';
-  const res = await window.pywebview.api.get_results();
+  // v48: грузим ВСЕ строки (раньше таблица ограничивалась — пользователь видел не всё)
+  const res = await window.pywebview.api.get_results(null, 1000000);
   if (!res.ok) {
     wrap.innerHTML = `<div class="empty-state"><div class="empty-ico">📋</div><p>${escapeHtml(res.error)}</p></div>`;
     return;
   }
   _allHeaders = res.columns;
   _allRows    = res.rows;
-  $('#results-count').textContent = `${res.total} строк · «${res.sheet}»`;
+  _visibleCols = null;  // v48: новый файл — колонки по умолчанию
+  const _moreNote = (res.total > _allRows.length)
+    ? ` (загружено ${_allRows.length})` : '';
+  $('#results-count').textContent = `${res.total} строк${_moreNote} · «${res.sheet}»`;
 
   // Fill status filter
   const statSel = $('#filter-status');
@@ -3369,15 +3393,81 @@ const PREFERRED_COLS = [
 // URL-колонки в таблице НЕ показываем (по просьбе), но используем для кликов:
 // «Артикул WB» -> страница товара, «Номер документа» -> страница реестра.
 
+// v48: видимые колонки — пользователь может скрывать/показывать любые столбцы.
+// null = набор по умолчанию (PREFERRED_COLS, что есть в данных).
+let _visibleCols = null;
+
+function _allDisplayableCols() {
+  // PREFERRED (что есть в данных) первыми, затем остальные колонки файла —
+  // URL-колонки исключаем (они используются для кликов, не для показа).
+  const pref = PREFERRED_COLS.filter(h => _allHeaders.includes(h));
+  const rest = _allHeaders.filter(h =>
+    h && !pref.includes(h) && !/^(ссылка на товар|ссылка на реестр|product_url|registry_url)$/i.test(h));
+  return pref.concat(rest);
+}
+
+function _defaultVisibleCols() {
+  return PREFERRED_COLS.filter(h => _allHeaders.includes(h));
+}
+
 function _tableColIndices() {
-  // Сопоставляем предпочтительные заголовки с реальными; чего нет — пропускаем.
+  // Сопоставляем выбранные (или дефолтные) заголовки с реальными; чего нет — пропускаем.
+  const cols = (_visibleCols && _visibleCols.length) ? _visibleCols : _defaultVisibleCols();
   let idx = [];
-  for (const name of PREFERRED_COLS) {
+  for (const name of cols) {
     const i = _allHeaders.indexOf(name);
     if (i >= 0 && !idx.includes(i)) idx.push(i);
   }
   if (!idx.length) idx = _allHeaders.map((_, i) => i).slice(0, 16);
   return idx;
+}
+
+// v48: панель выбора колонок (скрыть/показать любые столбцы результата).
+function toggleColPicker() {
+  let p = document.getElementById('col-picker');
+  if (p) { p.remove(); return; }
+  if (!_allHeaders.length) return;
+  const btn = document.getElementById('btn-columns');
+  const opts = _allDisplayableCols();
+  const visible = new Set((_visibleCols && _visibleCols.length) ? _visibleCols : _defaultVisibleCols());
+  p = document.createElement('div');
+  p.id = 'col-picker';
+  p.className = 'col-picker';
+  p.innerHTML =
+    '<div class="cp-head"><b>Колонки</b>' +
+    '<span class="cp-actions"><a data-cp="pref">по умолчанию</a> · <a data-cp="all">все</a> · <a data-cp="none">снять все</a></span></div>' +
+    '<div class="cp-list">' +
+    opts.map(h => `<label><input type="checkbox" value="${escapeHtml(h)}" ${visible.has(h) ? 'checked' : ''}> <span>${escapeHtml(h)}</span></label>`).join('') +
+    '</div>';
+  document.body.appendChild(p);
+  // позиционирование под кнопкой
+  if (btn) {
+    const r = btn.getBoundingClientRect();
+    p.style.top = (r.bottom + 6) + 'px';
+    p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 320)) + 'px';
+  }
+  function _applyFromChecks() {
+    _visibleCols = Array.from(p.querySelectorAll('input[type=checkbox]:checked')).map(c => c.value);
+    renderTable(_lastRenderRows);
+  }
+  p.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', _applyFromChecks));
+  p.querySelectorAll('[data-cp]').forEach(a => a.addEventListener('click', () => {
+    const mode = a.dataset.cp;
+    if (mode === 'all') _visibleCols = opts.slice();
+    else if (mode === 'none') _visibleCols = [];
+    else _visibleCols = _defaultVisibleCols();
+    const vis = new Set(_visibleCols);
+    p.querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = vis.has(cb.value); });
+    renderTable(_lastRenderRows);
+  }));
+  // закрытие по клику вне панели
+  setTimeout(() => {
+    document.addEventListener('click', function _close(ev) {
+      if (!p.contains(ev.target) && ev.target.id !== 'btn-columns') {
+        p.remove(); document.removeEventListener('click', _close);
+      }
+    });
+  }, 0);
 }
 
 let _sortCol = -1;      // индекс колонки сортировки (в _allHeaders)
@@ -3397,7 +3487,7 @@ function _sortRows(rows, ci, dir) {
 // (раньше 5000 строк × ~20 колонок) замораживало окно на секунды. Теперь
 // рендерим порциями по TABLE_CHUNK с кнопкой «Показать ещё»; фильтры,
 // сортировка и диаграммы по-прежнему работают по ПОЛНОМУ набору строк.
-const TABLE_CHUNK = 800;
+const TABLE_CHUNK = 1000;
 let _tblView = [];   // строки текущего вида (после сортировки)
 let _tblShown = 0;   // сколько строк уже в DOM
 let _tblCtx = null;  // {colIdx, hl, purlIdx, rurlIdx}
@@ -3457,10 +3547,14 @@ function _updateMoreBtn(wrap) {
   const more = wrap.querySelector('#tbl-more');
   if (!more) return;
   const left = _tblView.length - _tblShown;
-  if (left <= 0) { more.style.display = 'none'; return; }
-  more.style.display = '';
-  more.querySelector('button').textContent =
-    `Показать ещё ${Math.min(TABLE_CHUNK, left)} (показано ${_tblShown} из ${_tblView.length})`;
+  if (left <= 0) {
+    more.innerHTML = `<span class="text-muted text-sm">Показаны все ${_tblView.length} строк</span>`;
+    return;
+  }
+  more.innerHTML =
+    `<button class="btn btn-ghost btn-sm" data-more="chunk">Показать ещё ${Math.min(TABLE_CHUNK, left)}</button> ` +
+    `<button class="btn btn-ghost btn-sm" data-more="all">Показать все (${left})</button> ` +
+    `<span class="text-muted text-sm">показано ${_tblShown} из ${_tblView.length}</span>`;
 }
 
 function renderTable(rows) {
@@ -3491,7 +3585,7 @@ function renderTable(rows) {
       return `<th class="sortable" data-col="${i}" title="${escapeHtml(h)} (клик — сортировать)">${lbl}</th>`;
     }).join('') +
     '</tr></thead><tbody>' + _nextChunkHtml() + '</tbody></table>' +
-    '<div id="tbl-more" style="text-align:center;padding:10px"><button class="btn btn-ghost btn-sm"></button></div>';
+    '<div id="tbl-more" style="text-align:center;padding:10px"></div>';
   wrap.innerHTML = html;
   _updateMoreBtn(wrap);
 
@@ -3501,7 +3595,14 @@ function renderTable(rows) {
     const moreBtn = e.target.closest('#tbl-more button');
     if (moreBtn) {
       const tbody = wrap.querySelector('tbody');
-      if (tbody) tbody.insertAdjacentHTML('beforeend', _nextChunkHtml());
+      if (moreBtn.dataset.more === 'all') {
+        // дорисовываем ВСЕ оставшиеся строки порциями (чтобы не блокировать надолго)
+        let html = '';
+        while (_tblShown < _tblView.length) html += _nextChunkHtml();
+        if (tbody) tbody.insertAdjacentHTML('beforeend', html);
+      } else if (tbody) {
+        tbody.insertAdjacentHTML('beforeend', _nextChunkHtml());
+      }
       _updateMoreBtn(wrap);
       return;
     }
@@ -3561,6 +3662,7 @@ $('#filter-status').addEventListener('change', e => {
 });
 
 $('#btn-reload-results').addEventListener('click', loadResults);
+{ const _bc = document.getElementById('btn-columns'); if (_bc) _bc.addEventListener('click', (e) => { e.stopPropagation(); toggleColPicker(); }); }
 
 // Загрузка внешнего result.xlsx (с другого прогона) для анализа во вкладке.
 $('#btn-load-result').addEventListener('click', async () => {

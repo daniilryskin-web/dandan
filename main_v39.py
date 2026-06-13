@@ -1341,14 +1341,30 @@ async def fetch_original_via_card_json(
 # =============================================================================
 
 def card_json_docs_verified(parsed: Any) -> bool:
-    """True, если в card.json есть бейдж «Документ проверен WB»
-    (certificate.verified == true)."""
-    def _cert_verified(cert: Any) -> bool:
-        return isinstance(cert, dict) and cert.get("verified") is True
+    """True, если в card.json есть бейдж «Документ проверен WB».
+    Эмпирически бейдж = certificate.verified == true. v48: терпимы к форме
+    значения (true/1/"true"/"да") — если WB поменяет тип, не теряем «Да»."""
+    def _truthy(v: Any) -> bool:
+        if v is True:
+            return True
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v != 0
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "да", "yes", "verified")
+        return False
 
-    if isinstance(parsed, dict) and _cert_verified(parsed.get("certificate")):
+    def _cert_verified(cert: Any) -> bool:
+        if isinstance(cert, dict) and _truthy(cert.get("verified")):
+            return True
+        # некоторые карточки несут массив certificates[{verified:...}]
+        if isinstance(cert, list):
+            return any(isinstance(c, dict) and _truthy(c.get("verified")) for c in cert)
+        return False
+
+    if isinstance(parsed, dict) and (_cert_verified(parsed.get("certificate"))
+                                     or _cert_verified(parsed.get("certificates"))):
         return True
-    # защитный обход: certificate.verified==true в любом вложенном объекте
+    # защитный обход: certificate(s).verified в любом вложенном объекте
     found = False
 
     def walk(o: Any) -> None:
@@ -1356,7 +1372,7 @@ def card_json_docs_verified(parsed: Any) -> bool:
         if found:
             return
         if isinstance(o, dict):
-            if _cert_verified(o.get("certificate")):
+            if _cert_verified(o.get("certificate")) or _cert_verified(o.get("certificates")):
                 found = True
                 return
             for v in o.values():
@@ -1370,42 +1386,63 @@ def card_json_docs_verified(parsed: Any) -> bool:
 
 
 async def fetch_docs_verified_at_host(
-    session: "aiohttp.ClientSession", nm_id: int, host: str, timeout_sec: float = 6.0
+    session: "aiohttp.ClientSession", nm_id: int, host: str = "", timeout_sec: float = 6.0,
+    max_hosts: int = 16
 ) -> Optional[bool]:
-    """v46: тянет card.json с КОНКРЕТНОГО basket-шарда (того, где уже найден
-    certificate.json) и определяет бейдж «Документ проверен WB»
-    (certificate.verified). ОДИН запрос, БЕЗ перебора шардов — иначе массовый
-    перебор несуществующих basket-хостов заваливает лог DNS-ошибками (gaierror)
-    и грузит сеть. Возвращает True/False, либо None если card.json не отдался."""
-    if not host:
-        return None
-    # строим URL card.json для ИМЕННО этого шарда (тот же путь, что у certificate.json)
-    url = next((u for u in card_json_urls(nm_id, max_hosts=40) if hostname(u) == host), None)
-    if not url:
-        return None
+    """v46/48: определяет бейдж «Документ проверен WB» (card.json.certificate.verified).
+
+    Сначала пробует basket-шард, где найден certificate.json (host), затем —
+    детерминированные шарды card.json по порядку (первый валидный card.json
+    выигрывает), С ПОВТОРОМ транзиентных сбоёв. Раньше был ОДИН запрос без повтора:
+    на больших прогонах транзиентные таймауты давали ложное «Нет» (бейдж есть, а
+    программа писала, что нет). Перебор ограничен и идёт только для карточек С
+    документом, а DNS-шум несуществующих шардов гасится глобальным обработчиком.
+
+    Возвращает True (бейдж есть) / False (card.json получен, бейджа нет) /
+    None (card.json нигде не отдался — «не подтверждено»)."""
     headers = {
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "Origin": "https://www.wildberries.ru",
         "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
     }
-    timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec)))
-    try:
+    timeout = aiohttp.ClientTimeout(total=max(4.0, float(timeout_sec)))
+    urls = card_json_urls(nm_id, max_hosts=max_hosts)
+    # шард, где нашёлся certificate.json — первым (card.json почти всегда там же)
+    if host:
+        urls = sorted(urls, key=lambda u: 0 if hostname(u) == host else 1)
+
+    async def _probe(url: str):
+        """('ok', bool) | ('miss', None) — 404/пусто | бросает на транзиентном сбое."""
         async with session.get(url, headers=headers, timeout=timeout) as r:
             if int(r.status) != 200:
-                return None
+                return ('miss', None)
             raw = (await r.text(errors="replace")).strip()
             if not raw:
-                return None
+                return ('miss', None)
             try:
                 parsed = json.loads(raw)
             except Exception:
                 parsed = raw
-            return card_json_docs_verified(parsed)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return None
+            return ('ok', card_json_docs_verified(parsed))
+
+    for url in urls[:max_hosts]:
+        for attempt in range(2):  # 1 повтор транзиентного сбоя на шард
+            try:
+                kind, val = await _probe(url)
+                if kind == 'ok':
+                    return val           # нашли card.json — это и есть ответ
+                break                    # 404/пусто на этом шарде — следующий шард
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                if attempt == 0:
+                    await asyncio.sleep(0.2)
+                    continue             # повтор того же шарда
+                break                    # стойкий сбой — следующий шард
+            except Exception:
+                break
+    return None
 
 
 # =============================================================================
@@ -1722,14 +1759,12 @@ async def run_http_link_prefetch(
                     if _has_doc:
                         _m = re.search(r'basket-\d+\.wbbasket\.ru', detail or '')
                         _cert_host = _m.group(0) if _m else ''
-                        if _cert_host:
-                            try:
-                                _ver = await fetch_docs_verified_at_host(
-                                    session, card.nm_id, _cert_host, timeout_sec=cert_timeout)
-                                card.docs_verified = "Да" if _ver is True else "Нет"
-                            except Exception:
-                                card.docs_verified = "Нет"
-                        else:
+                        try:
+                            _ver = await fetch_docs_verified_at_host(
+                                session, card.nm_id, _cert_host,
+                                timeout_sec=cert_timeout, max_hosts=cert_max_hosts)
+                            card.docs_verified = "Да" if _ver is True else "Нет"
+                        except Exception:
                             card.docs_verified = "Нет"
                     else:
                         card.docs_verified = "Нет"
@@ -6707,8 +6742,16 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
     # Иначе «костюм для мальчика» vs «бельё для девочек» — это конфликт вида/слоя,
     # а не пола, и пол лишь добавляет шум. Конфликт пола осмыслен для ОДНОГО вида:
     # «трусы для мальчиков» vs «трусы для девочек».
+    # v48: ОБУВЬ из конфликта пола ИСКЛЮЧЕНА — обувные сертификаты обобщённые
+    # («Обувь повседневная ... для школьников-девочек, для школьников-мальчиков»),
+    # и определение пола по их тексту ненадёжно → давало ложные «НЕСООТВЕТСТВИЕ»
+    # («Сандалии для мальчиков» против детского обувного сертификата). Также не
+    # применяем пол к ШИРОКОМУ сертификату (3+ вида) — он покрывающий, не гендерный.
+    _cert_broad_sub = len(cert_sub) >= 3 or _contains_broad_child_clothing(cert_text)
     if (card_gender in ('male', 'female') and cert_gender in ('male', 'female')
-            and card_gender != cert_gender and (card_sub & cert_sub)):
+            and card_gender != cert_gender and (card_sub & cert_sub)
+            and 'footwear' not in card_cats and 'footwear' not in cert_cats
+            and not _cert_broad_sub):
         conflicts.append(f'пол не совпадает при совпадающем виде: карточка {card_gender}, сертификат {cert_gender}')
     # v41.1: конфликт несовместимых подтипов — ТОЛЬКО когда ОБЕ стороны узкие
     # (не более 2 подтипов каждая). Если сертификат перечисляет много видов (широкий) —

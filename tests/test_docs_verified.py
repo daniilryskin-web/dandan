@@ -45,6 +45,14 @@ def main():
     # мусор не валит
     check("None -> False", f(None) is False)
     check("строка -> False", f("оригинальный товар") is False)
+    # v48: терпимость к форме значения verified + массив certificates
+    check("verified=1 -> True", f({"certificate": {"verified": 1}}) is True)
+    check("verified='true' -> True", f({"certificate": {"verified": "true"}}) is True)
+    check("certificates[] -> True", f({"certificates": [{"verified": True}]}) is True)
+    check("verified=0 -> False", f({"certificate": {"verified": 0}}) is False)
+    # надёжность сбора: функция-фетчер с перебором шардов + повтором
+    check("fetch_docs_verified_at_host принимает max_hosts",
+          "max_hosts" in __import__("inspect").signature(mv.fetch_docs_verified_at_host).parameters)
     # не путаем посторонний verified
     check("посторонний verified не считается",
           f({"seller": {"verified": True}, "certificate": {}}) is False)

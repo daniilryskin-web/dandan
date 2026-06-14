@@ -8945,11 +8945,13 @@ async def run_registry_stage(args):
             rf_status = kg_rf_status_text(cert)
             if rf_status:
                 verdict = STATUS_INVALID_IN_RF
-            # v48: товар проходит (OK), но на карточке WB НЕТ плашки «Документы
-            # проверены» → отдельная категория «ДОКУМЕНТ НЕ ПРОВЕРЕН». Применяем
-            # ТОЛЬКО при ЯВНОМ «Нет» (на старых CSV без признака — не трогаем OK).
+            # v48: ВСЕ карточки без плашки «Документы проверены» (docs_verified=Нет)
+            # попадают в отдельную категорию «ДОКУМЕНТ НЕ ПРОВЕРЕН» — независимо от
+            # вердикта сравнения. Применяем ТОЛЬКО при ЯВНОМ «Нет» (старые CSV без
+            # признака не трогаем). Деталь сравнения/статус документа остаются в
+            # колонках «Примечания» и «Статус документа».
             _row_dv = str(row.get('docs_verified') or '').strip().lower()
-            if verdict == 'OK' and _row_dv == 'нет':
+            if _row_dv == 'нет':
                 verdict = STATUS_DOC_NOT_VERIFIED
             rr = ResultRow(
                 query=row.get('query', ''),
@@ -9661,10 +9663,10 @@ async def run_registry_stage(args):
         rf_status = kg_rf_status_text(cert)
         if rf_status:
             verdict = STATUS_INVALID_IN_RF
-        # v48: товар проходит (OK), но нет плашки «Документы проверены» на WB
-        # (только при ЯВНОМ «Нет» — старые CSV без признака не трогаем).
+        # v48: ВСЕ карточки без плашки «Документы проверены» → «ДОКУМЕНТ НЕ
+        # ПРОВЕРЕН» (только при ЯВНОМ «Нет»; старые CSV без признака не трогаем).
         _row_dv = str(row.get('docs_verified') or '').strip().lower()
-        if verdict == 'OK' and _row_dv == 'нет':
+        if _row_dv == 'нет':
             verdict = STATUS_DOC_NOT_VERIFIED
         # v39.14: достаём расширенные поля FSA из глобального кэша
         ext = _FSA_EXTENDED_FIELDS_CACHE.get(url, {})

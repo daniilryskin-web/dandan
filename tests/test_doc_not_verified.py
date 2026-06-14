@@ -28,12 +28,12 @@ def main():
     check("STATUS_DOC_NOT_VERIFIED = «ДОКУМЕНТ НЕ ПРОВЕРЕН»",
           m.STATUS_DOC_NOT_VERIFIED == "ДОКУМЕНТ НЕ ПРОВЕРЕН")
     src = (Path(__file__).resolve().parents[1] / "main_v39.py").read_text(encoding="utf-8")
-    # применяется ТОЛЬКО к OK и ТОЛЬКО при явном «нет»
-    check("override срабатывает на verdict OK",
-          "verdict == 'OK' and _row_dv == 'нет'" in src)
+    # применяется ко ВСЕМ карточкам с явным «нет» (а не только к OK)
+    check("override по docs_verified=нет (любой вердикт)",
+          "if _row_dv == 'нет':" in src)
     check("override применён в ОБОИХ местах записи (2)",
           src.count("verdict = STATUS_DOC_NOT_VERIFIED") == 2)
-    # старый CSV без признака (docs_verified отсутствует) → НЕ трогаем OK
+    # старый CSV без признака (docs_verified отсутствует) → НЕ трогаем вердикт
     for raw in ('', None, 'Да', 'да'):
         dv = str(raw or '').strip().lower()
         applies = (dv == 'нет')

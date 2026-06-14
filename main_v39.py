@@ -666,7 +666,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-13-v48"
+APP_VERSION = "2026-06-14-v49"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -3835,13 +3835,21 @@ class ResultStore:
         # v47/48: НЕБЛОКИРУЮЩЕЕ сохранение для больших прогонов (20k–50k+ строк).
         # Синхронная запись openpyxl на десятках тысяч строк занимает секунды и
         # раньше блокировала event loop: воркеры замирали, watchdog считал прогон
-        # зависшим и перезапускал воркеры. Теперь запись идёт в отдельном потоке,
-        # а параллельные вызовы сериализуются отдельным локом.
+        # зависшим и перезапускал воркеры. Запись идёт в отдельном потоке.
         # v48: CSV (resume-критичный, дешёвый) пишем ВСЕГДА; дорогой xlsx-отчёт на
-        # БОЛЬШИХ наборах строим РЕЖЕ (каждый 6-й промежуточный + всегда финальный),
-        # иначе на 50k каждое автосохранение пересобирало многолистовой xlsx секунды.
+        # БОЛЬШИХ наборах строим РЕЖЕ (каждый 6-й промежуточный + всегда финальный).
+        # v49: КРИТИЧНО — запись идёт в ВЫДЕЛЕННОМ 1-ПОТОЧНОМ executor'е. Раньше
+        # to_thread брал общий пул, и если save() отменяли (saver_task.cancel())
+        # ПОСРЕДИ записи — asyncio-лок освобождался, а поток продолжал писать
+        # result.xlsx.tmp; следующий save писал ТОТ ЖЕ .tmp параллельно → битый zip
+        # («invalid code lengths set»). Однопоточный executor сериализует записи:
+        # отменённая запись доходит до конца, следующая ждёт её в очереди потока.
         if not hasattr(self, "_save_lock"):
             self._save_lock = asyncio.Lock()
+        if getattr(self, "_save_executor", None) is None:
+            import concurrent.futures
+            self._save_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="store-save")
         async with self._save_lock:
             async with self.lock:
                 rows = list(self.rows)
@@ -3857,18 +3865,32 @@ class ResultStore:
                     self._save_csv(rows, self.csv_path)
                 if write_xlsx:
                     self._save_xlsx(rows, self.xlsx_path)
-            await asyncio.to_thread(_write)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(self._save_executor, _write)
             self.last_save_count = n
+
+    def _unique_tmp(self, path: Path) -> Path:
+        # v49: уникальное имя .tmp на каждую запись — две записи НИКОГДА не пишут в
+        # один временный файл (доп. страховка к 1-поточному executor'у).
+        self._tmp_seq = getattr(self, "_tmp_seq", 0) + 1
+        return path.with_suffix(path.suffix + f".{os.getpid()}.{self._tmp_seq}.tmp")
 
     def _save_csv(self, rows: List[ResultRow], path: Path):
         fields = list(ResultRow.__dataclass_fields__.keys())
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8-sig", newline="") as f:
-            wr = csv.DictWriter(f, fieldnames=fields)
-            wr.writeheader()
-            for r in rows:
-                wr.writerow(asdict(r))
-        os.replace(tmp, path)
+        tmp = self._unique_tmp(path)
+        try:
+            with tmp.open("w", encoding="utf-8-sig", newline="") as f:
+                wr = csv.DictWriter(f, fieldnames=fields)
+                wr.writeheader()
+                for r in rows:
+                    wr.writerow(asdict(r))
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     def _save_xlsx(self, rows: List[ResultRow], path: Path):
         wb = Workbook()
@@ -3938,8 +3960,13 @@ class ResultStore:
                 _build_details_sheet_v39(wb, rows, int(getattr(self, "expiry_warning_days", 30) or 0))
             except Exception as _e:
                 log.warning("build_details_sheet failed: %s", _e)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        # v49: уникальный .tmp на запись — две записи не могут перетереть друг друга.
+        tmp = self._unique_tmp(path)
         wb.save(tmp)
+        try:
+            wb.close()
+        except Exception:
+            pass
         # v40.2: os.replace падает PermissionError если файл открыт в Excel.
         # Делаем несколько попыток, потом fallback на файл с суффиксом, чтобы
         # данные НЕ терялись и прогон НЕ останавливался.
@@ -3965,6 +3992,12 @@ class ResultStore:
             if not getattr(self, "_warned_locked", False):
                 print(f"⚠️  Не могу записать {path.name} (открыт?). Данные во временном файле {tmp.name}.")
                 self._warned_locked = True
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 # -----------------------------

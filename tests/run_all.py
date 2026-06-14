@@ -24,6 +24,7 @@ MODULES = [
     "test_scale_20k",
     "test_catalog_sweep",
     "test_doc_not_verified",
+    "test_save_integrity",
     "test_fsa_stealth",
     "test_fsa_cookie_http",
     "test_fsa_fields",

@@ -173,6 +173,21 @@ def run():
         ok = verdict == expected
         passed += ok
         rows.append((ok, expected, verdict, round(score, 1), note, card[:34]))
+    # v49: статус документа «Возобновлён» — ДЕЙСТВУЮЩИЙ (не «недействующий»).
+    _ds_cases = [
+        ("Возобновлён", "OK"), ("Возобновлен", "OK"), ("Действует", "OK"),
+        ("Приостановлен", "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ"),
+        ("Прекращён", "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ"),
+        ("Архивный", "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ"),
+    ]
+    for ds, exp in _ds_cases:
+        total += 1
+        v, _s, _d = compare_product_names(
+            "Кофточка детская трикотажная", "Изделия трикотажные бельевые для детей",
+            subject="", doc_status=ds)
+        ok = v == exp
+        passed += ok
+        rows.append((ok, exp, v, 0.0, f"doc_status={ds}", "статус документа"))
     print(f"{'res':4} {'ожидание':22} {'факт':22} {'score':6} {'кейс'}")
     print("-" * 100)
     for ok, exp, got, sc, note, card in rows:

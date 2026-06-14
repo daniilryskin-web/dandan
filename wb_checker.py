@@ -3511,7 +3511,7 @@ function _rowHtml(row) {
       if (v.includes('OK') || v.includes('СОБРАНА') || v === 'Действует') badge = 'badge-ok';
       else if (v.includes('НЕДЕЙСТВ') || v.includes('НЕСООТВЕТ') || v.includes('ОШИБКА')
                || v.includes('ТАЙМАУТ') || v.includes('Прекращ') || v.includes('Аннулир')) badge = 'badge-error';
-      else if (v.includes('ПРОВЕРИТЬ') || v.includes('НЕ УДАЛОСЬ')
+      else if (v.includes('ПРОВЕРИТЬ') || v.includes('НЕ УДАЛОСЬ') || v.includes('НЕ ПРОВЕРЕН')
                || v.includes('Приостановл') || v.includes('Архивн')) badge = 'badge-warn';
       else if (v) badge = 'badge-muted';
     } else if (head.includes('маркетплейс') || head.includes('marketplace')) {
@@ -3806,6 +3806,7 @@ const STATUS_COLORS = {
   'НЕСООТВЕТСТВИЕ':                        '#ef4444', // красный
   'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА': '#a855f7', // фиолетовый
   'ПРОВЕРИТЬ ВРУЧНУЮ':                     '#eab308', // жёлтый
+  'ДОКУМЕНТ НЕ ПРОВЕРЕН':                  '#14b8a6', // бирюзовый (OK, но без плашки WB)
   'ОШИБКА':                                '#be123c', // тёмно-розовый
   'ТАЙМАУТ':                               '#fb923c', // оранжевый
   'НЕТ ДОКУМЕНТОВ':                        '#6b7280', // серый

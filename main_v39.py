@@ -660,6 +660,10 @@ STATUS_NO_DOCS = "НЕТ ДОКУМЕНТОВ"
 STATUS_NO_REGISTRY_LINK = "НЕТ ССЫЛКИ НА РЕЕСТР"
 STATUS_TIMEOUT = "ТАЙМАУТ"
 STATUS_ERROR = "ОШИБКА"
+# v48: документ корректен и совпадает с товаром, НО на карточке WB нет плашки
+# «Документы проверены» (certificate.verified=false). Отдельная категория: товар
+# проходит, но его документы НЕ верифицированы модерацией WB.
+STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
 APP_VERSION = "2026-06-13-v48"
@@ -2714,6 +2718,48 @@ async def discover_brand_filter_ids(session: aiohttp.ClientSession, brand: str, 
                 found.append(bid)
     return found[:10]
 
+
+async def discover_brand_subjects(session: aiohttp.ClientSession, brand_ids: List[str], timeout: float = 10.0) -> List[str]:
+    """v48: список subject(категория)-ID бренда, отсортированный по количеству
+    товаров. Нужен, чтобы ОБОЙТИ лимит WB ≈1200 на бренд-каталог: каждая
+    категория (xsubject) отдаётся отдельным запросом со своим лимитом, поэтому
+    у крупных брендов (adidas/nike) собирается во много раз больше карточек."""
+    subjects: Dict[str, int] = {}
+
+    def _walk_filters(o: Any):
+        # ищем фильтр с ключом xsubject/предмет и его items [{id,count}]
+        if isinstance(o, dict):
+            key = str(o.get('key') or o.get('name') or '').lower()
+            items = o.get('items')
+            if isinstance(items, list) and key in ('xsubject', 'subject', 'предмет', 'категория', 'подкатегория'):
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    sid = it.get('id')
+                    if sid is not None and re.fullmatch(r'\d{1,8}', str(sid).strip()):
+                        cnt = safe_int(it.get('count'))
+                        sid = str(sid).strip()
+                        subjects[sid] = max(subjects.get(sid, 0), cnt)
+            for v in o.values():
+                _walk_filters(v)
+        elif isinstance(o, list):
+            for v in o:
+                _walk_filters(v)
+
+    for bid in (brand_ids or [])[:3]:
+        b = urllib.parse.quote(str(bid))
+        urls = [
+            f"https://catalog.wb.ru/brands/v2/filters?ab_testing=false&appType=1&brand={b}&curr=rub&dest=-1257786&hide_dtype=13&lang=ru",
+            f"https://catalog.wb.ru/brands/filters?appType=1&brand={b}&curr=rub&dest=-1257786&lang=ru",
+        ]
+        for url in urls:
+            data = await fetch_json(session, url, timeout=timeout)
+            if data:
+                _walk_filters(data)
+        if subjects:
+            break
+    return [s for s, _ in sorted(subjects.items(), key=lambda kv: -kv[1])]
+
 async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: float = 12.0) -> Optional[Dict[str, Any]]:
     try:
         async with session.get(url, timeout=timeout) as r:
@@ -2800,7 +2846,7 @@ _FSA_FORCE_PACE = False
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
 _FSA_SAMPLE_DUMPED = False
 
-async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1, fbrand_ids: Optional[List[str]] = None) -> List[Card]:
+async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1, fbrand_ids: Optional[List[str]] = None, xsubject: str = '') -> List[Card]:
     """v39.9: subject отдельно от subjectName.
 
     WB API в v18 возвращает оба поля:
@@ -2828,12 +2874,15 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
     # топ поисковой выдачи, обрезанный на ~сотне). Ставим ПЕРВЫМ источником.
     for bid in (fbrand_ids or []):
         _b = urllib.parse.quote(str(bid))
+        # v48: xsubject (категория) обходит лимит WB ≈1200 на бренд-каталог —
+        # каждая категория отдаётся отдельно со своим лимитом.
+        _xs = ("&xsubject=" + urllib.parse.quote(str(xsubject))) if xsubject else ""
         urls.append(
             f"https://catalog.wb.ru/brands/v2/catalog?ab_testing=false&appType=1&brand={_b}"
-            f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&sort={sort}&spp=30")
+            f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}")
         urls.append(
             f"https://catalog.wb.ru/brands/catalog?appType=1&brand={_b}"
-            f"&curr=rub&dest=-1257786&lang=ru&page={_pg}&sort={sort}&spp=30")
+            f"&curr=rub&dest=-1257786&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}")
     # поисковая выдача (+ опционально фильтр по бренду fbrand)
     _search_bases = [
         f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
@@ -3093,13 +3142,21 @@ async def collect_cards(args) -> List[Card]:
         # замедляли сбор (каждая — отдельная серия запросов). Если brandId найден —
         # бренд-каталог и так отдаёт всё, сортировки тем более не нужны.
         _brand_sorts = ["popular", "newly"]
+        _brand_subjects: List[str] = []
         if _brand_search:
             try:
                 _fbrand_ids = await discover_brand_filter_ids(session, args.brand)
             except Exception as _e:
                 _fbrand_ids = []
+            # v48: категории бренда (xsubject) — обходим лимит WB ≈1200 на каталог.
+            if _fbrand_ids:
+                try:
+                    _brand_subjects = await discover_brand_subjects(session, _fbrand_ids)
+                except Exception:
+                    _brand_subjects = []
             print(f"Бренд-каталог: brandId={_fbrand_ids or 'не найден (работаю по поиску)'}; "
-                  f"сортировок={len(_brand_sorts)}, страниц до {_max_pages}")
+                  f"сортировок={len(_brand_sorts)}, страниц до {_max_pages}, "
+                  f"категорий бренда={len(_brand_subjects)}")
 
         _brand_base_q = (args.query or args.brand or "").strip()
 
@@ -3109,6 +3166,34 @@ async def collect_cards(args) -> List[Card]:
                 # глубокое листание. Остальные варианты («reebok кроссовки» и т.п.):
                 # только текстовый поиск, 1 сортировка, немного страниц — добор охвата.
                 is_base = (not _brand_search) or (q == _brand_base_q)
+                # v48: базовый бренд-запрос с КАТЕГОРИЯМИ (xsubject) — каждая
+                # категория со своим лимитом WB, что многократно увеличивает охват
+                # крупных брендов. Категории обходятся параллельно (отдельные work).
+                if _brand_search and is_base and _brand_subjects:
+                    _subj_pages = max(2, min(_max_pages, 14))
+                    for _sid in _brand_subjects:
+                        for sort in _brand_sorts:
+                            for _page in range(1, _subj_pages + 1):
+                                cards = await collect_one_query(
+                                    session, q, args.per_query_limit, sort,
+                                    domain='', stats=collect_stats, page=_page,
+                                    fbrand_ids=_fbrand_ids, xsubject=_sid)
+                                before = len(cards_map)
+                                for c in cards:
+                                    if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
+                                                             getattr(args, 'brand_match', 'contains') or 'contains'):
+                                        continue
+                                    cards_map.setdefault(c.nm_id, c)
+                                if len(cards_map) == before or not cards:
+                                    break
+                                if len(cards_map) >= args.limit:
+                                    break
+                            if len(cards_map) >= args.limit:
+                                break
+                        if len(cards_map) >= args.limit:
+                            break
+                    # после прохода по категориям — продолжаем обычным базовым каталогом
+                    # (добирает товары без проставленной категории).
                 if _brand_search and is_base:
                     _sorts = _brand_sorts
                     _pages = _max_pages
@@ -8860,6 +8945,12 @@ async def run_registry_stage(args):
             rf_status = kg_rf_status_text(cert)
             if rf_status:
                 verdict = STATUS_INVALID_IN_RF
+            # v48: товар проходит (OK), но на карточке WB НЕТ плашки «Документы
+            # проверены» → отдельная категория «ДОКУМЕНТ НЕ ПРОВЕРЕН». Применяем
+            # ТОЛЬКО при ЯВНОМ «Нет» (на старых CSV без признака — не трогаем OK).
+            _row_dv = str(row.get('docs_verified') or '').strip().lower()
+            if verdict == 'OK' and _row_dv == 'нет':
+                verdict = STATUS_DOC_NOT_VERIFIED
             rr = ResultRow(
                 query=row.get('query', ''),
                 nm_id=safe_int(row.get('nm_id')),
@@ -9570,6 +9661,11 @@ async def run_registry_stage(args):
         rf_status = kg_rf_status_text(cert)
         if rf_status:
             verdict = STATUS_INVALID_IN_RF
+        # v48: товар проходит (OK), но нет плашки «Документы проверены» на WB
+        # (только при ЯВНОМ «Нет» — старые CSV без признака не трогаем).
+        _row_dv = str(row.get('docs_verified') or '').strip().lower()
+        if verdict == 'OK' and _row_dv == 'нет':
+            verdict = STATUS_DOC_NOT_VERIFIED
         # v39.14: достаём расширенные поля FSA из глобального кэша
         ext = _FSA_EXTENDED_FIELDS_CACHE.get(url, {})
         rr = ResultRow(

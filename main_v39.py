@@ -666,7 +666,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-14-v49"
+APP_VERSION = "2026-06-15-v50"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -2609,7 +2609,51 @@ def generate_catalog_queries(profile_keys: Optional[List[str]] = None,
                 else:
                     _add(t)
         i += 1
+    # 3) v49: ТИП × модификатор (цвет/сезон/материал/пол) — без этого сметание ОДНОЙ
+    # категории давало мало запросов (~30) и ~2000 карточек. Модификаторы кратно
+    # увеличивают число запросов и охват; для «взрослых» категорий — нейтральные
+    # (без возрастных слов, чтобы не ловить игрушечную выдачу).
+    _mods = {d: _catalog_modifiers_for(d) for d in domains}
+    _mi = 0
+    _max_mi = max((len(_mods[d]) for d in domains), default=0)
+    while len(out) < max_variants and _mi < _max_mi:
+        for d in domains:
+            if len(out) >= max_variants:
+                break
+            mlist = _mods[d]
+            if _mi >= len(mlist):
+                continue
+            mod = mlist[_mi]
+            for t in per[d]:
+                if len(out) >= max_variants:
+                    break
+                _add(f'{t} {mod}')
+        _mi += 1
     return out[:max_variants]
+
+
+# v49: ЦЕНОВЫЕ ДИАПАЗОНЫ (priceU = цена в копейках, min;max). Один и тот же запрос
+# в разных диапазонах отдаёт РАЗНЫЕ карточки — так пробивается лимит глубины WB
+# (~10k результатов на запрос). Покрывают 0…~120 000 ₽ с уплотнением в массовом
+# сегменте (0–7000 ₽), где сосредоточена основная масса товаров.
+PRICE_BUCKETS = [
+    (0, 30000), (30000, 60000), (60000, 90000), (90000, 130000),
+    (130000, 180000), (180000, 250000), (250000, 350000), (350000, 500000),
+    (500000, 700000), (700000, 1000000), (1000000, 1500000), (1500000, 2500000),
+    (2500000, 4000000), (4000000, 7000000), (7000000, 12000000), (12000000, 200000000),
+]
+
+
+def _catalog_modifiers_for(domain: str) -> List[str]:
+    """v49: модификаторы для сметания каталога по типам — зависят от категории.
+    Одежда/обувь/аксессуары — цвета/сезоны/ростовки + возрастные; «взрослые»
+    (техника/электроника/посуда/дом) — только нейтральные (без возрастных слов);
+    игрушки/транспорт/косметика/питание — возрастные."""
+    if domain in ('clothing', 'shoes', 'kids_accessories'):
+        return list(APPAREL_MODIFIERS) + list(UNIVERSAL_MODIFIERS)
+    if domain in ('appliances', 'electronics', 'kitchenware', 'home'):
+        return list(APPLIANCE_MODIFIERS)
+    return list(UNIVERSAL_MODIFIERS)
 
 
 def recursive_find_products(obj: Any) -> List[Dict[str, Any]]:
@@ -2905,7 +2949,7 @@ _FSA_FORCE_PACE = False
 # чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
 _FSA_SAMPLE_DUMPED = False
 
-async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1, fbrand_ids: Optional[List[str]] = None, xsubject: str = '') -> List[Card]:
+async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1, fbrand_ids: Optional[List[str]] = None, xsubject: str = '', price_u: str = '') -> List[Card]:
     """v39.9: subject отдельно от subjectName.
 
     WB API в v18 возвращает оба поля:
@@ -2927,6 +2971,10 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
     cards: List[Card] = []
     q = urllib.parse.quote(query)
     _pg = max(1, int(page or 1))
+    # v49: ценовой фильтр priceU=min;max (в копейках) — обходит лимит глубины WB
+    # (~10k на запрос): один и тот же запрос в РАЗНЫХ ценовых диапазонах отдаёт
+    # РАЗНЫЕ карточки, что кратно увеличивает охват крупных категорий/брендов.
+    _pu = ("&priceU=" + urllib.parse.quote(str(price_u))) if price_u else ""
     # несколько актуальных хостов/версий, первый обычно быстрее
     urls = []
     # v27.9.x: ПОЛНЫЙ бренд-каталог по brandId — отдаёт ВСЕ товары бренда (а не
@@ -2938,15 +2986,15 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
         _xs = ("&xsubject=" + urllib.parse.quote(str(xsubject))) if xsubject else ""
         urls.append(
             f"https://catalog.wb.ru/brands/v2/catalog?ab_testing=false&appType=1&brand={_b}"
-            f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}")
+            f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}{_pu}")
         urls.append(
             f"https://catalog.wb.ru/brands/catalog?appType=1&brand={_b}"
-            f"&curr=rub&dest=-1257786&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}")
+            f"&curr=rub&dest=-1257786&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}{_pu}")
     # поисковая выдача (+ опционально фильтр по бренду fbrand)
     _search_bases = [
-        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
-        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
-        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30",
+        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false{_pu}",
+        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false{_pu}",
+        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30{_pu}",
     ]
     for _bu in _search_bases:
         for bid in (fbrand_ids or []):
@@ -3235,6 +3283,15 @@ async def collect_cards(args) -> List[Card]:
 
         _brand_base_q = (args.query or args.brand or "").strip()
 
+        # v49: ценовое углубление (&priceU) пробивает потолок глубины WB (~10k на
+        # запрос). Включаем на больших лимитах; запускаем только для продуктивных
+        # вариантов (которые реально упёрлись в потолок), чтобы не тратить запросы
+        # на узкие варианты. Для брендов порог ниже — там вариантов мало.
+        _use_price_buckets = int(args.limit) > 5000
+        _PB_THRESHOLD = 120 if _brand_search else 250
+        _pb_sorts = ["popular"]
+        _pb_pages = max(2, min(_max_pages, 5))
+
         async def work(q):
             async with sem:
                 # Базовый запрос бренда: ПОЛНЫЙ каталог по brandId + все сортировки +
@@ -3283,30 +3340,56 @@ async def collect_cards(args) -> List[Card]:
                     _sorts = [s.strip() or "popular" for s in args.search_sorts.split(",")]
                     _pages = _max_pages
                     _fb = []
+                def _ingest(cards):
+                    before = len(cards_map)
+                    for c in cards:
+                        # v27.9.x: для бренда ПРЕД-фильтруем по бренду прямо здесь —
+                        # иначе варианты «reebok кроссовки» забивают лимит чужими товарами.
+                        if _brand_search and not brand_matches_v39(
+                                getattr(c, 'brand', ''), args.brand,
+                                getattr(args, 'brand_match', 'contains') or 'contains'):
+                            continue
+                        cards_map.setdefault(c.nm_id, c)
+                    return len(cards_map) - before
+
+                _variant_added = 0
                 for sort in _sorts:
                     for _page in range(1, _pages + 1):
                         cards = await collect_one_query(
                             session, q, args.per_query_limit, sort,
                             domain=domain if use_filter else '', stats=collect_stats,
                             page=_page, fbrand_ids=_fb)
-                        before = len(cards_map)
-                        for c in cards:
-                            # v27.9.x: для бренда ПРЕД-фильтруем по бренду прямо здесь —
-                            # иначе варианты «reebok кроссовки» забивают лимит чужими
-                            # товарами, а нужные карточки не попадают. Столбец «Запрос»
-                            # оставляем = реальному варианту (видно, что вариаций много).
-                            if _brand_search:
-                                if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
-                                                         getattr(args, 'brand_match', 'contains') or 'contains'):
-                                    continue
-                            cards_map.setdefault(c.nm_id, c)
+                        _new = _ingest(cards)
+                        _variant_added += _new
                         # страница не дала ни одной НОВОЙ карточки — дальше листать смысла нет
-                        if len(cards_map) == before or not cards:
+                        if _new == 0 or not cards:
                             break
                         if len(cards_map) >= args.limit:
                             break
                     if len(cards_map) >= args.limit:
                         break
+                # v49: ЦЕНОВОЕ УГЛУБЛЕНИЕ. Если вариант продуктивен (много новых
+                # карточек — значит упёрся в лимит глубины WB ~10k), проходим по
+                # ценовым диапазонам: тот же запрос с &priceU отдаёт ДРУГИЕ карточки.
+                # Это и пробивает потолок для крупных категорий/брендов.
+                if (_use_price_buckets and _variant_added >= _PB_THRESHOLD
+                        and len(cards_map) < args.limit):
+                    for (pmin, pmax) in PRICE_BUCKETS:
+                        if len(cards_map) >= args.limit:
+                            break
+                        _pu = f"{pmin};{pmax}"
+                        for sort in _pb_sorts:
+                            for _page in range(1, _pb_pages + 1):
+                                cards = await collect_one_query(
+                                    session, q, args.per_query_limit, sort,
+                                    domain=domain if use_filter else '', stats=collect_stats,
+                                    page=_page, fbrand_ids=_fb, price_u=_pu)
+                                if _ingest(cards) == 0 or not cards:
+                                    break
+                                if len(cards_map) >= args.limit:
+                                    break
+                            if len(cards_map) >= args.limit:
+                                break
         tasks = [asyncio.create_task(work(q)) for q in variants]
         for t in asyncio.as_completed(tasks):
             try:

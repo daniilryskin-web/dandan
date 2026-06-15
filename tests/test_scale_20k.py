@@ -53,6 +53,32 @@ def main():
     check("appliances: нет «… детские/для мальчиков» (без игрушечной мусорной выдачи)",
           not any(x.endswith(' детские') or x.endswith(' для мальчиков') for x in _appl))
 
+    # v49: сметание каталога ОДНОЙ категории даёт МНОГО запросов (тип×модификатор),
+    # раньше было ~30 → ~2000 карточек. Теперь сотни вариантов на категорию.
+    for keys, mn in [(['электроника'], 300), (['бытовая техника'], 300),
+                     (['посуда'], 200), (['дом'], 200)]:
+        cq = m.generate_catalog_queries(keys, _mq)
+        check(f"catalog-sweep {keys[0]!r}: вариантов >= {mn} (было ~30)", len(cq) >= mn)
+    # «взрослые» категории в сметании — без возрастных слов
+    _cel = [x.lower() for x in m.generate_catalog_queries(['электроника'], _mq)]
+    check("catalog-sweep электроника: без «детск…» (нейтральные модификаторы)",
+          not any('детск' in x or 'для мальчик' in x or 'для девоч' in x for x in _cel))
+
+    # v49: ценовое углубление (&priceU) — пробивает потолок глубины WB (~10k/запрос)
+    src = (Path(__file__).resolve().parents[1] / "main_v39.py").read_text(encoding="utf-8")
+    check("PRICE_BUCKETS заданы (покрывают весь диапазон цен)",
+          len(m.PRICE_BUCKETS) >= 12 and m.PRICE_BUCKETS[0][0] == 0
+          and m.PRICE_BUCKETS[-1][1] >= 100000000)
+    check("collect_one_query принимает price_u",
+          "price_u" in __import__("inspect").signature(m.collect_one_query).parameters)
+    check("priceU попадает в URL запроса (и поиск, и бренд-каталог)",
+          src.count("priceU=") >= 1 and "_pu" in src)
+    check("ценовое углубление включается на больших лимитах",
+          "_use_price_buckets = int(args.limit) > 5000" in src
+          and "for (pmin, pmax) in PRICE_BUCKETS:" in src)
+    check("ценовое углубление только для продуктивных вариантов (порог)",
+          "_variant_added >= _PB_THRESHOLD" in src)
+
     # --- глубина листания обычного поиска ---
     check("малый лимит: 1 страница хватает", m.scaled_search_pages(250, 123) == 1)
     check("10k/123 вариантов: страниц >= 2", m.scaled_search_pages(10000, 123) >= 2)

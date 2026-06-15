@@ -3374,9 +3374,13 @@ async function loadResults() {
   renderTable(_allRows);
 
   // Charts — из статистики Python по всем строкам (authoritative).
-  if (_chartjs) {
-    buildResultsCharts(res.stats);
-  }
+  // v49: инициализируем Chart.js здесь же и строим БЕЗУСЛОВНО. Раньше стоял
+  // guard `if (_chartjs)`, а _chartjs выставляется лениво — при открытии экрана
+  // «Результаты» (особенно через «Загрузить файл») до первого опроса очереди он
+  // мог быть ещё null → графики не рисовались. tryInitCharts() подхватывает уже
+  // встроенный window.Chart; buildResultsCharts сам выходит, если его нет.
+  tryInitCharts();
+  buildResultsCharts(res.stats);
 }
 
 // v27.9.x: КУРИРУЕМЫЙ набор колонок таблицы — включает «Название в реестре»
@@ -4009,7 +4013,7 @@ function recomputeView() {
   const total = (_allRows || []).length;
   $('#results-count').textContent = Object.keys(_activeFilters).length
     ? `${rows.length} из ${total} строк (фильтр)` : `${total} строк`;
-  if (_chartjs) buildResultsCharts(computeStatsFromRows(rows));
+  if (_chartjs || window.Chart) { tryInitCharts(); buildResultsCharts(computeStatsFromRows(rows)); }
   renderFilterChips();
 }
 function setFilter(key, label, matcher) {
@@ -4119,20 +4123,40 @@ function _matchMarketplace(lbl) {
 
 function buildResultsCharts(stats) {
   tryInitCharts();
-  if (!_chartjs) return;
-  updateDonutChart('res-chart-status', 'res-chart-status-fb', stats.by_status || {}, STATUS_COLORS,
-    { onSegmentClick: l => setFilter('chart:status', 'Статус: ' + l, _matchExact(['технический статус', 'status'], l)) });
-  updateDonutChart('res-chart-registry', 'res-chart-registry-fb', stats.by_registry || {}, REGISTRY_COLORS,
-    { onSegmentClick: l => setFilter('chart:registry', 'Реестр: ' + l, _matchRegistry(l)) });
-  updateDonutChart('res-chart-marketplace', 'res-chart-marketplace-fb', stats.by_marketplace || {}, MKT_COLORS,
-    { onSegmentClick: l => setFilter('chart:marketplace', 'Маркетплейс: ' + l, _matchMarketplace(l)) });
-  updateDonutChart('res-chart-original', 'res-chart-original-fb', stats.by_original || {}, ORIGINAL_COLORS,
-    { onSegmentClick: l => setFilter('chart:original', 'Оригинал: ' + l, _matchOriginal(l)) });
-  updateDonutChart('res-chart-risk', 'res-chart-risk-fb', stats.by_risk || {}, RISK_COLORS,
-    { onSegmentClick: l => setFilter('chart:risk', 'Риск: ' + l, _matchExact(['риск по сроку'], l)) });
-  updateDonutChart('res-chart-brand', 'res-chart-brand-fb', stats.by_brand || {}, null,
-    { type: 'bar', maxLabel: 24, onSegmentClick: l => setFilter('chart:brand', 'Бренд: ' + l, _matchExact(['бренд', 'brand'], l)) });
+  if (!_chartjs) {
+    // Chart.js ещё не подгрузился (редкий CDN-fallback) — повторим чуть позже,
+    // чтобы графики всё-таки нарисовались, а не остались пустыми.
+    if (stats) {
+      _pendingChartStats = stats;
+      if (!_chartRetryTimer) {
+        _chartRetryTimer = setInterval(() => {
+          tryInitCharts();
+          if (_chartjs) {
+            clearInterval(_chartRetryTimer); _chartRetryTimer = null;
+            const s = _pendingChartStats; _pendingChartStats = null;
+            if (s) buildResultsCharts(s);
+          }
+        }, 400);
+      }
+    }
+    return;
+  }
+  const _draw = (fn) => { try { fn(); } catch (e) { console && console.warn && console.warn('chart', e); } };
+  _draw(() => updateDonutChart('res-chart-status', 'res-chart-status-fb', stats.by_status || {}, STATUS_COLORS,
+    { onSegmentClick: l => setFilter('chart:status', 'Статус: ' + l, _matchExact(['технический статус', 'status'], l)) }));
+  _draw(() => updateDonutChart('res-chart-registry', 'res-chart-registry-fb', stats.by_registry || {}, REGISTRY_COLORS,
+    { onSegmentClick: l => setFilter('chart:registry', 'Реестр: ' + l, _matchRegistry(l)) }));
+  _draw(() => updateDonutChart('res-chart-marketplace', 'res-chart-marketplace-fb', stats.by_marketplace || {}, MKT_COLORS,
+    { onSegmentClick: l => setFilter('chart:marketplace', 'Маркетплейс: ' + l, _matchMarketplace(l)) }));
+  _draw(() => updateDonutChart('res-chart-original', 'res-chart-original-fb', stats.by_original || {}, ORIGINAL_COLORS,
+    { onSegmentClick: l => setFilter('chart:original', 'Оригинал: ' + l, _matchOriginal(l)) }));
+  _draw(() => updateDonutChart('res-chart-risk', 'res-chart-risk-fb', stats.by_risk || {}, RISK_COLORS,
+    { onSegmentClick: l => setFilter('chart:risk', 'Риск: ' + l, _matchExact(['риск по сроку'], l)) }));
+  _draw(() => updateDonutChart('res-chart-brand', 'res-chart-brand-fb', stats.by_brand || {}, null,
+    { type: 'bar', maxLabel: 24, onSegmentClick: l => setFilter('chart:brand', 'Бренд: ' + l, _matchExact(['бренд', 'brand'], l)) }));
 }
+let _pendingChartStats = null;
+let _chartRetryTimer = null;
 
 // Кэш последней статистики для вкладки «Очередь»
 let _lastQueueStats = null;

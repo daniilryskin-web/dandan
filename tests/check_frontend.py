@@ -54,6 +54,12 @@ script_m = re.search(r"<script>\n(.*?)\n</script>", html, re.DOTALL)
 js = script_m.group(1) if script_m else ""
 check("JS-блок извлечён", len(js) > 1000, f"{len(js)} байт")
 
+# v49: графики результатов строятся БЕЗУСЛОВНО (tryInitCharts + buildResultsCharts),
+# иначе при открытии «Результаты»/«Загрузить файл» до инициализации Chart.js
+# диаграммы оставались пустыми.
+check("loadResults: tryInitCharts перед buildResultsCharts(res.stats)",
+      "tryInitCharts();\n  buildResultsCharts(res.stats);" in html)
+
 node = shutil.which("node")
 if node:
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:

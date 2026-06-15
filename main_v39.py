@@ -666,7 +666,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-15-v50"
+APP_VERSION = "2026-06-15-v51"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -3289,7 +3289,10 @@ async def collect_cards(args) -> List[Card]:
         # на узкие варианты. Для брендов порог ниже — там вариантов мало.
         _use_price_buckets = int(args.limit) > 5000
         _PB_THRESHOLD = 120 if _brand_search else 250
-        _pb_sorts = ["popular"]
+        # На очень больших лимитах добавляем 2-ю сортировку: внутри одного ценового
+        # диапазона «popular» и «newly» отдают РАЗНЫЕ карточки (выдача WB упёрта в
+        # ~10k на запрос), что ещё увеличивает охват продуктивных вариантов.
+        _pb_sorts = ["popular", "newly"] if int(args.limit) > 20000 else ["popular"]
         _pb_pages = max(2, min(_max_pages, 5))
 
         async def work(q):
@@ -5302,17 +5305,24 @@ def _priority_for_label(label: str, rules: List[Tuple[int, Tuple[str, ...]]]) ->
             return score
     return 0
 
-def _looks_like_product_value(value: str) -> bool:
+def _looks_like_product_value(value: str, known_product_label: bool = False) -> bool:
     v = clean_registry_value(value)
     low = norm_text(v)
-    if len(v) < 18:
+    # v50: когда поле ТОЧНО является наименованием продукции (метка уже совпала —
+    # «Полное/Однородное наименование продукции»), короткие названия из 1-2 слов
+    # («Юбки женские», «Платья женские», «Носки детские») — НОРМАЛЬНЫЕ значения.
+    # Жёсткий порог в 18 символов их отбрасывал → из сертификата с многими
+    # товарами в результат попадал только самый длинный → ложные несоответствия.
+    min_len = 6 if known_product_label else 18
+    min_alpha = 5 if known_product_label else 10
+    if len(v) < min_len:
         return False
     if low.startswith("http"):
         return False
     if any(x in low for x in ("сведения о сертификате", "сведения о декларации", "регистрационный номер документа")) and len(v) < 120:
         return False
     # Значение должно содержать хотя бы буквы и не быть номером/датой.
-    if len(re.findall(r"[а-яa-z]", low)) < 10:
+    if len(re.findall(r"[а-яa-z]", low)) < min_alpha:
         return False
     return True
 
@@ -5846,7 +5856,8 @@ def _table_pairs_exact(soup) -> List[Tuple[str, str]]:
     return out
 
 
-def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 5000) -> List[str]:
+def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 5000,
+                                     known_product_label: bool = False) -> List[str]:
     """Extract values for exact Russian labels in table-like visible text.
 
     Works when HTML is flattened as:
@@ -5882,7 +5893,7 @@ def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 
                     if sum(len(x) for x in buf) >= max_chars:
                         break
                 val = clean_registry_value(' '.join(buf))
-            if _looks_like_product_value(val) or ('регистрационный номер' in norm_text(label) and val):
+            if _looks_like_product_value(val, known_product_label=known_product_label) or ('регистрационный номер' in norm_text(label) and val):
                 out.append(_trim_product_value(val) if 'продукц' in norm_text(label) else clean_registry_value(val))
     # Collapsed variant for rows flattened into one string.
     collapsed = clean_registry_value(text)
@@ -5891,7 +5902,7 @@ def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 
         val = clean_registry_value(m.group(1))
         if 'продукц' in norm_text(label):
             val = _trim_product_value(val)
-        if val and ((_looks_like_product_value(val)) or ('регистрационный номер' in norm_text(label) and len(val) >= 4)):
+        if val and ((_looks_like_product_value(val, known_product_label=known_product_label)) or ('регистрационный номер' in norm_text(label) and len(val) >= 4)):
             out.append(val)
     return _unique_keep_order(out)
 
@@ -5948,20 +5959,20 @@ def parse_swis_registry_strict(text: str) -> Tuple[str, str, str]:
         if 'регистрационный номер документа' in ln:
             cert_numbers.append(val)
         elif 'однородное наименование продукции' in ln:
-            if _looks_like_product_value(val):
+            if _looks_like_product_value(val, known_product_label=True):
                 homogeneous.append(_trim_product_value(val))
         elif 'полное наименование продукции' in ln and 'идентификац' in ln:
             val = _trim_product_value(val)
-            if _looks_like_product_value(val) and not _swis_value_is_not_product(val):
+            if _looks_like_product_value(val, known_product_label=True) and not _swis_value_is_not_product(val):
                 full_products.append(val)
 
     if not cert_numbers:
         cert_numbers.extend(_extract_same_line_or_next_exact(visible, 'Регистрационный номер документа', max_chars=250))
     if not homogeneous:
-        homogeneous.extend(_extract_same_line_or_next_exact(visible, 'Однородное наименование продукции', max_chars=1800))
+        homogeneous.extend(_extract_same_line_or_next_exact(visible, 'Однородное наименование продукции', max_chars=1800, known_product_label=True))
     if not full_products:
         for lab in SWIS_PRODUCT_LABELS[1:]:
-            full_products.extend([v for v in _extract_same_line_or_next_exact(visible, lab, max_chars=5000) if not _swis_value_is_not_product(v)])
+            full_products.extend([v for v in _extract_same_line_or_next_exact(visible, lab, max_chars=5000, known_product_label=True) if not _swis_value_is_not_product(v)])
 
     cert_num = _unique_keep_order(cert_numbers)[0] if _unique_keep_order(cert_numbers) else ''
     full_products = _unique_keep_order(full_products)
@@ -8597,11 +8608,11 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
         # --- Сведения о продукции / Товар N (раздел может быть любым) ---
         if "однородное наименование продукции" in label:
             v = _trim_product_value(value)
-            if _looks_like_product_value(v):
+            if _looks_like_product_value(v, known_product_label=True):
                 homogeneous.append(v)
         elif "полное наименование продукции" in label and "идентификац" in label:
             v = _trim_product_value(value)
-            if _looks_like_product_value(v) and not _swis_value_is_not_product(v):
+            if _looks_like_product_value(v, known_product_label=True) and not _swis_value_is_not_product(v):
                 full_products.append(v)
         # v27.9.x: ЗАПАСНОЙ захват наименования продукции для других вёрсток SWIS
         # (KGZ-National / упрощённые декларации), где нет слов «однородное» или
@@ -8611,7 +8622,7 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
                or "наименование объекта" in label)
               and "однородн" not in label):
             v = _trim_product_value(value)
-            if _looks_like_product_value(v) and not _swis_value_is_not_product(v):
+            if _looks_like_product_value(v, known_product_label=True) and not _swis_value_is_not_product(v):
                 generic_products.append(v)
         elif "схема сертификации" in label and not out.get("scheme"):
             out["scheme"] = value[:40]

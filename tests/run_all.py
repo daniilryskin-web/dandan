@@ -39,6 +39,7 @@ MODULES = [
     "test_xlsx_safe",
     "test_load_result",
     "test_kg_rf_status",
+    "test_kg_multiproduct",
     "test_speed_indicator",
     "test_empty_report_save",
     "test_ozon_verdict",

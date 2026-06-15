@@ -69,6 +69,15 @@ def main():
     check("категории бренда отсортированы по количеству", subs == ['515', '108', '9'])
     check("ценовой фильтр НЕ попал в категории", '1' not in subs)
 
+    # v49: устойчивость сбора по бренду (мало карточек, когда brandId «не найден»)
+    src = (Path(__file__).resolve().parents[1] / "main_v39.py").read_text(encoding="utf-8")
+    check("discover_brand_filter_ids повторяет попытки (ретраи)",
+          "for _attempt in range(3):" in src and "await asyncio.sleep(1.0)" in src)
+    check("бренд: «бренд+тип» использует несколько сортировок",
+          '_sorts = ["popular", "newly", "rate"]' in src)
+    check("бренд: добавляются модификаторы на больших лимитах",
+          "_bmods" in src)
+
 
 if __name__ == "__main__":
     main()

@@ -2715,26 +2715,38 @@ async def discover_brand_filter_ids(session: aiohttp.ClientSession, brand: str, 
     # У каждого товара WB есть поля brand + brandId. Берём id у товаров, чей бренд
     # совпадает с искомым. Это работает даже когда resultset=filters/подсказки
     # отдают пусто или сменили структуру (из-за чего brandId «не находился»).
-    product_urls = [
-        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false",
-        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false",
-    ]
+    # v49: НЕСКОЛЬКО сортировок/страниц + ПОВТОРЫ — раньше один зашумлённый/
+    # затроттленный запрос давал «brandId не найден», и весь бренд-каталог +
+    # сбор по категориям отваливались (отсюда «мало карточек»).
     _bid_counts: Dict[str, int] = {}
-    for url in product_urls:
-        data = await fetch_json(session, url, timeout=timeout)
-        if not data:
-            continue
-        for p in recursive_find_products(data):
-            bid = p.get("brandId") or p.get("brand_id") or p.get("brandID")
-            pbrand = norm_key_brand(str(p.get("brand") or p.get("brandName") or ""))
-            if not bid or not pbrand:
-                continue
-            if not re.fullmatch(r"\d{1,10}", str(bid).strip()):
-                continue
-            if pbrand == wanted or wanted in pbrand or pbrand in wanted:
-                _bid_counts[str(bid).strip()] = _bid_counts.get(str(bid).strip(), 0) + 1
+    _host_pair = ("search.wb.ru", "u-search.wb.ru")
+    for _attempt in range(3):
+        for _sort in ("popular", "newly", "rate"):
+            for _pg in (1, 2):
+                for _host in _host_pair:
+                    url = (f"https://{_host}/exactmatch/ru/common/v18/search?ab_testing=false&appType=1"
+                           f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}"
+                           f"&resultset=catalog&sort={_sort}&spp=30&suppressSpellcheck=false")
+                    data = await fetch_json(session, url, timeout=timeout)
+                    if not data:
+                        continue
+                    for p in recursive_find_products(data):
+                        bid = p.get("brandId") or p.get("brand_id") or p.get("brandID")
+                        pbrand = norm_key_brand(str(p.get("brand") or p.get("brandName") or ""))
+                        if not bid or not pbrand:
+                            continue
+                        if not re.fullmatch(r"\d{1,10}", str(bid).strip()):
+                            continue
+                        if pbrand == wanted or wanted in pbrand or pbrand in wanted:
+                            _bid_counts[str(bid).strip()] = _bid_counts.get(str(bid).strip(), 0) + 1
+                    break  # один из хостов ответил — на этом (sort,page) хватит
+                if _bid_counts:
+                    break
+            if _bid_counts:
+                break
         if _bid_counts:
             break
+        await asyncio.sleep(1.0)  # затроттлено — подождём и повторим
     # самые частые brandId — впереди (основной бренд, а не случайные совпадения)
     for bid, _cnt in sorted(_bid_counts.items(), key=lambda kv: -kv[1]):
         if bid not in found:
@@ -3110,12 +3122,28 @@ async def collect_cards(args) -> List[Card]:
         if _brand_search:
             # Бренд: чистый бренд + (если выбраны категории) «бренд + тип товара» из
             # КАЖДОЙ выбранной категории. Больше карточек, не выходя за категории.
+            # v49: на больших лимитах добавляем «бренд + тип + модификатор»
+            # (пол/цвет/сезон) — WB на каждый такой запрос отдаёт частично новый
+            # набор товаров бренда, что кратно увеличивает охват.
             if _brand_domains:
                 variants = [args.brand]
+                _bmods = []
+                if int(args.limit) > 3000:
+                    _bmods = ['мужские', 'женские', 'детские', 'черные', 'белые',
+                              'синие', 'красные', 'серые', 'зеленые', 'розовые',
+                              'летние', 'зимние', 'демисезонные']
                 for _d in _brand_domains:
-                    variants += [f"{args.brand} {t}" for t in DOMAIN_PRODUCT_TYPES.get(_d, [])]
+                    _dtypes = DOMAIN_PRODUCT_TYPES.get(_d, [])
+                    variants += [f"{args.brand} {t}" for t in _dtypes]
+                    for t in _dtypes:
+                        for mm in _bmods:
+                            variants.append(f"{args.brand} {t} {mm}")
             else:
                 variants = [args.brand]
+                if int(args.limit) > 3000:
+                    for mm in ['мужское', 'женское', 'детское', 'обувь', 'одежда',
+                               'кроссовки', 'куртки', 'футболки', 'аксессуары', 'сумки']:
+                        variants.append(f"{args.brand} {mm}")
         elif args.limit <= args.per_query_limit and not args.auto_expand:
             variants = [args.query]
 
@@ -3246,8 +3274,10 @@ async def collect_cards(args) -> List[Card]:
                     _pages = _max_pages
                     _fb = _fbrand_ids
                 elif _brand_search:
-                    _sorts = ["popular"]
-                    _pages = min(_max_pages, 4)
+                    # v49: «бренд + тип» — 3 сортировки и больше страниц (раньше 1×4),
+                    # чтобы вытащить больше уникальных товаров бренда.
+                    _sorts = ["popular", "newly", "rate"]
+                    _pages = min(_max_pages, 8)
                     _fb = []
                 else:
                     _sorts = [s.strip() or "popular" for s in args.search_sorts.split(",")]

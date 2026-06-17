@@ -1613,6 +1613,98 @@ class Bridge:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    # v53 (улучшение №10): выгрузка ТОЛЬКО спорных строк («ПРОВЕРИТЬ ВРУЧНУЮ» +
+    # «НЕСООТВЕТСТВИЕ») отдельным Excel с КЛИКАБЕЛЬНЫМИ ссылками на карточку WB и
+    # на реестр + причиной вердикта. Ревью 300-800 строк по ссылкам вместо листания
+    # всех 50 000.
+    DISPUTED_STATUSES = ("ПРОВЕРИТЬ ВРУЧНУЮ", "НЕСООТВЕТСТВИЕ")
+
+    def export_disputed(self, xlsx_path: Optional[str] = None) -> dict:
+        res = self.get_results(xlsx_path)
+        if not res.get("ok"):
+            return res
+        rows = res["rows"]
+        headers = res["columns"]
+        h_lower = [str(h).lower() for h in headers]
+
+        def col(*needles: str) -> Optional[int]:
+            for needle in needles:
+                if needle in h_lower:
+                    return h_lower.index(needle)
+            for needle in needles:
+                for i, h in enumerate(h_lower):
+                    if needle in h:
+                        return i
+            return None
+
+        i_status = col("технический статус", "status", "статус")
+        i_nm     = col("артикул", "nm_id", "артикул wb")
+        i_name   = col("название товара", "product_name", "наименование")
+        i_brand  = col("бренд", "brand")
+        i_cert   = col("название в реестре", "certificate_product_name")
+        i_reason = col("примечания", "details", "детали", "причина")
+        i_purl   = col("ссылка на товар (wb)", "ссылка на товар", "product_url")
+        i_rurl   = col("ссылка на реестр", "registry_url", "реестр (url)")
+        if i_status is None:
+            return {"ok": False, "error": "В файле нет колонки статуса — нечего фильтровать."}
+
+        def cell(r, idx):
+            return "" if idx is None or idx >= len(r) else (r[idx] if r[idx] is not None else "")
+
+        disputed = [r for r in rows
+                    if str(cell(r, i_status)).strip() in self.DISPUTED_STATUSES]
+        if not disputed:
+            return {"ok": False, "error": "Спорных строк (ПРОВЕРИТЬ ВРУЧНУЮ / НЕСООТВЕТСТВИЕ) не найдено."}
+
+        try:
+            from openpyxl import Workbook  # type: ignore
+            from openpyxl.styles import Font, PatternFill, Alignment
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "На проверку"
+            out_headers = ["Артикул", "Название товара", "Бренд", "Вердикт",
+                           "Название в реестре", "Причина", "Карточка WB", "Реестр"]
+            ws.append(out_headers)
+            hfont = Font(bold=True, color="FFFFFF")
+            hfill = PatternFill("solid", fgColor="3A5FBF")
+            for c in ws[1]:
+                c.font = hfont
+                c.fill = hfill
+                c.alignment = Alignment(vertical="center")
+            link_font = Font(color="0563C1", underline="single")
+            warn_fill = PatternFill("solid", fgColor="FFF3CD")   # ПРОВЕРИТЬ ВРУЧНУЮ
+            bad_fill = PatternFill("solid", fgColor="F8D7DA")     # НЕСООТВЕТСТВИЕ
+            for r in disputed:
+                verdict = str(cell(r, i_status)).strip()
+                purl = str(cell(r, i_purl)).strip()
+                rurl = str(cell(r, i_rurl)).strip()
+                ws.append([
+                    cell(r, i_nm), cell(r, i_name), cell(r, i_brand), verdict,
+                    cell(r, i_cert), cell(r, i_reason),
+                    "Открыть" if purl else "", "Открыть" if rurl else "",
+                ])
+                row_i = ws.max_row
+                vcell = ws.cell(row=row_i, column=4)
+                vcell.fill = bad_fill if verdict == "НЕСООТВЕТСТВИЕ" else warn_fill
+                if purl:
+                    lc = ws.cell(row=row_i, column=7)
+                    lc.hyperlink = purl
+                    lc.font = link_font
+                if rurl:
+                    lc = ws.cell(row=row_i, column=8)
+                    lc.hyperlink = rurl
+                    lc.font = link_font
+            widths = [14, 42, 18, 20, 46, 50, 12, 12]
+            for ci, w in enumerate(widths, 1):
+                ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = w
+            ws.freeze_panes = "A2"
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            out_path = APP_DIR / f"на_проверку_{ts}.xlsx"
+            wb.save(str(out_path))
+            return {"ok": True, "path": str(out_path), "rows": len(disputed)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
 
 # ---------------------------------------------------------------------------
 # Frontend HTML/CSS/JS
@@ -2528,6 +2620,7 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
           <button class="btn btn-ghost btn-sm" id="btn-load-result">📂 Загрузить файл</button>
           <button class="btn btn-ghost btn-sm" id="btn-clear-loaded" style="display:none">✖ Текущий прогон</button>
           <button class="btn btn-ghost btn-sm" id="btn-export-csv">⬇ CSV</button>
+          <button class="btn btn-ghost btn-sm" id="btn-export-disputed" title="Выгрузить только спорные строки (ПРОВЕРИТЬ ВРУЧНУЮ + НЕСООТВЕТСТВИЕ) со ссылками на карточку и реестр">⬇ На проверку</button>
           <button class="btn btn-ghost btn-sm" id="btn-columns">⚙ Колонки</button>
           <span class="text-muted text-sm" id="results-count"></span>
           <span class="text-muted text-sm" id="loaded-file-badge" style="display:none"></span>
@@ -3707,6 +3800,19 @@ $('#btn-export-csv').addEventListener('click', async () => {
   const res = await window.pywebview.api.export_csv(null, q);
   if (res.ok) toast(`CSV сохранён: ${res.rows} строк`, 'ok');
   else toast(res.error || 'Ошибка экспорта', 'err');
+});
+
+// v53 (улучшение №10): выгрузка только спорных строк со ссылками и причиной.
+$('#btn-export-disputed').addEventListener('click', async () => {
+  const btn = $('#btn-export-disputed');
+  btn.disabled = true;
+  try {
+    const res = await window.pywebview.api.export_disputed(null);
+    if (res.ok) toast(`Файл «на проверку» сохранён: ${res.rows} спорных строк`, 'ok');
+    else toast(res.error || 'Ошибка экспорта', 'err');
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 // ============================================================

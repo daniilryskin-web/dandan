@@ -21,6 +21,7 @@ MODULES = [
     "test_tnved",
     "test_price_adaptive",
     "test_registry_cache",
+    "test_export_disputed",
     "test_chart_stats",
     "test_fsa_fastfail",
     "test_fsa_retry",

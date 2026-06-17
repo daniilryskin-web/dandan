@@ -3294,6 +3294,10 @@ async def collect_cards(args) -> List[Card]:
         # ~10k на запрос), что ещё увеличивает охват продуктивных вариантов.
         _pb_sorts = ["popular", "newly"] if int(args.limit) > 20000 else ["popular"]
         _pb_pages = max(2, min(_max_pages, 5))
+        # v53 (улучшение №6): пределы адаптивного дробления ценовой корзины.
+        # глубина 4 = до 16 под-корзин на корзину; не дробим диапазон уже 100 ₽.
+        _PB_MAX_DEPTH = 4
+        _PB_MIN_WIDTH = 10000  # копеек = 100 ₽
 
         async def work(q):
             async with sem:
@@ -3375,24 +3379,46 @@ async def collect_cards(args) -> List[Card]:
                 # карточек — значит упёрся в лимит глубины WB ~10k), проходим по
                 # ценовым диапазонам: тот же запрос с &priceU отдаёт ДРУГИЕ карточки.
                 # Это и пробивает потолок для крупных категорий/брендов.
+                # v53 (улучшение №6): АДАПТИВНОЕ дробление. Фиксированные корзины
+                # не спасают, если в одной корзине всё ещё >10k товаров (плотный
+                # масс-маркет): мы снова упираемся в потолок и теряем остаток.
+                # Поэтому если корзина «насыщена» (пролистали все страницы, и каждая
+                # давала новые карточки) — делим её пополам и углубляемся рекурсивно,
+                # пока под-диапазон не выгребается целиком или не дойдём до предела.
+                async def _deepen_price(pmin, pmax, depth):
+                    if len(cards_map) >= args.limit:
+                        return
+                    _pu = f"{pmin};{pmax}"
+                    saturated = False
+                    for sort in _pb_sorts:
+                        pages_with_new = 0
+                        for _page in range(1, _pb_pages + 1):
+                            cards = await collect_one_query(
+                                session, q, args.per_query_limit, sort,
+                                domain=domain if use_filter else '', stats=collect_stats,
+                                page=_page, fbrand_ids=_fb, price_u=_pu)
+                            if not cards or _ingest(cards) == 0:
+                                break
+                            pages_with_new += 1
+                            if len(cards_map) >= args.limit:
+                                return
+                        # пролистали ВСЕ страницы, и каждая давала новое → диапазон,
+                        # вероятно, упёрся в потолок WB → есть смысл дробить
+                        if pages_with_new >= _pb_pages:
+                            saturated = True
+                    if (saturated and depth < _PB_MAX_DEPTH
+                            and (pmax - pmin) > _PB_MIN_WIDTH
+                            and len(cards_map) < args.limit):
+                        mid = (pmin + pmax) // 2
+                        await _deepen_price(pmin, mid, depth + 1)
+                        await _deepen_price(mid, pmax, depth + 1)
+
                 if (_use_price_buckets and _variant_added >= _PB_THRESHOLD
                         and len(cards_map) < args.limit):
                     for (pmin, pmax) in PRICE_BUCKETS:
                         if len(cards_map) >= args.limit:
                             break
-                        _pu = f"{pmin};{pmax}"
-                        for sort in _pb_sorts:
-                            for _page in range(1, _pb_pages + 1):
-                                cards = await collect_one_query(
-                                    session, q, args.per_query_limit, sort,
-                                    domain=domain if use_filter else '', stats=collect_stats,
-                                    page=_page, fbrand_ids=_fb, price_u=_pu)
-                                if _ingest(cards) == 0 or not cards:
-                                    break
-                                if len(cards_map) >= args.limit:
-                                    break
-                            if len(cards_map) >= args.limit:
-                                break
+                        await _deepen_price(pmin, pmax, 0)
         tasks = [asyncio.create_task(work(q)) for q in variants]
         for t in asyncio.as_completed(tasks):
             try:

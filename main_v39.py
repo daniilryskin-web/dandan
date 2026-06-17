@@ -667,7 +667,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-16-v52"
+APP_VERSION = "2026-06-17-v53"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -7176,6 +7176,115 @@ def _contains_broad_child_clothing(cert_text: str) -> bool:
     return any(x in low for x in broad) and any(x in low for x in child)
 
 
+# =====================================================================
+# v53 (улучшение №1): СЕМАНТИЧЕСКОЕ сравнение названий (офлайн-эмбеддинги).
+# ---------------------------------------------------------------------
+# Словарь синонимов невозможно дописать до бесконечности — любой новый вид
+# товара даёт ложную «ручную проверку». Маленькая офлайн-модель (sentence-
+# transformers) превращает название в вектор-«смысловой отпечаток» и сравнивает
+# по смыслу: «тельняшка»≈«нательная футболка», «олимпийка»≈«спортивная кофта» —
+# даже если этих слов нет в словаре.
+#
+# ВСТРАИВАНИЕ БЕЗ РИСКА: если библиотека/модель не установлены — слой просто
+# выключен, программа работает на правилах как раньше. Эмбеддинги срабатывают
+# ТОЛЬКО как последняя попытка спасти от «ПРОВЕРИТЬ ВРУЧНУЮ» (после всех правил и
+# при отсутствии конфликтов) — они НЕ переопределяют конфликты и готовые OK.
+#
+# Установка у пользователя (один раз):
+#   pip install sentence-transformers
+#   модель скачается автоматически при первом запуске (нужен интернет 1 раз),
+#   далее работает офлайн. Имя модели — env WB_SEMANTIC_MODEL
+#   (по умолчанию «cointegrated/rubert-tiny2», ~120 МБ, быстрая на CPU).
+# =====================================================================
+
+SEMANTIC_MODEL_NAME = os.environ.get('WB_SEMANTIC_MODEL', 'cointegrated/rubert-tiny2')
+try:
+    SEMANTIC_OK_THRESHOLD = float(os.environ.get('WB_SEMANTIC_THRESHOLD', '0.62'))
+except Exception:
+    SEMANTIC_OK_THRESHOLD = 0.62
+
+# Кастомный эмбеддер можно внедрить (тесты/альтернативные модели): callable,
+# принимает list[str], возвращает list[vector] (нормированные numpy-векторы).
+_SEMANTIC_EMBED_FN = None
+_SEMANTIC_STATE: Dict[str, Any] = {'tried': False, 'model': None, 'name': ''}
+_SEMANTIC_CACHE: Dict[str, Any] = {}
+_SEMANTIC_DISABLED = False  # выставляется из --semantic false
+
+
+def _semantic_model():
+    """Лениво загружает sentence-transformers. None, если недоступно."""
+    if _SEMANTIC_STATE['tried']:
+        return _SEMANTIC_STATE['model']
+    _SEMANTIC_STATE['tried'] = True
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        _SEMANTIC_STATE['model'] = SentenceTransformer(SEMANTIC_MODEL_NAME)
+        _SEMANTIC_STATE['name'] = SEMANTIC_MODEL_NAME
+    except Exception:
+        _SEMANTIC_STATE['model'] = None
+    return _SEMANTIC_STATE['model']
+
+
+def semantic_available() -> bool:
+    return _SEMANTIC_EMBED_FN is not None or _semantic_model() is not None
+
+
+def semantic_status() -> str:
+    if _SEMANTIC_EMBED_FN is not None:
+        return 'семантика: пользовательский эмбеддер активен'
+    if _semantic_model() is not None:
+        return f'семантика ВКЛ (модель: {_SEMANTIC_STATE["name"]})'
+    return ('семантика ВЫКЛ (установите: pip install sentence-transformers — '
+            'тогда сложные названия будут сверяться по смыслу)')
+
+
+def _embed_one(text: str):
+    """Нормированный вектор для одной строки (с кэшем). None если недоступно."""
+    key = norm_text(text)
+    if key in _SEMANTIC_CACHE:
+        return _SEMANTIC_CACHE[key]
+    fn = _SEMANTIC_EMBED_FN
+    try:
+        if fn is not None:
+            vec = fn([key])[0]
+        else:
+            m = _semantic_model()
+            if m is None:
+                return None
+            vec = m.encode([key], normalize_embeddings=True)[0]
+    except Exception:
+        return None
+    import numpy as _np
+    vec = _np.asarray(vec, dtype='float32')
+    n = float((vec * vec).sum()) ** 0.5
+    if n > 0:
+        vec = vec / n
+    if len(_SEMANTIC_CACHE) < 200000:
+        _SEMANTIC_CACHE[key] = vec
+    return vec
+
+
+def semantic_best(card_text: str, cert_text: str) -> float:
+    """Максимальная косинусная близость карточки к ЛЮБОМУ из товаров сертификата
+    (в реестре их бывает много через «; »). Возвращает 0..1, либо -1 если слой
+    семантики недоступен (тогда вызывающий код просто его игнорирует)."""
+    if _SEMANTIC_DISABLED or not card_text or not cert_text:
+        return -1.0
+    cv = _embed_one(card_text)
+    if cv is None:
+        return -1.0
+    best = -1.0
+    parts = [p.strip() for p in re.split(r'[;\n]+', cert_text) if p.strip()][:20] or [cert_text]
+    for part in parts:
+        pv = _embed_one(part)
+        if pv is None:
+            continue
+        sim = float((cv * pv).sum())
+        if sim > best:
+            best = sim
+    return best
+
+
 def compare_product_names(product_name: str, cert_product_name: str, brand: str = '', subject: str = '', doc_status: str = '', cert_tnved: str = '') -> Tuple[str, float, str]:
     """Conservative professional comparison.
 
@@ -7430,6 +7539,16 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
 
     if score >= 78:
         return 'OK', score, 'Высокое суммарное совпадение без конфликтов; ' + detail_base
+    # v53 (улучшение №1): СЕМАНТИЧЕСКОЕ спасение от ручной проверки. Правила не
+    # дали OK и конфликтов нет — спросим офлайн-модель о смысловой близости
+    # названий. Если она высокая (≥ порога) — это OK (модель «понимает» виды
+    # товара, которых нет в словаре). Без модели semantic_best вернёт -1 и ничего
+    # не изменится. Конфликты сюда не доходят — переопределения вердиктов нет.
+    if not conflicts:
+        _sim = semantic_best(card_text, cert_text)
+        if _sim >= SEMANTIC_OK_THRESHOLD:
+            return 'OK', max(score, round(_sim * 100.0, 1)), \
+                f'Семантическое совпадение названий ({_sim:.2f} ≥ {SEMANTIC_OK_THRESHOLD:.2f}); ' + detail_base
     if score >= 40:
         return 'ПРОВЕРИТЬ ВРУЧНУЮ', score, 'Частичное совпадение, но недостаточно для автоматического OK; ' + detail_base
     return 'ПРОВЕРИТЬ ВРУЧНУЮ', score, 'Низкое совпадение без доказанного конфликта; ' + detail_base
@@ -9215,6 +9334,15 @@ async def run_registry_stage(args):
         except Exception as _e:
             print(f"⚠️  Таблица статусов КГ-РФ не загружена: {type(_e).__name__}: {_e}")
 
+    # v53 (улучшение №1): включаем/выключаем семантический слой и сообщаем статус.
+    global _SEMANTIC_DISABLED
+    _SEMANTIC_DISABLED = not bool(getattr(args, 'semantic', True))
+    try:
+        print("🧠 " + ("семантика отключена (--semantic false)"
+                        if _SEMANTIC_DISABLED else semantic_status()))
+    except Exception:
+        pass
+
     # v27.9.x: глушим КОСМЕТИЧЕСКИЕ ошибки event-loop'а вида «Future exception was
     # never retrieved» с net::ERR_ABORTED / «frame was detached». Они возникают,
     # когда жёсткий per-record timeout отменяет навигацию Playwright в момент
@@ -10404,6 +10532,11 @@ def build_parser():
     ap.add_argument("--registry-cache-ttl-days", type=float, default=7.0,
                     help="v53: срок свежести записи кэша, дней (по умолчанию 7). Старше — документ "
                          "парсится заново, чтобы обновить статус. 0 = кэш бессрочный.")
+    ap.add_argument("--semantic", type=str_to_bool, default=True,
+                    help="v53 (улучшение №1): семантическое сравнение названий офлайн-моделью "
+                         "(если установлена sentence-transformers). Спасает сложные названия от "
+                         "ложной «ПРОВЕРИТЬ ВРУЧНУЮ». Без модели работает на правилах. "
+                         "Модель: env WB_SEMANTIC_MODEL (по умолч. cointegrated/rubert-tiny2).")
     ap.add_argument("--fsa-human-delay-ms", default="300,1400",
                     help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
                          "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "

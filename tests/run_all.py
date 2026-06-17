@@ -20,6 +20,7 @@ MODULES = [
     "test_compare_v52",
     "test_tnved",
     "test_price_adaptive",
+    "test_registry_cache",
     "test_chart_stats",
     "test_fsa_fastfail",
     "test_fsa_retry",

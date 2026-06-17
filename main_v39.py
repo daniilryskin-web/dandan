@@ -28,6 +28,7 @@ import math
 import os
 import random
 import re
+import sqlite3
 import sys
 import time
 import traceback
@@ -9119,6 +9120,76 @@ def _load_prior_registry_parsed(xlsx_path: Path) -> Dict[str, Tuple[str, str, st
     return out
 
 
+class RegistryCache:
+    """v53 (улучшение №7): ПОСТОЯННЫЙ кэш распарсенных реестров между запусками.
+
+    Один документ (сертификат/декларация) часто покрывает СОТНИ карточек разных
+    продавцов и повторяется из прогона в прогон. Реестр — самое медленное место
+    этапа 2. Кэш на встроенном SQLite (ничего ставить не нужно) хранит результат
+    парсинга по ссылке на реестр и мгновенно отдаёт его при повторной встрече.
+
+    СВЕЖЕСТЬ: у записи есть метка времени. Статус документа может измениться, поэтому
+    запись старше ttl_days (по умолчанию 7) считается несвежей и документ парсится
+    заново (что обновляет и статус, и остальные поля). Стабильные поля (название,
+    даты, ТН ВЭД) у действующего документа не меняются — внутри окна свежести берём
+    всё из кэша. Кэшируем только ПОЛНЫЕ успешные разборы (номер+название+статус).
+    """
+
+    def __init__(self, path: Any, ttl_days: float = 7.0):
+        self.path = Path(path)
+        self.ttl = float(ttl_days) * 86400.0
+        self._conn = sqlite3.connect(str(self.path))
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS registry ("
+            "url TEXT PRIMARY KEY, cert TEXT, product TEXT, doc_type TEXT, "
+            "doc_status TEXT, detail TEXT, ext_json TEXT, ts REAL)")
+        self._conn.commit()
+
+    def get(self, url: str):
+        """(tuple5, ext_dict) если есть и СВЕЖАЯ; иначе None (→ парсить заново)."""
+        try:
+            cur = self._conn.execute(
+                "SELECT cert,product,doc_type,doc_status,detail,ext_json,ts "
+                "FROM registry WHERE url=?", (url,))
+            row = cur.fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        cert, product, doc_type, doc_status, detail, ext_json, ts = row
+        if self.ttl > 0 and (time.time() - float(ts or 0)) > self.ttl:
+            return None
+        try:
+            ext = json.loads(ext_json) if ext_json else {}
+        except Exception:
+            ext = {}
+        return (cert or '', product or '', doc_type or '', doc_status or '',
+                (detail or '') + ';from_cache'), ext
+
+    def put(self, url: str, val5, ext: Optional[Dict[str, str]] = None):
+        cert, product, doc_type, doc_status, detail = val5
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO registry VALUES (?,?,?,?,?,?,?,?)",
+                (url, cert, product, doc_type, doc_status, detail,
+                 json.dumps(ext or {}, ensure_ascii=False), time.time()))
+        except Exception:
+            pass
+
+    def commit(self):
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._conn.commit()
+            self._conn.close()
+        except Exception:
+            pass
+
+
 async def run_registry_stage(args):
     """v38.6: visible-browser registry stage with first-stage-like progress.
 
@@ -9256,6 +9327,36 @@ async def run_registry_stage(args):
                 print(f"⏯  Resume этапа 2: {len(done_urls)} из {len(_cur)} реестров уже "
                       f"собраны в {_out_p.name} — переношу как есть, парсить осталось "
                       f"{len(unique_urls)}. (Полный пере-парсинг: --registry-resume false)")
+
+    # v53 (улучшение №7): ПОСТОЯННЫЙ КЭШ реестров между запусками (SQLite).
+    # Документы массово повторяются между прогонами — берём их из кэша мгновенно,
+    # без обращения к реестру. Свежесть статуса — окно ttl (по умолчанию 7 дней).
+    _reg_cache = None
+    if bool(getattr(args, 'registry_cache', True)):
+        try:
+            _cache_path = (getattr(args, 'registry_cache_file', '') or '').strip() \
+                or str(Path(args.output).with_name('registry_cache.sqlite'))
+            _ttl_days = float(getattr(args, 'registry_cache_ttl_days', 7.0) or 0)
+            _reg_cache = RegistryCache(_cache_path, _ttl_days)
+            _cur_n = len(unique_urls)
+            _hit = 0
+            for u in list(unique_urls):
+                got = _reg_cache.get(u)
+                if not got:
+                    continue
+                val5, ext = got
+                _retry_seed[u] = val5
+                if ext and u not in _FSA_EXTENDED_FIELDS_CACHE:
+                    _FSA_EXTENDED_FIELDS_CACHE[u] = {k: v for k, v in ext.items() if v}
+                _hit += 1
+            if _hit:
+                unique_urls = [u for u in unique_urls if u not in _retry_seed]
+                print(f"🗃  Кэш реестров: {_hit} из {_cur_n} документов взяты из кэша "
+                      f"(свежесть ≤ {_ttl_days:g} дн.), парсить осталось {len(unique_urls)}. "
+                      f"(Отключить: --registry-cache false)")
+        except Exception as _e:
+            print(f"⚠️  Кэш реестров недоступен ({type(_e).__name__}: {_e}) — работаю без него.")
+            _reg_cache = None
 
     # Default second stage to browser-visible parsing for main registries. It is slower, but substantially more reliable for FSA SPA.
     browser_workers = max(1, int(getattr(args, 'registry_browser_workers', 2)))
@@ -10014,6 +10115,30 @@ async def run_registry_stage(args):
             if restart_count[0] > 0:
                 print(f"🛡  Watchdog 2 этапа сработал {restart_count[0]} раз за прогон")
 
+    # v53 (улучшение №7): пополняем постоянный кэш свежесобранными документами.
+    # Только ПОЛНЫЕ успешные разборы (номер+название+статус), не из кэша/resume и
+    # не belgiss-link-only. Это и ускоряет будущие прогоны, и снижает нагрузку на
+    # реестры (меньше блокировок).
+    if _reg_cache is not None:
+        try:
+            _saved = 0
+            for _u, _val in parsed.items():
+                if _u in _retry_seed:
+                    continue  # пришло из кэша/resume — уже сохранено
+                _c, _p, _t, _ds, _det = _val
+                if not (str(_c).strip() and str(_p).strip() and str(_ds).strip()):
+                    continue  # неполное/ошибка — не кэшируем (доберётся при повторе)
+                if 'belgiss' in (_det or ''):
+                    continue
+                _reg_cache.put(_u, _val, _FSA_EXTENDED_FIELDS_CACHE.get(_u, {}))
+                _saved += 1
+            _reg_cache.close()
+            if _saved:
+                print(f"🗃  Кэш реестров пополнен: +{_saved} документов "
+                      f"(ускорит следующие прогоны).")
+        except Exception as _e:
+            print(f"⚠️  Не удалось пополнить кэш реестров: {type(_e).__name__}: {_e}")
+
     progress_task.cancel()
     saver_task.cancel()
     for t in (progress_task, saver_task):
@@ -10269,6 +10394,16 @@ def build_parser():
     ap.add_argument("--registry-resume-max-age-hours", type=float, default=72.0,
                     help="v47: максимальный возраст result.xlsx для resume этапа 2, часов. Старше — "
                          "полный пере-парсинг (статусы документов могли поменяться).")
+    ap.add_argument("--registry-cache", type=str_to_bool, default=True,
+                    help="v53 (улучшение №7): постоянный кэш распарсенных реестров между "
+                         "запусками (SQLite). Документы массово повторяются — берём их из кэша "
+                         "мгновенно, без обращения к реестру. Отключить: --registry-cache false.")
+    ap.add_argument("--registry-cache-file", default="",
+                    help="v53: путь к файлу кэша реестров. Пусто = registry_cache.sqlite рядом "
+                         "с файлом результата.")
+    ap.add_argument("--registry-cache-ttl-days", type=float, default=7.0,
+                    help="v53: срок свежести записи кэша, дней (по умолчанию 7). Старше — документ "
+                         "парсится заново, чтобы обновить статус. 0 = кэш бессрочный.")
     ap.add_argument("--fsa-human-delay-ms", default="300,1400",
                     help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
                          "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "

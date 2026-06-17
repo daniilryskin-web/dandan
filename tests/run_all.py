@@ -18,6 +18,7 @@ MODULES = [
     "test_compare_layers",
     "test_compare_footwear",
     "test_compare_v52",
+    "test_tnved",
     "test_chart_stats",
     "test_fsa_fastfail",
     "test_fsa_retry",

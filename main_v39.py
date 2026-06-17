@@ -7051,6 +7051,84 @@ def _seq_ratio(a: str, b: str) -> float:
     return 100.0 * difflib.SequenceMatcher(None, norm_text(a), norm_text(b)).ratio()
 
 
+# v53 (улучшение №2): КАРТА ПРЕФИКСОВ ТН ВЭД ЕАЭС → внутренняя товарная категория.
+# Первые 2-4 цифры кода = товарная группа (гармонизированная система). Это ВТОРОЙ,
+# независимый от названия, признак товара. Применение:
+#   • спасает случаи, где в реестре вместо названия только коды («КОД ТН ВЭД: 6107…»);
+#   • усиливает OK, когда код подтверждает категорию карточки;
+#   • ловит конфликты (код=игрушки 9503, а карточка=посуда).
+# Длинный префикс (4 цифры) важнее короткого (2 цифры) — ищем самый длинный.
+TNVED_PREFIX_CATEGORY = {
+    # Одежда (61 — трикотажная, 62 — текстильная)
+    '61': 'clothing', '62': 'clothing', '4203': 'clothing', '6217': 'clothing',
+    # Обувь
+    '64': 'footwear',
+    # Головные уборы и галантерея → аксессуары
+    '6501': 'accessories', '6502': 'accessories', '6503': 'accessories',
+    '6504': 'accessories', '6505': 'accessories', '6506': 'accessories',
+    '6507': 'accessories', '4202': 'accessories', '6601': 'accessories',
+    # Домашний текстиль / постельные принадлежности
+    '6301': 'home_textile', '6302': 'home_textile', '6303': 'home_textile',
+    '6304': 'home_textile', '9404': 'home_textile', '6307': 'home_textile',
+    # Игрушки и игры
+    '9503': 'toys', '9504': 'toys', '9505': 'toys',
+    # Электроника / связь / ИТ
+    '8517': 'electronics', '8518': 'electronics', '8519': 'electronics',
+    '8521': 'electronics', '8527': 'electronics', '8528': 'electronics',
+    '8471': 'electronics', '8443': 'electronics', '8523': 'electronics',
+    '8504': 'electronics', '8506': 'electronics', '8507': 'electronics',
+    '9006': 'electronics', '9504': 'toys',
+    # Бытовая техника (приборы)
+    '8516': 'appliances', '8509': 'appliances', '8508': 'appliances',
+    '8450': 'appliances', '8451': 'appliances', '8418': 'appliances',
+    '8415': 'appliances', '8414': 'appliances', '8422': 'appliances',
+    '8421': 'appliances', '8210': 'appliances', '8516': 'appliances',
+    # Посуда и кухонные принадлежности
+    '7013': 'kitchenware', '7323': 'kitchenware', '7324': 'kitchenware',
+    '8215': 'kitchenware', '3924': 'kitchenware', '4419': 'kitchenware',
+    '6911': 'kitchenware', '6912': 'kitchenware', '7615': 'kitchenware',
+    '8211': 'kitchenware', '9617': 'kitchenware',
+    # Косметика / гигиена
+    '3303': 'cosmetics', '3304': 'cosmetics', '3305': 'cosmetics',
+    '3306': 'cosmetics', '3307': 'cosmetics', '3401': 'cosmetics',
+    # Бытовая химия
+    '3402': 'household_chemistry', '3405': 'household_chemistry',
+    # Мебель
+    '9401': 'furniture', '9403': 'furniture',
+    # Детские товары
+    '9619': 'nursery', '8715': 'nursery',
+    # Канцелярия
+    '4820': 'stationery', '9608': 'stationery', '9609': 'stationery',
+    # Ювелирка / бижутерия
+    '7113': 'jewelry', '7117': 'jewelry',
+    # Светотехника
+    '9405': 'lighting', '8539': 'lighting',
+}
+
+
+def _tnved_category(code: Any) -> str:
+    """Категория по коду ТН ВЭД (по самому длинному совпавшему префиксу). '' если нет."""
+    digits = re.sub(r'\D', '', str(code or ''))
+    if len(digits) < 2:
+        return ''
+    for plen in (4, 2):
+        if len(digits) >= plen:
+            cat = TNVED_PREFIX_CATEGORY.get(digits[:plen])
+            if cat:
+                return cat
+    return ''
+
+
+def _tnved_categories_from_text(text: str) -> Set[str]:
+    """Все категории из кодов ТН ВЭД, встреченных в тексте (для поля-дампа кодов)."""
+    out: Set[str] = set()
+    for m in re.findall(r'\b(\d{4,10})\b', str(text or '')):
+        cat = _tnved_category(m)
+        if cat:
+            out.add(cat)
+    return out
+
+
 def _contains_broad_child_clothing(cert_text: str) -> bool:
     """True только для ДЕЙСТВИТЕЛЬНО широких сертификатов на детскую одежду
     («Изделия швейные/трикотажные для детей», «Одежда детская»).
@@ -7071,7 +7149,7 @@ def _contains_broad_child_clothing(cert_text: str) -> bool:
     return any(x in low for x in broad) and any(x in low for x in child)
 
 
-def compare_product_names(product_name: str, cert_product_name: str, brand: str = '', subject: str = '', doc_status: str = '') -> Tuple[str, float, str]:
+def compare_product_names(product_name: str, cert_product_name: str, brand: str = '', subject: str = '', doc_status: str = '', cert_tnved: str = '') -> Tuple[str, float, str]:
     """Conservative professional comparison.
 
     The goal is not to force a verdict for every row, but to separate:
@@ -7103,8 +7181,18 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
     _alpha_words = re.findall(r'[а-яёa-z]{4,}', _cpn_low)
     _meaningful = [w for w in _alpha_words if w not in (
         'код', 'коды', 'еаэс', 'твэд', 'тнвэд', 'номер', 'прочие', 'прочее')]
+    # v53 (улучшение №2): категория по коду ТН ВЭД — отдельный/из текста.
+    _tnved_cats = set()
+    if cert_tnved:
+        _c = _tnved_category(cert_tnved)
+        if _c:
+            _tnved_cats.add(_c)
+    _tnved_cats |= _tnved_categories_from_text(cert_product_name)
     if ('тн вэд' in _cpn_low or 'тнвэд' in _cpn_low) and len(_meaningful) < 2:
-        return 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА', 0.0, 'в поле продукции — коды ТН ВЭД, а не название'
+        # Раньше тут был тупик «НЕ УДАЛОСЬ ИЗВЛЕЧЬ». Теперь, если из КОДОВ удалось
+        # определить категорию — сравниваем по ней (код = официальный признак товара).
+        if not _tnved_cats:
+            return 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА', 0.0, 'в поле продукции — коды ТН ВЭД, а не название'
 
     card_text = clean_registry_value(' '.join(x for x in [product_name, subject] if x))
     cert_text = clean_registry_value(cert_product_name)
@@ -7113,6 +7201,10 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
 
     card_cats = _detect_categories(card_text)
     cert_cats = _detect_categories(cert_text)
+    # v53 (улучшение №2): код ТН ВЭД — авторитетный признак категории сертификата.
+    # Только ДОБАВЛЯЕМ (объединение), не убираем текстовые категории.
+    if _tnved_cats:
+        cert_cats = set(cert_cats) | _tnved_cats
     card_sub = _detect_subtypes(card_text)
     cert_sub = _detect_subtypes(cert_text)
     card_layers = _detect_layers(card_text)
@@ -9205,7 +9297,7 @@ async def run_registry_stage(args):
                 verdict, score, cmp_details = compare_product_names(
                     row.get('product_name', ''), prod,
                     brand=row.get('brand', ''), subject=row.get('subject', ''),
-                    doc_status=doc_status,
+                    doc_status=doc_status, cert_tnved=ext.get('tnved', ''),
                 )
                 if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                     verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'
@@ -9923,7 +10015,7 @@ async def run_registry_stage(args):
         else:
             verdict, score, cmp_details = compare_product_names(
                 row.get('product_name', ''), prod, brand=row.get('brand', ''), subject=row.get('subject', ''),
-                doc_status=doc_status,
+                doc_status=doc_status, cert_tnved=_FSA_EXTENDED_FIELDS_CACHE.get(url, {}).get('tnved', ''),
             )
             if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                 verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'

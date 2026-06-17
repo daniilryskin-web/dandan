@@ -666,7 +666,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-15-v51"
+APP_VERSION = "2026-06-16-v52"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -6782,6 +6782,10 @@ def _detect_categories(text: str) -> Set[str]:
         if _contains_word_token(low, _gst):
             cats.add('clothing')
             break
+    # v52: «слип» (детский слип-комбинезон) — это ОДЕЖДА, но НЕ путать со
+    # «слипоны» (обувь). Поэтому отдельная проверка с отрицательным просмотром.
+    if re.search(r'(?:^|[^а-яёa-z])слип(?!он)', low):
+        cats.add('clothing')
     return cats
 
 
@@ -6886,6 +6890,42 @@ def _detect_subtypes(text: str) -> Set[str]:
 # Детский слип-комбинезон ловится по «боди/ползунки/распашонка/комбинезон».
 SUBTYPE_SYNONYMS.setdefault("белье", set()).update({"боди", "распашонка", "распашонки", "ползунки", "ползунок", "фуфайка", "фуфайки", "лонгслив"})
 
+# v52: РАСШИРЕНИЕ распознавания видов одежды. На прогоне 50k множество реальных
+# товаров не распознавалось (card_cats/card_sub/card_layers пустые), из-за чего
+# корректные совпадения уходили в ЛОЖНОЕ «ПРОВЕРИТЬ ВРУЧНУЮ» («Тельняшка детская»,
+# «Кальсоны», «Олимпийка», «Термолонгслив», «Шапочки» и т.п.). Добавляем
+# недостающие виды СТЕМАМИ (matcher сопоставляет по началу слова с границей).
+_V52_CLOTHING_STEMS = {
+    'тельняшк', 'кальсон', 'подштанник', 'олимпийк', 'дождевик', 'туник',
+    'термолонгслив', 'термофутболк', 'термоштан', 'термокомплект', 'термокофт',
+    'термоводолазк', 'термокальсон', 'термоноск', 'термобель', 'бодик',
+    'комбидрес', 'кофточк', 'маечк', 'фуфайк', 'ночнушк', 'поддёвк', 'поддевк',
+    'свитшот', 'худи', 'водолазк',
+    # базовые виды как СТЕМЫ — ловят словоформы/опечатки, которые полные слова
+    # из CATEGORY_TERMS пропускали («Пижам», «шортами», «белья», «юбк-шорты»).
+    'пижам', 'шорт', 'юбк', 'плать', 'футболк', 'куртк', 'джинс', 'брюк',
+    'блуз', 'рубашк', 'сарафан', 'комбинезон', 'халат', 'свитер', 'джемпер',
+    'кардиган', 'бель', 'распашонк', 'ползунк', 'песочник', 'лонгслив',
+}
+CATEGORY_TERMS['clothing'].update(_V52_CLOTHING_STEMS)
+# Обувь — диминутивы/множественные формы, которые не ловились полными словами.
+CATEGORY_TERMS['footwear'].update({
+    'полусапожк', 'сапожк', 'босоножк', 'туфельк', 'ботиночк', 'сандалик',
+    'кроссовочк', 'полуботинк', 'угг', 'чешк', 'пинетк',
+})
+# Головные уборы — это аксессуары; добавляем стемы, которые иначе не ловились
+# («шапочки» не совпадало со стемом «шапк», «чепчик» был только в одежде).
+CATEGORY_TERMS.setdefault('accessories', set()).update(
+    {'шапочк', 'чепчик', 'чепец', 'бандан', 'косынк', 'панамк', 'шапк', 'берет'})
+
+# Подтипы — для точного совпадения card_sub & cert_sub (сильный сигнал OK).
+SUBTYPE_SYNONYMS['толстовка'].update({'олимпийк', 'термокофт'})
+SUBTYPE_SYNONYMS['футболка'].update({'тельняшк', 'термофутболк'})
+SUBTYPE_SYNONYMS['белье'].update({'кальсон', 'подштанник', 'термобель', 'термокальсон', 'термокомплект', 'бодик', 'комбидрес', 'фуфайк'})
+SUBTYPE_SYNONYMS['брюки'].update({'термоштан'})
+SUBTYPE_SYNONYMS['рубашка'].update({'туник'})
+SUBTYPE_SYNONYMS.setdefault('шапка', set()).update({'шапочк', 'чепчик', 'чепец'})
+
 def _age_marker(text: str) -> str:
     low = norm_text(text)
     child_words = ("детск", "для детей", "для мальчик", "для девоч", "ясель", "дошколь", "школь", "подрост", "новорожден", "малыш", "младен", "baby", "kids", "children")
@@ -6947,6 +6987,17 @@ CLOTHING_LAYER_TERMS = {
     'headwear': {'шапк', 'панам', 'кепк', 'шляп', 'головн'},
 }
 
+# v52: слои одежды для новых видов (чтобы card_layers заполнялся и срабатывало
+# правило OK по совпадению слоя, либо корректно гасился конфликт слоя).
+CLOTHING_LAYER_TERMS['first_layer'].update({
+    'тельняшк', 'кальсон', 'подштанник', 'термолонгслив', 'термофутболк',
+    'термокальсон', 'термокомплект', 'термоводолазк', 'термобель', 'бодик',
+    'комбидрес', 'фуфайк', 'поддёвк', 'поддевк', 'маечк',
+})
+CLOTHING_LAYER_TERMS['second_layer'].update({'олимпийк', 'туник', 'термоштан', 'термокофт'})
+CLOTHING_LAYER_TERMS['third_layer'].update({'дождевик'})
+CLOTHING_LAYER_TERMS['headwear'].update({'шапочк', 'чепчик', 'чепец', 'панамк'})
+
 PRODUCT_CONFLICT_TERMS = {
     'toys': {'игруш', 'кукл', 'конструктор', 'мяч', 'пазл'},
     'cosmetics': {'космет', 'крем', 'шампун', 'мыло', 'гель душ', 'дезодорант'},
@@ -6978,6 +7029,9 @@ def _detect_layers(text: str) -> Set[str]:
     for layer, terms in CLOTHING_LAYER_TERMS.items():
         if any(_contains_word_token(low, norm_text(t)) for t in terms):
             out.add(layer)
+    # v52: «слип» — первый слой (детское нательное), но не «слипоны» (обувь).
+    if re.search(r'(?:^|[^а-яёa-z])слип(?!он)', low):
+        out.add('first_layer')
     return out
 
 
@@ -7113,7 +7167,16 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
                 conflicts.append(f'несовместимый вид: карточка {sorted(card_sub)}, сертификат {sorted(cert_sub)}')
                 break
     # Layer conflict is meaningful only when both sides are apparel and both layers known.
-    if 'clothing' in card_cats and 'clothing' in cert_cats and card_layers and cert_layers and card_layers.isdisjoint(cert_layers):
+    # v52: ШИРОКИЙ сертификат (перечисляет 3+ видов одежды, ИЛИ покрывает несколько
+    # слоёв, ИЛИ это общая детская одёжная группа) — покрывающий: к нему относятся
+    # разные виды/слои, поэтому несовпадение слоя НЕ является даже «мягким» сигналом.
+    # Это убирало сотни ложных «ПРОВЕРИТЬ ВРУЧНУЮ» (спорт-штаны/шорты/свитшот против
+    # бельевого сертификата, который сам перечисляет брюки/толстовки/футболки).
+    _cert_broad_cover = (len(cert_sub) >= 3 or len(cert_layers) >= 2
+                         or _contains_broad_child_clothing(cert_text))
+    if ('clothing' in card_cats and 'clothing' in cert_cats and card_layers
+            and cert_layers and card_layers.isdisjoint(cert_layers)
+            and not _cert_broad_cover):
         # Allow if exact subtype still overlaps (e.g. комбинезон can be different layer depending on context).
         if not (card_sub & cert_sub):
             # v27.9.x: несовпадение слоя — «мягкий» сигнал. Узкий сертификат (напр.

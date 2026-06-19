@@ -85,6 +85,28 @@ def main():
           "_reg_cache.put(_u, _val" in src)
     check("belgiss-link-only не кэшируется",
           "'belgiss' in (_det or '')" in src)
+    # v54.2: инкрементальная запись + инвалидация по версии парсера
+    check("кэш пишется инкрементально (в saver_loop), а не одним батчем",
+          "_flush_cache" in src and "Кэш реестров пополнен: +" in src)
+    check("инвалидация кэша по версии парсера",
+          "PARSER_VERSION" in src and "DELETE FROM registry" in src)
+
+    # версия парсера сбрасывает старые записи
+    import sqlite3
+    with tempfile.TemporaryDirectory() as td2:
+        p2 = Path(td2) / "c.sqlite"
+        c = m.RegistryCache(p2, 7.0)
+        c.put("uX", ("N", "Товар А; Товар Б", "серт", "Действует", "ok"), {})
+        c.commit()
+        c.close()
+        con = sqlite3.connect(str(p2))
+        con.execute("UPDATE meta SET v='OLD-VER' WHERE k='parser_version'")
+        con.commit()
+        con.close()
+        c2 = m.RegistryCache(p2, 7.0)
+        check("при смене версии парсера старая запись сброшена (перепарсится)",
+              c2.get("uX") is None)
+        c2.close()
 
 
 if __name__ == "__main__":

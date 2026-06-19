@@ -20,6 +20,7 @@ MODULES = [
     "test_compare_v52",
     "test_tnved",
     "test_compare_v54",
+    "test_appliances",
     "test_price_adaptive",
     "test_registry_cache",
     "test_export_disputed",

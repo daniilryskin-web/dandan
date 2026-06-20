@@ -58,7 +58,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
-APP_VERSION = "2026-06-19-v54.3"
+APP_VERSION = "2026-06-20-v54.4"
 APP_DIR = Path(__file__).resolve().parent
 # pywebview на Windows часто запускается через pythonw.exe (без консоли) — это ломает stdout pipe в дочерних
 # процессах. Сила принуждаем использовать python.exe (с консолью) для subprocess.
@@ -318,6 +318,8 @@ class AppState:
     progress_total: int = 0
     progress_pct: float = 0.0
     progress_stage: str = ""
+    progress_speed: int = 0   # карточек/мин (из движка)
+    progress_eta: int = 0     # сек до конца этапа (из движка)
     log_lines: List[str] = field(default_factory=list)
     output_path: str = ""
     ozon_output_path: str = ""
@@ -386,6 +388,8 @@ class AppState:
             "progress_total": self.progress_total,
             "progress_pct": self.progress_pct,
             "progress_stage": self.progress_stage,
+            "progress_speed": self.progress_speed,
+            "progress_eta": self.progress_eta,
             "output_path": self.output_path,
             "ozon_output_path": self.ozon_output_path,
             "log_path": self.log_path,
@@ -406,6 +410,7 @@ class AppState:
 # в первую очередь — это убирает скачки полосы из-за «повтор 2/5» и т.п.
 PROGRESS_SENTINEL_RX = re.compile(
     r"@@PROGRESS@@\s+stage=(\S+)\s+done=(\d+)\s+total=(\d+)"
+    r"(?:\s+speed=(\d+)\s+eta=(\d+))?"
 )
 PROGRESS_RX = re.compile(r"(\d+)\s*/\s*(\d+)")
 PROGRESS_PCT_RX = re.compile(r"(\d+(?:\.\d+)?)\s*%")
@@ -784,6 +789,10 @@ class EngineRunner:
                     self.state.progress_done = d
                     self.state.progress_total = t
                     self.state.progress_pct = min(100.0, 100.0 * d / t)
+                    # v54.4 (улучшение №7): скорость (карточек/мин) и ETA (сек) из движка
+                    if m.group(4) is not None:
+                        self.state.progress_speed = int(m.group(4))
+                        self.state.progress_eta = int(m.group(5))
                     self.state.tick_activity()
                     self.state.record_progress_sample()
                     return
@@ -1453,9 +1462,28 @@ class Bridge:
                 idx_docstatus   = find_col("document_status", "статус документа")
                 idx_brand       = find_col("brand", "бренд")
                 idx_risk        = find_col("риск по сроку", "риск", "risk")
+                idx_details     = find_col("примечания", "details", "детали")
                 # Если маркетплейс не в файле — определяем по product_url
                 # (в листе «Подробности» колонка называется «Ссылка на товар»).
                 idx_purl = find_col("product_url", "ссылка на товар", "ссылка на товар (wb)")
+                # v54.4 (улучшение №8): группировка «почему ПРОВЕРИТЬ ВРУЧНУЮ» по причине
+                stats["by_review_reason"] = {}
+
+                def _review_reason(det: str) -> str:
+                    d = (det or "").lower()
+                    if "категори" in d and ("не совпада" in d or "другой групп" in d):
+                        return "конфликт категории"
+                    if "слой" in d and "не совпада" in d:
+                        return "не совпал слой/вид одежды"
+                    if "низкое совпадение" in d:
+                        return "нет категории / низкое совпадение"
+                    if "частичное совпадение" in d:
+                        return "частичное совпадение"
+                    if "коды тн вэд" in d or "тн вэд, а не название" in d:
+                        return "в реестре только коды ТН ВЭД"
+                    if "не извлечено" in d:
+                        return "не извлечено наименование"
+                    return "прочее"
                 for row in rows:
                     if idx_status is not None and idx_status < len(row):
                         v = str(row[idx_status] or "").strip()
@@ -1496,6 +1524,12 @@ class Bridge:
                     if idx_risk is not None and idx_risk < len(row):
                         v = str(row[idx_risk] or "").strip()
                         if v: stats["by_risk"][v] = stats["by_risk"].get(v, 0) + 1
+                    # причина ручной проверки (только для ПРОВЕРИТЬ ВРУЧНУЮ)
+                    if (idx_status is not None and idx_status < len(row)
+                            and str(row[idx_status] or "").strip() == "ПРОВЕРИТЬ ВРУЧНУЮ"):
+                        det = str(row[idx_details] or "") if idx_details is not None and idx_details < len(row) else ""
+                        rk = _review_reason(det)
+                        stats["by_review_reason"][rk] = stats["by_review_reason"].get(rk, 0) + 1
                 # Обрезаем by_brand до топ-12, остальные в «Прочее»
                 if len(stats["by_brand"]) > 12:
                     sb = sorted(stats["by_brand"].items(), key=lambda kv: -kv[1])
@@ -1702,6 +1736,161 @@ class Bridge:
             out_path = APP_DIR / f"на_проверку_{ts}.xlsx"
             wb.save(str(out_path))
             return {"ok": True, "path": str(out_path), "rows": len(disputed)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _results_columns_rows(self, xlsx_path):
+        res = self.get_results(xlsx_path)
+        if not res.get("ok"):
+            return None, None, res
+        return res["columns"], res["rows"], None
+
+    @staticmethod
+    def _col_finder(headers):
+        h_lower = [str(h).lower() for h in headers]
+
+        def col(*needles):
+            for needle in needles:
+                if needle in h_lower:
+                    return h_lower.index(needle)
+            for needle in needles:
+                for i, h in enumerate(h_lower):
+                    if needle in h:
+                        return i
+            return None
+        return col
+
+    def export_supplier_stats(self, xlsx_path: Optional[str] = None) -> dict:
+        """v54.4 (улучшение №12): сводка по продавцам/брендам — у кого больше всего
+        несоответствий/спорных. Помогает приоритизировать ручные проверки."""
+        headers, rows, err = self._results_columns_rows(xlsx_path)
+        if err:
+            return err
+        col = self._col_finder(headers)
+        i_status = col("технический статус", "status", "статус")
+        i_seller = col("продавец", "seller_name", "поставщик")
+        i_brand = col("бренд", "brand")
+        if i_status is None or (i_seller is None and i_brand is None):
+            return {"ok": False, "error": "В файле нет нужных колонок (статус/продавец/бренд)."}
+
+        def cell(r, idx):
+            return "" if idx is None or idx >= len(r) else str(r[idx] or "")
+
+        BAD = {"НЕСООТВЕТСТВИЕ", "ПРОВЕРИТЬ ВРУЧНУЮ", "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ",
+               "НЕДЕЙСТВУЕТ В РФ", "ДОКУМЕНТ НЕ ПРОВЕРЕН"}
+        from collections import defaultdict
+        agg = defaultdict(lambda: defaultdict(int))
+        keyname = "продавец" if i_seller is not None else "бренд"
+        ikey = i_seller if i_seller is not None else i_brand
+        for r in rows:
+            key = cell(r, ikey).strip() or "(не указан)"
+            st = cell(r, i_status).strip()
+            agg[key]["всего"] += 1
+            if st == "OK":
+                agg[key]["OK"] += 1
+            if st in BAD:
+                agg[key]["проблемных"] += 1
+            agg[key][st] += 1
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "По продавцам"
+            ws.append([keyname.capitalize(), "Всего", "OK", "Проблемных",
+                       "% проблемных", "НЕСООТВЕТСТВИЕ", "ПРОВЕРИТЬ ВРУЧНУЮ",
+                       "НЕДЕЙСТВ. ДОК", "НЕДЕЙСТВ. В РФ", "ДОК НЕ ПРОВЕРЕН"])
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="3A5FBF")
+            ordered = sorted(agg.items(), key=lambda kv: -kv[1]["проблемных"])
+            for key, d in ordered:
+                tot = d["всего"]
+                pct = round(100.0 * d["проблемных"] / tot, 1) if tot else 0.0
+                ws.append([key, tot, d["OK"], d["проблемных"], pct,
+                           d["НЕСООТВЕТСТВИЕ"], d["ПРОВЕРИТЬ ВРУЧНУЮ"],
+                           d["НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ"], d["НЕДЕЙСТВУЕТ В РФ"],
+                           d["ДОКУМЕНТ НЕ ПРОВЕРЕН"]])
+            for ci, w in enumerate([40, 9, 8, 12, 13, 16, 18, 14, 14, 16], 1):
+                ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = w
+            ws.freeze_panes = "A2"
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            out_path = APP_DIR / f"по_продавцам_{ts}.xlsx"
+            wb.save(str(out_path))
+            return {"ok": True, "path": str(out_path), "rows": len(ordered)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def suggest_dictionary(self, xlsx_path: Optional[str] = None) -> dict:
+        """v54.4 (улучшение №9): «обучить словарь». Сканирует товары, у которых
+        НЕ определилась категория, собирает частые незнакомые слова и выгружает их
+        кандидатами в словарь (слово, частота, пример). Пользователь проставляет
+        категорию и кладёт файл как dictionary.csv рядом с программой."""
+        headers, rows, err = self._results_columns_rows(xlsx_path)
+        if err:
+            return err
+        col = self._col_finder(headers)
+        i_name = col("название товара", "product_name", "наименование")
+        i_status = col("технический статус", "status", "статус")
+        if i_name is None:
+            return {"ok": False, "error": "В файле нет колонки с названием товара."}
+
+        def cell(r, idx):
+            return "" if idx is None or idx >= len(r) else str(r[idx] or "")
+        try:
+            import main_v39 as _mv
+            import re as _re
+            from collections import Counter
+        except Exception as exc:
+            return {"ok": False, "error": f"Движок недоступен: {exc}"}
+
+        STOP = {"для", "под", "без", "при", "это", "или", "как", "что", "над",
+                "из", "на", "по", "до", "от", "со", "шт", "см", "мл", "гр", "кг"}
+        freq = Counter()
+        example = {}
+        focus = {"ПРОВЕРИТЬ ВРУЧНУЮ", "НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА"}
+        for r in rows:
+            name = cell(r, i_name)
+            if not name:
+                continue
+            st = cell(r, i_status).strip()
+            # карточки без определённой категории — кандидаты на пополнение словаря
+            try:
+                cats = _mv._detect_categories(name)
+            except Exception:
+                cats = set()
+            if cats:
+                continue
+            # на спорных/неизвлечённых акцент сильнее (но берём и прочие без категории)
+            weight = 3 if st in focus else 1
+            for w in _re.findall(r"[а-яёa-z]{4,}", name.lower()):
+                if w in STOP:
+                    continue
+                freq[w] += weight
+                example.setdefault(w, name)
+        cands = [(w, c) for w, c in freq.most_common(400) if c >= 3]
+        if not cands:
+            return {"ok": False, "error": "Незнакомых частых слов не найдено — словарь уже хорошо покрывает товары."}
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Кандидаты словаря"
+            ws.append(["слово/стем", "категория (впишите)", "частота", "пример названия"])
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="3A5FBF")
+            for w, c in cands:
+                ws.append([w, "", c, example.get(w, "")[:80]])
+            for ci, wdt in enumerate([22, 22, 10, 60], 1):
+                ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = wdt
+            ws.freeze_panes = "A2"
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            out_path = APP_DIR / f"словарь_кандидаты_{ts}.xlsx"
+            wb.save(str(out_path))
+            return {"ok": True, "path": str(out_path), "rows": len(cands),
+                    "hint": "Впишите категорию рядом с каждым словом, сохраните как dictionary.csv (слово,категория) рядом с программой."}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -2486,6 +2675,11 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
             <div class="kpi-value" id="kpi-speed">—</div>
             <div class="kpi-sub">строк/мин</div>
           </div>
+          <div class="kpi-card" style="--kpi-color:var(--info)">
+            <div class="kpi-label">Осталось (ETA)</div>
+            <div class="kpi-value" id="kpi-eta">—</div>
+            <div class="kpi-sub">оценка времени</div>
+          </div>
           <div class="kpi-card" style="--kpi-color:var(--error)">
             <div class="kpi-label">Ошибок</div>
             <div class="kpi-value" id="kpi-errors">0</div>
@@ -2621,10 +2815,14 @@ td.cell-link:hover { color:#88aaff; background:rgba(91,140,255,0.12); text-decor
           <button class="btn btn-ghost btn-sm" id="btn-clear-loaded" style="display:none">✖ Текущий прогон</button>
           <button class="btn btn-ghost btn-sm" id="btn-export-csv">⬇ CSV</button>
           <button class="btn btn-ghost btn-sm" id="btn-export-disputed" title="Выгрузить только спорные строки (ПРОВЕРИТЬ ВРУЧНУЮ + НЕСООТВЕТСТВИЕ) со ссылками на карточку и реестр">⬇ На проверку</button>
+          <button class="btn btn-ghost btn-sm" id="btn-supplier-stats" title="Сводка по продавцам/брендам: у кого больше всего несоответствий и спорных">⬇ По продавцам</button>
+          <button class="btn btn-ghost btn-sm" id="btn-suggest-dict" title="Собрать частые незнакомые слова из товаров без категории — кандидаты для пополнения словаря">🧠 Обучить словарь</button>
           <button class="btn btn-ghost btn-sm" id="btn-columns">⚙ Колонки</button>
           <span class="text-muted text-sm" id="results-count"></span>
           <span class="text-muted text-sm" id="loaded-file-badge" style="display:none"></span>
         </div>
+
+        <div id="review-reasons" style="display:none; margin:0 0 10px; padding:8px 12px; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:8px; font-size:12.5px; color:var(--fg2);"></div>
 
         <div class="tbl-wrap" id="tbl-wrap">
           <div class="empty-state">
@@ -3235,7 +3433,14 @@ function updateQueueScreen(s) {
     ? `${s.progress_done} из ${s.progress_total}` : '— из —';
   $('#kpi-elapsed').textContent = fmtElapsed(s.elapsed_sec || 0);
   $('#kpi-mode-lbl').textContent = s.mode || '—';
-  $('#kpi-speed').textContent = s.speed_per_min > 0 ? s.speed_per_min.toFixed(1) : '—';
+  $('#kpi-speed').textContent = s.speed_per_min > 0 ? s.speed_per_min.toFixed(1)
+    : (s.progress_speed > 0 ? s.progress_speed : '—');
+  // v54.4 (улучшение №7): ETA из движка
+  const etaEl = $('#kpi-eta');
+  if (etaEl) {
+    const eta = s.progress_eta || 0;
+    etaEl.textContent = (s.running && eta > 0) ? fmtElapsed(eta) : '—';
+  }
   $('#prog-label').textContent = s.running ? 'выполняется' : (s.output_path ? 'завершено' : 'ожидание');
   const STAGE_LABELS = {
     links: 'этап: сбор ссылок на документы',
@@ -3474,6 +3679,21 @@ async function loadResults() {
   // встроенный window.Chart; buildResultsCharts сам выходит, если его нет.
   tryInitCharts();
   buildResultsCharts(res.stats);
+
+  // v54.4 (улучшение №8): почему «ПРОВЕРИТЬ ВРУЧНУЮ» — разбивка по причинам.
+  const rr = res.stats.by_review_reason || {};
+  const rrPanel = $('#review-reasons');
+  if (rrPanel) {
+    const items = Object.entries(rr).sort((a, b) => b[1] - a[1]);
+    if (items.length) {
+      rrPanel.style.display = '';
+      rrPanel.innerHTML = '<b>Почему «Проверить вручную»:</b> ' +
+        items.map(([k, v]) => `${escapeHtml(k)} — <b>${v}</b>`).join(' · ') +
+        ' <span style="opacity:.7">(подсказывает, где пополнить словарь — кнопка «Обучить словарь»)</span>';
+    } else {
+      rrPanel.style.display = 'none';
+    }
+  }
 }
 
 // v27.9.x: КУРИРУЕМЫЙ набор колонок таблицы — включает «Название в реестре»
@@ -3813,6 +4033,28 @@ $('#btn-export-disputed').addEventListener('click', async () => {
   } finally {
     btn.disabled = false;
   }
+});
+
+// v54.4 (улучшение №12): сводка по продавцам/брендам.
+$('#btn-supplier-stats').addEventListener('click', async () => {
+  const btn = $('#btn-supplier-stats');
+  btn.disabled = true;
+  try {
+    const res = await window.pywebview.api.export_supplier_stats(null);
+    if (res.ok) toast(`Сводка по продавцам сохранена: ${res.rows} строк`, 'ok');
+    else toast(res.error || 'Ошибка экспорта', 'err');
+  } finally { btn.disabled = false; }
+});
+
+// v54.4 (улучшение №9): «обучить словарь» — кандидаты из товаров без категории.
+$('#btn-suggest-dict').addEventListener('click', async () => {
+  const btn = $('#btn-suggest-dict');
+  btn.disabled = true;
+  try {
+    const res = await window.pywebview.api.suggest_dictionary(null);
+    if (res.ok) toast(`Кандидаты словаря: ${res.rows} слов. ${res.hint || ''}`, 'ok', 9000);
+    else toast(res.error || 'Ошибка', 'err');
+  } finally { btn.disabled = false; }
 });
 
 // ============================================================

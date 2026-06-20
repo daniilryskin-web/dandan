@@ -22,6 +22,7 @@ MODULES = [
     "test_compare_v54",
     "test_appliances",
     "test_categories_broad",
+    "test_v544",
     "test_price_adaptive",
     "test_registry_cache",
     "test_export_disputed",

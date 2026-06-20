@@ -667,7 +667,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-19-v54.3"
+APP_VERSION = "2026-06-20-v54.4"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -793,12 +793,32 @@ def now_iso() -> str:
 # «повтор 2/5», «заполнено 120/200» и т.п. дёргали полосу прогресса. Этот
 # однозначный маркер парсится в первую очередь; печатается рядом с обычным
 # человекочитаемым логом, поэтому логи остаются прежними.
+_PROGRESS_STATE: Dict[str, Any] = {}
+
+
 def emit_progress(stage: str, done: int, total: int) -> None:
+    # v54.4 (улучшение №7): к прогрессу добавлены СКОРОСТЬ (карточек/мин) и ETA (сек),
+    # чтобы окно показывало оценку оставшегося времени. Считаем по фактическому
+    # темпу от старта этапа.
     try:
-        print(f"@@PROGRESS@@ stage={stage} done={int(done)} total={int(total)}",
-              flush=True)
+        done = int(done)
+        total = int(total)
+        now = time.time()
+        st = _PROGRESS_STATE.get(stage)
+        if st is None or done < st.get('done', 0):
+            st = {'start': now, 'done': done}
+            _PROGRESS_STATE[stage] = st
+        elapsed = max(1e-6, now - st['start'])
+        speed = done / elapsed * 60.0  # в минуту
+        eta = ((total - done) / (done / elapsed)) if done > 0 else 0.0
+        st['done'] = done
+        print(f"@@PROGRESS@@ stage={stage} done={done} total={total} "
+              f"speed={speed:.0f} eta={int(max(0, eta))}", flush=True)
     except Exception:
-        pass
+        try:
+            print(f"@@PROGRESS@@ stage={stage} done={int(done)} total={int(total)}", flush=True)
+        except Exception:
+            pass
 
 
 # v39.8: precompiled regex и LRU cache для горячих утилит.
@@ -7283,13 +7303,98 @@ TNVED_PREFIX_CATEGORY = {
     '9405': 'lighting', '8539': 'lighting',
 }
 
+# v54.4 (улучшение №11): РАСШИРЕНИЕ карты ТН ВЭД до более полного справочника.
+TNVED_PREFIX_CATEGORY.update({
+    # Продукты питания (главы 04, 09, 15-22)
+    '04': 'food', '09': 'food', '15': 'food', '16': 'food', '17': 'food',
+    '18': 'food', '19': 'food', '20': 'food', '21': 'food', '22': 'food',
+    '2309': 'pet',  # корма для животных
+    # Косметика/гигиена (глава 33-34)
+    '3304': 'cosmetics', '3305': 'cosmetics', '3306': 'cosmetics', '3307': 'cosmetics',
+    '3401': 'cosmetics', '9619': 'nursery',
+    '3402': 'household_chemistry', '3405': 'household_chemistry', '3808': 'household_chemistry',
+    # Спорттовары (глава 9506-9507)
+    '9506': 'sport_equipment', '9507': 'sport_equipment', '9508': 'toys',
+    # Канцелярия (бумага/ручки/доски)
+    '4817': 'stationery', '4820': 'stationery', '9608': 'stationery', '9609': 'stationery',
+    '9610': 'stationery', '9611': 'stationery',
+    # Инструмент (главы 8201-8205 ручной, 8467 электро)
+    '8201': 'tools', '8202': 'tools', '8203': 'tools', '8204': 'tools', '8205': 'tools',
+    '8206': 'tools', '8207': 'tools', '8467': 'tools', '8466': 'tools',
+    # Авто (шины/детали/масла/АКБ)
+    '4011': 'auto', '8708': 'auto', '8714': 'auto', '2710': 'auto', '3819': 'auto',
+    '8507': 'auto',
+    # Сантехника (керамика/пластик/металл санитарные)
+    '6910': 'plumbing', '3922': 'plumbing', '7324': 'kitchenware',
+    # Мебель/матрасы
+    '9401': 'furniture', '9402': 'furniture', '9403': 'furniture',
+    # Ювелирка/бижутерия
+    '7113': 'jewelry', '7114': 'jewelry', '7116': 'jewelry', '7117': 'jewelry',
+    # Электроника/техника доп.
+    '8525': 'electronics', '8526': 'electronics', '9013': 'electronics', '9101': 'jewelry',
+    '9102': 'electronics', '9105': 'electronics',
+    '8479': 'appliances', '8543': 'appliances', '8516': 'appliances', '8419': 'appliances',
+    # Посуда/кухонные изделия доп.
+    '7010': 'kitchenware', '7012': 'kitchenware', '4823': 'home_textile',
+})
+
+
+def load_tnved_map(path: Any) -> int:
+    """v54.4 (улучшение №11): подгружает дополнительную карту ТН ВЭД из CSV
+    (две колонки: префикс,категория) — пользователь может расширять справочник без
+    правки кода. Возвращает число добавленных строк."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    n = 0
+    try:
+        import csv as _csv
+        with p.open('r', encoding='utf-8-sig', newline='') as f:
+            for row in _csv.reader(f):
+                if len(row) < 2:
+                    continue
+                pref = re.sub(r'\D', '', str(row[0]))
+                cat = str(row[1]).strip().lower()
+                if pref and cat:
+                    TNVED_PREFIX_CATEGORY[pref] = cat
+                    n += 1
+    except Exception:
+        return n
+    return n
+
+
+def load_user_dictionary(path: Any) -> int:
+    """v54.4 (улучшение №9): подгружает пользовательский словарь видов товаров из
+    CSV (две колонки: слово/стем,категория). Позволяет расширять распознавание
+    без правки кода — например, словами, предложенными функцией «обучить словарь».
+    Возвращает число добавленных терминов."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    n = 0
+    try:
+        import csv as _csv
+        with p.open('r', encoding='utf-8-sig', newline='') as f:
+            for row in _csv.reader(f):
+                if len(row) < 2:
+                    continue
+                word = str(row[0]).strip().lower()
+                cat = str(row[1]).strip().lower()
+                if not word or not cat or word.startswith('#'):
+                    continue
+                CATEGORY_TERMS.setdefault(cat, set()).add(word)
+                n += 1
+    except Exception:
+        return n
+    return n
+
 
 def _tnved_category(code: Any) -> str:
     """Категория по коду ТН ВЭД (по самому длинному совпавшему префиксу). '' если нет."""
     digits = re.sub(r'\D', '', str(code or ''))
     if len(digits) < 2:
         return ''
-    for plen in (4, 2):
+    for plen in (6, 4, 2):
         if len(digits) >= plen:
             cat = TNVED_PREFIX_CATEGORY.get(digits[:plen])
             if cat:
@@ -7305,6 +7410,30 @@ def _tnved_categories_from_text(text: str) -> Set[str]:
         if cat:
             out.add(cat)
     return out
+
+
+# v54.4 (улучшение №2): ссылки на СТАНДАРТЫ в поле наименования продукции. Иногда
+# реестр кладёт в «наименование продукции» название стандарта/техрегламента
+# («ГОСТ CISPR 14-2-2016 …», «ТР ТС 020/2011») вместо самого товара. Цифры/коды
+# стандарта засоряют сравнение по словам. Вырезаем ИМЕННО ссылку на стандарт
+# (номер), оставляя описательный «хвост» («…требования для бытовых приборов»),
+# по которому ещё можно определить категорию.
+_STANDARD_REF_RX = re.compile(
+    r'(?is)\b(?:ГОСТ(?:\s+(?:Р|IEC|ISO|EN|CISPR|МЭК))?|СТБ|СТ\s*РК|СТ\s*РБ|DIN|EN|IEC|CISPR|МЭК)'
+    r'\s*[\d][\d.\-–/:\s]*\d'
+    r'|ТР\s*(?:ТС|ЕАЭС|CU)\s*\d+\s*/\s*\d+')
+
+
+def _strip_standard_refs(text: str) -> str:
+    """Убирает из текста ссылки на стандарты/техрегламенты (ГОСТ …, ТР ТС …),
+    оставляя остальной текст. Используется для очистки «наименования продукции»."""
+    if not text:
+        return text
+    cleaned = _STANDARD_REF_RX.sub(' ', str(text))
+    # частые служебные обрывки после вырезанного номера
+    cleaned = re.sub(r'(?i)\b(требования\s+безопасности|общие\s+технические\s+условия|'
+                     r'технические\s+условия|методы\s+испытаний)\b', ' ', cleaned)
+    return re.sub(r'\s{2,}', ' ', cleaned).strip(' ;,"«»«»')
 
 
 def _contains_broad_child_clothing(cert_text: str) -> bool:
@@ -7459,6 +7588,14 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
 
     if not cert_product_name:
         return 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА', 0.0, 'В реестре не извлечено поле продукции'
+
+    # v54.4 (улучшение №2): если в поле наименования — ссылка на стандарт/техрегламент
+    # («ГОСТ CISPR 14-2-2016 …»), вырезаем номер стандарта (засоряет сравнение по
+    # словам), оставляя описательный текст. Категорию/коды берём из очищенного.
+    _cert_orig = cert_product_name
+    _cert_stripped = _strip_standard_refs(cert_product_name)
+    if _cert_stripped and _cert_stripped != cert_product_name:
+        cert_product_name = _cert_stripped
 
     # v48: иногда в поле названия попадает НЕ название, а дамп кодов ТН ВЭД
     # («КОД ТН ВЭД ЕАЭС: 6203191000, 6203199000, …»). Сравнивать с цифрами нельзя —
@@ -9513,6 +9650,25 @@ async def run_registry_stage(args):
         except Exception as _e:
             print(f"⚠️  Таблица статусов КГ-РФ не загружена: {type(_e).__name__}: {_e}")
 
+    # v54.4 (улучшения №9, №11): пользовательский словарь видов товаров и доп. карта
+    # ТН ВЭД — подгружаются из файлов рядом с программой (если есть). Расширяют
+    # распознавание без правки кода.
+    try:
+        for _dpath in (getattr(args, 'user_dictionary_file', '') or '', 'dictionary.csv', 'user_dictionary.csv'):
+            if _dpath and Path(_dpath).exists():
+                _dn = load_user_dictionary(_dpath)
+                if _dn:
+                    print(f"📖 Пользовательский словарь: +{_dn} терминов из {Path(_dpath).name}")
+                break
+        for _tpath in (getattr(args, 'tnved_map_file', '') or '', 'tnved_map.csv'):
+            if _tpath and Path(_tpath).exists():
+                _tn = load_tnved_map(_tpath)
+                if _tn:
+                    print(f"📖 Доп. карта ТН ВЭД: +{_tn} префиксов из {Path(_tpath).name}")
+                break
+    except Exception:
+        pass
+
     # v53 (улучшение №1): включаем/выключаем семантический слой и сообщаем статус.
     global _SEMANTIC_DISABLED
     _SEMANTIC_DISABLED = not bool(getattr(args, 'semantic', True))
@@ -10736,6 +10892,12 @@ def build_parser():
                          "(если установлена sentence-transformers). Спасает сложные названия от "
                          "ложной «ПРОВЕРИТЬ ВРУЧНУЮ». Без модели работает на правилах. "
                          "Модель: env WB_SEMANTIC_MODEL (по умолч. cointegrated/rubert-tiny2).")
+    ap.add_argument("--user-dictionary-file", default="",
+                    help="v54.4 (улучшение №9): CSV-словарь видов товаров (слово,категория) "
+                         "для расширения распознавания. Пусто — ищется dictionary.csv рядом.")
+    ap.add_argument("--tnved-map-file", default="",
+                    help="v54.4 (улучшение №11): CSV доп. карты ТН ВЭД (префикс,категория). "
+                         "Пусто — ищется tnved_map.csv рядом.")
     ap.add_argument("--fsa-human-delay-ms", default="300,1400",
                     help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
                          "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "

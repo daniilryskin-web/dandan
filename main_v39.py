@@ -667,7 +667,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-20-v54.4"
+APP_VERSION = "2026-06-21-v54.5"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -3977,6 +3977,239 @@ def _build_details_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
                 c.alignment = _align
 
 
+# =============================================================================
+# v54.5 (доработки №5/№6/№7): дополнительные аналитические листы отчёта.
+# Все три — АГРЕГАТЫ по тем же rows (без обращения к сети), объём небольшой.
+# =============================================================================
+
+# Статусы-вердикты 2-го этапа (есть результат сравнения карточки с документом).
+VERDICT_STATUSES_V39 = frozenset({
+    "OK", "НЕСООТВЕТСТВИЕ", "ПРОВЕРИТЬ ВРУЧНУЮ", "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ",
+    "НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА", STATUS_INVALID_IN_RF,
+    STATUS_DOC_NOT_VERIFIED,
+})
+# Из них — «проблемные» (требуют внимания продавца, т.е. всё кроме OK).
+PROBLEM_STATUSES_V39 = frozenset(VERDICT_STATUSES_V39 - {"OK"})
+
+
+def _classify_reason_v39(row: "ResultRow") -> str:
+    """Доработка №5: человекочитаемая ПРИЧИНА проблемного вердикта (по статусу/деталям)."""
+    st = (getattr(row, "status", "") or "").strip()
+    det = (getattr(row, "details", "") or "").lower().replace("ё", "е")
+    if st == "НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ":
+        return "Документ не действует (прекращён/приостановлен/архивный)"
+    if st == STATUS_INVALID_IN_RF:
+        return "Недействует в РФ (киргизский документ)"
+    if st == STATUS_DOC_NOT_VERIFIED:
+        return "Нет плашки «Документы проверены» в карточке"
+    if st == "НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА":
+        return "Не удалось извлечь название продукции из реестра"
+    if st in ("НЕСООТВЕТСТВИЕ", "ПРОВЕРИТЬ ВРУЧНУЮ"):
+        if "возраст" in det or "детск" in det or "взросл" in det:
+            return "Конфликт по возрасту (детское vs взрослое; ТР ТС 007/017)"
+        if "пол не совпадает" in det:
+            return "Конфликт по полу (муж/жен) при совпавшем виде"
+        if "другой группе" in det:
+            return "Сертификат относится к другой товарной группе"
+        if "категория карточки" in det or "не совпадает с категорией" in det:
+            return "Конфликт товарных категорий"
+        if "несовместимый вид" in det:
+            return "Несовместимый вид продукции внутри категории"
+        if "слой" in det or "вид одежды" in det:
+            return "Не совпал слой/вид одежды"
+        if "частичное совпадение" in det:
+            return "Частичное совпадение названий (недостаточно для авто-OK)"
+        if "низкое совпадение" in det:
+            return "Низкое совпадение названий без явного конфликта"
+        if "широк" in det or "общую" in det or "слишком" in det:
+            return "Документ слишком общий/неоднозначный"
+        return "Прочее (НЕСООТВЕТСТВИЕ)" if st == "НЕСООТВЕТСТВИЕ" else "Прочее (вручную)"
+    return st or "—"
+
+
+def _build_reasons_sheet_v39(wb_obj, rows: List["ResultRow"]) -> None:
+    """Доработка №5: сводка по ПРИЧИНАМ проблемных вердиктов (не только по статусам)."""
+    problem = [r for r in rows if (getattr(r, "status", "") or "") in PROBLEM_STATUSES_V39]
+    ws = wb_obj.create_sheet("Причины")
+    hdr_fill = PatternFill("solid", fgColor="1F4E78")
+    hdr_font = Font(color="FFFFFF", bold=True)
+    ws.append(["Причины проблемных вердиктов"])
+    ws["A1"].font = Font(bold=True, size=14)
+    ws.append(["Всего проблемных строк", len(problem)])
+    ws["A2"].font = Font(bold=True)
+    ws.append([])
+    ws.append(["Причина", "Количество", "Доля от проблемных, %"])
+    hdr_row = ws.max_row
+    counts: Dict[str, int] = {}
+    for r in problem:
+        k = _classify_reason_v39(r)
+        counts[k] = counts.get(k, 0) + 1
+    total = max(1, len(problem))
+    for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        ws.append([k, v, round(v * 100.0 / total, 1)])
+    end_row = ws.max_row
+    for col in ("A", "B", "C"):
+        ws[f"{col}{hdr_row}"].fill = hdr_fill
+        ws[f"{col}{hdr_row}"].font = hdr_font
+    ws.column_dimensions["A"].width = 62
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 22
+    ws.freeze_panes = f"A{hdr_row + 1}"
+    try:
+        from openpyxl.chart import BarChart, Reference
+        if end_row >= hdr_row + 1:
+            bar = BarChart()
+            bar.title = "Причины проблемных вердиктов"
+            bar.type = "bar"
+            bar.height = max(7.5, 0.55 * (end_row - hdr_row) + 3)
+            bar.width = 20
+            data = Reference(ws, min_col=2, min_row=hdr_row, max_row=end_row)
+            cats = Reference(ws, min_col=1, min_row=hdr_row + 1, max_row=end_row)
+            bar.add_data(data, titles_from_data=True)
+            bar.set_categories(cats)
+            bar.legend = None
+            ws.add_chart(bar, "E4")
+    except Exception:
+        pass
+
+
+def _build_sellers_sheet_v39(wb_obj, rows: List["ResultRow"]) -> None:
+    """Доработка №6: аналитика по продавцам — где системно проблемы с документами."""
+    ws = wb_obj.create_sheet("Продавцы")
+    hdr_fill = PatternFill("solid", fgColor="1F4E78")
+    hdr_font = Font(color="FFFFFF", bold=True)
+    agg: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        name = (getattr(r, "seller_name", "") or "").strip() or "—"
+        st = (getattr(r, "status", "") or "")
+        d = agg.setdefault(name, {"supplier_id": getattr(r, "supplier_id", ""),
+                                  "total": 0, "ok": 0, "mismatch": 0, "manual": 0,
+                                  "invalid": 0, "problem": 0})
+        if not d["supplier_id"]:
+            d["supplier_id"] = getattr(r, "supplier_id", "")
+        d["total"] += 1
+        if st == "OK":
+            d["ok"] += 1
+        elif st == "НЕСООТВЕТСТВИЕ":
+            d["mismatch"] += 1
+        elif st == "ПРОВЕРИТЬ ВРУЧНУЮ":
+            d["manual"] += 1
+        elif st in ("НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ", STATUS_INVALID_IN_RF):
+            d["invalid"] += 1
+        if st in PROBLEM_STATUSES_V39:
+            d["problem"] += 1
+    ws.append(["Продавец", "supplier_id", "Всего", "OK", "НЕСООТВЕТСТВИЕ",
+               "ВРУЧНУЮ", "Недейств.", "Проблемных", "% проблемных"])
+    hdr_row = ws.max_row
+    rows_sorted = sorted(agg.items(), key=lambda kv: (-kv[1]["problem"], -kv[1]["total"], kv[0]))
+    for name, d in rows_sorted:
+        pct = round(d["problem"] * 100.0 / max(1, d["total"]), 1)
+        ws.append([name, d["supplier_id"], d["total"], d["ok"], d["mismatch"],
+                   d["manual"], d["invalid"], d["problem"], pct])
+    for cell in ws[hdr_row]:
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for i, w in enumerate([40, 14, 9, 8, 16, 10, 11, 12, 13], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    if ws.max_row >= 2:
+        ws.auto_filter.ref = ws.dimensions
+        try:
+            from openpyxl.formatting.rule import DataBarRule
+            rule = DataBarRule(start_type="num", start_value=0, end_type="num",
+                               end_value=100, color="F4B183")
+            ws.conditional_formatting.add(f"I2:I{ws.max_row}", rule)
+        except Exception:
+            pass
+
+
+def _build_diff_sheet_v39(wb_obj, rows: List["ResultRow"], prev: Dict[str, dict]) -> None:
+    """Доработка №7: что изменилось с прошлого прогона (снимок <output>.prev.json)."""
+    ws = wb_obj.create_sheet("Изменения")
+    hdr_fill = PatternFill("solid", fgColor="1F4E78")
+    hdr_font = Font(color="FFFFFF", bold=True)
+    if not prev:
+        ws.append(["Сравнивать не с чем — нет снимка прошлого прогона с вердиктами."])
+        ws.append(["После этого прогона снимок сохранится, и следующий покажет изменения."])
+        ws.column_dimensions["A"].width = 90
+        return
+
+    def _key(nm, url):
+        return f"{nm}|{url or ''}"
+
+    cur: Dict[str, dict] = {}
+    for r in rows:
+        if (getattr(r, "status", "") or "") not in VERDICT_STATUSES_V39:
+            continue
+        k = _key(getattr(r, "nm_id", ""), getattr(r, "registry_url", ""))
+        cur[k] = {
+            "nm_id": getattr(r, "nm_id", ""),
+            "product_name": getattr(r, "product_name", ""),
+            "seller_name": getattr(r, "seller_name", ""),
+            "status": getattr(r, "status", ""),
+            "document_status": getattr(r, "document_status", ""),
+            "registry_url": getattr(r, "registry_url", ""),
+            "expiry": _compute_expiry_v39(r, 0)[1],
+        }
+    changes = []  # (тип, nm_id, товар, продавец, было, стало, ссылка)
+    for k, c in cur.items():
+        p = prev.get(k)
+        if p is None:
+            changes.append(("Новая (нет в прошлом прогоне)", c["nm_id"], c["product_name"],
+                            c["seller_name"], "", c["status"], c["registry_url"]))
+            continue
+        ps, cs = p.get("status", ""), c["status"]
+        if ps != cs:
+            if cs == "НЕСООТВЕТСТВИЕ":
+                t = "⚠ Стало НЕСООТВЕТСТВИЕ"
+            elif cs == "OK" and ps in PROBLEM_STATUSES_V39:
+                t = "✓ Проблема устранена (стало OK)"
+            else:
+                t = "Изменился вердикт"
+            changes.append((t, c["nm_id"], c["product_name"], c["seller_name"], ps, cs, c["registry_url"]))
+        pds, cds = (p.get("document_status", "") or ""), (c["document_status"] or "")
+        # только реальные переходы (оба статуса известны); пустой «стало» — это, как
+        # правило, разовый промах парсинга, а не событие — его не показываем как изменение.
+        if pds and cds and pds != cds:
+            changes.append(("Изменился статус документа", c["nm_id"], c["product_name"],
+                            c["seller_name"], pds, cds, c["registry_url"]))
+        if p.get("expiry") != EXPIRY_RISK_EXPIRED and c["expiry"] == EXPIRY_RISK_EXPIRED:
+            changes.append(("Документ истёк с прошлого раза", c["nm_id"], c["product_name"],
+                            c["seller_name"], p.get("expiry", ""), c["expiry"], c["registry_url"]))
+    for k, p in prev.items():
+        if k not in cur:
+            changes.append(("Исчезла (была в прошлом прогоне)", p.get("nm_id", ""),
+                            p.get("product_name", ""), p.get("seller_name", ""),
+                            p.get("status", ""), "", p.get("registry_url", "")))
+
+    order = {"⚠ Стало НЕСООТВЕТСТВИЕ": 0, "Документ истёк с прошлого раза": 1,
+             "Изменился статус документа": 2, "Изменился вердикт": 3,
+             "Новая (нет в прошлом прогоне)": 4, "✓ Проблема устранена (стало OK)": 5,
+             "Исчезла (была в прошлом прогоне)": 6}
+    changes.sort(key=lambda x: (order.get(x[0], 9), str(x[1])))
+
+    ws.append([f"Изменений с прошлого прогона: {len(changes)}"])
+    ws["A1"].font = Font(bold=True, size=13)
+    ws.append([])
+    ws.append(["Тип изменения", "nm_id", "Товар", "Продавец", "Было", "Стало", "Ссылка на реестр"])
+    hdr_row = ws.max_row
+    _MAX = 8000
+    for row in changes[:_MAX]:
+        ws.append([_xlsx_safe(x) for x in row])
+    if len(changes) > _MAX:
+        ws.append([f"... и ещё {len(changes) - _MAX} изменений (показаны первые {_MAX})"])
+    for cell in ws[hdr_row]:
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for i, w in enumerate([34, 12, 50, 28, 22, 22, 50], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = f"A{hdr_row + 1}"
+    if ws.max_row > hdr_row:
+        ws.auto_filter.ref = f"A{hdr_row}:G{ws.max_row}"
+
+
 class ResultStore:
     def __init__(self, xlsx_path: Path, csv_path: Optional[Path] = None,
                  expiry_warning_days: int = 30, make_report_xlsx: bool = True):
@@ -3989,6 +4222,52 @@ class ResultStore:
         self.lock = asyncio.Lock()
         self._save_lock = asyncio.Lock()  # v47: сериализация фоновых сохранений
         self.last_save_count = 0
+        # v54.5 (доработка №7): снимок вердиктов прошлого прогона для листа «Изменения».
+        # Лежит рядом с output как <output>.prev.json. Читаем ОДИН раз при создании
+        # хранилища (до первой перезаписи), пишем — только на финальном сохранении
+        # прогона С ВЕРДИКТАМИ (links-only этап 1 не затирает снимок прошлых вердиктов).
+        self._prev_path = (Path(str(xlsx_path) + ".prev.json") if xlsx_path else None)
+        self._prev_snapshot = self._load_prev_snapshot()
+
+    def _load_prev_snapshot(self) -> Dict[str, dict]:
+        p = getattr(self, "_prev_path", None)
+        if not p or not Path(p).exists():
+            return {}
+        try:
+            with Path(p).open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_prev_snapshot(self, rows: List["ResultRow"]) -> None:
+        p = getattr(self, "_prev_path", None)
+        if not p:
+            return
+        snap: Dict[str, dict] = {}
+        for r in rows:
+            st = getattr(r, "status", "") or ""
+            if st not in VERDICT_STATUSES_V39:
+                continue
+            k = f'{getattr(r, "nm_id", "")}|{getattr(r, "registry_url", "") or ""}'
+            snap[k] = {
+                "nm_id": getattr(r, "nm_id", ""),
+                "product_name": getattr(r, "product_name", ""),
+                "seller_name": getattr(r, "seller_name", ""),
+                "status": st,
+                "document_status": getattr(r, "document_status", ""),
+                "registry_url": getattr(r, "registry_url", ""),
+                "expiry": _compute_expiry_v39(r, 0)[1],
+            }
+        if not snap:
+            return  # нет вердиктов (этап 1) — не затираем снимок прошлых вердиктов
+        try:
+            tmp = Path(str(p) + f".{os.getpid()}.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(snap, f, ensure_ascii=False)
+            os.replace(tmp, p)
+        except Exception:
+            pass
 
     def processed_ids_from_csv(self, valid_ids: Optional[Set[int]] = None) -> Tuple[Set[int], int]:
         """
@@ -4074,7 +4353,11 @@ class ResultStore:
                 if self.csv_path:
                     self._save_csv(rows, self.csv_path)
                 if write_xlsx:
-                    self._save_xlsx(rows, self.xlsx_path)
+                    self._save_xlsx(rows, self.xlsx_path, final=final)
+                # v54.5 (доработка №7): на финальном сохранении прогона с вердиктами
+                # обновляем снимок для будущего листа «Изменения».
+                if final and write_xlsx:
+                    self._write_prev_snapshot(rows)
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(self._save_executor, _write)
             self.last_save_count = n
@@ -4102,7 +4385,7 @@ class ResultStore:
             except Exception:
                 pass
 
-    def _save_xlsx(self, rows: List[ResultRow], path: Path):
+    def _save_xlsx(self, rows: List[ResultRow], path: Path, final: bool = False):
         wb = Workbook()
         ws = wb.active
         ws.title = "results"
@@ -4170,6 +4453,19 @@ class ResultStore:
                 _build_details_sheet_v39(wb, rows, int(getattr(self, "expiry_warning_days", 30) or 0))
             except Exception as _e:
                 log.warning("build_details_sheet failed: %s", _e)
+            # v54.5 (доработки №5/№6/№7): причины / продавцы / изменения с прошлого прогона.
+            try:
+                _build_reasons_sheet_v39(wb, rows)
+            except Exception as _e:
+                log.warning("build_reasons_sheet failed: %s", _e)
+            try:
+                _build_sellers_sheet_v39(wb, rows)
+            except Exception as _e:
+                log.warning("build_sellers_sheet failed: %s", _e)
+            try:
+                _build_diff_sheet_v39(wb, rows, getattr(self, "_prev_snapshot", {}) or {})
+            except Exception as _e:
+                log.warning("build_diff_sheet failed: %s", _e)
         # v49: уникальный .tmp на запись — две записи не могут перетереть друг друга.
         tmp = self._unique_tmp(path)
         wb.save(tmp)
@@ -5075,6 +5371,56 @@ async def run_link_collection(args):
     # с certificate.json, поэтому card.json берётся 1 запросом с того же шарда (без
     # перебора несуществующих хостов, который заваливал лог DNS-ошибками).
 
+    # v54.5 (доработка №8): ГЛОБАЛЬНЫЙ кэш карточек (этап 1) по nm_id. Уже собранную
+    # ссылку на реестр берём из кэша мгновенно — без повторного запроса certificate.json
+    # (в т.ч. для карточек, встреченных в ДРУГИХ запросах/прогонах). См. --card-cache.
+    _card_cache = None
+    if bool(getattr(args, 'card_cache', True)) and remaining:
+        try:
+            _cc_path = (getattr(args, 'card_cache_file', '') or '').strip() \
+                or str(Path(args.output).with_name('card_cache.sqlite'))
+            _cc_ttl = float(getattr(args, 'card_cache_ttl_days', 7.0) or 0)
+            _card_cache = CardCache(_cc_path, _cc_ttl)
+            _cc_total = len(remaining)
+            _cc_hit = 0
+            _cc_left = []
+            for c in remaining:
+                got = _card_cache.get(c.nm_id)
+                if (not got or got.get("status") != STATUS_LINK_COLLECTED
+                        or not got.get("registry_url")):
+                    _cc_left.append(c)
+                    continue
+                if got.get("docs_verified"):
+                    c.docs_verified = got["docs_verified"]
+                _u = got["registry_url"]
+                row = ResultRow(
+                    query=c.source_query or args.query,
+                    nm_id=c.nm_id,
+                    **_card_fields_for_result(c),
+                    status=STATUS_LINK_COLLECTED,
+                    registry_url=_u,
+                    registry_host=got.get("registry_host") or hostname(_u),
+                    registry_record_id=got.get("registry_record_id") or extract_record_id(_u),
+                    certificate_number=got.get("certificate_number", ""),
+                    details=f"http_fast_path; {got.get('detail', '')};from_card_cache",
+                    worker="cache", checked_at=now_iso(),
+                )
+                await store.add(row)
+                processed.add(c.nm_id)
+                _cc_hit += 1
+            if _cc_hit:
+                remaining = _cc_left
+                print(f"🗃  Кэш карточек: {_cc_hit} из {_cc_total} ссылок взяты из кэша "
+                      f"(свежесть ≤ {_cc_ttl:g} дн.), запрашивать осталось {len(remaining)}. "
+                      f"(Отключить: --card-cache false)")
+                try:
+                    await store.save()
+                except Exception:
+                    pass
+        except Exception as _e:
+            print(f"⚠️  Кэш карточек недоступен ({type(_e).__name__}: {_e}) — работаю без него.")
+            _card_cache = None
+
     # =============================================================================
     # v40: HTTP сбор ссылок через certificate.json. БЕЗ браузера на 1 этапе.
     # Наличие документа однозначно определяется по json: 200=есть, 404 везде=нет.
@@ -5094,6 +5440,27 @@ async def run_link_collection(args):
             import traceback as _tb
             print(f"⚠️  HTTP fast-path упал: {type(e).__name__}: {e}")
             print(_tb.format_exc()[:800])
+
+    # v54.5 (доработка №8): пополняем кэш карточек СОБРАННЫМИ ссылками из prefetch
+    # (http_only — основной режим — собирает все ссылки именно здесь).
+    if _card_cache is not None:
+        try:
+            _cc_new = 0
+            for r in store.rows:
+                if r.status != STATUS_LINK_COLLECTED or not r.registry_url:
+                    continue
+                if 'from_card_cache' in (r.details or ''):
+                    continue  # уже из кэша — не переписываем
+                _card_cache.put(r.nm_id, r.status, r.registry_url, r.registry_host,
+                                r.registry_record_id, getattr(r, 'certificate_number', ''),
+                                getattr(r, 'docs_verified', ''), r.details or '')
+                _cc_new += 1
+            _card_cache.commit()
+            _card_cache.close()
+            if _cc_new:
+                print(f"🗃  Кэш карточек пополнен: +{_cc_new} собранных ссылок.")
+        except Exception:
+            pass
 
     q: asyncio.Queue = asyncio.Queue()
     for c in remaining:
@@ -9693,6 +10060,88 @@ class RegistryCache:
             pass
 
 
+class CardCache:
+    """Доработка №8: ГЛОБАЛЬНЫЙ кэш карточек 1-го этапа (SQLite), ключ — nm_id.
+
+    Одна и та же карточка WB встречается в РАЗНЫХ запросах и прогонах. Сбор ссылки
+    на реестр (запрос certificate.json + плашка «Документы проверены») — сетевой и
+    самый массовый шаг 1-го этапа. Кэш мгновенно отдаёт уже найденную ссылку по
+    nm_id — независимо от того, в каком запросе/выходном файле карточка встретилась
+    (в отличие от resume по CSV, который привязан к ОДНОМУ файлу --output-links-csv).
+
+    КЭШИРУЕМ только УСПЕШНО СОБРАННУЮ ссылку (STATUS_LINK_COLLECTED) — как и resume.
+    «Нет документов»/«нет ссылки»/сетевые ошибки НЕ кэшируем: они перепроверяются
+    (могли быть временным сбоем, или продавец позже добавил документ).
+
+    СВЕЖЕСТЬ: запись старше ttl_days (по умолчанию 7) → None (карточка перепроверится,
+    т.е. ссылка обновится, если продавец сменил документ). TTL=0 = бессрочно.
+    """
+    CACHE_VERSION = "2026-06-21-card1"
+
+    def __init__(self, path: Any, ttl_days: float = 7.0):
+        self.path = Path(path)
+        self.ttl = float(ttl_days) * 86400.0
+        self._conn = sqlite3.connect(str(self.path))
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS card ("
+            "nm_id INTEGER PRIMARY KEY, status TEXT, registry_url TEXT, "
+            "registry_host TEXT, registry_record_id TEXT, certificate_number TEXT, "
+            "docs_verified TEXT, detail TEXT, ts REAL)")
+        self._conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+        cur = self._conn.execute("SELECT v FROM meta WHERE k='cache_version'")
+        row = cur.fetchone()
+        stored = row[0] if row else None
+        if stored != self.CACHE_VERSION:
+            self._conn.execute("DELETE FROM card")
+            self._conn.execute("INSERT OR REPLACE INTO meta VALUES ('cache_version', ?)",
+                               (self.CACHE_VERSION,))
+        self._conn.commit()
+
+    def get(self, nm_id) -> Optional[Dict[str, str]]:
+        """dict со СВЕЖЕЙ собранной ссылкой, иначе None (→ запросить заново)."""
+        try:
+            cur = self._conn.execute(
+                "SELECT status, registry_url, registry_host, registry_record_id, "
+                "certificate_number, docs_verified, detail, ts FROM card WHERE nm_id=?",
+                (int(nm_id),))
+            row = cur.fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        status, url, host, rec, cert, dv, det, ts = row
+        if self.ttl > 0 and (time.time() - float(ts or 0)) > self.ttl:
+            return None
+        return {"status": status or "", "registry_url": url or "",
+                "registry_host": host or "", "registry_record_id": rec or "",
+                "certificate_number": cert or "", "docs_verified": dv or "",
+                "detail": det or ""}
+
+    def put(self, nm_id, status, registry_url, registry_host, registry_record_id,
+            certificate_number, docs_verified, detail):
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO card VALUES (?,?,?,?,?,?,?,?,?)",
+                (int(nm_id), status or '', registry_url or '', registry_host or '',
+                 registry_record_id or '', certificate_number or '', docs_verified or '',
+                 detail or '', time.time()))
+        except Exception:
+            pass
+
+    def commit(self):
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._conn.commit()
+            self._conn.close()
+        except Exception:
+            pass
+
+
 async def run_registry_stage(args):
     """v38.6: visible-browser registry stage with first-stage-like progress.
 
@@ -10955,6 +11404,15 @@ def build_parser():
     ap.add_argument("--registry-cache-ttl-days", type=float, default=7.0,
                     help="v53: срок свежести записи кэша, дней (по умолчанию 7). Старше — документ "
                          "парсится заново, чтобы обновить статус. 0 = кэш бессрочный.")
+    ap.add_argument("--card-cache", type=str_to_bool, default=True,
+                    help="Доработка №8: глобальный кэш карточек 1-го этапа (SQLite) по nm_id. "
+                         "Уже собранную ссылку на реестр берём из кэша мгновенно, в т.ч. для "
+                         "карточек из других запросов/прогонов. Отключить: --card-cache false")
+    ap.add_argument("--card-cache-file", default="",
+                    help="Доработка №8: путь к файлу кэша карточек. Пусто = card_cache.sqlite рядом с output.")
+    ap.add_argument("--card-cache-ttl-days", type=float, default=7.0,
+                    help="Доработка №8: срок свежести записи кэша карточек, дней (по умолч. 7). "
+                         "Старше — карточка перепроверяется (ссылка обновится). 0 = бессрочно.")
     ap.add_argument("--semantic", type=str_to_bool, default=True,
                     help="v53 (улучшение №1): семантическое сравнение названий офлайн-моделью "
                          "(если установлена sentence-transformers). Спасает сложные названия от "

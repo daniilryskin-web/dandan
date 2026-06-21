@@ -6,6 +6,10 @@ __pycache__/
 *_live.xlsx
 *.tmp
 *_run.log
+run_*.log
+# Caches and run-to-run snapshots (доработки №7/№8)
+*.sqlite
+*.prev.json
 # Virtual envs
 .venv/
 venv/

@@ -324,6 +324,7 @@ class AppState:
     output_path: str = ""
     ozon_output_path: str = ""
     log_path: str = ""
+    full_log_path: str = ""  # v54.6: путь к ПОЛНОМУ логу прогона на диске
     metrics: Dict[str, Any] = field(default_factory=dict)
     last_cmd: str = ""
     error: str = ""
@@ -393,6 +394,7 @@ class AppState:
             "output_path": self.output_path,
             "ozon_output_path": self.ozon_output_path,
             "log_path": self.log_path,
+            "full_log_path": self.full_log_path,
             "metrics": self.metrics,
             "last_cmd": self.last_cmd,
             "error": self.error,
@@ -518,6 +520,41 @@ class EngineRunner:
         self.proc_ozon: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
+        self._full_log_fh = None  # v54.6: файловый дескриптор полного лога прогона
+
+    def _open_full_log(self) -> None:
+        """v54.6: открывает файл ПОЛНОГО лога прогона. Живой лог в памяти —
+        кольцевой (последние 5000 строк), поэтому длинный прогон в нём виден не
+        целиком, и казалось, что программа «встала на 11698». Файл на диске хранит
+        ВСЁ от первой до последней строки."""
+        self._close_full_log()
+        try:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = APP_DIR / f"run_{ts}.log"
+            self._full_log_fh = open(path, "w", encoding="utf-8", errors="replace")
+            self.state.full_log_path = str(path)
+            self.state.log_lines.append(f"📄 Полный лог прогона пишется на диск: {path}")
+        except Exception:
+            self._full_log_fh = None
+
+    def _write_full_log(self, line: str) -> None:
+        fh = self._full_log_fh
+        if fh is None:
+            return
+        try:
+            fh.write(line + "\n")
+            fh.flush()
+        except Exception:
+            pass
+
+    def _close_full_log(self) -> None:
+        fh = self._full_log_fh
+        self._full_log_fh = None
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
 
     def start(self, spec: RunSpec) -> None:
         """Запускает прогон по переданному RunSpec."""
@@ -562,6 +599,8 @@ class EngineRunner:
         s._last_activity_ts = 0.0
         s._activity_counter = 0
         s._progress_samples = []
+        s.full_log_path = ""
+        self._open_full_log()
 
     def _run(self, spec: RunSpec) -> None:
         try:
@@ -631,6 +670,13 @@ class EngineRunner:
                 if self.state.progress_total:
                     self.state.progress_done = self.state.progress_total
             self._finalize_paths(spec)
+            # v54.6: финал полного лога — чтобы было видно, что прогон РЕАЛЬНО дошёл
+            # до конца (живой лог в памяти кольцевой и теряет раннюю часть).
+            if self.state.full_log_path:
+                tail = "[прогон завершён]" if not self.state.error else f"[прогон завершён с ошибкой: {self.state.error}]"
+                self._write_full_log(tail)
+                self.state.log_lines.append(f"📄 Полный лог прогона сохранён: {self.state.full_log_path}")
+            self._close_full_log()
 
     def _run_unified(self, spec: RunSpec) -> None:
         """Запускает WB и Ozon параллельно, затем мержит результаты."""
@@ -686,9 +732,11 @@ class EngineRunner:
         """Запускает один subprocess, читает stdout, возвращает код возврата."""
         self.state.stage_label = label
         self.state.log_lines.append(f"\n━━━ {label} ━━━")
+        self._write_full_log(f"\n━━━ {label} ━━━")
         cmd_str = " ".join(f'"{a}"' if " " in str(a) else str(a) for a in args)
         self.state.last_cmd = cmd_str
         self.state.log_lines.append(f"[команда] {cmd_str}")
+        self._write_full_log(f"[команда] {cmd_str}")
         try:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
@@ -726,11 +774,13 @@ class EngineRunner:
             self.state.log_lines.append(line)
             if len(self.state.log_lines) > 6000:
                 self.state.log_lines = self.state.log_lines[-5000:]
+            self._write_full_log(line)
             self._parse_line(line)
 
         proc.wait()
         rc = proc.returncode or 0
         self.state.log_lines.append(f"[завершено, код {rc}]")
+        self._write_full_log(f"[завершено, код {rc}]")
         if rc != 0 and not self.state.error:
             self.state.error = f"Subprocess завершился с кодом {rc} (см. Логи)"
         return rc
@@ -738,8 +788,10 @@ class EngineRunner:
     def _run_one_collect(self, args: List[str], label: str, lines_out: List[str]) -> int:
         """Версия _run_one для параллельного запуска — добавляет строки в lines_out."""
         self.state.log_lines.append(f"\n━━━ {label} ━━━")
+        self._write_full_log(f"\n━━━ {label} ━━━")
         cmd_str = " ".join(f'"{a}"' if " " in str(a) else str(a) for a in args)
         self.state.log_lines.append(f"[команда] {cmd_str}")
+        self._write_full_log(f"[команда] {cmd_str}")
         try:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
@@ -772,6 +824,7 @@ class EngineRunner:
             self.state.log_lines.append(f"  [{label[:2]}] {line}")
             if len(self.state.log_lines) > 6000:
                 self.state.log_lines = self.state.log_lines[-5000:]
+            self._write_full_log(f"  [{label[:2]}] {line}")
             self._parse_line(line)
 
         proc.wait()

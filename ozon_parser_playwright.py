@@ -183,6 +183,29 @@ def _extract_sku_from_url(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def _extract_product_links_from_capture(captured: Dict[str, str]) -> List[Dict[str, str]]:
+    """v27.9.x: достаёт ссылки на товары из ПЕРЕХВАЧЕННОГО JSON Ozon (widgetStates).
+
+    Поиск Ozon отдаёт карточки в composer/entrypoint-api JSON. Раньше ссылки
+    брались ТОЛЬКО из DOM (a[href*='/product/']) — а Ozon часто рендерит выдачу
+    так, что прямых anchor'ов нет (виртуализация, шаблоны), и поиск возвращал 0.
+    Здесь ловим /product/...-<sku> прямо в перехваченном JSON — это устойчивее
+    к изменениям вёрстки.
+    """
+    out: Dict[str, Dict[str, str]] = {}
+    rx = re.compile(r"/product/[A-Za-z0-9_\-]+?-(\d{6,})")
+    for raw in (captured or {}).values():
+        if not raw:
+            continue
+        text = raw.replace("\\/", "/")  # JSON часто экранирует слэши
+        for m in rx.finditer(text):
+            sku = m.group(1)
+            path = m.group(0)
+            if sku not in out:
+                out[sku] = {"url": "https://www.ozon.ru" + path, "title": "", "sku": sku}
+    return list(out.values())
+
+
 class OzonPlaywrightParser:
     """Парсер Ozon на основе Playwright + стелс-настроек."""
 
@@ -263,6 +286,8 @@ class OzonPlaywrightParser:
         log.info("Открываю поиск: %s (лимит %d)", url, limit)
 
         page = await self._context.new_page()
+        # v27.9.x: перехватываем JSON выдачи (надёжнее DOM-ссылок).
+        captured = _attach_widget_capture(page)
         try:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.search_timeout_ms)
@@ -289,9 +314,12 @@ class OzonPlaywrightParser:
             # Скроллим вниз, чтобы подгрузились товары
             seen_links: Dict[str, Dict[str, str]] = {}
             for scroll_idx in range(8):  # до 8 раз скроллим
+                # 1) ссылки из DOM
                 links = await self._extract_product_links(page)
+                # 2) ссылки из перехваченного JSON (устойчивее к вёрстке)
+                links += _extract_product_links_from_capture(captured)
                 for lnk in links:
-                    sku = _extract_sku_from_url(lnk["url"])
+                    sku = lnk.get("sku") or _extract_sku_from_url(lnk["url"])
                     if sku and sku not in seen_links:
                         lnk["sku"] = sku
                         seen_links[sku] = lnk
@@ -749,6 +777,11 @@ async def run_playwright_parser(
                     continue
                 print(f"[Ozon-Playwright] карточка {idx}/{len(search_results)}: {url}", flush=True)
                 try:
+                    from main_v39 import emit_progress as _emit
+                    _emit("cards", idx, len(search_results))
+                except Exception:
+                    pass
+                try:
                     row = await parser.parse_card(url, query=query)
                     if row:
                         rows.append(row)
@@ -777,11 +810,21 @@ async def run_playwright_parser(
             print(f"[Ozon-Playwright] обогащение реестрами: {n_with_reg} карточек с реестровой ссылкой", flush=True)
             t2 = time.time()
             try:
+                from main_v39 import emit_progress as _emit
+                _emit("registry", 0, n_with_reg)
+            except Exception:
+                pass
+            try:
                 rows = await enrich_registry_data(rows, workers=8, timeout_sec=12.0)
             except Exception as e:
                 log.warning("Обогащение реестрами упало: %s", e)
             # Финальный вердикт сверки названия карточки с названием из реестра
             _apply_ozon_verdicts(rows)
+            try:
+                from main_v39 import emit_progress as _emit
+                _emit("registry", n_with_reg, n_with_reg)
+            except Exception:
+                pass
             print(f"[Ozon-Playwright] реестры обработаны за {time.time()-t2:.1f}с", flush=True)
             diag["rows_with_registry"] = n_with_reg
         else:

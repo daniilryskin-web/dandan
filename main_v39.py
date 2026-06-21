@@ -28,9 +28,20 @@ import math
 import os
 import random
 import re
+import sqlite3
 import sys
 import time
 import traceback
+import logging as _logging
+
+# v27.9.x: модульный логгер. Раньше код местами вызывал log.warning(...), но
+# `log` нигде не определялся -> при ЛЮБОМ исключении в построении «Сводки»
+# падало с NameError и рушило сохранение всего файла. Теперь логгер есть.
+log = _logging.getLogger("wb_registry")
+
+
+class _SkipSecondPass(Exception):
+    """v27.9.x: внутренний сигнал — пропустить второй проход FSA (он теперь по кнопке)."""
 import difflib
 import urllib.parse
 from dataclasses import dataclass, asdict
@@ -250,32 +261,276 @@ def _format_date(s: Any) -> str:
 
 
 def parse_fsa_json(obj: Any, url: str, kind: str, doc_id: str) -> Dict[str, str]:
-    """Достаёт ключевые поля из JSON-ответа FSA. Возвращает dict с registry_*."""
+    """Достаёт ключевые поля из JSON-ответа FSA. Возвращает dict с registry_*.
+
+    v27.9.x: разбор по РЕАЛЬНОЙ структуре API ФСА (подтверждена живым ответом).
+    Реальный JSON вложенный и кодирует status/scheme/техрегламент числами, а
+    название/изготовителя держит в под-объектах (product.fullName,
+    manufacturer.fullName и т.п.) — наивный поиск по подстроке ключа брал не те
+    поля (idLegalSubject вместо fullName, idProduct вместо названия). Поэтому
+    сначала пытаемся СТРОГО по структуре, и только то, что не нашли — добираем
+    старым обобщённым поиском.
+    """
     payload = _unwrap_payload(obj)
-    leaves = _walk_leaves(payload)
-    # Имена полей в FSA-JSON могут варьироваться, ищем по нескольким ключам.
+    is_cert = (kind == "rss_certificate")
     out: Dict[str, str] = {
-        "doc_type": "Сертификат" if kind == "rss_certificate" else "Декларация",
-        "doc_number": _find_value(leaves, ("number", "regnumber", "registrationnumber"), exclude_any=("blank", "applicant", "manufacturer")),
-        "blank_number": _find_value(leaves, ("blanknumber", "blank_number")),
-        "status": _find_value(leaves, ("status",), exclude_any=("change", "history")),
-        "status_date": _format_date(_find_value(leaves, ("statusdate", "status_date"))),
-        "status_basis": _find_value(leaves, ("statusbasis", "status_basis", "decisionnumber"), exclude_any=("date",)),
-        "date_start": _format_date(_find_value(leaves, ("certregdate", "regdate", "datestart", "date_start", "issuedate"), exclude_any=("end", "expir"))),
-        "date_end": _format_date(_find_value(leaves, ("certenddate", "datetill", "dateend", "date_end", "expirationdate"))),
-        "applicant": _find_value(leaves, ("applicant", "fullname"), include_all=("applicant",)) or _find_value(leaves, ("applicantname",)),
-        "applicant_inn": _find_value(leaves, ("applicantinn", "applicant_inn"), include_all=("applicant",)) or _find_value(leaves, ("inn",), include_all=("applicant",)),
-        "manufacturer": _find_value(leaves, ("manufacturer", "fullname"), include_all=("manufacturer",)) or _find_value(leaves, ("manufacturername",)),
-        "product_group": _find_value(leaves, ("productgroup", "product_group")),
-        "product_full": _find_value(leaves, ("productname", "product_name", "product"), exclude_any=("manufacturer", "applicant", "group")),
-        "tnved": _find_value(leaves, ("tnved", "tncode", "tn_ved")),
-        "scheme": _find_value(leaves, ("scheme",)),
-        "technical_regulation": _find_value(leaves, ("techreg", "technicalregulation", "technical_regulation")),
-        "evidence": _find_value(leaves, ("evidence",)),
-        "source": f"curl_cffi:{url}",
+        "doc_type": "Сертификат" if is_cert else "Декларация",
+        "source": f"json:{url}",
     }
-    # Чистим пустые
+
+    if isinstance(payload, dict):
+        def _org_name(d: Any) -> str:
+            if isinstance(d, dict):
+                return str(d.get("fullName") or d.get("shortName") or "").strip()
+            return ""
+
+        def _org_inn(d: Any) -> str:
+            if isinstance(d, dict):
+                return str(d.get("inn") or "").strip()
+            return ""
+
+        prod = payload.get("product") if isinstance(payload.get("product"), dict) else {}
+        applicant = payload.get("applicant")
+        manufacturer = payload.get("manufacturer")
+
+        # Номер документа
+        if payload.get("number"):
+            out["doc_number"] = str(payload["number"]).strip()
+        if payload.get("blankNumber"):
+            out["blank_number"] = str(payload["blankNumber"]).strip()
+
+        # Статус (числовой код idStatus -> текст). 6 = «Действует» (подтверждено).
+        st_id = payload.get("idStatus")
+        if st_id is None:
+            chg = payload.get("statusChanges")
+            if isinstance(chg, list) and chg and isinstance(chg[-1], dict):
+                st_id = chg[-1].get("idStatus")
+        if st_id is not None:
+            out["status"] = _FSA_STATUS_MAP.get(int(st_id), f"Статус {st_id}") \
+                if isinstance(st_id, (int, float)) or str(st_id).isdigit() else str(st_id)
+            out["status_code"] = str(st_id)
+
+        # Даты
+        ds = _format_date(payload.get("certRegDate") or payload.get("declRegDate")
+                          or payload.get("regDate"))
+        de = _format_date(payload.get("certEndDate") or payload.get("declEndDate")
+                          or payload.get("endDate"))
+        if ds:
+            out["date_start"] = ds
+        if de:
+            out["date_end"] = de
+
+        # Заявитель / изготовитель — берём имя из под-объекта (НЕ id!)
+        if _org_name(applicant):
+            out["applicant"] = _org_name(applicant)
+        if _org_inn(applicant):
+            out["applicant_inn"] = _org_inn(applicant)
+        if _org_name(manufacturer):
+            out["manufacturer"] = _org_name(manufacturer)
+        if _org_inn(manufacturer):
+            out["manufacturer_inn"] = _org_inn(manufacturer)
+
+        # Название продукции. ФСА держит ДВА названия:
+        #   • product.fullName — «Общее наименование продукции» (часто общее, напр.
+        #     «Электрические приборы бытового назначения»);
+        #   • product.identifications[].name — «Наименование (обозначение) продукции»
+        #     (конкретика: «электрические чайники, торговой марки …, модель …»).
+        # Раньше брали только fullName → общее имя не совпадало с названием WB и
+        # давало ложное «НЕСООТВЕТСТВИЕ». Собираем ОБА поля в одно через «; »
+        # (с дедупликацией: если они совпадают — не дублируем).
+        _name_parts: List[str] = []
+        if prod.get("fullName"):
+            _name_parts.append(str(prod["fullName"]).strip())
+        _idents = prod.get("identifications")
+        if isinstance(_idents, list):
+            for _it in _idents:
+                if isinstance(_it, dict) and _it.get("name"):
+                    _name_parts.append(str(_it["name"]).strip())
+        _seen_names: List[str] = []
+        for _p in _name_parts:
+            if _p and _p not in _seen_names:
+                _seen_names.append(_p)
+        if _seen_names:
+            out["product_full"] = "; ".join(_seen_names)
+
+        # Схема. У СЕРТИФИКАТОВ idCertScheme = реальный номер схемы (1..7 -> «1с»).
+        # У ДЕКЛАРАЦИЙ idDeclScheme — это ВНУТРЕННИЙ id записи (напр. 3581), а НЕ номер
+        # схемы. Поэтому код берём только если это настоящий однозначный/двузначный
+        # номер схемы (1..9). Для деклараций реальную схему («1д») добираем из ТЕКСТА
+        # страницы (см. _parse_fsa_with_existing_page_v386).
+        sch = payload.get("idCertScheme") if is_cert else payload.get("idDeclScheme")
+        if sch is None:
+            sch = payload.get("idCertScheme") or payload.get("idDeclScheme")
+        if sch is not None and str(sch).strip().isdigit() and 1 <= int(sch) <= 9:
+            out["scheme"] = f"{int(sch)}{'с' if is_cert else 'д'}"
+
+        # Технические регламенты (idTechnicalReglaments -> текст по словарю).
+        # v27.9.x: словарь FSA НЕ последовательный (007/2011=id39), поэтому
+        # неизвестные id НЕ выводим как «ТР (код N)» — это путало пользователя.
+        # Известные id маппим; для неизвестных оставляем technical_regulation
+        # пустым, чтобы его заполнил настоящий «ТР ТС NNN/YYYY» из текста
+        # страницы/вкладок (см. вызов в _parse_fsa_with_existing_page_v386).
+        tregs = payload.get("idTechnicalReglaments")
+        if isinstance(tregs, list) and tregs:
+            names = []
+            for t in tregs:
+                try:
+                    nm = _FSA_TECHREG_MAP.get(int(t))
+                    if nm:
+                        names.append(nm)
+                except Exception:
+                    pass
+            if names:
+                out["technical_regulation"] = "; ".join(dict.fromkeys(names))
+
+        # ТН ВЭД — в JSON только внутренние idTnveds (не сами коды), пропускаем.
+
+    # Добор обобщённым поиском только тех полей, что не нашли строго.
+    leaves = _walk_leaves(payload)
+    if not out.get("doc_number"):
+        out["doc_number"] = _find_value(leaves, ("number", "regnumber"), exclude_any=("blank", "applicant", "manufacturer"))
+    if not out.get("applicant"):
+        out["applicant"] = _find_value(leaves, ("applicantname",)) or _find_value(leaves, ("applicant", "fullname"), include_all=("applicant", "fullname"))
+    if not out.get("manufacturer"):
+        out["manufacturer"] = _find_value(leaves, ("manufacturername",)) or _find_value(leaves, ("manufacturer", "fullname"), include_all=("manufacturer", "fullname"))
+    if not out.get("product_full"):
+        out["product_full"] = _find_value(leaves, ("productfullname", "product_fullname"))
+    # Схема/техрегламент: если в JSON они даны строкой (не числовым кодом) —
+    # добираем обобщённо. exclude id*, чтобы не схватить idCertScheme и пр.
+    if not out.get("scheme"):
+        out["scheme"] = _find_value(leaves, ("scheme",), exclude_any=("id", "object"))
+    if not out.get("technical_regulation"):
+        out["technical_regulation"] = _find_value(
+            leaves, ("techreg", "technicalregulation", "technical_regulation"), exclude_any=("id",))
+    # v45.5: техрегламент НАДЁЖНО достаём из ТЕКСТА самого JSON (без словаря id).
+    # В ответе ФСА сам код ТР встречается в названиях документов/стандартов и тексте
+    # типа сертификата: «ТР ТС 017/2011», «Технического регламента Таможенного союза
+    # 007/2011», «Евразийского экономического союза 037/2016». Сканируем все строковые
+    # листья и собираем нормализованные «ТР ТС/ЕАЭС NNN/YYYY».
+    if not out.get("technical_regulation"):
+        _tr_found: List[str] = []
+        for _p, _v in leaves:
+            if not isinstance(_v, str) or "/" not in _v:
+                continue
+            for m in re.finditer(r"ТР\s+(ТС|ЕАЭС)\s+(\d{3}/\d{4})", _v):
+                _s = f"ТР {m.group(1)} {m.group(2)}"
+                if _s not in _tr_found:
+                    _tr_found.append(_s)
+            for m in re.finditer(r"регламента\s+Таможенного\s+союза\s+(\d{3}/\d{4})", _v, re.I):
+                _s = f"ТР ТС {m.group(1)}"
+                if _s not in _tr_found:
+                    _tr_found.append(_s)
+            for m in re.finditer(r"(?:Евразийского\s+экономического\s+союза|ЕАЭС)\s+(\d{3}/\d{4})", _v, re.I):
+                _s = f"ТР ЕАЭС {m.group(1)}"
+                if _s not in _tr_found:
+                    _tr_found.append(_s)
+        if _tr_found:
+            out["technical_regulation"] = "; ".join(_tr_found)
+    if not out.get("status"):
+        out["status"] = _find_value(leaves, ("status",), exclude_any=("id", "change", "history", "date"))
+
     return {k: v for k, v in out.items() if v}
+
+
+# Словарь статусов ФСА (idStatus). Коды подтверждены пользователем по карточкам
+# реестра. ВАЖНО для вердикта: действующий — только «Действует» (6); остальные
+# (приостановлен/прекращён/недействителен/архивный) = документ НЕ действует.
+_FSA_STATUS_MAP: Dict[int, str] = {
+    1: "Архивный",
+    6: "Действует",
+    11: "Недействителен",
+    14: "Прекращён",
+    15: "Приостановлен",
+}
+# Статусы, при которых документ считается НЕдействующим (для вердикта/окраски).
+_FSA_INACTIVE_STATUS_CODES = {1, 11, 14, 15}
+
+
+# =============================================================================
+# v46: Статус КИРГИЗСКИХ документов на территории РФ
+# =============================================================================
+# Пользователь ведёт таблицу (xlsx) с киргизскими (ЕАЭС KG…) документами, которые
+# приостановлены/прекращены именно на территории РФ. Колонки: number, [reg_date],
+# id_status_in_rf (14 = прекращён, 15 = приостановлен). Программа сверяет номер
+# документа из реестра с этой таблицей и, если документ там есть, выставляет
+# колонку «Статус на территории РФ» и итоговый вердикт «НЕДЕЙСТВУЕТ В РФ».
+STATUS_INVALID_IN_RF = "НЕДЕЙСТВУЕТ В РФ"
+_KG_RF_STATUS_MAP: Dict[str, int] = {}     # norm_number -> код (14/15/…)
+_KG_RF_CODE_TEXT = {14: "Прекращён", 15: "Приостановлен"}
+
+
+def _norm_doc_number(s: Any) -> str:
+    """Нормализация номера документа для сверки: убираем всё кроме букв/цифр,
+    приводим к нижнему регистру. «ЕАЭС KG 417/043.RU.02.09525» и
+    «ЕАЭС KG417/043.RU.02.09525.» дают одинаковый ключ."""
+    return re.sub(r'[^0-9a-zA-Zа-яА-ЯёЁ]', '', str(s or '')).lower()
+
+
+def load_kg_rf_status(path: Any) -> int:
+    """Загружает таблицу статусов КГ-документов в РФ в _KG_RF_STATUS_MAP.
+    Поддерживает .xlsx (колонки number/…/id_status_in_rf — по именам или по
+    позиции 0 и последняя) и .csv. Возвращает число загруженных записей."""
+    global _KG_RF_STATUS_MAP
+    p = Path(str(path))
+    if not p.exists():
+        return 0
+    rows_iter = []
+    try:
+        if p.suffix.lower() in ('.xlsx', '.xlsm'):
+            from openpyxl import load_workbook
+            wb = load_workbook(p, read_only=True, data_only=True)
+            ws = wb.worksheets[0]
+            rows_iter = list(ws.iter_rows(values_only=True))
+        else:
+            import csv as _csv
+            with open(p, 'r', encoding='utf-8-sig', newline='') as f:
+                rows_iter = [tuple(r) for r in _csv.reader(f)]
+    except Exception as e:
+        print(f"⚠️  Не удалось прочитать таблицу статусов КГ-РФ ({p.name}): {type(e).__name__}: {e}")
+        return 0
+    if not rows_iter:
+        return 0
+    header = [str(c).strip().lower() if c is not None else '' for c in rows_iter[0]]
+    # ищем колонки number и id_status_in_rf по именам; иначе 0 и последняя
+    num_i = next((i for i, h in enumerate(header) if 'number' in h or 'номер' in h), 0)
+    st_i = next((i for i, h in enumerate(header)
+                 if 'status' in h or 'статус' in h), len(header) - 1)
+    has_header = ('number' in header[num_i]) or ('номер' in header[num_i]) or \
+                 ('status' in header[st_i]) or ('статус' in header[st_i])
+    data = rows_iter[1:] if has_header else rows_iter
+    m: Dict[str, int] = {}
+    for r in data:
+        if not r or num_i >= len(r) or st_i >= len(r):
+            continue
+        key = _norm_doc_number(r[num_i])
+        if not key:
+            continue
+        try:
+            code = int(str(r[st_i]).strip())
+        except Exception:
+            continue
+        m[key] = code
+    _KG_RF_STATUS_MAP = m
+    return len(m)
+
+
+def kg_rf_status_text(cert_number: Any) -> str:
+    """Если номер документа есть в таблице КГ-РФ — возвращает русский статус
+    («Прекращён»/«Приостановлен»/«Статус N»), иначе пустую строку."""
+    if not _KG_RF_STATUS_MAP or not cert_number:
+        return ""
+    code = _KG_RF_STATUS_MAP.get(_norm_doc_number(cert_number))
+    if code is None:
+        return ""
+    return _KG_RF_CODE_TEXT.get(code, f"Статус {code}")
+
+# Словарь технических регламентов ФСА (idTechnicalReglaments). 39 = ТР ТС
+# 007/2011 подтверждён живым ответом (в тексте документов). Остальные —
+# по мере подтверждения; неизвестные отдаются как «ТР (код N)».
+_FSA_TECHREG_MAP: Dict[int, str] = {
+    39: "ТР ТС 007/2011",
+}
+
 
 
 # =============================================================================
@@ -290,6 +545,7 @@ def fetch_fsa_via_http(
     user_agent: Optional[str] = None,
     aggressive: bool = False,
     skip_warmup: bool = False,
+    cookies: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, str]]:
     """Главный публичный API.
 
@@ -297,6 +553,12 @@ def fetch_fsa_via_http(
       - URL не FSA-документ
       - curl_cffi не установлен (FSA вернёт 403)
       - все попытки вернули 403/500/пустые ответы
+
+    v45.2: cookies — куки сессии, СНЯТЫЕ С НАСТОЯЩЕГО БРАУЗЕРА (который прошёл
+    JS-антибот ФСА). С ними curl_cffi обращается к /api/v1/.../{id} напрямую и
+    получает тот же JSON, что браузер — но в разы быстрее и одним лёгким запросом
+    вместо полной отрисовки SPA. Это ключ к скорости без блокировок: после первого
+    документа (через браузер) все остальные тянем по HTTP с этими куками.
 
     Использование:
         result = fetch_fsa_via_http("https://pub.fsa.gov.ru/rss/certificate/view/123/baseInfo")
@@ -322,11 +584,21 @@ def fetch_fsa_via_http(
     impersonates = [impersonate, "chrome120", "chrome110"]
     seen = set()
     impersonates = [x for x in impersonates if not (x in seen or seen.add(x))]
+    _ck = {str(k): str(v) for k, v in (cookies or {}).items() if k}
 
     for imp in impersonates:
         try:
             sess = _curl_requests.Session()
+            # v45.2: подкладываем браузерные куки в сессию curl_cffi — с ними API ФСА
+            # отвечает там, где «голый» HTTP получает 403 (антибот ставит куку через JS).
+            if _ck:
+                try:
+                    for _k, _v in _ck.items():
+                        sess.cookies.set(_k, _v, domain="pub.fsa.gov.ru")
+                except Exception:
+                    pass
             # Warm-up — это критично, без него FSA часто отдаёт 403
+
             if not skip_warmup:
                 for label, warm_url, typ in _fsa_warmup_urls(kind, doc_id, referer):
                     try:
@@ -380,13 +652,22 @@ def fetch_fsa_via_http(
 # -----------------------------
 
 STATUS_LINK_COLLECTED = "ССЫЛКА НА РЕЕСТР СОБРАНА"
+# v27.9.x: реестры, которые по требованию НЕ парсим (оставляем только ссылку).
+_BELGISS_EAEU_HOSTS = {
+    "belgiss.by", "www.belgiss.by", "tsouz.belgiss.by",
+    "portal.eaeunion.org", "eaeunion.org",
+}
 STATUS_NO_DOCS = "НЕТ ДОКУМЕНТОВ"
 STATUS_NO_REGISTRY_LINK = "НЕТ ССЫЛКИ НА РЕЕСТР"
 STATUS_TIMEOUT = "ТАЙМАУТ"
 STATUS_ERROR = "ОШИБКА"
+# v48: документ корректен и совпадает с товаром, НО на карточке WB нет плашки
+# «Документы проверены» (certificate.verified=false). Отдельная категория: товар
+# проходит, но его документы НЕ верифицированы модерацией WB.
+STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-06-v27.6-playwright"
+APP_VERSION = "2026-06-20-v54.4"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -448,6 +729,10 @@ class Card:
     pics_count: int = 0
     in_stock: int = 0
     is_original: str = ""  # v43: признак оригинальности из карточки WB
+    docs_verified: str = ""  # v46: бейдж «Документ проверен WB» (Да/Нет) из card.json
+    view_flags: int = 0     # v46: сырой viewFlags из поиска WB (для вывода бита «Документы проверены»)
+    colors: str = ""        # v27.9.x: цвет(а) товара из карточки WB
+    wb_root: str = ""       # v27.9.x: корневой ID карточки WB (группировка вариантов)
 
 @dataclass
 class ResultRow:
@@ -466,6 +751,9 @@ class ResultRow:
     rating: float = 0.0
     feedbacks: int = 0
     is_original: str = ""  # v43: признак оригинальности
+    docs_verified: str = ""  # v46: бейдж «Документ проверен WB» (Да/Нет)
+    colors: str = ""        # v27.9.x: цвет(а) товара из карточки WB
+    wb_root: str = ""       # v27.9.x: корневой ID карточки WB
     # Реестровая ссылка
     registry_url: str = ""
     registry_host: str = ""
@@ -474,6 +762,7 @@ class ResultRow:
     certificate_number: str = ""
     document_type: str = ""
     document_status: str = ""  # v39.5: "Действует" / "Прекращён" / "Приостановлен" и т.п.
+    rf_status: str = ""         # v46: статус киргизского документа на территории РФ
     certificate_product_name: str = ""
     # v39.14: расширенные поля из реестра (если HTTP-парсер их нашёл)
     document_date_start: str = ""
@@ -497,6 +786,40 @@ class ResultRow:
 
 def now_iso() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# v27.9.x: машиночитаемый прогресс для GUI. Раньше окно вытаскивало прогресс
+# слабым regex (\d+/\d+) прямо из логов и ловило ложные срабатывания —
+# «повтор 2/5», «заполнено 120/200» и т.п. дёргали полосу прогресса. Этот
+# однозначный маркер парсится в первую очередь; печатается рядом с обычным
+# человекочитаемым логом, поэтому логи остаются прежними.
+_PROGRESS_STATE: Dict[str, Any] = {}
+
+
+def emit_progress(stage: str, done: int, total: int) -> None:
+    # v54.4 (улучшение №7): к прогрессу добавлены СКОРОСТЬ (карточек/мин) и ETA (сек),
+    # чтобы окно показывало оценку оставшегося времени. Считаем по фактическому
+    # темпу от старта этапа.
+    try:
+        done = int(done)
+        total = int(total)
+        now = time.time()
+        st = _PROGRESS_STATE.get(stage)
+        if st is None or done < st.get('done', 0):
+            st = {'start': now, 'done': done}
+            _PROGRESS_STATE[stage] = st
+        elapsed = max(1e-6, now - st['start'])
+        speed = done / elapsed * 60.0  # в минуту
+        eta = ((total - done) / (done / elapsed)) if done > 0 else 0.0
+        st['done'] = done
+        print(f"@@PROGRESS@@ stage={stage} done={done} total={total} "
+              f"speed={speed:.0f} eta={int(max(0, eta))}", flush=True)
+    except Exception:
+        try:
+            print(f"@@PROGRESS@@ stage={stage} done={int(done)} total={int(total)}", flush=True)
+        except Exception:
+            pass
+
 
 # v39.8: precompiled regex и LRU cache для горячих утилит.
 # Эти функции вызываются десятки тысяч раз за прогон (compare_product_names
@@ -652,8 +975,15 @@ def wb_volume_part(nm_id: int) -> Tuple[int, int]:
 
 
 def wb_basket_by_volume(vol: int) -> int:
-    """Приблизительная официальная шардировка WB media basket по vol.
+    """Официальная шардировка WB media-basket по vol.
     Источник: реальные HAR-дампы. Для vol=1982 → basket-13.
+
+    v27.9.x: таблица точна для vol≤5429. Для бОльших vol мэппинг продолжается,
+    но НЕ шагом 216 — по реальным прогонам (5514→29, 6708→32, 7627→36, 8004→37)
+    шаг более пологий, ≈311 vol на шард. Прежняя экстраполяция по 216 «перелетала»
+    в несуществующие basket-50+ (vol≈9800 давал basket-50, а реальный — ~40),
+    из-за чего запросы шли к нерезолвящимся хостам (DNS-ошибки) и карточка зря
+    помечалась ОШИБКОЙ. Теперь наклон ≈311 и осторожный кап.
     """
     ranges = [
         (143, 1), (287, 2), (431, 3), (719, 4), (1007, 5),
@@ -661,31 +991,56 @@ def wb_basket_by_volume(vol: int) -> int:
         (1655, 11), (1919, 12), (2045, 13), (2189, 14), (2405, 15),
         (2621, 16), (2837, 17), (3053, 18), (3269, 19), (3485, 20),
         (3701, 21), (3917, 22), (4133, 23), (4349, 24), (4565, 25),
-        (4781, 26), (4997, 27), (5213, 28), (5429, 29), (10**9, 30),
+        (4781, 26), (4997, 27), (5213, 28), (5429, 29),
     ]
     for max_vol, basket in ranges:
         if vol <= max_vol:
             return basket
-    return 30
+    # vol > 5429 — пологое продолжение ≈311 vol/шард (подтверждено прогонами).
+    extra = round((int(vol) - 5429) / 311.0)
+    return min(60, 29 + extra)
 
 
 def certificate_json_urls(nm_id: int, max_hosts: int = 12) -> List[str]:
     """Возвращает упорядоченный список URL'ов для перебора basket-хостов.
-    Первым идёт наиболее вероятный (по vol), затем соседи (±2), затем популярные 13/12/14.
+    Первым идёт наиболее вероятный (по vol), затем соседи (±4), затем
+    исторически «населённые» шарды и полный диапазон.
+
+    Под конкурентным перебором (см. fetch_certificate_json_for_nm) порядок не
+    критичен для скорости, но primary + соседи дают самый быстрый HTTP 200 в
+    типичном случае. Диапазон fill больше не обрывается на 30 — иначе новые
+    высоковолюмные товары (primary>30) никогда не нашли бы свой шард.
     """
     nm = int(nm_id)
     vol, part = wb_volume_part(nm)
     primary = wb_basket_by_volume(vol)
     order: List[int] = []
-    for b in [primary, primary - 1, primary + 1, primary - 2, primary + 2, 13, 12, 14]:
-        if 1 <= b <= 30 and b not in order:
+
+    def push(b: int) -> None:
+        if 1 <= b <= 199 and b not in order:
             order.append(b)
-    for b in range(1, 31):
-        if b not in order:
-            order.append(b)
+
+    # 1) расчётный шард и широкий круг соседей (страховка от неточности мэппинга
+    #    высоких vol — там границы шардов известны хуже)
+    for d in (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6):
+        push(primary + d)
+    # 2) для высоких vol реальные шарды лежат в диапазоне ~30..40 (по прогонам
+    #    встречаются вплоть до basket-37). Плотно добиваем именно его, иначе при
+    #    неточном primary карточка не нашла бы свой шард среди первых кандидатов.
+    if primary >= 28:
+        for b in (37, 36, 38, 35, 39, 34, 40, 33, 32, 31, 30, 41, 42, 43):
+            push(b)
+    # 3) исторически «населённые» низкие шарды
+    for b in (13, 12, 14, 15, 16, 11, 10, 17, 18, 1):
+        push(b)
+    # 4) добиваем остальной диапазон
+    upper = max(42, primary + 6)
+    for b in range(1, upper + 1):
+        push(b)
+
     return [
         f"https://basket-{b:02d}.wbbasket.ru/vol{vol}/part{part}/{nm}/info/certificate.json"
-        for b in order[:max_hosts]
+        for b in order[:max(1, int(max_hosts))]
     ]
 
 
@@ -724,7 +1079,7 @@ def extract_registry_urls_from_certificate_json(parsed: Any) -> List[str]:
 
 async def fetch_certificate_json_for_nm(
     session: "aiohttp.ClientSession", nm_id: int, timeout_sec: float = 6.0,
-    max_hosts: int = 30
+    max_hosts: int = 30, concurrency: int = 0
 ) -> Tuple[List[str], str]:
     """v40: HTTP-определение наличия документа по certificate.json. БЕЗ браузера.
 
@@ -750,68 +1105,369 @@ async def fetch_certificate_json_for_nm(
         "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
     }
     timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec)))
-    tried = 0
-    not_found = 0          # честные 404
-    net_errors: List[str] = []   # timeout / connection — это НЕ 404
-    other_status: List[str] = [] # 5xx и прочее
-    found_json_hosts: List[str] = []  # шарды где json реально есть (200)
-    all_urls: List[str] = []
+    urls = certificate_json_urls(nm_id, max_hosts=max_hosts)
+    tried = len(urls)
 
-    for url in certificate_json_urls(nm_id, max_hosts=max_hosts):
-        tried += 1
-        try:
-            async with session.get(url, headers=headers, timeout=timeout) as r:
-                status = int(r.status)
-                if status == 404:
-                    not_found += 1
-                    continue
-                if status != 200:
-                    other_status.append(f"{status}:{hostname(url)}")
-                    continue
-                # HTTP 200 — json существует, значит документ ЕСТЬ
-                raw = (await r.text(errors="replace")).strip()
-                found_json_hosts.append(hostname(url))
-                if not raw:
-                    # json пустой, но он есть — документ есть, ссылки нет
-                    continue
-                parsed: Any = raw
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    pass
-                urls_found = extract_registry_urls_from_certificate_json(parsed)
-                if not urls_found and isinstance(raw, str):
-                    urls_found = extract_registry_urls_from_certificate_json(raw)
-                for u in urls_found:
-                    if u not in all_urls:
-                        all_urls.append(u)
-                if all_urls:
-                    # Нашли ссылку — этого достаточно, возвращаем сразу
-                    return all_urls, f"cert_json_ok:{found_json_hosts[0]}"
-                # json есть, но ссылки внутри пока нет — продолжаем искать на др. шардах
-                # (вдруг на соседнем basket лежит более полный json со ссылкой)
-        except asyncio.TimeoutError:
-            net_errors.append(f"timeout:{hostname(url)}")
-        except aiohttp.ClientError as e:
-            net_errors.append(f"{type(e).__name__}:{hostname(url)}")
-        except Exception as e:
-            net_errors.append(f"{type(e).__name__}:{hostname(url)}")
+    # v45.10: ВОЗВРАТ К СТАРОМУ РАБОЧЕМУ ПОВЕДЕНИЮ. basket-шарды пробуются ПО ОДНОМУ
+    # в порядке «самый вероятный первым» (шард считается детерминированно по vol), и
+    # как только найден json со ссылкой — остальные пробы мгновенно отменяются. У
+    # карточки с документом он почти всегда на расчётном шарде, поэтому это 1 запрос
+    # на карточку — ровно как в старых версиях, где сбор шёл за секунды.
+    # Параллельный «залп» всех 16 шардов (его добавили позже ради скорости no-doc
+    # карточек) на деле ЛОМАЛ сбор: 30 воркеров × 16 = ~480 соединений к wbbasket.ru
+    # разом → WB CDN включал троттлинг → пробы отваливались по таймауту («сетевые
+    # ошибки») и скорость падала. Один запрос на карточку нагрузку убирает.
+    if concurrency and concurrency > 0:
+        probe_concurrency = int(concurrency)
+    else:
+        probe_concurrency = 1
+    probe_concurrency = max(1, probe_concurrency)
+    sem = asyncio.Semaphore(probe_concurrency)
 
-    # Прошли все шарды. Классифицируем исход.
+    state = {
+        "not_found": 0,            # честные 404
+        "host_absent": 0,          # DNS не резолвится = такого basket-шарда НЕТ (как 404)
+        "net_errors": [],          # timeout / connection reset — это НЕ 404 (повторить)
+        "other_status": [],        # 5xx и прочее
+        "json_hosts": [],          # шарды где json реально есть (200)
+        "urls": [],                # извлечённые ссылки на реестр
+    }
+    found = asyncio.Event()
+
+    def _is_host_absent(exc: BaseException) -> bool:
+        # Несуществующий basket-хост: DNS не резолвится. Это НЕ временный сбой —
+        # такого шарда просто нет, повтор не поможет, трактуем как «нет файла».
+        name = type(exc).__name__
+        if "DNS" in name or "gaierror" in name:
+            return True
+        s = str(exc).lower()
+        return ("getaddrinfo" in s or "name or service not known" in s
+                or "nodename nor servname" in s or "temporary failure in name resolution" in s)
+
+    async def probe(url: str) -> None:
+        if found.is_set():
+            return
+        async with sem:
+            if found.is_set():
+                return
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as r:
+                    status = int(r.status)
+                    if status == 404:
+                        state["not_found"] += 1
+                        return
+                    if status != 200:
+                        state["other_status"].append(f"{status}:{hostname(url)}")
+                        return
+                    # HTTP 200 — json существует, значит документ ЕСТЬ
+                    raw = (await r.text(errors="replace")).strip()
+                    state["json_hosts"].append(hostname(url))
+                    if not raw:
+                        return  # json пустой, но он есть — документ есть, ссылки нет
+                    parsed: Any = raw
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        pass
+                    urls_found = extract_registry_urls_from_certificate_json(parsed)
+                    if not urls_found and isinstance(raw, str):
+                        urls_found = extract_registry_urls_from_certificate_json(raw)
+                    for u in urls_found:
+                        if u not in state["urls"]:
+                            state["urls"].append(u)
+                    if state["urls"]:
+                        found.set()  # ссылка найдена — сигнал отменить остальные пробы
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                state["net_errors"].append(f"timeout:{hostname(url)}")
+            except aiohttp.ClientError as e:
+                if _is_host_absent(e):
+                    state["host_absent"] += 1   # такого basket-шарда нет = как 404
+                else:
+                    state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
+            except Exception as e:
+                if _is_host_absent(e):
+                    state["host_absent"] += 1
+                else:
+                    state["net_errors"].append(f"{type(e).__name__}:{hostname(url)}")
+
+    tasks = [asyncio.create_task(probe(u)) for u in urls]
+    try:
+        pending = set(tasks)
+        while pending:
+            _done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if found.is_set():
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Классифицируем исход (контракт статусов сохранён 1:1 со старой версией).
+    all_urls = state["urls"]
+    json_hosts = state["json_hosts"]
+    not_found = state["not_found"]
+    host_absent = state["host_absent"]
+    net_errors = state["net_errors"]
+    other_status = state["other_status"]
+    # «нет файла» = честный 404 ИЛИ несуществующий хост (DNS). И то и другое —
+    # достоверный сигнал отсутствия документа на этом шарде, а не сетевой сбой.
+    absent = not_found + host_absent
     if all_urls:
-        return all_urls, f"cert_json_ok:{found_json_hosts[0] if found_json_hosts else '?'}"
-    if found_json_hosts:
+        return all_urls, f"cert_json_ok:{json_hosts[0] if json_hosts else '?'}"
+    if json_hosts:
         # json существует (документ есть), но ссылку извлечь не удалось
-        return [], f"cert_json_has_doc_no_url:hosts={','.join(found_json_hosts[:3])}"
-    if not_found and not net_errors and not other_status:
-        # ВСЕ шарды честно вернули 404 → документа нет
-        return [], f"cert_json_no_docs:tried={tried},404={not_found}"
-    if net_errors and not_found < max_hosts:
-        # были сетевые ошибки, не получили полную картину 404 → надо повторить
-        return [], f"cert_json_neterror:tried={tried},404={not_found},net={';'.join(net_errors[:4])}"
-    # смешанный случай: часть 404, часть ошибок — считаем что скорее нет докум,
-    # но помечаем как neterror чтобы можно было повторить
-    return [], f"cert_json_neterror:tried={tried},404={not_found},net={';'.join(net_errors[:3])},other={';'.join(other_status[:2])}"
+        return [], f"cert_json_has_doc_no_url:hosts={','.join(json_hosts[:3])}"
+    if net_errors:
+        # БЫЛИ настоящие сетевые сбои (timeout/reset) без 200 → надо повторить
+        return [], f"cert_json_neterror:tried={tried},404={not_found},dns={host_absent},net={';'.join(net_errors[:4])}"
+    if absent:
+        # все ответы — 404 и/или несуществующие шарды → документа действительно нет
+        return [], f"cert_json_no_docs:tried={tried},404={not_found},dns={host_absent}"
+    # ничего внятного (только other_status) → помечаем neterror
+    return [], f"cert_json_neterror:tried={tried},404={not_found},other={';'.join(other_status[:2])}"
+
+
+# =============================================================================
+# v27.9.x: БЫСТРОЕ определение плашки «Оригинал» через статический card.json.
+# Найдено по HAR живой карточки WB: страница тянет card.json из той же basket-CDN,
+# что и certificate.json (путь /info/ru/card.json). Это СТАТИЧЕСКИЙ файл — берётся
+# обычным HTTP без браузера/токена/антибота, быстро и батчами (как certificate.json).
+# В нём лежит полная карточка, включая признак оригинальности.
+# =============================================================================
+
+def card_json_urls(nm_id: int, max_hosts: int = 16) -> List[str]:
+    """URL'ы статического card.json в той же basket-CDN (тот же шард, что и
+    certificate.json). Путь /info/ru/card.json."""
+    nm = int(nm_id)
+    cert = certificate_json_urls(nm, max_hosts=max_hosts)
+    return [u.replace(f"/{nm}/info/certificate.json", f"/{nm}/info/ru/card.json") for u in cert]
+
+
+# Ключи/значения card.json, означающие «оригинальный товар».
+# ВНИМАНИЕ: точный набор подтверждается по реальному телу card.json. Сканер
+# намеренно широкий: и булевы флаги по ключу, и текст «оригинальный товар».
+_ORIGINAL_KEY_RE = re.compile(
+    r"(?:is_?original|has_?original(?:mark)?|original_?mark|original_?badge|"
+    r"isoriginal|originalproduct|panelpromo)", re.I
+)
+
+
+def card_json_has_original(parsed: Any) -> bool:
+    """Глубокий обход card.json: True, если найден признак «Оригинал»
+    (булев флаг по ключу ИЛИ текст «оригинальный товар»)."""
+    found = False
+
+    def truthy(v: Any) -> bool:
+        if v is True:
+            return True
+        if isinstance(v, (int, float)):
+            return v != 0
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "да", "yes", "y", "оригинал", "original")
+        return False
+
+    def walk(o: Any) -> None:
+        nonlocal found
+        if found:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if _ORIGINAL_KEY_RE.search(str(k)) and truthy(v):
+                    found = True
+                    return
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+        elif isinstance(o, str):
+            if "оригинальный товар" in o.lower():
+                found = True
+
+    walk(parsed)
+    return found
+
+
+async def fetch_original_via_card_json(
+    session: "aiohttp.ClientSession", nm_id: int, timeout_sec: float = 6.0,
+    max_hosts: int = 16, concurrency: int = 0
+) -> Tuple[Optional[bool], str]:
+    """Тянет card.json по basket-шардам (конкурентно, первый 200 выигрывает) и
+    определяет признак «Оригинал».
+
+    Возвращает (is_original|None, detail). None = card.json не нашли (не знаем),
+    тогда результат не должен перетирать другие методы.
+    """
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+    }
+    timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec)))
+    urls = card_json_urls(nm_id, max_hosts=max_hosts)
+    probe_concurrency = max(1, int(concurrency) if concurrency else min(len(urls), 16))
+    sem = asyncio.Semaphore(probe_concurrency)
+    state = {"result": None, "host": ""}
+    done = asyncio.Event()
+
+    async def probe(url: str) -> None:
+        if done.is_set():
+            return
+        async with sem:
+            if done.is_set():
+                return
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as r:
+                    if int(r.status) != 200:
+                        return
+                    raw = (await r.text(errors="replace")).strip()
+                    if not raw:
+                        return
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        parsed = raw
+                    state["result"] = card_json_has_original(parsed)
+                    state["host"] = hostname(url)
+                    done.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    tasks = [asyncio.create_task(probe(u)) for u in urls]
+    try:
+        pending = set(tasks)
+        while pending:
+            _d, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if done.is_set():
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    if state["result"] is None:
+        return None, "card_json_not_found"
+    return bool(state["result"]), f"card_json_ok:{state['host']}:{'orig' if state['result'] else 'no'}"
+
+
+# =============================================================================
+# v46: БЕЙДЖ «Документ проверен WB» через статический card.json.
+# Эмпирически (по живым карточкам, 7 «с кнопкой» / 7 «без»): признак наличия
+# кнопки «Документы проверены» = card.json.certificate.verified == true.
+# Карточки С кнопкой: {"certificate": {"verified": true}}; БЕЗ: {"certificate": {}}
+# либо поля нет. Лежит в том же card.json (та же basket-CDN), что и «Оригинал».
+# Бейджа НЕТ в viewFlags/supplierFlags/promotions динамического API (проверено).
+# =============================================================================
+
+def card_json_docs_verified(parsed: Any) -> bool:
+    """True, если в card.json есть бейдж «Документ проверен WB».
+    Эмпирически бейдж = certificate.verified == true. v48: терпимы к форме
+    значения (true/1/"true"/"да") — если WB поменяет тип, не теряем «Да»."""
+    def _truthy(v: Any) -> bool:
+        if v is True:
+            return True
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v != 0
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "да", "yes", "verified")
+        return False
+
+    def _cert_verified(cert: Any) -> bool:
+        if isinstance(cert, dict) and _truthy(cert.get("verified")):
+            return True
+        # некоторые карточки несут массив certificates[{verified:...}]
+        if isinstance(cert, list):
+            return any(isinstance(c, dict) and _truthy(c.get("verified")) for c in cert)
+        return False
+
+    if isinstance(parsed, dict) and (_cert_verified(parsed.get("certificate"))
+                                     or _cert_verified(parsed.get("certificates"))):
+        return True
+    # защитный обход: certificate(s).verified в любом вложенном объекте
+    found = False
+
+    def walk(o: Any) -> None:
+        nonlocal found
+        if found:
+            return
+        if isinstance(o, dict):
+            if _cert_verified(o.get("certificate")) or _cert_verified(o.get("certificates")):
+                found = True
+                return
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(parsed)
+    return found
+
+
+async def fetch_docs_verified_at_host(
+    session: "aiohttp.ClientSession", nm_id: int, host: str = "", timeout_sec: float = 6.0,
+    max_hosts: int = 16
+) -> Optional[bool]:
+    """v46/48: определяет бейдж «Документ проверен WB» (card.json.certificate.verified).
+
+    Сначала пробует basket-шард, где найден certificate.json (host), затем —
+    детерминированные шарды card.json по порядку (первый валидный card.json
+    выигрывает), С ПОВТОРОМ транзиентных сбоёв. Раньше был ОДИН запрос без повтора:
+    на больших прогонах транзиентные таймауты давали ложное «Нет» (бейдж есть, а
+    программа писала, что нет). Перебор ограничен и идёт только для карточек С
+    документом, а DNS-шум несуществующих шардов гасится глобальным обработчиком.
+
+    Возвращает True (бейдж есть) / False (card.json получен, бейджа нет) /
+    None (card.json нигде не отдался — «не подтверждено»)."""
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+    }
+    timeout = aiohttp.ClientTimeout(total=max(4.0, float(timeout_sec)))
+    urls = card_json_urls(nm_id, max_hosts=max_hosts)
+    # шард, где нашёлся certificate.json — первым (card.json почти всегда там же)
+    if host:
+        urls = sorted(urls, key=lambda u: 0 if hostname(u) == host else 1)
+
+    async def _probe(url: str):
+        """('ok', bool) | ('miss', None) — 404/пусто | бросает на транзиентном сбое."""
+        async with session.get(url, headers=headers, timeout=timeout) as r:
+            if int(r.status) != 200:
+                return ('miss', None)
+            raw = (await r.text(errors="replace")).strip()
+            if not raw:
+                return ('miss', None)
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = raw
+            return ('ok', card_json_docs_verified(parsed))
+
+    for url in urls[:max_hosts]:
+        for attempt in range(2):  # 1 повтор транзиентного сбоя на шард
+            try:
+                kind, val = await _probe(url)
+                if kind == 'ok':
+                    return val           # нашли card.json — это и есть ответ
+                break                    # 404/пусто на этом шарде — следующий шард
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                if attempt == 0:
+                    await asyncio.sleep(0.2)
+                    continue             # повтор того же шарда
+                break                    # стойкий сбой — следующий шард
+            except Exception:
+                break
+    return None
 
 
 # =============================================================================
@@ -819,6 +1475,16 @@ async def fetch_certificate_json_for_nm(
 # WB API v18 в поисковой выдаче отдаёт supplierId, но НЕ имя продавца.
 # Имя берём батчами через card.wb.ru/cards/v2/detail?nm=id1;id2;... (до 100 nm за раз).
 # =============================================================================
+
+# v27.9.x: бит маски viewFlags, означающий плашку «Оригинал». viewFlags WB
+# отдаёт в поисковой выдаче по каждому товару, поэтому проверка БЕСПЛАТНА (без
+# доп. запросов) и мгновенна.
+# Значение подтверждено на реальных данных (3 товара с плашкой vs 4 без):
+#   оригинал  863239425=135671833, 173642704=135028761, 519200637=202899465  → бит 3 есть
+#   обычные   1008983494=811026, 267983778=135798913, 237643208=135028736, 663082548=8591261696 → бита 3 нет
+# Бит 3 (значение 8) установлен у ВСЕХ оригинальных и НИ У ОДНОГО обычного.
+WB_ORIGINAL_VIEWFLAG_BIT = 8
+
 
 def _detect_wb_original(p: Dict[str, Any]) -> str:
     """v43: определяет признак оригинальности товара из объекта WB.
@@ -830,6 +1496,12 @@ def _detect_wb_original(p: Dict[str, Any]) -> str:
     (см. enrich-режим), но это даёт быстрый сигнал по данным поиска.
     """
     try:
+        # 0) viewFlags — битовая маска бейджей WB (есть прямо в поисковой выдаче).
+        #    Если известен бит «Оригинал» — это самый быстрый и точный сигнал.
+        if WB_ORIGINAL_VIEWFLAG_BIT:
+            vf = p.get("viewFlags")
+            if isinstance(vf, int) and (vf & WB_ORIGINAL_VIEWFLAG_BIT):
+                return "оригинал"
         # 1) Явные строковые поля, где WB иногда помечает оригинальность
         for key in ("promoTextCard", "promoTextCat", "name"):
             v = str(p.get(key) or "")
@@ -928,11 +1600,58 @@ async def enrich_sellers_batch(cards: List[Card], args) -> None:
                         sid = str(p.get("supplierId") or p.get("supplierID") or "")
                         if sid:
                             c.supplier_id = sid
+                    # v27.9.x: признак «Оригинал» из viewFlags detail-ответа
+                    # (подстраховка к основному пути — viewFlags из поиска).
+                    if WB_ORIGINAL_VIEWFLAG_BIT:
+                        _vf = p.get("viewFlags")
+                        if isinstance(_vf, int) and (_vf & WB_ORIGINAL_VIEWFLAG_BIT):
+                            c.is_original = "оригинал"
                 break  # один из шаблонов сработал
         tasks = [asyncio.create_task(do_batch(b)) for b in batches]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     print(f"✓ Имена продавцов: заполнено {filled['n']}/{len(need)} за {time.time()-t0:.1f}с")
+
+
+def _install_quiet_dns_exc_handler():
+    """v46: глушит КОСМЕТИЧЕСКИЙ шум event-loop'а вида «gaierror exception in
+    shielded future» / «getaddrinfo failed». aiohttp при переборе basket-шардов
+    делает DNS-резолв через asyncio.shield; когда несуществующий basket-хост не
+    резолвится и на него висит несколько запросов, «лишние» исключения никто не
+    забирает → asyncio печатает их трейсбеки тоннами. На результат это не влияет
+    (несуществующий шард = как 404), поэтому такие сообщения молча гасим.
+    Возвращает (loop, prev_handler) для последующего восстановления, либо None."""
+    try:
+        loop = asyncio.get_event_loop()
+    except Exception:
+        return None
+    prev = loop.get_exception_handler()
+
+    def _h(l, ctx):
+        exc = ctx.get('exception')
+        txt = f"{ctx.get('message', '')} {type(exc).__name__ if exc else ''}: {exc if exc else ''}"
+        for marker in ('getaddrinfo', 'gaierror', 'shielded future',
+                       'Temporary failure in name resolution',
+                       'Name or service not known', 'getaddr'):
+            if marker in txt:
+                return  # DNS-шум перебора шардов — гасим
+        if prev is not None:
+            prev(l, ctx)
+        else:
+            l.default_exception_handler(ctx)
+
+    loop.set_exception_handler(_h)
+    return (loop, prev)
+
+
+def _restore_exc_handler(saved) -> None:
+    if not saved:
+        return
+    loop, prev = saved
+    try:
+        loop.set_exception_handler(prev)
+    except Exception:
+        pass
 
 
 async def run_http_link_prefetch(
@@ -952,6 +1671,7 @@ async def run_http_link_prefetch(
     """
     if not cards:
         return set()
+    _quiet_saved = _install_quiet_dns_exc_handler()
     workers = max(1, int(getattr(args, 'http_link_workers', 30)))
     cert_timeout = float(getattr(args, 'cert_timeout_sec', 6.0))
     cert_max_hosts = int(getattr(args, 'cert_max_hosts', 30))
@@ -966,7 +1686,10 @@ async def run_http_link_prefetch(
     print(f"   Логика: json со ссылкой → СОБРАНА; все 404 → НЕТ ДОКУМЕНТОВ; json без ссылки → НЕТ ССЫЛКИ; сетевая ошибка → {'браузер' if allow_browser_fallback else 'повтор (ERROR)'}.")
 
     timeout = aiohttp.ClientTimeout(total=30, connect=8)
-    connector = aiohttp.TCPConnector(limit=workers * 2, ttl_dns_cache=300, ssl=False)
+    # v45.10: шарды пробуются по одному (см. fetch_certificate_json_for_nm), значит
+    # одновременных соединений ~ числу воркеров. Пул workers*2 (как в старых версиях)
+    # достаточно — никакого «залпа» больше нет.
+    connector = aiohttp.TCPConnector(limit=max(32, workers * 2), ttl_dns_cache=300, ssl=False)
     headers = {
         "User-Agent": getattr(args, 'user_agent', '') or
                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
@@ -981,6 +1704,7 @@ async def run_http_link_prefetch(
 
     async def progress_loop():
         nonlocal last_print
+        _last_autosave = time.time()
         try:
             while stats['done'] < len(cards):
                 await asyncio.sleep(3.0)
@@ -993,7 +1717,17 @@ async def run_http_link_prefetch(
                     f"нет_ссылки={stats['no_link']}, ошибки={stats['errors']}, "
                     f"fallback→браузер={stats['fallback']}, ETA≈{eta:.0f}с"
                 )
+                emit_progress("links", stats['done'], len(cards))
                 last_print = time.time()
+                # v47: периодический автосейв ВНУТРИ prefetch. Раньше CSV/XLSX писались
+                # только в конце — обрыв на 15k/20k карточек терял весь прогресс
+                # (resume нечего было читать). Пишем раз в ~60с в отдельном потоке.
+                if time.time() - _last_autosave >= 60:
+                    _last_autosave = time.time()
+                    try:
+                        await store.save()
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             return
 
@@ -1007,8 +1741,58 @@ async def run_http_link_prefetch(
                     urls, detail = await fetch_certificate_json_for_nm(
                         session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
                     )
+                    # v45.12: ОДИН повтор временной сетевой ошибки — но ТОЛЬКО пока
+                    # ошибок мало. Если ошибок уже много, значит WB троттлит IP — тогда
+                    # повторы лишь УСИЛИВАЮТ нагрузку и углубляют бан, поэтому НЕ повторяем
+                    # (карточка пойдёт в ОШИБКУ, повторный запуск/resume её доберёт позже).
+                    if (not urls and detail.startswith("cert_json_neterror")
+                            and stats['errors'] < 15):
+                        await asyncio.sleep(0.4 + random.uniform(0, 0.3))
+                        try:
+                            urls, detail = await fetch_certificate_json_for_nm(
+                                session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
+                            )
+                        except Exception as e:
+                            urls, detail = [], f"cert_json_exception:{type(e).__name__}:{str(e)[:120]}"
                 except Exception as e:
                     urls, detail = [], f"cert_json_exception:{type(e).__name__}:{str(e)[:120]}"
+
+                # v27.9.x: card.json НЕ содержит признак «Оригинал» (подтверждено
+                # реальным телом card.json) — плашка приходит из viewFlags в
+                # динамическом API. Поэтому card.json-проба по умолчанию ОТКЛЮЧЕНА
+                # (не тратим лишние запросы). Определение «Оригинал» — по биту
+                # viewFlags из поисковой выдачи (см. _detect_wb_original).
+                if getattr(args, 'check_original_cardjson', False):
+                    try:
+                        _is_orig, _odet = await fetch_original_via_card_json(
+                            session, card.nm_id, timeout_sec=cert_timeout, max_hosts=cert_max_hosts
+                        )
+                        if _is_orig is True:
+                            card.is_original = 'оригинал'
+                    except Exception:
+                        pass
+
+                # v46: бейдж «Документ проверен WB» (card.json.certificate.verified).
+                # verified невозможен без сертификата, поэтому card.json тянем ТОЛЬКО
+                # когда документ найден — и с ТОГО ЖЕ basket-шарда, где лежит
+                # certificate.json (хост известен из detail). Это 1 запрос на карточку
+                # без перебора шардов — иначе массовый перебор несуществующих basket-
+                # хостов заваливал лог DNS-ошибками (gaierror) и грузил сеть.
+                if getattr(args, 'check_docs_verified', True) and not getattr(card, 'docs_verified', ''):
+                    _has_doc = bool(urls) or detail.startswith("cert_json_ok") \
+                        or detail.startswith("cert_json_has_doc_no_url")
+                    if _has_doc:
+                        _m = re.search(r'basket-\d+\.wbbasket\.ru', detail or '')
+                        _cert_host = _m.group(0) if _m else ''
+                        try:
+                            _ver = await fetch_docs_verified_at_host(
+                                session, card.nm_id, _cert_host,
+                                timeout_sec=cert_timeout, max_hosts=cert_max_hosts)
+                            card.docs_verified = "Да" if _ver is True else "Нет"
+                        except Exception:
+                            card.docs_verified = "Нет"
+                    else:
+                        card.docs_verified = "Нет"
 
                 base_fields = dict(
                     query=card.source_query or args.query,
@@ -1097,6 +1881,7 @@ async def run_http_link_prefetch(
         await store.save()
     except Exception as e:
         print(f"⚠️  Сохранение после HTTP prefetch: {e}")
+    _restore_exc_handler(_quiet_saved)
     return done_nm
 
 
@@ -1205,6 +1990,14 @@ DOMAIN_PRODUCT_TYPES = {
         'свитшоты', 'боди', 'ползунки', 'носки', 'колготки', 'белье',
         'халаты', 'жилеты', 'свитеры', 'кардиганы', 'водолазки',
         'распашонки', 'песочники', 'юбки', 'сарафаны', 'блузки', 'рубашки',
+        # v49: расширение типов одежды — больше точек входа для сбора
+        'джинсы', 'леггинсы', 'лосины', 'трусы', 'майки', 'бомберы', 'ветровки',
+        'парки', 'пуховики', 'плащи', 'дождевики', 'жакеты', 'пиджаки',
+        'тельняшки', 'регланы', 'свитшот', 'кофточки', 'распашонка', 'слипы',
+        'человечки', 'боди-комбинезоны', 'штанишки', 'шапочки', 'чепчики',
+        'нагрудники', 'слюнявчики', 'пинетки', 'комплекты одежды', 'бодики',
+        'термобелье', 'поддева', 'олимпийки', 'спортивные костюмы', 'тренчи',
+        'полукомбинезоны', 'безрукавки', 'туники', 'юбки-шорты', 'сорочки',
     ],
     'shoes': [
         'кроссовки', 'кеды', 'ботинки', 'сапоги', 'туфли', 'сандалии',
@@ -1217,33 +2010,62 @@ DOMAIN_PRODUCT_TYPES = {
         'неваляшки', 'юла', 'каталки', 'игрушечная посуда', 'фигурки',
         'плюшевые игрушки', 'развивающие игрушки', 'игровые наборы',
         'спиннеры', 'pop it', 'мозаика', 'трещотки',
+        'роботы', 'интерактивные игрушки', 'музыкальные игрушки', 'сортеры',
+        'пирамидки', 'шнуровки', 'бизиборды', 'кинетический песок', 'слаймы',
+        'наборы для творчества', 'пластилин', 'пальчиковые краски', 'раскраски',
+        'игрушечная кухня', 'железная дорога', 'трек для машинок', 'набор доктора',
+        'радиоуправляемые машинки', 'сюжетно-ролевые наборы',
     ],
     'kids_accessories': [
         'шапки', 'панамы', 'кепки', 'варежки', 'перчатки', 'шарфы',
         'рюкзаки', 'пеналы', 'портфели', 'ранцы', 'сумки', 'банты', 'заколки',
+        'снуды', 'бейсболки', 'обручи', 'резинки для волос', 'ободки',
+        'зонты', 'солнцезащитные очки', 'ремни', 'кошельки', 'часы',
     ],
     'baby_gear': [
         'коляски', 'автокресла', 'манежи', 'переноски', 'кроватки',
         'пеленальные столики', 'стульчики для кормления', 'ходунки', 'качели',
+        'люльки', 'прыгунки', 'мобили', 'шезлонги', 'бортики в кроватку',
+        'слинги', 'кенгуру', 'санки', 'беговелы', 'самокаты',
+        'трёхколёсные велосипеды', 'дождевики для коляски', 'москитные сетки',
     ],
     'cosmetics': [
         'кремы', 'шампуни', 'мыло', 'гели для душа', 'дезодоранты', 'духи',
         'туши для ресниц', 'помады', 'лаки для ногтей', 'маски для лица',
+        'бальзамы', 'кондиционеры для волос', 'пены для ванны', 'влажные салфетки',
+        'зубные пасты', 'зубные щётки', 'ватные палочки', 'ватные диски',
+        'присыпки', 'детское масло', 'пенки для умывания', 'тоники', 'скрабы',
+        'сыворотки', 'патчи',
     ],
     'electronics': [
         'наушники', 'колонки', 'клавиатуры', 'мыши', 'роутеры', 'провода',
         'зарядные устройства', 'powerbank', 'usb кабели',
+        'беспроводные наушники', 'гарнитуры', 'веб-камеры', 'микрофоны',
+        'флешки', 'карты памяти', 'hdmi кабели', 'удлинители', 'сетевые фильтры',
+        'адаптеры', 'переходники', 'блоки питания', 'держатели для телефона',
+        'умные часы', 'фитнес-браслеты', 'смартфоны', 'планшеты', 'мониторы',
+        'проекторы', 'приставки',
     ],
     'home': [
         'постельное белье', 'подушки', 'одеяла', 'пледы', 'полотенца',
         'покрывала', 'простыни', 'наволочки', 'скатерти', 'шторы', 'коврики',
+        'матрасы', 'наматрасники', 'бортики', 'балдахины', 'пеленки',
+        'конверты для новорожденных', 'спальные мешки', 'ночники',
+        'корзины для игрушек', 'органайзеры', 'тканевые салфетки', 'полотенца с уголком',
     ],
     'kitchenware': [
         'кастрюли', 'сковороды', 'кухонные ножи', 'тарелки', 'кружки', 'чашки',
         'столовые приборы', 'разделочные доски',
+        'сотейники', 'ковши', 'заварочные чайники', 'миски', 'салатники',
+        'формы для выпечки', 'противни', 'дуршлаги', 'тёрки', 'лопатки',
+        'половники', 'шумовки', 'контейнеры для еды', 'термосы',
+        'бутылки для воды', 'ланч-боксы', 'детская посуда', 'поильники',
     ],
     'food': [
         'смеси молочные', 'каши', 'пюре', 'напитки детские', 'соки', 'печенье',
+        'детская вода', 'детский чай', 'сухие завтраки', 'мюсли', 'батончики',
+        'йогурты', 'творожки', 'снеки', 'фруктовое пюре', 'мясное пюре',
+        'овощное пюре', 'кисели', 'макароны детские',
     ],
 }
 
@@ -1251,14 +2073,33 @@ DOMAIN_PRODUCT_TYPES = {
 UNIVERSAL_MODIFIERS = [
     'для мальчиков', 'для девочек', 'детские', 'подростковые', 'школьные',
     'для малышей', 'для дошкольников', 'для новорожденных',
+    'детский', 'детская', 'ясельные', 'для младенцев', 'унисекс',
 ]
 
-# Цветовые/размерные модификаторы — для одежды и обуви.
+# Цветовые/размерные модификаторы — для одежды и обуви. v49: расширены (больше
+# цветов/материалов/сезонов/ростовок) — кратно увеличивают охват уникальных
+# карточек, т.к. WB на каждый такой запрос отдаёт частично НОВЫЙ набор товаров.
 APPAREL_MODIFIERS = [
-    'летние', 'демисезонные', 'зимние', 'весна', 'осень',
+    'летние', 'демисезонные', 'зимние', 'весна', 'осень', 'теплые', 'утепленные',
     'черные', 'белые', 'синие', 'розовые', 'серые', 'бежевые',
-    'красные', 'голубые', 'зеленые', 'желтые',
-] + [f'рост {x}' for x in [62, 86, 104, 116, 128, 140, 152, 164]]
+    'красные', 'голубые', 'зеленые', 'желтые', 'коричневые', 'оранжевые',
+    'фиолетовые', 'бирюзовые', 'хаки', 'молочные', 'разноцветные',
+    'хлопковые', 'трикотажные', 'флисовые', 'вельветовые', 'джинсовые',
+    'нарядные', 'повседневные', 'спортивные',
+] + [f'рост {x}' for x in [56, 62, 68, 74, 80, 86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164, 170]]
+
+# v49: НЕЙТРАЛЬНЫЕ модификаторы для «взрослых» категорий (техника/электроника/
+# посуда/дом). БЕЗ возрастных слов (иначе «стиральные машины детские» = игрушки) —
+# только цвета/материалы/признаки, которые WB реально различает в выдаче. Дают
+# рост уникальных карточек для категорий с узким словарём типов.
+APPLIANCE_MODIFIERS = [
+    'черные', 'белые', 'серебристые', 'серые', 'красные', 'бежевые', 'синие',
+    'золотистые', 'зеленые', 'розовые', 'бирюзовые', 'прозрачные',
+    'стеклянные', 'металлические', 'пластиковые', 'керамические', 'деревянные',
+    'нержавеющая сталь', 'встраиваемые', 'компактные', 'портативные',
+    'беспроводные', 'аккумуляторные', 'с дисплеем', 'сенсорные',
+    'набор', 'комплект', 'большие', 'маленькие',
+]
 
 
 def detect_query_domain(base_query: str) -> str:
@@ -1373,7 +2214,7 @@ DOMAIN_SUBJECT_NAME_KEYWORDS = {
         # брюки, шорты, юбки, штаны, легинсы
         'брюк', 'джинс', 'штан', 'шорт', 'юбк', 'легинс', 'лосин', 'велосипедк', 'бридж',
         # боди, комбинезоны, песочники, ползунки, слипы, распашонки
-        'боди', 'комбинезон', 'песочник', 'ползунк', 'слип', 'распашонк', 'штанишк',
+        'боди', 'комбинезон', 'песочник', 'ползунк', 'распашонк', 'штанишк',
         # рубашки, блузки, сорочки
         'рубаш', 'блузк', 'сорочк',
         # бельё, пижамы, халаты, ночные сорочки
@@ -1464,6 +2305,47 @@ DOMAIN_SUBJECT_NAME_KEYWORDS = {
     ],
 }
 
+# v27.9.x: домен «бытовая техника» (appliances) — для поиска по бренду (напр.
+# indesit, bosch, electrolux), чтобы выдача ограничивалась техникой, а не
+# попадали чехлы/аксессуары/одежда. Добавляем отдельно, чтобы не трогать большие
+# литералы выше.
+DOMAIN_PRODUCT_TYPES['appliances'] = [
+    # крупная бытовая техника
+    'стиральные машины', 'холодильники', 'посудомоечные машины', 'плиты',
+    'духовые шкафы', 'варочные панели', 'микроволновые печи', 'вытяжки',
+    'морозильные камеры', 'пылесосы', 'водонагреватели', 'кондиционеры',
+    'сушильные машины', 'встраиваемые духовые шкафы', 'газовые плиты',
+    'электроплиты', 'винные шкафы', 'сплит-системы',
+    # мелкая кухонная техника
+    'чайники электрические', 'мультиварки', 'блендеры', 'миксеры', 'тостеры',
+    'кофемашины', 'кофеварки', 'мясорубки', 'соковыжималки', 'кухонные комбайны',
+    'грили', 'аэрогрили', 'фритюрницы', 'хлебопечки', 'электрочайники',
+    'пароварки', 'вафельницы', 'электрогрили', 'кулеры для воды',
+    # климат, уход, мелкая бытовая
+    'увлажнители воздуха', 'очистители воздуха', 'обогреватели', 'конвекторы',
+    'тепловентиляторы', 'вентиляторы', 'фены', 'выпрямители для волос',
+    'утюги', 'отпариватели', 'ирригаторы', 'электробритвы',
+    'машинки для стрижки', 'триммеры', 'весы напольные', 'весы кухонные',
+    'роботы-пылесосы', 'парогенераторы',
+]
+DOMAIN_SUBJECT_NAME_KEYWORDS['appliances'] = [
+    # крупная
+    'стиральн', 'холодильник', 'посудомоечн', 'плита', 'плиты', 'духов',
+    'варочн', 'микроволнов', 'вытяжк', 'морозильник', 'морозильн', 'пылесос',
+    'водонагреватель', 'кондиционер', 'сплит-систем', 'сушильн', 'винн', 'шкаф',
+    'бытовая техник', 'духовой шкаф',
+    # мелкая кухонная
+    'чайник', 'мультиварк', 'блендер', 'миксер', 'тостер', 'кофемашин',
+    'кофеварк', 'мясорубк', 'соковыжималк', 'комбайн', 'гриль', 'фритюр',
+    'хлебопечк', 'пароварк', 'вафельниц', 'кулер', 'ростер', 'электропечь',
+    # климат/уход/мелкая
+    'увлажнитель', 'очиститель воздуха', 'обогреватель', 'конвектор',
+    'тепловентилятор', 'вентилятор', 'фен ', 'фены', 'выпрямитель', 'плойк',
+    'утюг', 'отпариватель', 'парогенератор', 'ирригатор', 'электробритв',
+    'машинка для стрижки', 'триммер', 'весы', 'климат', 'обогрев',
+]
+DOMAIN_SUBJECT_WHITELIST['appliances'] = []  # фильтруем по ключевым словам названия
+
 
 def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '', product_name: str = '') -> bool:
     """v39.10: проверяет относится ли карточка к ожидаемому домену.
@@ -1484,8 +2366,25 @@ def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '
     if not domain or domain == 'unknown':
         return True
 
+    # v27.9.x: поддержка НЕСКОЛЬКИХ доменов (мультикатегория бренда) — "clothing,shoes".
+    # Карточка релевантна, если подходит ХОТЯ БЫ ПОД ОДИН из доменов.
+    if ',' in str(domain):
+        return any(is_card_relevant_for_domain(subject, d.strip(), subject_name, product_name)
+                   for d in str(domain).split(',') if d.strip())
+
     keywords = DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain, [])
     wl = DOMAIN_SUBJECT_WHITELIST.get(domain) or set()
+
+    # v46: НЕГАТИВНЫЙ фильтр для «взрослых» категорий (техника/электроника/посуда/дом):
+    # отсеиваем ИГРУШЕЧНЫЕ товары. WB по «стиральные машины» иногда возвращает
+    # «детская стиральная машина игрушечная» — в названии есть «стиральн», поэтому
+    # обычный фильтр её пропускал. Если subject/название = игрушка — это не техника.
+    if domain in ('appliances', 'electronics', 'kitchenware', 'home'):
+        _toy = ('игрушк', 'игрушеч', 'игрушечн')
+        sn = norm_text(subject_name or '')
+        pn = norm_text(product_name or '')
+        if any(t in sn for t in _toy) or any(t in pn for t in _toy):
+            return False
 
     # Если нет ни ключевых слов ни whitelist'а для этого домена — фильтр не применяем
     if not keywords and not wl:
@@ -1512,6 +2411,27 @@ def is_card_relevant_for_domain(subject: str, domain: str, subject_name: str = '
     return False
 
 
+def scaled_search_pages(limit: int, n_variants: int) -> int:
+    """v47: глубина листания обычного поиска (страниц на вариант запроса).
+    Раньше всегда 1 — сбор упирался в ~4-8k уникальных карточек при любом
+    лимите. Растёт с лимитом, капится 10 (WB глубже редко отдаёт новое);
+    страницы без новых карточек обрываются досрочно в цикле сбора."""
+    need_per_variant = int(limit) / max(1, int(n_variants))
+    return max(1, min(10, int(need_per_variant / 45) + 1))
+
+
+def scaled_max_queries(limit: int, max_expanded_queries: int) -> int:
+    """v47: на больших лимитах (20k+) глубина выдачи WB на ОДИН запрос ограничена
+    (~несколько тысяч карточек), поэтому число вариантов запроса должно расти с
+    лимитом — иначе сбор упирается в потолок задолго до limit. Явно заданное
+    (не дефолтное 250) значение --max-expanded-queries уважаем как есть."""
+    if limit > 10000 and max_expanded_queries == 250:
+        # v49: потолок поднят 800→1800 — больше разнообразных запросов = больше
+        # уникальных карточек на больших лимитах (50k+). Дубли отсеиваются.
+        return min(1800, 250 + limit // 30)
+    return max_expanded_queries
+
+
 def generate_query_variants(base_query: str, profile: str = "auto", max_variants: int = 250) -> List[str]:
     """v39.7: универсальная генерация запросов под любую категорию.
 
@@ -1526,14 +2446,23 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
     base_query = " ".join(base_query.split())
     profile = (profile or "auto").lower()
 
-    # Маппинг старых профилей на новые домены — обратная совместимость
+    # Маппинг профилей на домены. v46: ДОБАВЛЕНЫ все недостающие категории
+    # (food/kitchenware/baby_gear/kids_accessories/appliances) + RU-алиасы. Раньше
+    # их тут не было, поэтому для них домен «не распознавался» и вариантов запроса
+    # генерировалось мало (только базовый + универсальные) — отсюда «у одежды много,
+    # у продуктов/посуды мало».
     profile_to_domain = {
         'clothing': 'clothing', 'одежда': 'clothing',
         'shoes': 'shoes', 'обувь': 'shoes',
         'toys': 'toys', 'игрушки': 'toys',
         'cosmetics': 'cosmetics', 'косметика': 'cosmetics',
         'electronics': 'electronics', 'электроника': 'electronics',
-        'home': 'home',
+        'home': 'home', 'дом': 'home', 'дом и текстиль': 'home', 'текстиль': 'home',
+        'kitchenware': 'kitchenware', 'посуда': 'kitchenware',
+        'food': 'food', 'продукты': 'food', 'питание': 'food',
+        'baby_gear': 'baby_gear', 'детский транспорт': 'baby_gear',
+        'kids_accessories': 'kids_accessories', 'детские аксессуары': 'kids_accessories',
+        'appliances': 'appliances', 'бытовая техника': 'appliances', 'техника': 'appliances',
         'auto': None,
     }
     domain = profile_to_domain.get(profile)
@@ -1543,12 +2472,18 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
     types = DOMAIN_PRODUCT_TYPES.get(domain, [])
     is_kids = any(w in base_query.lower() for w in ('детск', 'для детей', 'для малыш', 'малышам'))
     is_apparel_like = domain in ('clothing', 'shoes', 'kids_accessories')
+    # v46: «взрослые» категории — техника/электроника/посуда/дом. К ним НЕЛЬЗЯ
+    # применять детские/возрастные модификаторы: «стиральные машины детские» тянет
+    # ИГРУШЕЧНЫЕ стиральные машины, «бытовая техника для мальчиков» — детские товары.
+    _appliance_like = domain in ('appliances', 'electronics', 'kitchenware', 'home')
 
     variants: List[str] = [base_query]
 
-    # Стратегия 1: исходный запрос + универсальные модификаторы
-    for m in UNIVERSAL_MODIFIERS:
-        variants.append(f'{base_query} {m}')
+    # Стратегия 1: исходный запрос + универсальные (возрастные/гендерные) модификаторы.
+    # Только если категория НЕ «взрослая» (иначе мусор: «бытовая техника детские»).
+    if not _appliance_like:
+        for m in UNIVERSAL_MODIFIERS:
+            variants.append(f'{base_query} {m}')
 
     # Стратегия 2: для одежды/обуви — ещё цветовые/сезонные модификаторы
     if is_apparel_like:
@@ -1562,10 +2497,31 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
         else:
             variants.append(t)
 
-    # Стратегия 4: тип + модификатор (только для apparel-like, чтобы не размывать игрушки)
+    # Стратегия 4: ТИП + возрастной/гендерный модификатор. Для «детских» категорий
+    # это кратно увеличивает охват. Для «взрослых» (техника/электроника/посуда/дом)
+    # НЕ применяем — иначе «стиральные машины детские» = игрушки. Там охват берём
+    # из расширенного списка ТИПОВ (стратегия 3).
+    # v49: генерируем ЩЕДРО (все типы × все модификаторы) — лишнее обрежет cap
+    # max_variants. Это и даёт рост уникальных карточек на больших лимитах.
+    if domain and domain != 'unknown' and not _appliance_like:
+        for t in types:
+            for m in UNIVERSAL_MODIFIERS:
+                variants.append(f'{t} {m}')
+
+    # Стратегия 5 (одежда/обувь/аксессуары): ТИП × цвет/сезон/материал/ростовка —
+    # самый сильный множитель охвата: WB на «куртки красные», «куртки рост 104» и
+    # т.п. отдаёт частично разные наборы карточек.
     if is_apparel_like:
-        for t in types[:20]:
-            for m in UNIVERSAL_MODIFIERS[:6]:  # только базовые мод-ры
+        for t in types:
+            for m in APPAREL_MODIFIERS:
+                variants.append(f'{t} {m}')
+
+    # Стратегия 6 («взрослые» категории — техника/электроника/посуда/дом):
+    # ТИП × НЕЙТРАЛЬНЫЙ модификатор (цвет/материал/признак, БЕЗ возрастных слов).
+    # Так электроника/техника/посуда тоже набирают много уникальных карточек.
+    if _appliance_like and types:
+        for t in types:
+            for m in APPLIANCE_MODIFIERS:
                 variants.append(f'{t} {m}')
 
     # Если домен неизвестен — добавляем только базовый и универсальные комбинации.
@@ -1588,6 +2544,139 @@ def generate_query_variants(base_query: str, profile: str = "auto", max_variants
             break
     return clean
 
+# v48: «ПОИСК БЕЗ ЗАПРОСА» — программа сама формирует запросы, сметая каталог WB
+# по типам товаров всех (или выбранных) категорий. Порядок доменов: массовые/
+# ходовые категории первыми, чтобы охват рос максимально быстро.
+CATALOG_SWEEP_DOMAINS = [
+    'clothing', 'shoes', 'toys', 'kids_accessories', 'home', 'kitchenware',
+    'appliances', 'electronics', 'cosmetics', 'baby_gear', 'food',
+]
+
+# Несколько обобщённых «категорийных» сидов на домен — широкие выдачи WB, дающие
+# большой пул карточек ещё до перебора конкретных типов товаров.
+CATALOG_DOMAIN_SEEDS = {
+    'clothing': ['одежда детская', 'одежда женская', 'одежда мужская'],
+    'shoes': ['обувь детская', 'обувь женская', 'обувь мужская'],
+    'toys': ['игрушки', 'развивающие игрушки'],
+    'kids_accessories': ['детские аксессуары', 'головные уборы детские'],
+    'home': ['постельное белье', 'домашний текстиль'],
+    'kitchenware': ['посуда', 'посуда кухонная'],
+    'appliances': ['бытовая техника', 'техника для кухни'],
+    'electronics': ['электроника', 'аксессуары для телефонов'],
+    'cosmetics': ['косметика', 'уход за кожей'],
+    'baby_gear': ['товары для новорожденных', 'детский транспорт'],
+    'food': ['детское питание', 'продукты питания'],
+}
+
+_CATALOG_RU_TO_DOMAIN = {
+    'clothing': 'clothing', 'одежда': 'clothing',
+    'shoes': 'shoes', 'обувь': 'shoes',
+    'toys': 'toys', 'игрушки': 'toys',
+    'cosmetics': 'cosmetics', 'косметика': 'cosmetics',
+    'electronics': 'electronics', 'электроника': 'electronics',
+    'home': 'home', 'дом': 'home', 'дом и текстиль': 'home', 'текстиль': 'home',
+    'kitchenware': 'kitchenware', 'посуда': 'kitchenware',
+    'food': 'food', 'продукты': 'food', 'питание': 'food',
+    'baby_gear': 'baby_gear', 'детский транспорт': 'baby_gear',
+    'kids_accessories': 'kids_accessories', 'детские аксессуары': 'kids_accessories',
+    'appliances': 'appliances', 'бытовая техника': 'appliances', 'техника': 'appliances',
+}
+
+
+def catalog_domains_for(profile_keys: Optional[List[str]]) -> List[str]:
+    """RU/en метки категорий -> список доменов (в порядке поступления)."""
+    out: List[str] = []
+    for k in (profile_keys or []):
+        d = _CATALOG_RU_TO_DOMAIN.get((k or '').strip().lower())
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def generate_catalog_queries(profile_keys: Optional[List[str]] = None,
+                             max_variants: int = 1200, kids: bool = False) -> List[str]:
+    """v48: «поиск без запроса» — программа сама формирует запросы, сметая каталог
+    WB по типам товаров всех (или выбранных) категорий. Возвращает широкий,
+    breadth-first (по кругу между категориями) список запросов: сначала обобщённые
+    сиды по каждой категории, затем конкретные типы товаров вперемешку."""
+    domains = catalog_domains_for(profile_keys) or list(CATALOG_SWEEP_DOMAINS)
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(q: str) -> None:
+        q = re.sub(r"\s+", " ", str(q)).strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+
+    # 1) обобщённые сиды — широкий пул сразу (по одному кругу между категориями)
+    _seed_lists = {d: list(CATALOG_DOMAIN_SEEDS.get(d, [])) for d in domains}
+    _j = 0
+    while any(_j < len(_seed_lists[d]) for d in domains):
+        for d in domains:
+            if _j < len(_seed_lists[d]):
+                _add(_seed_lists[d][_j])
+        _j += 1
+    # 2) конкретные типы — интерливинг по доменам (breadth-first)
+    per = {d: list(DOMAIN_PRODUCT_TYPES.get(d, [])) for d in domains}
+    i = 0
+    while len(out) < max_variants and any(i < len(per[d]) for d in domains):
+        for d in domains:
+            if i < len(per[d]) and len(out) < max_variants:
+                t = per[d][i]
+                if kids and not any(w in t.lower() for w in
+                                    ('детск', 'для', 'малыш', 'новорожд', 'школьн', 'подрост')):
+                    _add(f'детские {t}')
+                else:
+                    _add(t)
+        i += 1
+    # 3) v49: ТИП × модификатор (цвет/сезон/материал/пол) — без этого сметание ОДНОЙ
+    # категории давало мало запросов (~30) и ~2000 карточек. Модификаторы кратно
+    # увеличивают число запросов и охват; для «взрослых» категорий — нейтральные
+    # (без возрастных слов, чтобы не ловить игрушечную выдачу).
+    _mods = {d: _catalog_modifiers_for(d) for d in domains}
+    _mi = 0
+    _max_mi = max((len(_mods[d]) for d in domains), default=0)
+    while len(out) < max_variants and _mi < _max_mi:
+        for d in domains:
+            if len(out) >= max_variants:
+                break
+            mlist = _mods[d]
+            if _mi >= len(mlist):
+                continue
+            mod = mlist[_mi]
+            for t in per[d]:
+                if len(out) >= max_variants:
+                    break
+                _add(f'{t} {mod}')
+        _mi += 1
+    return out[:max_variants]
+
+
+# v49: ЦЕНОВЫЕ ДИАПАЗОНЫ (priceU = цена в копейках, min;max). Один и тот же запрос
+# в разных диапазонах отдаёт РАЗНЫЕ карточки — так пробивается лимит глубины WB
+# (~10k результатов на запрос). Покрывают 0…~120 000 ₽ с уплотнением в массовом
+# сегменте (0–7000 ₽), где сосредоточена основная масса товаров.
+PRICE_BUCKETS = [
+    (0, 30000), (30000, 60000), (60000, 90000), (90000, 130000),
+    (130000, 180000), (180000, 250000), (250000, 350000), (350000, 500000),
+    (500000, 700000), (700000, 1000000), (1000000, 1500000), (1500000, 2500000),
+    (2500000, 4000000), (4000000, 7000000), (7000000, 12000000), (12000000, 200000000),
+]
+
+
+def _catalog_modifiers_for(domain: str) -> List[str]:
+    """v49: модификаторы для сметания каталога по типам — зависят от категории.
+    Одежда/обувь/аксессуары — цвета/сезоны/ростовки + возрастные; «взрослые»
+    (техника/электроника/посуда/дом) — только нейтральные (без возрастных слов);
+    игрушки/транспорт/косметика/питание — возрастные."""
+    if domain in ('clothing', 'shoes', 'kids_accessories'):
+        return list(APPAREL_MODIFIERS) + list(UNIVERSAL_MODIFIERS)
+    if domain in ('appliances', 'electronics', 'kitchenware', 'home'):
+        return list(APPLIANCE_MODIFIERS)
+    return list(UNIVERSAL_MODIFIERS)
+
+
 def recursive_find_products(obj: Any) -> List[Dict[str, Any]]:
     res = []
     if isinstance(obj, dict):
@@ -1603,6 +2692,197 @@ def recursive_find_products(obj: Any) -> List[Dict[str, Any]]:
             if isinstance(x, (dict, list)):
                 res.extend(recursive_find_products(x))
     return res
+
+
+# =============================================================================
+# v27.9.x: ПОЛНЫЙ каталог бренда. Текстовый поиск «reebok» обрезается WB на ~сотне
+# карточек. Чтобы собрать ВСЕ товары бренда, находим brandId (через resultset=
+# filters и подсказки WB), затем листаем прямой бренд-каталог
+# catalog.wb.ru/brands/v2/catalog?brand=<id>. Логика портирована из main_brand.py.
+# =============================================================================
+def _recursive_find_brand_filter_ids(obj: Any, brand: str) -> List[str]:
+    wanted = norm_key_brand(brand)
+    ids: List[str] = []
+    def add_id(v: Any):
+        if v is None:
+            return
+        txt = str(v).strip()
+        if txt and re.fullmatch(r"\d{1,10}", txt) and txt not in ids:
+            ids.append(txt)
+    def is_brand_like(x: Any) -> bool:
+        k = norm_key_brand(str(x or ""))
+        return bool(k) and (k == wanted or wanted in k or k in wanted)
+    def walk(x: Any, in_brand_filter: bool = False):
+        if isinstance(x, dict):
+            name = x.get("name") or x.get("title") or x.get("value") or x.get("label")
+            key = norm_key_brand(str(x.get("key") or x.get("type") or x.get("id") or ""))
+            header = norm_key_brand(str(name or ""))
+            brand_filter = in_brand_filter or header in {"бренд", "brand", "brands"} or key in {"fbrand", "brand", "brands"}
+            if is_brand_like(name):
+                for k in ("id", "value", "key"):
+                    if k in x and str(x.get(k)).strip() != str(name).strip():
+                        add_id(x.get(k))
+                for k in ("ids", "values"):
+                    if isinstance(x.get(k), list):
+                        for v in x[k]:
+                            add_id(v)
+            if brand_filter:
+                for arr_key in ("items", "values", "list", "filters"):
+                    arr = x.get(arr_key)
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if isinstance(item, dict) and is_brand_like(item.get("name") or item.get("title") or item.get("value") or item.get("label")):
+                                for k in ("id", "value", "key"):
+                                    add_id(item.get(k))
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v, brand_filter)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, in_brand_filter)
+    walk(obj)
+    return ids[:20]
+
+
+def _find_brand_ids_in_suggestions(obj: Any, brand: str) -> List[str]:
+    wanted = norm_key_brand(brand)
+    ids: List[str] = []
+    def walk(x: Any):
+        if isinstance(x, dict):
+            name = x.get("name") or x.get("text") or x.get("title") or x.get("value")
+            nk = norm_key_brand(str(name or ""))
+            type_hint = norm_key_brand(str(x.get("type") or x.get("entity") or ""))
+            is_brand_entity = ("brand" in type_hint) or bool(x.get("brandId")) or bool(x.get("brand_id"))
+            name_matches = nk and (nk == wanted or wanted in nk or nk in wanted)
+            if is_brand_entity and (name_matches or not name):
+                for k in ("brandId", "brand_id", "id"):
+                    v = x.get(k)
+                    if v is not None and re.fullmatch(r"\d{1,10}", str(v).strip()):
+                        if str(v).strip() not in ids:
+                            ids.append(str(v).strip())
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(obj)
+    return ids
+
+
+async def discover_brand_filter_ids(session: aiohttp.ClientSession, brand: str, timeout: float = 10.0) -> List[str]:
+    """Находит числовой brandId(ы) WB для прямого бренд-каталога."""
+    q = urllib.parse.quote(brand)
+    found: List[str] = []
+    wanted = norm_key_brand(brand)
+
+    # v27.9.x: САМЫЙ НАДЁЖНЫЙ источник — brandId прямо из ТОВАРОВ поисковой выдачи.
+    # У каждого товара WB есть поля brand + brandId. Берём id у товаров, чей бренд
+    # совпадает с искомым. Это работает даже когда resultset=filters/подсказки
+    # отдают пусто или сменили структуру (из-за чего brandId «не находился»).
+    # v49: НЕСКОЛЬКО сортировок/страниц + ПОВТОРЫ — раньше один зашумлённый/
+    # затроттленный запрос давал «brandId не найден», и весь бренд-каталог +
+    # сбор по категориям отваливались (отсюда «мало карточек»).
+    _bid_counts: Dict[str, int] = {}
+    _host_pair = ("search.wb.ru", "u-search.wb.ru")
+    for _attempt in range(3):
+        for _sort in ("popular", "newly", "rate"):
+            for _pg in (1, 2):
+                for _host in _host_pair:
+                    url = (f"https://{_host}/exactmatch/ru/common/v18/search?ab_testing=false&appType=1"
+                           f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}"
+                           f"&resultset=catalog&sort={_sort}&spp=30&suppressSpellcheck=false")
+                    data = await fetch_json(session, url, timeout=timeout)
+                    if not data:
+                        continue
+                    for p in recursive_find_products(data):
+                        bid = p.get("brandId") or p.get("brand_id") or p.get("brandID")
+                        pbrand = norm_key_brand(str(p.get("brand") or p.get("brandName") or ""))
+                        if not bid or not pbrand:
+                            continue
+                        if not re.fullmatch(r"\d{1,10}", str(bid).strip()):
+                            continue
+                        if pbrand == wanted or wanted in pbrand or pbrand in wanted:
+                            _bid_counts[str(bid).strip()] = _bid_counts.get(str(bid).strip(), 0) + 1
+                    break  # один из хостов ответил — на этом (sort,page) хватит
+                if _bid_counts:
+                    break
+            if _bid_counts:
+                break
+        if _bid_counts:
+            break
+        await asyncio.sleep(1.0)  # затроттлено — подождём и повторим
+    # самые частые brandId — впереди (основной бренд, а не случайные совпадения)
+    for bid, _cnt in sorted(_bid_counts.items(), key=lambda kv: -kv[1]):
+        if bid not in found:
+            found.append(bid)
+
+    filter_urls = [
+        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30&suppressSpellcheck=false",
+        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30&suppressSpellcheck=false",
+        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=filters&spp=30",
+    ]
+    for url in filter_urls:
+        data = await fetch_json(session, url, timeout=timeout)
+        if not data:
+            continue
+        for bid in _recursive_find_brand_filter_ids(data, brand):
+            if bid not in found:
+                found.append(bid)
+    suggest_urls = [
+        f"https://search.wb.ru/exactmatch/common/v5/search?query={q}&resultset=suggestions",
+        f"https://suggests.wb.ru/api/v6/hint?query={q}&gender=common&locale=ru",
+    ]
+    for url in suggest_urls:
+        data = await fetch_json(session, url, timeout=timeout)
+        if not data:
+            continue
+        for bid in _find_brand_ids_in_suggestions(data, brand):
+            if bid not in found:
+                found.append(bid)
+    return found[:10]
+
+
+async def discover_brand_subjects(session: aiohttp.ClientSession, brand_ids: List[str], timeout: float = 10.0) -> List[str]:
+    """v48: список subject(категория)-ID бренда, отсортированный по количеству
+    товаров. Нужен, чтобы ОБОЙТИ лимит WB ≈1200 на бренд-каталог: каждая
+    категория (xsubject) отдаётся отдельным запросом со своим лимитом, поэтому
+    у крупных брендов (adidas/nike) собирается во много раз больше карточек."""
+    subjects: Dict[str, int] = {}
+
+    def _walk_filters(o: Any):
+        # ищем фильтр с ключом xsubject/предмет и его items [{id,count}]
+        if isinstance(o, dict):
+            key = str(o.get('key') or o.get('name') or '').lower()
+            items = o.get('items')
+            if isinstance(items, list) and key in ('xsubject', 'subject', 'предмет', 'категория', 'подкатегория'):
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    sid = it.get('id')
+                    if sid is not None and re.fullmatch(r'\d{1,8}', str(sid).strip()):
+                        cnt = safe_int(it.get('count'))
+                        sid = str(sid).strip()
+                        subjects[sid] = max(subjects.get(sid, 0), cnt)
+            for v in o.values():
+                _walk_filters(v)
+        elif isinstance(o, list):
+            for v in o:
+                _walk_filters(v)
+
+    for bid in (brand_ids or [])[:3]:
+        b = urllib.parse.quote(str(bid))
+        urls = [
+            f"https://catalog.wb.ru/brands/v2/filters?ab_testing=false&appType=1&brand={b}&curr=rub&dest=-1257786&hide_dtype=13&lang=ru",
+            f"https://catalog.wb.ru/brands/filters?appType=1&brand={b}&curr=rub&dest=-1257786&lang=ru",
+        ]
+        for url in urls:
+            data = await fetch_json(session, url, timeout=timeout)
+            if data:
+                _walk_filters(data)
+        if subjects:
+            break
+    return [s for s, _ in sorted(subjects.items(), key=lambda kv: -kv[1])]
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: float = 12.0) -> Optional[Dict[str, Any]]:
     try:
@@ -1632,6 +2912,9 @@ def _card_fields_for_result(card: Card) -> Dict[str, Any]:
         "rating": getattr(card, "rating", 0.0),
         "feedbacks": getattr(card, "feedbacks", 0),
         "is_original": getattr(card, "is_original", ""),
+        "docs_verified": getattr(card, "docs_verified", ""),
+        "colors": getattr(card, "colors", ""),
+        "wb_root": getattr(card, "wb_root", ""),
     }
 
 
@@ -1649,7 +2932,45 @@ _FSA_HTTP_FAILS = 0
 _FSA_HTTP_DISABLED = False
 _FSA_HTTP_FAIL_LIMIT = 5
 
-async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None) -> List[Card]:
+# v45.2: куки сессии ФСА, снятые с настоящего браузера (он проходит JS-антибот,
+# который ставит сессионную куку). С этими куками curl_cffi обращается к API ФСА
+# напрямую — быстро и одним лёгким запросом, без полной отрисовки SPA. Заполняется
+# после первого УСПЕШНОГО браузерного парсинга и обновляется, если куки протухли.
+_FSA_SESSION_COOKIES: Dict[str, str] = {}
+_FSA_COOKIE_HTTP_OK = 0   # сколько документов добыто быстрым HTTP по кукам
+_FSA_COOKIE_HTTP_FAIL = 0  # сколько раз HTTP по кукам не сработал (куки протухли/нет токена)
+
+# v45.6: АВТО-ВОССТАНОВЛЕНИЕ при блокировке FSA. Когда FSA начинает массово отдавать
+# сетевые ошибки/таймауты (rate-limit/временный бан), программа сама ставит FSA на
+# паузу (cooldown с экспоненциальным ростом), сбрасывает «отравленную» сессию (куки)
+# и потом продолжает. Это снимает временный rate-limit без участия пользователя.
+# Полный сетевой бан IP пауза не лечит — тогда после N циклов FSA отпускается, а
+# недобранное добивается кнопкой «Повторить упавшие FSA».
+_FSA_CONSEC_FAILS = 0       # подряд идущих неудач FSA (сбрасывается успехом)
+_FSA_COOLDOWN_UNTIL = 0.0   # время (epoch), до которого FSA на паузе
+_FSA_COOLDOWN_CYCLES = 0    # сколько раз уже включали паузу за прогон
+# v47: ВОЗВРАТ БЮДЖЕТА ПАУЗ. Раньше _FSA_COOLDOWN_CYCLES только рос и после N пауз
+# FSA отпускался НАВСЕГДА — на больших прогонах FSA «обрывался спустя какое-то
+# время», даже если между блокировками успешно восстанавливался. Теперь череда
+# успехов «возвращает» потраченную паузу: FSA может пережить много циклов
+# блокировка→пауза→восстановление и не бросается, пока реально собирает данные.
+_FSA_RECOVER_STREAK = 0     # успехов FSA подряд после последней паузы
+# v46: САМОНАСТРОЙКА темпа в медленном режиме. Множитель к базовой паузе: растёт при
+# сбоях ФСА (тормозим), снижается при череде успехов (ускоряемся) — программа сама
+# нащупывает самый быстрый безопасный темп вокруг 20-30 док/мин.
+_FSA_SLOW_MULT = 1.0
+_FSA_SLOW_OK = 0
+# v47: «залипающий» паузо-режим. Как только FSA впервые заблокировал и сработала
+# авто-пауза — дальше FSA идёт строго последовательно с паузой между запросами
+# (как медленный режим), даже если пользователь его НЕ включал. Это превращает
+# «стандартный» прогон, который блокируется, в устойчивый темп без срывов.
+_FSA_FORCE_PACE = False
+
+# v27.9.x: один раз за прогон сохраняем сырой JSON-ответ API ФСА в файл —
+# чтобы по реальной структуре доразобрать status/scheme/название (диагностика).
+_FSA_SAMPLE_DUMPED = False
+
+async def collect_one_query(session: aiohttp.ClientSession, query: str, per_query_limit: int = 250, sort: str = "popular", domain: str = '', stats: Optional[Dict[str, int]] = None, page: int = 1, fbrand_ids: Optional[List[str]] = None, xsubject: str = '', price_u: str = '') -> List[Card]:
     """v39.9: subject отдельно от subjectName.
 
     WB API в v18 возвращает оба поля:
@@ -1663,15 +2984,43 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
     v39.11: добавлен опциональный dict stats для подсчёта сколько карточек
     WB вернул всего и сколько было отфильтровано. Это даёт пользователю
     видеть «WB вернул 0» vs «фильтр отбросил».
+
+    v27.9.x: page — номер страницы WB-поиска. Нужно для ПОИСКА ПО БРЕНДУ одним
+    «чистым» запросом (без расширения категориями): листаем страницы, чтобы
+    собрать все товары бренда, а не только первую (~100 шт).
     """
     cards: List[Card] = []
     q = urllib.parse.quote(query)
+    _pg = max(1, int(page or 1))
+    # v49: ценовой фильтр priceU=min;max (в копейках) — обходит лимит глубины WB
+    # (~10k на запрос): один и тот же запрос в РАЗНЫХ ценовых диапазонах отдаёт
+    # РАЗНЫЕ карточки, что кратно увеличивает охват крупных категорий/брендов.
+    _pu = ("&priceU=" + urllib.parse.quote(str(price_u))) if price_u else ""
     # несколько актуальных хостов/версий, первый обычно быстрее
-    urls = [
-        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
-        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page=1&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false",
-        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page=1&query={q}&resultset=catalog&sort={sort}&spp=30",
+    urls = []
+    # v27.9.x: ПОЛНЫЙ бренд-каталог по brandId — отдаёт ВСЕ товары бренда (а не
+    # топ поисковой выдачи, обрезанный на ~сотне). Ставим ПЕРВЫМ источником.
+    for bid in (fbrand_ids or []):
+        _b = urllib.parse.quote(str(bid))
+        # v48: xsubject (категория) обходит лимит WB ≈1200 на бренд-каталог —
+        # каждая категория отдаётся отдельно со своим лимитом.
+        _xs = ("&xsubject=" + urllib.parse.quote(str(xsubject))) if xsubject else ""
+        urls.append(
+            f"https://catalog.wb.ru/brands/v2/catalog?ab_testing=false&appType=1&brand={_b}"
+            f"&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}{_pu}")
+        urls.append(
+            f"https://catalog.wb.ru/brands/catalog?appType=1&brand={_b}"
+            f"&curr=rub&dest=-1257786&lang=ru&page={_pg}&sort={sort}&spp=30{_xs}{_pu}")
+    # поисковая выдача (+ опционально фильтр по бренду fbrand)
+    _search_bases = [
+        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false{_pu}",
+        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&hide_dtype=13&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30&suppressSpellcheck=false{_pu}",
+        f"https://search.wb.ru/exactmatch/ru/common/v13/search?appType=1&curr=rub&dest=-1257786&lang=ru&page={_pg}&query={q}&resultset=catalog&sort={sort}&spp=30{_pu}",
     ]
+    for _bu in _search_bases:
+        for bid in (fbrand_ids or []):
+            urls.append(_bu + "&fbrand=" + urllib.parse.quote(str(bid)))
+        urls.append(_bu)
     for url in urls:
         data = await fetch_json(session, url)
         if not data:
@@ -1741,6 +3090,15 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                 # v43: оригинальность товара — по флагам/полям карточки WB.
                 # supplierFlags и отдельные поля могут содержать признак оригинала.
                 is_original = _detect_wb_original(p)
+                # v27.9.x: дополнительные поля карточки (защитно, пусто если нет).
+                color_names: List[str] = []
+                for _c in (p.get("colors") or []):
+                    if isinstance(_c, dict):
+                        _cn = str(_c.get("name") or "").strip()
+                        if _cn:
+                            color_names.append(_cn)
+                colors_str = ", ".join(dict.fromkeys(color_names))
+                wb_root = str(p.get("root") or "")
                 rating = 0.0
                 try:
                     r_v = p.get("rating") or p.get("reviewRating") or p.get("supplierRating")
@@ -1757,7 +3115,8 @@ async def collect_one_query(session: aiohttp.ClientSession, query: str, per_quer
                     price_rub=price_rub, sale_price_rub=sale_price_rub or price_rub,
                     seller_name=seller_name, supplier_id=supplier_id,
                     rating=rating, feedbacks=feedbacks, pics_count=pics_count, in_stock=in_stock,
-                    is_original=is_original,
+                    is_original=is_original, colors=colors_str, wb_root=wb_root,
+                    view_flags=(int(p.get("viewFlags")) if isinstance(p.get("viewFlags"), int) else 0),
                 ))
             break
     return cards
@@ -1782,31 +3141,114 @@ async def collect_cards(args) -> List[Card]:
                     break
         return cards
 
-    variants = generate_query_variants(args.query, args.query_profile, args.max_expanded_queries)
-    if args.limit <= args.per_query_limit and not args.auto_expand:
-        variants = [args.query]
+    _brand_search = bool((getattr(args, 'brand', '') or '').strip()) and \
+        (getattr(args, 'brand_match', 'any') or 'any') != 'any'
 
-    # v39.7: определяем domain один раз, используем для фильтрации мусорных subject
+    # v39.7 + v27.9.x: профиль → домен. Расширено: identity для всех доменных
+    # ключей (clothing/shoes/.../appliances) и RU-алиасы. Нужно для ВЫБОРА
+    # КАТЕГОРИИ при поиске по бренду (reebok→одежда, indesit→бытовая техника).
     profile_to_domain = {
         'clothing': 'clothing', 'одежда': 'clothing',
         'shoes': 'shoes', 'обувь': 'shoes',
         'toys': 'toys', 'игрушки': 'toys',
+        'kids_accessories': 'kids_accessories', 'детские аксессуары': 'kids_accessories',
+        'baby_gear': 'baby_gear', 'детский транспорт': 'baby_gear',
         'cosmetics': 'cosmetics', 'косметика': 'cosmetics',
         'electronics': 'electronics', 'электроника': 'electronics',
-        'home': 'home',
+        'appliances': 'appliances', 'бытовая техника': 'appliances', 'техника': 'appliances',
+        'home': 'home', 'дом': 'home', 'дом и текстиль': 'home', 'текстиль': 'home',
+        'kitchenware': 'kitchenware', 'посуда': 'kitchenware',
+        'food': 'food', 'продукты': 'food', 'питание': 'food',
     }
-    domain = profile_to_domain.get((args.query_profile or 'auto').lower())
-    if not domain:
-        domain = detect_query_domain(args.query)
-    # v39.11: фильтр включаем если ЕСТЬ хоть какой-то сигнал по домену — либо
-    # whitelist subject ID, либо keywords для названий/категорий.
-    # Раньше требовался только whitelist — это блокировало работу для shoes/home/cosmetics
-    # где whitelist пустой, но keywords есть.
+    # v27.9.x: КАТЕГОРИИ ТОВАРОВ для бренда — можно НЕСКОЛЬКО через запятую
+    # (--query-profile clothing,shoes). Если выбраны — сужаем выдачу до них.
+    _profile_raw = (getattr(args, 'query_profile', '') or 'auto').strip().lower()
+    _profile_keys = [p.strip() for p in _profile_raw.split(',') if p.strip()]
+    _brand_domains = []
+    for _k in _profile_keys:
+        if _k in ('auto', '', 'any', 'любая'):
+            continue
+        _d = profile_to_domain.get(_k)
+        if _d and _d not in _brand_domains:
+            _brand_domains.append(_d)
+    _profile_key = _profile_keys[0] if _profile_keys else 'auto'
+
+    # v48: «ПОИСК БЕЗ ЗАПРОСА» — пользователь задал только число карточек, программа
+    # сама сметает каталог WB по типам товаров (всех или выбранных категорий).
+    _catalog_sweep = bool(getattr(args, 'catalog_sweep', False)) and not _brand_search
+    _cat_keys = [s.strip() for s in (getattr(args, 'catalog_categories', '') or '').split(',') if s.strip()]
+    if _catalog_sweep:
+        _sweep_max = min(2000, max(300, int(args.limit) // 25))
+        variants = generate_catalog_queries(_cat_keys, _sweep_max)
+        print(f"🧭 Поиск БЕЗ запроса (сметание каталога WB): категории={_cat_keys or 'ВСЕ'}, "
+              f"вариантов запросов={len(variants)}, лимит={args.limit}.")
+    else:
+        _max_q = scaled_max_queries(int(args.limit), int(args.max_expanded_queries))
+        if _max_q != int(args.max_expanded_queries):
+            print(f"📈 Большой лимит ({args.limit}): расширяю число вариантов запроса до {_max_q} "
+                  f"(WB ограничивает глубину выдачи на один запрос).")
+        variants = generate_query_variants(args.query, args.query_profile, _max_q)
+        if _brand_search:
+            # Бренд: чистый бренд + (если выбраны категории) «бренд + тип товара» из
+            # КАЖДОЙ выбранной категории. Больше карточек, не выходя за категории.
+            # v49: на больших лимитах добавляем «бренд + тип + модификатор»
+            # (пол/цвет/сезон) — WB на каждый такой запрос отдаёт частично новый
+            # набор товаров бренда, что кратно увеличивает охват.
+            if _brand_domains:
+                variants = [args.brand]
+                _bmods = []
+                if int(args.limit) > 3000:
+                    _bmods = ['мужские', 'женские', 'детские', 'черные', 'белые',
+                              'синие', 'красные', 'серые', 'зеленые', 'розовые',
+                              'летние', 'зимние', 'демисезонные']
+                for _d in _brand_domains:
+                    _dtypes = DOMAIN_PRODUCT_TYPES.get(_d, [])
+                    variants += [f"{args.brand} {t}" for t in _dtypes]
+                    for t in _dtypes:
+                        for mm in _bmods:
+                            variants.append(f"{args.brand} {t} {mm}")
+            else:
+                variants = [args.brand]
+                if int(args.limit) > 3000:
+                    for mm in ['мужское', 'женское', 'детское', 'обувь', 'одежда',
+                               'кроссовки', 'куртки', 'футболки', 'аксессуары', 'сумки']:
+                        variants.append(f"{args.brand} {mm}")
+        elif args.limit <= args.per_query_limit and not args.auto_expand:
+            variants = [args.query]
+
     strict_filter_enabled = getattr(args, 'strict_domain_filter', True)
-    has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
-    use_filter = strict_filter_enabled and domain and has_signals
+    if _catalog_sweep:
+        # Сметание каталога: если выбраны конкретные категории — фильтруем выдачу по
+        # ним (точнее); если категорий нет (ВСЕ) — фильтр выключен (берём всё подряд).
+        _sw_domains = catalog_domains_for(_cat_keys)
+        domain = ','.join(_sw_domains) if _sw_domains else ''
+        use_filter = bool(_sw_domains) and strict_filter_enabled and any(
+            DOMAIN_SUBJECT_NAME_KEYWORDS.get(d) or DOMAIN_SUBJECT_WHITELIST.get(d)
+            for d in _sw_domains)
+    elif _brand_search:
+        # v45.3: ПОИСК ПО БРЕНДУ. Категория нужна НЕ чтобы резать выдачу, а чтобы
+        # ДОБРАТЬ больше карточек бренда: по «голому» бренду WB отдаёт одну выдачу
+        # (~сотню), а варианты «бренд + тип товара категории» (стиральные машины,
+        # чайники, фены, …) вытаскивают карточки, которых в первой выдаче не было.
+        # Сами карточки по категории НЕ отсеиваем — бренд-фильтр уже гарантирует, что
+        # это товары нужного бренда, и терять их нельзя. Поэтому доменный фильтр ВЫКЛ.
+        domain = ''
+        use_filter = False
+    elif _brand_domains:
+        # Поиск ПО ЗАПРОСУ с явно выбранной категорией — здесь фильтр уместен
+        # (уточняет выдачу запроса; бренда, который бы гарантировал релевантность, нет).
+        domain = ','.join(_brand_domains)
+        use_filter = strict_filter_enabled and any(
+            DOMAIN_SUBJECT_NAME_KEYWORDS.get(d) or DOMAIN_SUBJECT_WHITELIST.get(d)
+            for d in _brand_domains)
+    else:
+        # Обычный поиск без явной категории — авто-домен по тексту запроса.
+        domain = profile_to_domain.get(_profile_key) or detect_query_domain(args.query)
+        has_signals = bool(DOMAIN_SUBJECT_WHITELIST.get(domain)) or bool(DOMAIN_SUBJECT_NAME_KEYWORDS.get(domain))
+        use_filter = strict_filter_enabled and domain and has_signals
     filter_label = f"domain={domain} subject_filter={'ON' if use_filter else 'OFF'}"
-    print(f"Получаю список карточек через JSON-каталог WB: базовый query='{args.query}', вариантов={len(variants)}, общий limit={args.limit}, collect-workers={args.collect_workers}; {filter_label}")
+    _q_label = (args.query or '').strip() or ('БЕЗ ЗАПРОСА (каталог)' if _catalog_sweep else '')
+    print(f"Получаю список карточек через JSON-каталог WB: базовый query='{_q_label}', вариантов={len(variants)}, общий limit={args.limit}, collect-workers={args.collect_workers}; {filter_label}")
 
     timeout = aiohttp.ClientTimeout(total=18)
     headers = {
@@ -1822,15 +3264,182 @@ async def collect_cards(args) -> List[Card]:
     collect_stats = {'wb_returned': 0, 'filtered_out': 0}
     sem = asyncio.Semaphore(args.collect_workers)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        # v27.9.x: для бренда листаем до нужного лимита (одна «чистая» выдача),
+        # для обычного поиска — 1 страница (охват даёт расширение вариантов).
+        if _brand_search:
+            _max_pages = max(1, min(60, (int(args.limit) // 90) + 2))
+        else:
+            # v47: обычный поиск раньше листал ТОЛЬКО 1-ю страницу каждого варианта —
+            # сбор упирался в ~4-8k уникальных карточек при ЛЮБОМ лимите (для 20k+
+            # это был жёсткий потолок). Теперь глубина листания растёт с лимитом;
+            # страница без новых карточек обрывает листание сама (см. break ниже),
+            # поэтому лишних запросов на малых лимитах не появляется.
+            _max_pages = scaled_search_pages(int(args.limit), len(variants))
+
+        # v27.9.x: для бренда находим brandId и тянем ПОЛНЫЙ бренд-каталог
+        # (catalog.wb.ru/brands/...), а не обрезанную поисковую выдачу. Плюс
+        # перебираем НЕСКОЛЬКО сортировок — это докидывает товары, которые в одной
+        # сортировке не попали в первые страницы.
+        _fbrand_ids: List[str] = []
+        # v27.9.x: СКОРОСТЬ — для бренда хватает 2 сортировок (popular/newly) с
+        # листанием; 5 сортировок почти не добавляли уникальных, но кратно
+        # замедляли сбор (каждая — отдельная серия запросов). Если brandId найден —
+        # бренд-каталог и так отдаёт всё, сортировки тем более не нужны.
+        _brand_sorts = ["popular", "newly"]
+        _brand_subjects: List[str] = []
+        if _brand_search:
+            try:
+                _fbrand_ids = await discover_brand_filter_ids(session, args.brand)
+            except Exception as _e:
+                _fbrand_ids = []
+            # v48: категории бренда (xsubject) — обходим лимит WB ≈1200 на каталог.
+            if _fbrand_ids:
+                try:
+                    _brand_subjects = await discover_brand_subjects(session, _fbrand_ids)
+                except Exception:
+                    _brand_subjects = []
+            print(f"Бренд-каталог: brandId={_fbrand_ids or 'не найден (работаю по поиску)'}; "
+                  f"сортировок={len(_brand_sorts)}, страниц до {_max_pages}, "
+                  f"категорий бренда={len(_brand_subjects)}")
+
+        _brand_base_q = (args.query or args.brand or "").strip()
+
+        # v49: ценовое углубление (&priceU) пробивает потолок глубины WB (~10k на
+        # запрос). Включаем на больших лимитах; запускаем только для продуктивных
+        # вариантов (которые реально упёрлись в потолок), чтобы не тратить запросы
+        # на узкие варианты. Для брендов порог ниже — там вариантов мало.
+        _use_price_buckets = int(args.limit) > 5000
+        _PB_THRESHOLD = 120 if _brand_search else 250
+        # На очень больших лимитах добавляем 2-ю сортировку: внутри одного ценового
+        # диапазона «popular» и «newly» отдают РАЗНЫЕ карточки (выдача WB упёрта в
+        # ~10k на запрос), что ещё увеличивает охват продуктивных вариантов.
+        _pb_sorts = ["popular", "newly"] if int(args.limit) > 20000 else ["popular"]
+        _pb_pages = max(2, min(_max_pages, 5))
+        # v53 (улучшение №6): пределы адаптивного дробления ценовой корзины.
+        # глубина 4 = до 16 под-корзин на корзину; не дробим диапазон уже 100 ₽.
+        _PB_MAX_DEPTH = 4
+        _PB_MIN_WIDTH = 10000  # копеек = 100 ₽
+
         async def work(q):
             async with sem:
-                for sort in args.search_sorts.split(","):
-                    sort = sort.strip() or "popular"
-                    cards = await collect_one_query(session, q, args.per_query_limit, sort, domain=domain if use_filter else '', stats=collect_stats)
+                # Базовый запрос бренда: ПОЛНЫЙ каталог по brandId + все сортировки +
+                # глубокое листание. Остальные варианты («reebok кроссовки» и т.п.):
+                # только текстовый поиск, 1 сортировка, немного страниц — добор охвата.
+                is_base = (not _brand_search) or (q == _brand_base_q)
+                # v48: базовый бренд-запрос с КАТЕГОРИЯМИ (xsubject) — каждая
+                # категория со своим лимитом WB, что многократно увеличивает охват
+                # крупных брендов. Категории обходятся параллельно (отдельные work).
+                if _brand_search and is_base and _brand_subjects:
+                    _subj_pages = max(2, min(_max_pages, 14))
+                    for _sid in _brand_subjects:
+                        for sort in _brand_sorts:
+                            for _page in range(1, _subj_pages + 1):
+                                cards = await collect_one_query(
+                                    session, q, args.per_query_limit, sort,
+                                    domain='', stats=collect_stats, page=_page,
+                                    fbrand_ids=_fbrand_ids, xsubject=_sid)
+                                before = len(cards_map)
+                                for c in cards:
+                                    if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
+                                                             getattr(args, 'brand_match', 'contains') or 'contains'):
+                                        continue
+                                    cards_map.setdefault(c.nm_id, c)
+                                if len(cards_map) == before or not cards:
+                                    break
+                                if len(cards_map) >= args.limit:
+                                    break
+                            if len(cards_map) >= args.limit:
+                                break
+                        if len(cards_map) >= args.limit:
+                            break
+                    # после прохода по категориям — продолжаем обычным базовым каталогом
+                    # (добирает товары без проставленной категории).
+                if _brand_search and is_base:
+                    _sorts = _brand_sorts
+                    _pages = _max_pages
+                    _fb = _fbrand_ids
+                elif _brand_search:
+                    # v49: «бренд + тип» — 3 сортировки и больше страниц (раньше 1×4),
+                    # чтобы вытащить больше уникальных товаров бренда.
+                    _sorts = ["popular", "newly", "rate"]
+                    _pages = min(_max_pages, 8)
+                    _fb = []
+                else:
+                    _sorts = [s.strip() or "popular" for s in args.search_sorts.split(",")]
+                    _pages = _max_pages
+                    _fb = []
+                def _ingest(cards):
+                    before = len(cards_map)
                     for c in cards:
+                        # v27.9.x: для бренда ПРЕД-фильтруем по бренду прямо здесь —
+                        # иначе варианты «reebok кроссовки» забивают лимит чужими товарами.
+                        if _brand_search and not brand_matches_v39(
+                                getattr(c, 'brand', ''), args.brand,
+                                getattr(args, 'brand_match', 'contains') or 'contains'):
+                            continue
                         cards_map.setdefault(c.nm_id, c)
+                    return len(cards_map) - before
+
+                _variant_added = 0
+                for sort in _sorts:
+                    for _page in range(1, _pages + 1):
+                        cards = await collect_one_query(
+                            session, q, args.per_query_limit, sort,
+                            domain=domain if use_filter else '', stats=collect_stats,
+                            page=_page, fbrand_ids=_fb)
+                        _new = _ingest(cards)
+                        _variant_added += _new
+                        # страница не дала ни одной НОВОЙ карточки — дальше листать смысла нет
+                        if _new == 0 or not cards:
+                            break
+                        if len(cards_map) >= args.limit:
+                            break
                     if len(cards_map) >= args.limit:
                         break
+                # v49: ЦЕНОВОЕ УГЛУБЛЕНИЕ. Если вариант продуктивен (много новых
+                # карточек — значит упёрся в лимит глубины WB ~10k), проходим по
+                # ценовым диапазонам: тот же запрос с &priceU отдаёт ДРУГИЕ карточки.
+                # Это и пробивает потолок для крупных категорий/брендов.
+                # v53 (улучшение №6): АДАПТИВНОЕ дробление. Фиксированные корзины
+                # не спасают, если в одной корзине всё ещё >10k товаров (плотный
+                # масс-маркет): мы снова упираемся в потолок и теряем остаток.
+                # Поэтому если корзина «насыщена» (пролистали все страницы, и каждая
+                # давала новые карточки) — делим её пополам и углубляемся рекурсивно,
+                # пока под-диапазон не выгребается целиком или не дойдём до предела.
+                async def _deepen_price(pmin, pmax, depth):
+                    if len(cards_map) >= args.limit:
+                        return
+                    _pu = f"{pmin};{pmax}"
+                    saturated = False
+                    for sort in _pb_sorts:
+                        pages_with_new = 0
+                        for _page in range(1, _pb_pages + 1):
+                            cards = await collect_one_query(
+                                session, q, args.per_query_limit, sort,
+                                domain=domain if use_filter else '', stats=collect_stats,
+                                page=_page, fbrand_ids=_fb, price_u=_pu)
+                            if not cards or _ingest(cards) == 0:
+                                break
+                            pages_with_new += 1
+                            if len(cards_map) >= args.limit:
+                                return
+                        # пролистали ВСЕ страницы, и каждая давала новое → диапазон,
+                        # вероятно, упёрся в потолок WB → есть смысл дробить
+                        if pages_with_new >= _pb_pages:
+                            saturated = True
+                    if (saturated and depth < _PB_MAX_DEPTH
+                            and (pmax - pmin) > _PB_MIN_WIDTH
+                            and len(cards_map) < args.limit):
+                        mid = (pmin + pmax) // 2
+                        await _deepen_price(pmin, mid, depth + 1)
+                        await _deepen_price(mid, pmax, depth + 1)
+
+                if (_use_price_buckets and _variant_added >= _PB_THRESHOLD
+                        and len(cards_map) < args.limit):
+                    for (pmin, pmax) in PRICE_BUCKETS:
+                        if len(cards_map) >= args.limit:
+                            break
+                        await _deepen_price(pmin, pmax, 0)
         tasks = [asyncio.create_task(work(q)) for q in variants]
         for t in asyncio.as_completed(tasks):
             try:
@@ -1843,22 +3452,110 @@ async def collect_cards(args) -> List[Card]:
                         x.cancel()
                 break
 
+        # v45.1: ДОБОР по фактическим категориям бренда. Раньше запускался ТОЛЬКО
+        # когда категория не выбрана. Но при ВЫБРАННОЙ категории, если brandId не
+        # нашёлся, базовый поиск «бренд» часто не листается дальше первой страницы
+        # (WB отдаёт те же ~100), а варианты «бренд + тип» из моего списка отсеиваются
+        # бренд-фильтром (это товары ЧУЖИХ брендов). Итог — сбор застревал на ~100,
+        # хотя пользователь просил 1000. Поэтому добор теперь идёт и при выбранной
+        # категории: subject'ы берём из УЖЕ собранных карточек (т.е. они реальные и
+        # уже прошли доменный фильтр), а сам добор тоже фильтруется по домену —
+        # это докидывает товары бренда той же категории, которых не было на 1-й стр.
+        if _brand_search and len(cards_map) < args.limit:
+            from collections import Counter as _Counter
+            _subj_counter: "_Counter[str]" = _Counter()
+            for c in list(cards_map.values()):
+                sn = (getattr(c, 'subject', '') or '').strip()
+                if sn and not sn.isdigit() and len(sn) <= 60:
+                    _subj_counter[sn] += 1
+            _top_subjects = [s for s, _ in _subj_counter.most_common(25)]
+
+            async def _expand(subj: str):
+                async with sem:
+                    qx = f"{args.brand} {subj}".strip()
+                    for sort in ("popular", "newly"):
+                        for _page in range(1, min(_max_pages, 5) + 1):
+                            if len(cards_map) >= args.limit:
+                                return
+                            cards = await collect_one_query(
+                                session, qx, args.per_query_limit, sort,
+                                domain=domain if use_filter else '', stats=collect_stats, page=_page)
+                            before = len(cards_map)
+                            for c in cards:
+                                if not brand_matches_v39(getattr(c, 'brand', ''), args.brand,
+                                                         getattr(args, 'brand_match', 'contains') or 'contains'):
+                                    continue
+                                cards_map.setdefault(c.nm_id, c)
+                            if len(cards_map) == before or not cards:
+                                break
+
+            if _top_subjects:
+                print(f"Добор по категориям бренда: {len(_top_subjects)} категорий "
+                      f"({', '.join(_top_subjects[:6])}…)")
+                _ex_tasks = [asyncio.create_task(_expand(s)) for s in _top_subjects]
+                for t in asyncio.as_completed(_ex_tasks):
+                    try:
+                        await t
+                    except Exception:
+                        pass
+                    if len(cards_map) >= args.limit:
+                        for x in _ex_tasks:
+                            if not x.done():
+                                x.cancel()
+                        break
+
     # v39.11: показать статистику сбора. Особенно важно когда найдено мало карточек
     # — пользователь поймёт причина в WB-выдаче или в нашем фильтре.
     n_kept = len(cards_map)
     n_total = collect_stats.get('wb_returned', 0)
     n_filtered = collect_stats.get('filtered_out', 0)
     print(f"📊 Статистика сбора: WB вернул всего {n_total} карточек (включая дубли), уникальных собрано {n_kept}, отфильтровано {n_filtered}.")
+    # v27.9.x: WB вернул 0 на ВСЕ запросы — это не баг кода, а ВРЕМЕННЫЙ лимит
+    # запросов WB (часто после серии частых прогонов WB начинает отдавать пусто).
+    if n_total == 0:
+        print("=" * 80)
+        print("🔴 WB вернул 0 карточек на ВСЕ запросы. Это НЕ ошибка программы, а")
+        print("   временный анти-бот лимит Wildberries (срабатывает после серии")
+        print("   частых прогонов с одного IP). Что делать:")
+        print("   • подожди 2–5 минут и запусти снова;")
+        print("   • или смени сеть/IP (мобильный интернет, VPN);")
+        print("   • проверь, что в обычном браузере открывается www.wildberries.ru.")
+        print("=" * 80)
     if use_filter and n_filtered > n_kept * 5 and n_kept < args.limit / 2:
         print(f"   ⚠️  Фильтр отсеял много карточек. Если кажется что отсеиваются нужные товары:")
         print(f"      • попробуй --strict-domain-filter false (выключить фильтр)")
         print(f"      • или дай мне xlsx с примерами — расширю списки для домена '{domain}'")
     final_cards = list(cards_map.values())[:args.limit]
 
+    # v46: ДИАГНОСТИКА для вывода бита «Документы проверены». viewFlags WB — битовая
+    # маска бейджей (плашка «Оригинал» = бит 8). Бит «Документы проверены» неизвестен,
+    # поэтому выводим сырой viewFlags по собранным карточкам в файл: пользователь
+    # открывает несколько товаров, смотрит где есть/нет кнопки «Документы проверены»,
+    # и по разнице viewFlags вычисляем бит. Лёгкий CSV, пишется один раз.
+    if bool(getattr(args, 'dump_viewflags', True)) and final_cards:
+        try:
+            import csv as _csv
+            with open("wb_viewflags.csv", "w", encoding="utf-8-sig", newline="") as _vf:
+                _w = _csv.writer(_vf)
+                _w.writerow(["nm_id", "viewFlags", "is_original(bit8)", "name", "product_url"])
+                for _c in final_cards:
+                    _vfv = int(getattr(_c, "view_flags", 0) or 0)
+                    _w.writerow([_c.nm_id, _vfv, "да" if (_vfv & WB_ORIGINAL_VIEWFLAG_BIT) else "",
+                                 (_c.product_name or "")[:80], product_url(_c.nm_id)])
+            print("📝 [diag] viewFlags карточек сохранён в wb_viewflags.csv — открой 2-3 товара "
+                  "С кнопкой «Документы проверены» и 2-3 БЕЗ неё, найди их nm_id в файле и пришли "
+                  "мне их viewFlags: по разнице вычислю бит для колонки «Документы проверены».")
+        except Exception:
+            pass
+
     # v27.5: проверка плашки «Оригинальный товар» через wb_enhanced.
     # Поля .is_original проставляются внутри enrich_cards_batch в формате bool;
     # в ResultRow это попадает как "оригинал" / "не указано".
-    if bool(getattr(args, 'check_original', True)) and final_cards:
+    # v27.9.x: СТАРЫЙ HTML-детектор «Оригинал» по умолчанию ОТКЛЮЧЁН — WB рендерит
+    # плашку через JS, и в HTML её больше нет (всегда давал «не указано»). Его
+    # заменил быстрый card.json-детектор в run_http_link_prefetch. Старый путь
+    # оставлен только под явный флаг --check-original-html для отладки.
+    if bool(getattr(args, 'check_original_html', False)) and final_cards:
         try:
             from wb_enhanced import WBEnhancedClient as _WBEnh
             _orig_domains = [d.strip() for d in str(getattr(args, 'check_original_domains', 'ru') or 'ru').split(',') if d.strip()]
@@ -1927,12 +3624,16 @@ DETAILS_HEADERS_RU_V39: Dict[str, str] = {
     "rating": "Рейтинг",
     "feedbacks": "Отзывы",
     "is_original": "Плашка 'Оригинал'",
+    "docs_verified": "Документ проверен WB",
+    "colors": "Цвет",
+    "wb_root": "Корневой ID (WB)",
     "registry_url": "Ссылка на реестр",
     "registry_host": "Реестр (хост)",
     "registry_record_id": "ID записи реестра",
     "certificate_number": "Номер документа",
     "document_type": "Тип документа",
     "document_status": "Статус документа",
+    "rf_status": "Статус на территории РФ",
     "certificate_product_name": "Название в реестре",
     "document_date_start": "Действует с",
     "document_date_end": "Действует до",
@@ -2106,16 +3807,24 @@ def _build_summary_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
             bar.set_categories(cats3)
             ws.add_chart(bar, "E41")
 
-        # Data-bar на колонку «Количество» по всем трём таблицам
-        rule = DataBarRule(start_type="num", start_value=0,
-                           end_type="max", color="4F81BD", showValue=True)
-        ws.conditional_formatting.add(f"B{status_hdr + 1}:B{status_end}", rule)
-        ws.conditional_formatting.add(f"B{orig_hdr + 1}:B{orig_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="9BBB59", showValue=True))
-        ws.conditional_formatting.add(f"B{risk_hdr + 1}:B{risk_end}",
-                                      DataBarRule(start_type="num", start_value=0,
-                                                  end_type="max", color="C0504D", showValue=True))
+        # Data-bar на колонку «Количество» по всем трём таблицам.
+        # v27.9.x: ПРОПУСКАЕМ если таблица пустая (нет строк данных) — иначе
+        # диапазон «B9:B8» падал ValueError и рушил сохранение всего файла.
+        if status_end >= status_hdr + 1:
+            ws.conditional_formatting.add(
+                f"B{status_hdr + 1}:B{status_end}",
+                DataBarRule(start_type="num", start_value=0, end_type="max",
+                            color="4F81BD", showValue=True))
+        if orig_end >= orig_hdr + 1:
+            ws.conditional_formatting.add(
+                f"B{orig_hdr + 1}:B{orig_end}",
+                DataBarRule(start_type="num", start_value=0, end_type="max",
+                            color="9BBB59", showValue=True))
+        if risk_end >= risk_hdr + 1:
+            ws.conditional_formatting.add(
+                f"B{risk_hdr + 1}:B{risk_end}",
+                DataBarRule(start_type="num", start_value=0, end_type="max",
+                            color="C0504D", showValue=True))
     except Exception as _e:
         log.warning("Не удалось добавить графики/условное форматирование в Сводку: %s", _e)
 
@@ -2159,13 +3868,47 @@ def _write_run_log_v39(rows: List["ResultRow"], xlsx_path: Path, warning_days: i
         return None
 
 
+# v27.9.x: openpyxl роняет ВЕСЬ файл (IllegalCharacterError) на управляющих
+# символах, которые регулярно встречаются в спарсенном тексте (наименования и
+# описания из карточек/реестров). Из-за этого отчёт мог сохраняться «криво» или
+# не сохраняться целиком. _xlsx_safe гарантирует безопасное значение в ячейке.
+_XLSX_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xlsx_safe(value: Any, max_len: int = 32000):
+    """Безопасное значение для ячейки xlsx.
+
+    Числа оставляем числами (для сортировки и числового формата Excel), всё
+    остальное приводим к строке, вычищаем недопустимые управляющие символы,
+    схлопываем переводы строк/табуляции в пробел (иначе колонки визуально
+    «разъезжаются») и обрезаем по лимиту ячейки Excel (~32767 символов).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "да" if value else ""
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if not s:
+        return ""
+    s = _XLSX_ILLEGAL_RE.sub("", s)
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if "  " in s:
+        s = re.sub(r"\s{2,}", " ", s)
+    s = s.strip()
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
 # v25-reporting: единый порядок ядра 'Подробностей' в обоих движках.
 # Специфичные поля движка пойдут после ядра, expiry-флаги — в самом конце.
 CORE_DETAILS_ORDER_V39: Tuple[str, ...] = (
     "query", "nm_id", "product_name", "brand", "subject", "product_url",
     "status", "price_rub", "sale_price_rub", "seller_name", "supplier_id",
-    "is_original", "registry_url", "document_type", "document_status",
-    "certificate_number", "document_date_start", "document_date_end",
+    "is_original", "docs_verified", "registry_url", "document_type", "document_status",
+    "rf_status", "certificate_number", "document_date_start", "document_date_end",
 )
 
 
@@ -2192,7 +3935,7 @@ def _build_details_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
         days_left, risk = _compute_expiry_v39(r, warning_days)
         d["expiry_days_left"] = "" if days_left is None else days_left
         d["expiry_risk"] = risk
-        ws.append([d.get(f, "") for f in fields])
+        ws.append([_xlsx_safe(d.get(f, "")) for f in fields])
     hdr_fill = PatternFill("solid", fgColor="1F4E78")
     hdr_font = Font(color="FFFFFF", bold=True)
     for cell in ws[1]:
@@ -2218,13 +3961,20 @@ def _build_details_sheet_v39(wb_obj, rows: List["ResultRow"], warning_days: int)
         EXPIRY_RISK_EXPIRED: PatternFill("solid", fgColor="F4CCCC"),
         EXPIRY_RISK_UNKNOWN: PatternFill("solid", fgColor="EFEFEF"),
     }
+    # v47: per-cell стилизация на больших объёмах НЕПОДЪЁМНА: 20k строк × 39
+    # колонок = ~800k объектов стиля → запись раздувается на десятки секунд и
+    # сотни МБ. Для прогонов >8000 строк красим ТОЛЬКО колонку риска (она и несёт
+    # смысл), без выравнивания каждой ячейки. Малые отчёты — как раньше.
+    _full_style = ws.max_row <= 8001
+    _align = Alignment(vertical="top", wrap_text=True)
     for row in ws.iter_rows(min_row=2):
         risk_val = str(row[risk_col_idx - 1].value or "")
         fill = fills.get(risk_val)
         if fill is not None:
             row[risk_col_idx - 1].fill = fill
-        for c in row:
-            c.alignment = Alignment(vertical="top", wrap_text=True)
+        if _full_style:
+            for c in row:
+                c.alignment = _align
 
 
 class ResultStore:
@@ -2237,6 +3987,7 @@ class ResultStore:
         self.make_report_xlsx = bool(make_report_xlsx)
         self.rows: List[ResultRow] = []
         self.lock = asyncio.Lock()
+        self._save_lock = asyncio.Lock()  # v47: сериализация фоновых сохранений
         self.last_save_count = 0
 
     def processed_ids_from_csv(self, valid_ids: Optional[Set[int]] = None) -> Tuple[Set[int], int]:
@@ -2271,6 +4022,9 @@ class ResultStore:
                     data = {k: row.get(k, "") for k in ResultRow.__dataclass_fields__.keys()}
                     data["nm_id"] = nm
                     data["score"] = float(data.get("score") or 0)
+                    # v47: бейдж — строго Да/Нет (старый CSV мог не иметь признака)
+                    if not data.get("docs_verified"):
+                        data["docs_verified"] = "Нет"
                     latest[nm] = ResultRow(**data)
         except Exception:
             return ids, ignored
@@ -2279,26 +4033,74 @@ class ResultStore:
         return ids, ignored
 
     async def add(self, row: ResultRow):
+        # v47: «Документ проверен WB» — строго Да/Нет, без пустых ячеек. Пусто
+        # бывает у resume-карточек (собраны старой сборкой) и у редких путей
+        # записи, не проставивших признак. Бейдж не зафиксирован = «Нет».
+        if not getattr(row, 'docs_verified', ''):
+            row.docs_verified = 'Нет'
         async with self.lock:
             self.rows.append(row)
 
-    async def save(self):
-        async with self.lock:
-            rows = list(self.rows)
-        if self.csv_path:
-            self._save_csv(rows, self.csv_path)
-        self._save_xlsx(rows, self.xlsx_path)
-        self.last_save_count = len(rows)
+    async def save(self, final: bool = False):
+        # v47/48: НЕБЛОКИРУЮЩЕЕ сохранение для больших прогонов (20k–50k+ строк).
+        # Синхронная запись openpyxl на десятках тысяч строк занимает секунды и
+        # раньше блокировала event loop: воркеры замирали, watchdog считал прогон
+        # зависшим и перезапускал воркеры. Запись идёт в отдельном потоке.
+        # v48: CSV (resume-критичный, дешёвый) пишем ВСЕГДА; дорогой xlsx-отчёт на
+        # БОЛЬШИХ наборах строим РЕЖЕ (каждый 6-й промежуточный + всегда финальный).
+        # v49: КРИТИЧНО — запись идёт в ВЫДЕЛЕННОМ 1-ПОТОЧНОМ executor'е. Раньше
+        # to_thread брал общий пул, и если save() отменяли (saver_task.cancel())
+        # ПОСРЕДИ записи — asyncio-лок освобождался, а поток продолжал писать
+        # result.xlsx.tmp; следующий save писал ТОТ ЖЕ .tmp параллельно → битый zip
+        # («invalid code lengths set»). Однопоточный executor сериализует записи:
+        # отменённая запись доходит до конца, следующая ждёт её в очереди потока.
+        if not hasattr(self, "_save_lock"):
+            self._save_lock = asyncio.Lock()
+        if getattr(self, "_save_executor", None) is None:
+            import concurrent.futures
+            self._save_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="store-save")
+        async with self._save_lock:
+            async with self.lock:
+                rows = list(self.rows)
+            n = len(rows)
+            self._save_calls = getattr(self, "_save_calls", 0) + 1
+            big = n >= 12000
+            # xlsx можно прореживать ТОЛЬКО когда есть дешёвый CSV (resume/данные не
+            # теряются). Без CSV (например out_store этапа 2) xlsx пишем всегда.
+            write_xlsx = final or (not big) or (self.csv_path is None) or (self._save_calls % 6 == 0)
+
+            def _write():
+                if self.csv_path:
+                    self._save_csv(rows, self.csv_path)
+                if write_xlsx:
+                    self._save_xlsx(rows, self.xlsx_path)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(self._save_executor, _write)
+            self.last_save_count = n
+
+    def _unique_tmp(self, path: Path) -> Path:
+        # v49: уникальное имя .tmp на каждую запись — две записи НИКОГДА не пишут в
+        # один временный файл (доп. страховка к 1-поточному executor'у).
+        self._tmp_seq = getattr(self, "_tmp_seq", 0) + 1
+        return path.with_suffix(path.suffix + f".{os.getpid()}.{self._tmp_seq}.tmp")
 
     def _save_csv(self, rows: List[ResultRow], path: Path):
         fields = list(ResultRow.__dataclass_fields__.keys())
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8-sig", newline="") as f:
-            wr = csv.DictWriter(f, fieldnames=fields)
-            wr.writeheader()
-            for r in rows:
-                wr.writerow(asdict(r))
-        os.replace(tmp, path)
+        tmp = self._unique_tmp(path)
+        try:
+            with tmp.open("w", encoding="utf-8-sig", newline="") as f:
+                wr = csv.DictWriter(f, fieldnames=fields)
+                wr.writeheader()
+                for r in rows:
+                    wr.writerow(asdict(r))
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     def _save_xlsx(self, rows: List[ResultRow], path: Path):
         wb = Workbook()
@@ -2307,7 +4109,7 @@ class ResultStore:
         fields = list(ResultRow.__dataclass_fields__.keys())
         ws.append(fields)
         for r in rows:
-            ws.append([getattr(r, f) for f in fields])
+            ws.append([_xlsx_safe(getattr(r, f)) for f in fields])
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
         for cell in ws[1]:
@@ -2323,7 +4125,8 @@ class ResultStore:
             "query": 18, "nm_id": 12, "product_name": 42, "brand": 22, "subject": 20,
             "product_url": 48, "status": 28, "price_rub": 12, "sale_price_rub": 14,
             "seller_name": 26, "supplier_id": 14, "rating": 8, "feedbacks": 10,
-            "is_original": 14, "registry_url": 60, "registry_host": 24,
+            "is_original": 14, "colors": 20, "wb_root": 14,
+            "registry_url": 60, "registry_host": 24,
             "registry_record_id": 20, "certificate_number": 30, "document_type": 16,
             "document_status": 16, "certificate_product_name": 55,
             "document_date_start": 16, "document_date_end": 16, "applicant_name": 40,
@@ -2342,7 +4145,7 @@ class ResultStore:
         good_statuses = {STATUS_LINK_COLLECTED, "OK"}
         for r in rows:
             if r.status not in good_statuses:
-                review.append([getattr(r, f) for f in fields])
+                review.append([_xlsx_safe(getattr(r, f)) for f in fields])
         review.freeze_panes = "A2"
         review.auto_filter.ref = review.dimensions
         for cell in review[1]:
@@ -2367,8 +4170,13 @@ class ResultStore:
                 _build_details_sheet_v39(wb, rows, int(getattr(self, "expiry_warning_days", 30) or 0))
             except Exception as _e:
                 log.warning("build_details_sheet failed: %s", _e)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        # v49: уникальный .tmp на запись — две записи не могут перетереть друг друга.
+        tmp = self._unique_tmp(path)
         wb.save(tmp)
+        try:
+            wb.close()
+        except Exception:
+            pass
         # v40.2: os.replace падает PermissionError если файл открыт в Excel.
         # Делаем несколько попыток, потом fallback на файл с суффиксом, чтобы
         # данные НЕ терялись и прогон НЕ останавливался.
@@ -2394,6 +4202,12 @@ class ResultStore:
             if not getattr(self, "_warned_locked", False):
                 print(f"⚠️  Не могу записать {path.name} (открыт?). Данные во временном файле {tmp.name}.")
                 self._warned_locked = True
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 # -----------------------------
@@ -3057,8 +4871,12 @@ async def link_worker(worker_id: int, pool: BrowserPool, queue: asyncio.Queue, s
                     await close_context_quiet(context)
                     context, page = await make_page(pool, pool_idx, args)
 
-                if args.autosave_every > 0 and progress["done"] % args.autosave_every == 0:
-                    await store.save()
+                if args.autosave_every > 0:
+                    # v47: на больших прогонах автосейв реже — каждая запись xlsx
+                    # переписывает ВЕСЬ файл, на 20k+ строк это десятки секунд.
+                    _as_every = max(args.autosave_every, len(store.rows) // 100)
+                    if progress["done"] % _as_every == 0:
+                        await store.save()
             except Exception as e:
                 progress["tech"] += 1
                 err_row = ResultRow(
@@ -3185,6 +5003,7 @@ async def progress_loop(queue: asyncio.Queue, store: ResultStore, args, progress
                 f"нет документов={progress['no_docs']}, нет ссылки={progress['no_link']}, "
                 f"очередь={queue.qsize()}, тех={progress['tech']}, активные=[{'; '.join(active_desc)}]{stall_str}"
             )
+            emit_progress("links", done, total)
             if now - last_change > args.stuck_report_sec:
                 stuck = []
                 for w, info in list(progress["active"].items()):
@@ -3251,6 +5070,11 @@ async def run_link_collection(args):
         except Exception as e:
             print(f"⚠️  Обогащение продавцами не удалось (не критично): {type(e).__name__}: {e}")
 
+    # v46: бейдж «Документ проверен WB» (card.json.certificate.verified) собирается
+    # ВНУТРИ HTTP fast-path (run_http_link_prefetch) — там уже известен basket-шард
+    # с certificate.json, поэтому card.json берётся 1 запросом с того же шарда (без
+    # перебора несуществующих хостов, который заваливал лог DNS-ошибками).
+
     # =============================================================================
     # v40: HTTP сбор ссылок через certificate.json. БЕЗ браузера на 1 этапе.
     # Наличие документа однозначно определяется по json: 200=есть, 404 везде=нет.
@@ -3286,7 +5110,7 @@ async def run_link_collection(args):
     }
     print(f"К обработке в этом запуске: осталось={len(remaining)}, уже есть={len(processed)}")
     if not remaining:
-        await store.save()
+        await store.save(final=True)
         print(f"Все карточки текущей выборки уже есть в CSV/XLSX: {len(processed)}/{len(cards)}")
         return
 
@@ -3306,7 +5130,7 @@ async def run_link_collection(args):
                 worker="http", checked_at=now_iso(),
             )
             await store.add(row)
-        await store.save()
+        await store.save(final=True)
         return
 
     print(f"Параллельность: browsers={args.browser_count}, workers={args.workers}, headless={args.headless}, registry-mode=strict")
@@ -3418,7 +5242,7 @@ async def run_link_collection(args):
         finally:
             await pool.close_all()
 
-    await store.save()
+    await store.save(final=True)
     print(
         f"Финальный прогресс: обработано={progress['done']}/{len(cards)}, ссылок={progress['links']}, "
         f"нет документов={progress['no_docs']}, нет ссылки={progress['no_link']}, тех.статусы={progress['tech']}"
@@ -3528,17 +5352,24 @@ def _priority_for_label(label: str, rules: List[Tuple[int, Tuple[str, ...]]]) ->
             return score
     return 0
 
-def _looks_like_product_value(value: str) -> bool:
+def _looks_like_product_value(value: str, known_product_label: bool = False) -> bool:
     v = clean_registry_value(value)
     low = norm_text(v)
-    if len(v) < 18:
+    # v50: когда поле ТОЧНО является наименованием продукции (метка уже совпала —
+    # «Полное/Однородное наименование продукции»), короткие названия из 1-2 слов
+    # («Юбки женские», «Платья женские», «Носки детские») — НОРМАЛЬНЫЕ значения.
+    # Жёсткий порог в 18 символов их отбрасывал → из сертификата с многими
+    # товарами в результат попадал только самый длинный → ложные несоответствия.
+    min_len = 6 if known_product_label else 18
+    min_alpha = 5 if known_product_label else 10
+    if len(v) < min_len:
         return False
     if low.startswith("http"):
         return False
     if any(x in low for x in ("сведения о сертификате", "сведения о декларации", "регистрационный номер документа")) and len(v) < 120:
         return False
     # Значение должно содержать хотя бы буквы и не быть номером/датой.
-    if len(re.findall(r"[а-яa-z]", low)) < 10:
+    if len(re.findall(r"[а-яa-z]", low)) < min_alpha:
         return False
     return True
 
@@ -4072,7 +5903,8 @@ def _table_pairs_exact(soup) -> List[Tuple[str, str]]:
     return out
 
 
-def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 5000) -> List[str]:
+def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 5000,
+                                     known_product_label: bool = False) -> List[str]:
     """Extract values for exact Russian labels in table-like visible text.
 
     Works when HTML is flattened as:
@@ -4108,7 +5940,7 @@ def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 
                     if sum(len(x) for x in buf) >= max_chars:
                         break
                 val = clean_registry_value(' '.join(buf))
-            if _looks_like_product_value(val) or ('регистрационный номер' in norm_text(label) and val):
+            if _looks_like_product_value(val, known_product_label=known_product_label) or ('регистрационный номер' in norm_text(label) and val):
                 out.append(_trim_product_value(val) if 'продукц' in norm_text(label) else clean_registry_value(val))
     # Collapsed variant for rows flattened into one string.
     collapsed = clean_registry_value(text)
@@ -4117,7 +5949,7 @@ def _extract_same_line_or_next_exact(visible: str, label: str, max_chars: int = 
         val = clean_registry_value(m.group(1))
         if 'продукц' in norm_text(label):
             val = _trim_product_value(val)
-        if val and ((_looks_like_product_value(val)) or ('регистрационный номер' in norm_text(label) and len(val) >= 4)):
+        if val and ((_looks_like_product_value(val, known_product_label=known_product_label)) or ('регистрационный номер' in norm_text(label) and len(val) >= 4)):
             out.append(val)
     return _unique_keep_order(out)
 
@@ -4174,20 +6006,20 @@ def parse_swis_registry_strict(text: str) -> Tuple[str, str, str]:
         if 'регистрационный номер документа' in ln:
             cert_numbers.append(val)
         elif 'однородное наименование продукции' in ln:
-            if _looks_like_product_value(val):
+            if _looks_like_product_value(val, known_product_label=True):
                 homogeneous.append(_trim_product_value(val))
         elif 'полное наименование продукции' in ln and 'идентификац' in ln:
             val = _trim_product_value(val)
-            if _looks_like_product_value(val) and not _swis_value_is_not_product(val):
+            if _looks_like_product_value(val, known_product_label=True) and not _swis_value_is_not_product(val):
                 full_products.append(val)
 
     if not cert_numbers:
         cert_numbers.extend(_extract_same_line_or_next_exact(visible, 'Регистрационный номер документа', max_chars=250))
     if not homogeneous:
-        homogeneous.extend(_extract_same_line_or_next_exact(visible, 'Однородное наименование продукции', max_chars=1800))
+        homogeneous.extend(_extract_same_line_or_next_exact(visible, 'Однородное наименование продукции', max_chars=1800, known_product_label=True))
     if not full_products:
         for lab in SWIS_PRODUCT_LABELS[1:]:
-            full_products.extend([v for v in _extract_same_line_or_next_exact(visible, lab, max_chars=5000) if not _swis_value_is_not_product(v)])
+            full_products.extend([v for v in _extract_same_line_or_next_exact(visible, lab, max_chars=5000, known_product_label=True) if not _swis_value_is_not_product(v)])
 
     cert_num = _unique_keep_order(cert_numbers)[0] if _unique_keep_order(cert_numbers) else ''
     full_products = _unique_keep_order(full_products)
@@ -4639,7 +6471,7 @@ CATEGORY_TERMS = {
         "платье", "платья", "сарафан", "сарафаны", "юбка", "юбки",
         "толстовка", "толстовки", "худи", "свитшот", "свитшоты", "джемпер",
         "джемперы", "кофта", "кофты", "рубашка", "рубашки", "блузка", "блузки",
-        "пижама", "пижамы", "боди", "слип", "лонгслив", "водолазка", "майка",
+        "пижама", "пижамы", "боди", "лонгслив", "водолазка", "майка",
         "майки", "трусы", "белье", "носки", "колготки", "жилет", "жилеты",
         "пиджак", "пиджаки", "блейзер", "блейзеры", "поло", "топ", "топы",
         "сорочка", "сорочки", "распашонка", "распашонки", "ползунки", "слипы",
@@ -4660,7 +6492,8 @@ CATEGORY_TERMS = {
         "сникеры", "мокасины", "лоферы", "балетки", "угги", "валенки", "дутики",
         # v41: расширение
         "полуботинки", "полусапоги", "ботильоны", "сапожки", "туфельки",
-        "пинетки", "сабо", "шлепанцы", "шлёпанцы", "вьетнамки", "галоши",
+        "пинетки", "сабо", "шлепанцы", "шлёпанцы", "шлепки", "шлёпки", "шлёпы",
+        "вьетнамки", "галоши",
         "резиновые сапоги", "слипоны", "эспадрильи", "топсайдеры", "челси",
         "дерби", "оксфорды", "монки", "берцы", "унты", "ботфорты", "мюли",
         "тапки", "пантолеты", "босоножки", "тимберленды",
@@ -4697,7 +6530,9 @@ CATEGORY_TERMS = {
              "самолет", "грузовик", "трактор", "паровозик", "железная дорога",
              "настольная игра", "лото", "домино", "развивающая", "каталка",
              "качалка", "интерактивная игрушка", "слайм", "антистресс", "спиннер"},
-    "cosmetics": {"косметика", "крем", "кремы", "шампунь", "шампуни", "гель",
+    "cosmetics": {"косметика", "косметическ", "парфюмерно-косметическ",
+                  "косметическое средство", "средство косметическое",
+                  "крем", "кремы", "шампунь", "шампуни", "гель",
                   "гели", "мыло", "лосьон", "лосьоны", "зубная паста",
                   # v41
                   "пенка", "пена для", "бальзам", "масло детское", "присыпка",
@@ -4718,7 +6553,8 @@ CATEGORY_TERMS = {
     },
     "nursery": {
         # v41: НОВАЯ категория — детские товары/мебель/транспорт
-        "коляска", "коляски", "автокресло", "автолюлька", "кроватка", "манеж",
+        "коляска", "коляски", "автокресло", "автолюлька", "кроватка", "кроватки",
+        "кровать детская", "люлька", "люльки", "колыбель", "манеж", "манежи",
         "ходунки", "прыгунки", "шезлонг", "качели", "стульчик для кормления",
         "пеленальный", "горшок", "комод пеленальный", "матрасик", "мобиль",
         "радионяня", "видеоняня", "переноска", "слинг", "кенгуру", "эрго-рюкзак",
@@ -4726,13 +6562,18 @@ CATEGORY_TERMS = {
     # v27.7: НОВЫЕ категории — расширение на любые товарные группы (не только лёгкая промышленность).
     "electronics": {
         "электроника", "наушники", "наушник", "гарнитура", "колонка", "колонки",
-        "акустика", "акустическая система", "смартфон", "смартфоны", "телефон",
+        "акустика", "акустическая система", "акустическ", "саундбар", "смартфон", "смартфоны", "телефон",
         "телефоны", "телефоны мобильные", "планшет", "планшеты", "ноутбук",
         "ноутбуки", "монитор", "мониторы", "клавиатура", "мышь компьютерная",
+        "мышь", "мышка", "мышки", "устройство ввода", "устройства ввода",
+        "манипулятор", "манипулятор компьютерный",
         "телевизор", "телевизоры", "повербанк", "повербанки", "пауэрбанк",
         "power bank", "powerbank", "внешний аккумулятор", "батареи аккумуляторные",
         "аккумуляторная батарея",
-        "зарядное устройство", "зарядное", "кабель", "кабели", "адаптер", "адаптеры",
+        "зарядное устройство", "зарядные устройства", "зарядное", "зарядка", "зарядки",
+        "сетевое зарядное", "блок питания", "адаптер питания",
+        "кабель", "кабели", "адаптер", "адаптеры", "переходник", "переходники",
+        "штекер", "штекеры", "коннектор", "разъём", "разъем", "usb", "type-c", "hdmi", "otg",
         "роутер", "маршрутизатор", "флешка", "флеш-накопитель", "карта памяти",
         "фотоаппарат", "видеокамера", "веб-камера", "магнитола", "радиоприёмник",
         "проектор", "приставка игровая", "геймпад", "джойстик", "умные часы",
@@ -4966,7 +6807,78 @@ def _detect_categories(text: str) -> Set[str]:
                 if _contains_word_token(low, tl):
                     cats.add(cat)
                     break
+    # v48: ЯВНЫЕ «игрушечные» маркеры → это ИГРУШКА, даже если в названии есть слова
+    # другой категории. «Игрушечная посуда», «игрушечный телефон», «игровой набор»,
+    # «набор для кукол» сертифицируются как ИГРУШКИ; без этого они ложно конфликтовали
+    # (kitchenware/electronics vs toys). Добавляем toys, НЕ убирая прочие категории.
+    if any(w in low for w in (
+            'игрушечн', 'игрушеч', 'игрушк', 'игровой набор', 'для кукол', 'кукольн', 'кукл',
+            'пазл', 'конструктор', 'погремушк', 'неваляшк', 'пирамидк', 'сортер', 'бизиборд',
+            'водяной пистолет', 'водный пистолет', 'бластер', 'набор доктора', 'набор врача',
+            'набор парикмахера', 'игровая палатка', 'игровой домик', 'мягкая игрушка',
+            'развивающая игрушка', 'развивающие игрушки', 'развивающий коврик',
+            'игровой коврик', 'коврик развивающий', 'развивающий центр', 'игровой центр',
+            # v54: мягконабивные игрушки (в т.ч. бренды) и надувные водные игрушки —
+            # часто названы «… в костюме/жилете», что ложно давало одежду.
+            'мягконабивн', 'мягкая игрушка', 'мягкие игрушки', 'плюшевая игрушка',
+            'плюшевый', 'басик', 'ляля', 'зайка ми')):
+        cats.add('toys')
+    # v54: надувной плавательный инвентарь (жилет/нарукавники/круг для плавания) —
+    # это ВОДНАЯ ИГРУШКА/средство, сертифицируется как игрушка, а не одежда.
+    if (('надувн' in low and any(w in low for w in ('плавани', 'плавательн', 'бассейн', 'для воды', 'на воде')))
+            or any(w in low for w in ('нарукавник', 'круг для плавания', 'жилет для плавания', 'плавательный круг'))):
+        cats.add('toys')
+    # v48: ЯВНЫЕ «одёжные» маркеры (стемы) → это ОДЕЖДА, даже если в названии есть
+    # слово другой категории («трусы под ПОДГУЗНИК» → cosmetics, «джоггеры
+    # СПОРТИВНЫЕ» → sport, «ПИНЕТКИ носочки» → footwear). Из-за словоформ
+    # («трусов») точные термины не срабатывали. Добавляем clothing, НЕ убирая прочее.
+    for _gst in ('трус', 'джоггер', 'трико', 'лосин', 'леггинс', 'носки', 'носочк',
+                 'колгот', 'чулочн', 'гольф', 'пинетк', 'распашонк', 'штанишк',
+                 'кофточк', 'бодик', 'песочник', 'водолазк', 'лонгслив', 'свитшот', 'тайтс'):
+        if _contains_word_token(low, _gst):
+            cats.add('clothing')
+            break
+    # v52: «слип» (детский слип-комбинезон) — это ОДЕЖДА, но НЕ путать со
+    # «слипоны» (обувь). Поэтому отдельная проверка с отрицательным просмотром.
+    if re.search(r'(?:^|[^а-яёa-z])слип(?!он)', low):
+        cats.add('clothing')
     return cats
+
+
+# v46: «родственные» товарные группы — категории, которые в реестрах ФСА часто
+# смешаны и НЕ должны считаться конфликтом. Бытовая электроника и «приборы
+# бытового назначения» (appliances) — одна предметная область: реестровый
+# сертификат «Аппараты электрические бытового назначения: сетевые зарядные
+# устройства/акустические системы» (appliances по префиксу) покрывает WB-карточку
+# «зарядка/колонка» (electronics). Раньше это давало ложное «НЕСООТВЕТСТВИЕ».
+RELATED_CATEGORY_GROUPS: List[frozenset] = [
+    frozenset({"electronics", "appliances"}),
+    # v48: ДЕТСКАЯ КОМНАТА. Кроватки/манежи/люльки/пеленальные столики и детская
+    # мебель/текстиль — сертификаты этих товаров постоянно пересекают группы
+    # (карточка «кроватка с бортиком» → home_textile, а сертификат «Мебель детская:
+    # кровати» → furniture). Это одна предметная область, не конфликт.
+    frozenset({"nursery", "baby_gear", "furniture", "home_textile"}),
+    # v48: КАТАЛКИ/РАЙД-ОН. Беговелы, трёхколёсные велосипеды, самокаты, каталки,
+    # детские мячи в ЕАЭС сертифицируются как ИГРУШКИ, а карточка детектится как
+    # спортинвентарь → ложный конфликт sport_equipment vs toys.
+    frozenset({"toys", "sport_equipment"}),
+    # v48: ГОЛОВНЫЕ УБОРЫ/АКСЕССУАРЫ. Косынки, банданы, шапки, варежки покрываются
+    # трикотажными/одёжными сертификатами (accessories vs clothing — не конфликт).
+    frozenset({"accessories", "clothing"}),
+    # v48: КОРМЛЕНИЕ/ПОСУДА — поильники/бутылочки/посуда часто на одном сертификате.
+    frozenset({"feeding", "kitchenware"}),
+]
+
+
+def _categories_related(a: Set[str], b: Set[str]) -> bool:
+    """True, если категории из a и b лежат в одной «родственной» группе
+    (например electronics и appliances) — тогда несовпадение категорий НЕ конфликт."""
+    if not a or not b:
+        return False
+    for g in RELATED_CATEGORY_GROUPS:
+        if (a & g) and (b & g):
+            return True
+    return False
 
 
 def _contains_word_token(text_low: str, term_low: str) -> bool:
@@ -5028,13 +6940,194 @@ def _detect_subtypes(text: str) -> Set[str]:
 
 
 # Extend old subtype/age dictionaries without touching link collection.
-SUBTYPE_SYNONYMS.setdefault("белье", set()).update({"боди", "слип", "распашонка", "распашонки", "ползунки", "ползунок", "фуфайка", "фуфайки", "лонгслив"})
-SUBTYPE_SYNONYMS.setdefault("комбинезон", set()).update({"слип"})
+# v27.9.x: убрали синоним «слип» — токен-матчер сопоставляет по началу слова
+# (стем), поэтому «слип» совпадал со «слипоны»/«слипон» (ОБУВЬ) и тапочки-слипоны
+# ложно классифицировались как бельё → ложный OK против бельевых сертификатов.
+# Детский слип-комбинезон ловится по «боди/ползунки/распашонка/комбинезон».
+SUBTYPE_SYNONYMS.setdefault("белье", set()).update({"боди", "распашонка", "распашонки", "ползунки", "ползунок", "фуфайка", "фуфайки", "лонгслив"})
+
+# v52: РАСШИРЕНИЕ распознавания видов одежды. На прогоне 50k множество реальных
+# товаров не распознавалось (card_cats/card_sub/card_layers пустые), из-за чего
+# корректные совпадения уходили в ЛОЖНОЕ «ПРОВЕРИТЬ ВРУЧНУЮ» («Тельняшка детская»,
+# «Кальсоны», «Олимпийка», «Термолонгслив», «Шапочки» и т.п.). Добавляем
+# недостающие виды СТЕМАМИ (matcher сопоставляет по началу слова с границей).
+_V52_CLOTHING_STEMS = {
+    'тельняшк', 'кальсон', 'подштанник', 'олимпийк', 'дождевик', 'туник',
+    'термолонгслив', 'термофутболк', 'термоштан', 'термокомплект', 'термокофт',
+    'термоводолазк', 'термокальсон', 'термоноск', 'термобель', 'бодик',
+    'комбидрес', 'кофточк', 'маечк', 'фуфайк', 'ночнушк', 'поддёвк', 'поддевк',
+    'свитшот', 'худи', 'водолазк',
+    # базовые виды как СТЕМЫ — ловят словоформы/опечатки, которые полные слова
+    # из CATEGORY_TERMS пропускали («Пижам», «шортами», «белья», «юбк-шорты»).
+    'пижам', 'шорт', 'юбк', 'плать', 'футболк', 'куртк', 'джинс', 'брюк',
+    'блуз', 'рубашк', 'сарафан', 'комбинезон', 'халат', 'свитер', 'джемпер',
+    'кардиган', 'бель', 'распашонк', 'ползунк', 'песочник', 'лонгслив',
+}
+CATEGORY_TERMS['clothing'].update(_V52_CLOTHING_STEMS)
+# Обувь — диминутивы/множественные формы, которые не ловились полными словами.
+CATEGORY_TERMS['footwear'].update({
+    'полусапожк', 'сапожк', 'босоножк', 'туфельк', 'ботиночк', 'сандалик',
+    'кроссовочк', 'полуботинк', 'угг', 'чешк', 'пинетк',
+})
+# Головные уборы — это аксессуары; добавляем стемы, которые иначе не ловились
+# («шапочки» не совпадало со стемом «шапк», «чепчик» был только в одежде).
+CATEGORY_TERMS.setdefault('accessories', set()).update(
+    {'шапочк', 'чепчик', 'чепец', 'бандан', 'косынк', 'панамк', 'шапк', 'берет'})
+
+# v54: кожгалантерея (сумки/рюкзаки/чехлы/кошельки) — это аксессуары. Без этого
+# «Сумка кросс-боди» против сертификата «Кожгалантерейные изделия … сумки, чехлы
+# для телефонов» ложно уходила в «другую группу».
+CATEGORY_TERMS.setdefault('accessories', set()).update(
+    {'кожгалантере', 'галантере', 'кросс-боди', 'кроссбоди'})
+# v54: парфюм/туалетная вода — косметика (был ложный конфликт «Body Paint
+# парфюмерная вода» с card='боди'→одежда).
+CATEGORY_TERMS.setdefault('cosmetics', set()).update(
+    {'парфюм', 'парфюмерн', 'туалетная вода', 'духи', 'одеколон', 'парфюмерная вода'})
+
+# v54.2: РАСШИРЕНИЕ распознавания БЫТОВОЙ ТЕХНИКИ. На прогоне по технике/электронике
+# карточки «аэрогриль/хлебопечка/гриль/кухонный комбайн…» не относились ни к одной
+# категории (словарь был «одёжный») → card_cats пустой → «низкое совпадение» →
+# масса ложных «ПРОВЕРИТЬ ВРУЧНУЮ». Сертификаты-то распознавались («Электрические
+# приборы бытового назначения…» → appliances), а карточки — нет.
+CATEGORY_TERMS.setdefault('appliances', set()).update({
+    'аэрогрил', 'хлебопеч', 'электрогрил', 'гриль электрическ', 'гриль-духовк',
+    'фритюрниц', 'вафельниц', 'блинниц', 'сэндвичниц', 'бутербродниц', 'йогуртниц',
+    'измельчител', 'чоппер', 'рисоварк', 'скороварк', 'мантоварк', 'ростер',
+    'мини-печ', 'электропеч', 'электроплит', 'электроплитк', 'индукционн',
+    'кухонный комбайн', 'комбайн кухонн', 'отпариват', 'парогенератор',
+    'электробритв', 'машинка для стрижк', 'триммер для', 'массажёр', 'массажер',
+    'ирригатор', 'озонатор', 'ионизатор', 'дегидратор', 'сушилка для овощ',
+    'сушилка для фрукт', 'морожениц', 'шашлычниц', 'электрокамин', 'масляный радиатор',
+    'инфракрасный обогреватель', 'тепловая пушк', 'кулер для воды', 'диспенсер для воды',
+    'робот-пылесос', 'электрогрелк', 'электросамовар', 'капучинатор', 'электромясорубк',
+    'аппарат для приготовления', 'прибор для приготовления', 'для приготовления пищи',
+    'для нагревания жидкости', 'для нагрева жидкости',
+})
+
+# v54.2b: СТЕМЫ для техники/электроники/посуды. Многие термины хранились в
+# единственном числе с мягким знаком/окончанием («обогреватель», «кофеварка») и
+# НЕ совпадали с множественным («обогревателИ», «кофеваркИ») — токен-матчер ищет
+# совпадение по началу слова. Это давало пустую категорию и «низкое совпадение».
+CATEGORY_TERMS['appliances'].update({
+    'обогревател', 'кофеварк', 'кофемашин', 'кофемолк', 'соковыжималк', 'мясорубк',
+    'микроволнов', 'морозильник', 'морозильн', 'холодильник', 'холодильн', 'стиральн',
+    'посудомоечн', 'сушильн машин', 'пылесос', 'мультиварк', 'пароварк', 'плойк',
+    'вытяжк', 'выпрямител', 'водонагреват', 'увлажнител', 'очистител воздух',
+    'варочн', 'духовк', 'духовой шкаф', 'кондиционер', 'сплит-система', 'сплит система',
+    'термопот', 'тепловентилятор', 'конвектор', 'эпилятор', 'утюг', 'тостер',
+    'миксер', 'блендер', 'термостат', 'электрогрелк', 'электрокамин', 'электробритв',
+    'парогенератор', 'отпариват', 'вентилятор', 'обогрев', 'нагреват',
+    # электро-составные: внутренний корень не на границе слова, нужен свой стем
+    'электроводонагреват', 'электровафельниц', 'электросушилк', 'электротехническ',
+    'электрические бытового', 'очиститель воздуха',
+})
+CATEGORY_TERMS['electronics'].update({
+    'наушник', 'колонк', 'зарядк', 'зарядное устройство', 'кабел', 'адаптер',
+    'переходник', 'повербанк', 'пауэрбанк', 'аккумулятор', 'мышк', 'клавиатур',
+    'монитор', 'телевизор', 'смартфон', 'планшет', 'ноутбук', 'роутер',
+    'маршрутизатор', 'модем', 'флешк', 'карта памяти', 'веб-камер', 'видеокамер',
+    'фотоаппарат', 'проектор', 'микрофон', 'гарнитур', 'геймпад', 'джойстик',
+    'смарт-часы', 'умные часы', 'фитнес-браслет', 'магнитол', 'саундбар', 'компьютерные мыши',
+})
+CATEGORY_TERMS['kitchenware'].update({
+    'кастрюл', 'сковород', 'сотейник', 'кружк', 'чашк', 'тарелк', 'миск', 'стакан',
+    'бокал', 'вилк', 'ложк', 'половник', 'шумовк', 'дуршлаг', 'тёрк', 'терк', 'турк',
+    'казан', 'графин', 'салатник', 'противень', 'форм для выпечк', 'контейнер пищев',
+    'термос', 'термокружк', 'столов прибор', 'разделочн доск', 'гейзерн кофеварк',
+})
+
+# v54.3: РАСШИРЕНИЕ остальных категорий. Те же два принципа: (1) термины СТЕМАМИ,
+# чтобы ловить словоформы; (2) добавлены частые на WB виды товаров. Стемы выбраны
+# уникальными для категории, чтобы не пересекаться с другими (проверено тестами).
+CATEGORY_TERMS['cosmetics'].update({
+    'тушь', 'помад', 'тени для век', 'румян', 'тональн', 'консилер', 'хайлайтер',
+    'база под макияж', 'лак для ногтей', 'гель-лак', 'сыворотк', 'патчи под глаза',
+    'мицеллярн', 'пилинг', 'бронзатор', 'блеск для губ', 'карандаш для глаз',
+    'карандаш для бровей', 'кондиционер для волос', 'маска для волос', 'маска для лица',
+    'сухой шампунь', 'пенка для умывания', 'автозагар', 'крем для рук', 'крем для лица',
+    'крем для ног', 'крем для тела', 'бб-крем', 'флюид', 'гидрофильное масло',
+    'термальная вода', 'мист для лица', 'праймер', 'хна для бровей', 'масло для волос',
+})
+CATEGORY_TERMS['sport_equipment'].update({
+    'обруч', 'хулахуп', 'утяжелител', 'фитнес-резинк', 'степпер', 'беговая дорожка',
+    'орбитрек', 'эллипсоид', 'бодибар', 'медбол', 'ролик для пресса', 'колесо для пресса',
+    'перекладин', 'кольца гимнастическ', 'мат гимнастическ', 'батут', 'лыжи', 'сноуборд',
+    'ласты', 'очки для плавания', 'маска для плавания', 'шапочка для плавания', 'дартс',
+    'бадминтон', 'воланчик', 'теннисный стол', 'боксёрск', 'боксерск', 'капа боксёрск',
+    'напульсник', 'наколенник спортивн', 'мяч футбольн', 'мяч баскетбольн', 'мяч волейбольн',
+    'насос для мяч', 'эспандер', 'фитнес-браслет спортивн', 'гимнастическ',
+})
+CATEGORY_TERMS['toys'].update({
+    'кукл', 'пупс', 'трансформер', 'радиоуправляем', 'квадрокоптер', 'игровой набор',
+    'кукольн', 'слайм', 'лизун', 'сквиш', 'кинетическ песок', 'раскраск', 'аппликаци',
+    'набор для творчеств', 'набор для лепк', 'музыкальн игрушк', 'каталк', 'толокар',
+    'бизиборд', 'шнуровк', 'мозаик', 'пирамидк', 'погремушк', 'неваляшк', 'фигурк',
+    'сортер', 'паззл', 'конструктор', 'мягкая игрушк', 'плюшев игрушк', 'игрушечн',
+})
+CATEGORY_TERMS['pet'].update({
+    'миска для животных', 'автопоилк', 'когтерез', 'когтеточк', 'домик для кошк',
+    'лежак для', 'лежанк', 'террариум', 'вольер', 'груминг', 'шлейк', 'сухой корм',
+    'влажный корм', 'лакомств для', 'переноск для животных', 'клетк для', 'антицарапк',
+    'пелёнк для животных', 'когтеточ', 'миска для собак', 'миска для кошек',
+})
+CATEGORY_TERMS['furniture'].update({
+    'кроват', 'трюмо', 'консоль', 'пуфик', 'кресло-мешок', 'стол компьютерн',
+    'стол письменн', 'стол журнальн', 'кухонный уголок', 'обувниц', 'гардероб',
+    'шкаф-купе', 'витрин', 'буфет', 'сервант', 'тумб', 'комод', 'стеллаж', 'этажерк',
+    'полк настенн', 'вешалк напольн', 'кресло-качалк',
+})
+CATEGORY_TERMS['lighting'].update({
+    'спот ', 'трековый светильник', 'лампа накаливания', 'филаментн', 'панель светодиодн',
+    'уличный фонарь', 'садовый светильник', 'подсветк', 'светодиодн лент', 'led-лент',
+    'лампочк', 'торшер', 'бра ', 'ночник', 'гирлянд', 'настольная лампа', 'люстр',
+})
+CATEGORY_TERMS['household_chemistry'].update({
+    'гель для посуд', 'таблетки для посудомоеч', 'соль для посудомоеч', 'капсулы для стирк',
+    'чистящий гель', 'средство от засор', 'антижир', 'средство для унитаз', 'средство для ванн',
+    'полирол', 'жидкость для мытья', 'спрей чистящ', 'отбеливат', 'пятновыводител',
+    'кондиционер для белья', 'ополаскиватель для белья', 'порошок стиральн',
+})
+CATEGORY_TERMS['stationery'].update({
+    'ежедневник', 'скетчбук', 'цветная бумага', 'картон', 'кисти для рисован', 'мольберт',
+    'клей-карандаш', 'клей пва', 'дырокол', 'файл-вкладыш', 'стикеры', 'закладк для книг',
+    'глобус', 'счётные палочк', 'тетрад', 'блокнот', 'дневник', 'альбом для', 'пенал',
+    'фломастер', 'карандаш', 'маркер', 'точилк', 'ластик', 'линейк', 'циркуль',
+})
+CATEGORY_TERMS['home_textile'].update({
+    'постельн', 'наволочк', 'простын', 'пододеяльник', 'одеял', 'подушк', 'плед',
+    'покрывал', 'полотенц', 'скатерт', 'штор', 'тюль', 'занавеск', 'матрас', 'наматрасник',
+    'пелёнк', 'пеленк', 'бортик в кроватк', 'балдахин', 'плед-конверт', 'салфетк сервировочн',
+})
+CATEGORY_TERMS['kitchenware'].update({
+    'венчик', 'консервный нож', 'открывашк', 'штопор', 'пресс для чеснок', 'толкушк',
+    'сито', 'скалк', 'банка для сыпуч', 'контейнер для хранения', 'ланч-бокс', 'фляг',
+    'форма для запекан', 'силиконов форм', 'лопатка кухонн', 'разделочн',
+})
+
+# Подтипы — для точного совпадения card_sub & cert_sub (сильный сигнал OK).
+SUBTYPE_SYNONYMS['толстовка'].update({'олимпийк', 'термокофт'})
+SUBTYPE_SYNONYMS['футболка'].update({'тельняшк', 'термофутболк'})
+SUBTYPE_SYNONYMS['белье'].update({'кальсон', 'подштанник', 'термобель', 'термокальсон', 'термокомплект', 'бодик', 'комбидрес', 'фуфайк'})
+SUBTYPE_SYNONYMS['брюки'].update({'термоштан'})
+SUBTYPE_SYNONYMS['рубашка'].update({'туник'})
+SUBTYPE_SYNONYMS.setdefault('шапка', set()).update({'шапочк', 'чепчик', 'чепец'})
+
 
 def _age_marker(text: str) -> str:
     low = norm_text(text)
-    child_words = ("детск", "для детей", "для мальчик", "для девоч", "ясель", "дошколь", "школь", "подрост", "новорожден", "малыш", "младен", "baby", "kids", "children")
-    adult_words = ("для взрослых", "женск", "мужск")
+    # v54.1: расширены маркеры для более качественного выявления «детское vs
+    # взрослый сертификат». ДЕТСКОЕ имеет приоритет: если в тексте есть и детские,
+    # и взрослые слова (сертификат «для детей и взрослых»/«мужские, женские,
+    # детские»), считаем его ДЕТСКИМ — он покрывает детей, конфликта нет.
+    # ВНИМАНИЕ: маркеры должны быть устойчивы к ложным подстрокам. Напр. бывшее
+    # «грудн» ловило «наГРУДНик» (комбинезоны с нагрудниками) в ВЗРОСЛЫХ сертификатах
+    # и пряталo реальные несоответствия → используем «груднич».
+    child_words = ("детск", "для детей", "детям", "ребёнок", "ребенок", "ребят",
+                   "для мальчик", "для девоч", "мальчиков", "девочек", "ясельн",
+                   "ясель", "дошколь", "школьн", "подрост", "юниор", "юношеск",
+                   "тинейдж", "новорожд", "малыш", "младен", "груднич",
+                   "baby", "kids", "children")
+    adult_words = ("для взрослых", "взросл", "женск", "мужск", "женщин", "мужчин")
     has_child = any(w in low for w in child_words)
     has_adult = any(w in low for w in adult_words)
     if has_child:
@@ -5075,7 +7168,7 @@ CLOTHING_LAYER_TERMS = {
     'first_layer': {
         'бельев', 'первого слоя', '1 слоя', 'нательное', 'боди', 'пижам', 'футбол',
         'фуфайк', 'майк', 'трус', 'сорочк', 'комбинезон бельев', 'ползунк',
-        'распашонк', 'слип', 'лонгслив',
+        'распашонк', 'лонгслив',
     },
     'second_layer': {
         'второго слоя', '2 слоя', 'плать', 'сарафан', 'юбк', 'брюк', 'штан',
@@ -5091,6 +7184,17 @@ CLOTHING_LAYER_TERMS = {
     'hosiery': {'носк', 'гольф', 'колгот', 'чулоч'},
     'headwear': {'шапк', 'панам', 'кепк', 'шляп', 'головн'},
 }
+
+# v52: слои одежды для новых видов (чтобы card_layers заполнялся и срабатывало
+# правило OK по совпадению слоя, либо корректно гасился конфликт слоя).
+CLOTHING_LAYER_TERMS['first_layer'].update({
+    'тельняшк', 'кальсон', 'подштанник', 'термолонгслив', 'термофутболк',
+    'термокальсон', 'термокомплект', 'термоводолазк', 'термобель', 'бодик',
+    'комбидрес', 'фуфайк', 'поддёвк', 'поддевк', 'маечк',
+})
+CLOTHING_LAYER_TERMS['second_layer'].update({'олимпийк', 'туник', 'термоштан', 'термокофт'})
+CLOTHING_LAYER_TERMS['third_layer'].update({'дождевик'})
+CLOTHING_LAYER_TERMS['headwear'].update({'шапочк', 'чепчик', 'чепец', 'панамк'})
 
 PRODUCT_CONFLICT_TERMS = {
     'toys': {'игруш', 'кукл', 'конструктор', 'мяч', 'пазл'},
@@ -5123,6 +7227,9 @@ def _detect_layers(text: str) -> Set[str]:
     for layer, terms in CLOTHING_LAYER_TERMS.items():
         if any(_contains_word_token(low, norm_text(t)) for t in terms):
             out.add(layer)
+    # v52: «слип» — первый слой (детское нательное), но не «слипоны» (обувь).
+    if re.search(r'(?:^|[^а-яёa-z])слип(?!он)', low):
+        out.add('first_layer')
     return out
 
 
@@ -5142,14 +7249,323 @@ def _seq_ratio(a: str, b: str) -> float:
     return 100.0 * difflib.SequenceMatcher(None, norm_text(a), norm_text(b)).ratio()
 
 
+# v53 (улучшение №2): КАРТА ПРЕФИКСОВ ТН ВЭД ЕАЭС → внутренняя товарная категория.
+# Первые 2-4 цифры кода = товарная группа (гармонизированная система). Это ВТОРОЙ,
+# независимый от названия, признак товара. Применение:
+#   • спасает случаи, где в реестре вместо названия только коды («КОД ТН ВЭД: 6107…»);
+#   • усиливает OK, когда код подтверждает категорию карточки;
+#   • ловит конфликты (код=игрушки 9503, а карточка=посуда).
+# Длинный префикс (4 цифры) важнее короткого (2 цифры) — ищем самый длинный.
+TNVED_PREFIX_CATEGORY = {
+    # Одежда (61 — трикотажная, 62 — текстильная)
+    '61': 'clothing', '62': 'clothing', '4203': 'clothing', '6217': 'clothing',
+    # Обувь
+    '64': 'footwear',
+    # Головные уборы и галантерея → аксессуары
+    '6501': 'accessories', '6502': 'accessories', '6503': 'accessories',
+    '6504': 'accessories', '6505': 'accessories', '6506': 'accessories',
+    '6507': 'accessories', '4202': 'accessories', '6601': 'accessories',
+    # Домашний текстиль / постельные принадлежности
+    '6301': 'home_textile', '6302': 'home_textile', '6303': 'home_textile',
+    '6304': 'home_textile', '9404': 'home_textile', '6307': 'home_textile',
+    # Игрушки и игры
+    '9503': 'toys', '9504': 'toys', '9505': 'toys',
+    # Электроника / связь / ИТ
+    '8517': 'electronics', '8518': 'electronics', '8519': 'electronics',
+    '8521': 'electronics', '8527': 'electronics', '8528': 'electronics',
+    '8471': 'electronics', '8443': 'electronics', '8523': 'electronics',
+    '8504': 'electronics', '8506': 'electronics', '8507': 'electronics',
+    '9006': 'electronics', '9504': 'toys',
+    # Бытовая техника (приборы)
+    '8516': 'appliances', '8509': 'appliances', '8508': 'appliances',
+    '8450': 'appliances', '8451': 'appliances', '8418': 'appliances',
+    '8415': 'appliances', '8414': 'appliances', '8422': 'appliances',
+    '8421': 'appliances', '8210': 'appliances', '8516': 'appliances',
+    # Посуда и кухонные принадлежности
+    '7013': 'kitchenware', '7323': 'kitchenware', '7324': 'kitchenware',
+    '8215': 'kitchenware', '3924': 'kitchenware', '4419': 'kitchenware',
+    '6911': 'kitchenware', '6912': 'kitchenware', '7615': 'kitchenware',
+    '8211': 'kitchenware', '9617': 'kitchenware',
+    # Косметика / гигиена
+    '3303': 'cosmetics', '3304': 'cosmetics', '3305': 'cosmetics',
+    '3306': 'cosmetics', '3307': 'cosmetics', '3401': 'cosmetics',
+    # Бытовая химия
+    '3402': 'household_chemistry', '3405': 'household_chemistry',
+    # Мебель
+    '9401': 'furniture', '9403': 'furniture',
+    # Детские товары
+    '9619': 'nursery', '8715': 'nursery',
+    # Канцелярия
+    '4820': 'stationery', '9608': 'stationery', '9609': 'stationery',
+    # Ювелирка / бижутерия
+    '7113': 'jewelry', '7117': 'jewelry',
+    # Светотехника
+    '9405': 'lighting', '8539': 'lighting',
+}
+
+# v54.4 (улучшение №11): РАСШИРЕНИЕ карты ТН ВЭД до более полного справочника.
+TNVED_PREFIX_CATEGORY.update({
+    # Продукты питания (главы 04, 09, 15-22)
+    '04': 'food', '09': 'food', '15': 'food', '16': 'food', '17': 'food',
+    '18': 'food', '19': 'food', '20': 'food', '21': 'food', '22': 'food',
+    '2309': 'pet',  # корма для животных
+    # Косметика/гигиена (глава 33-34)
+    '3304': 'cosmetics', '3305': 'cosmetics', '3306': 'cosmetics', '3307': 'cosmetics',
+    '3401': 'cosmetics', '9619': 'nursery',
+    '3402': 'household_chemistry', '3405': 'household_chemistry', '3808': 'household_chemistry',
+    # Спорттовары (глава 9506-9507)
+    '9506': 'sport_equipment', '9507': 'sport_equipment', '9508': 'toys',
+    # Канцелярия (бумага/ручки/доски)
+    '4817': 'stationery', '4820': 'stationery', '9608': 'stationery', '9609': 'stationery',
+    '9610': 'stationery', '9611': 'stationery',
+    # Инструмент (главы 8201-8205 ручной, 8467 электро)
+    '8201': 'tools', '8202': 'tools', '8203': 'tools', '8204': 'tools', '8205': 'tools',
+    '8206': 'tools', '8207': 'tools', '8467': 'tools', '8466': 'tools',
+    # Авто (шины/детали/масла/АКБ)
+    '4011': 'auto', '8708': 'auto', '8714': 'auto', '2710': 'auto', '3819': 'auto',
+    '8507': 'auto',
+    # Сантехника (керамика/пластик/металл санитарные)
+    '6910': 'plumbing', '3922': 'plumbing', '7324': 'kitchenware',
+    # Мебель/матрасы
+    '9401': 'furniture', '9402': 'furniture', '9403': 'furniture',
+    # Ювелирка/бижутерия
+    '7113': 'jewelry', '7114': 'jewelry', '7116': 'jewelry', '7117': 'jewelry',
+    # Электроника/техника доп.
+    '8525': 'electronics', '8526': 'electronics', '9013': 'electronics', '9101': 'jewelry',
+    '9102': 'electronics', '9105': 'electronics',
+    '8479': 'appliances', '8543': 'appliances', '8516': 'appliances', '8419': 'appliances',
+    # Посуда/кухонные изделия доп.
+    '7010': 'kitchenware', '7012': 'kitchenware', '4823': 'home_textile',
+})
+
+
+def load_tnved_map(path: Any) -> int:
+    """v54.4 (улучшение №11): подгружает дополнительную карту ТН ВЭД из CSV
+    (две колонки: префикс,категория) — пользователь может расширять справочник без
+    правки кода. Возвращает число добавленных строк."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    n = 0
+    try:
+        import csv as _csv
+        with p.open('r', encoding='utf-8-sig', newline='') as f:
+            for row in _csv.reader(f):
+                if len(row) < 2:
+                    continue
+                pref = re.sub(r'\D', '', str(row[0]))
+                cat = str(row[1]).strip().lower()
+                if pref and cat:
+                    TNVED_PREFIX_CATEGORY[pref] = cat
+                    n += 1
+    except Exception:
+        return n
+    return n
+
+
+def load_user_dictionary(path: Any) -> int:
+    """v54.4 (улучшение №9): подгружает пользовательский словарь видов товаров из
+    CSV (две колонки: слово/стем,категория). Позволяет расширять распознавание
+    без правки кода — например, словами, предложенными функцией «обучить словарь».
+    Возвращает число добавленных терминов."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    n = 0
+    try:
+        import csv as _csv
+        with p.open('r', encoding='utf-8-sig', newline='') as f:
+            for row in _csv.reader(f):
+                if len(row) < 2:
+                    continue
+                word = str(row[0]).strip().lower()
+                cat = str(row[1]).strip().lower()
+                if not word or not cat or word.startswith('#'):
+                    continue
+                CATEGORY_TERMS.setdefault(cat, set()).add(word)
+                n += 1
+    except Exception:
+        return n
+    return n
+
+
+def _tnved_category(code: Any) -> str:
+    """Категория по коду ТН ВЭД (по самому длинному совпавшему префиксу). '' если нет."""
+    digits = re.sub(r'\D', '', str(code or ''))
+    if len(digits) < 2:
+        return ''
+    for plen in (6, 4, 2):
+        if len(digits) >= plen:
+            cat = TNVED_PREFIX_CATEGORY.get(digits[:plen])
+            if cat:
+                return cat
+    return ''
+
+
+def _tnved_categories_from_text(text: str) -> Set[str]:
+    """Все категории из кодов ТН ВЭД, встреченных в тексте (для поля-дампа кодов)."""
+    out: Set[str] = set()
+    for m in re.findall(r'\b(\d{4,10})\b', str(text or '')):
+        cat = _tnved_category(m)
+        if cat:
+            out.add(cat)
+    return out
+
+
+# v54.4 (улучшение №2): ссылки на СТАНДАРТЫ в поле наименования продукции. Иногда
+# реестр кладёт в «наименование продукции» название стандарта/техрегламента
+# («ГОСТ CISPR 14-2-2016 …», «ТР ТС 020/2011») вместо самого товара. Цифры/коды
+# стандарта засоряют сравнение по словам. Вырезаем ИМЕННО ссылку на стандарт
+# (номер), оставляя описательный «хвост» («…требования для бытовых приборов»),
+# по которому ещё можно определить категорию.
+_STANDARD_REF_RX = re.compile(
+    r'(?is)\b(?:ГОСТ(?:\s+(?:Р|IEC|ISO|EN|CISPR|МЭК))?|СТБ|СТ\s*РК|СТ\s*РБ|DIN|EN|IEC|CISPR|МЭК)'
+    r'\s*[\d][\d.\-–/:\s]*\d'
+    r'|ТР\s*(?:ТС|ЕАЭС|CU)\s*\d+\s*/\s*\d+')
+
+
+def _strip_standard_refs(text: str) -> str:
+    """Убирает из текста ссылки на стандарты/техрегламенты (ГОСТ …, ТР ТС …),
+    оставляя остальной текст. Используется для очистки «наименования продукции»."""
+    if not text:
+        return text
+    cleaned = _STANDARD_REF_RX.sub(' ', str(text))
+    # частые служебные обрывки после вырезанного номера
+    cleaned = re.sub(r'(?i)\b(требования\s+безопасности|общие\s+технические\s+условия|'
+                     r'технические\s+условия|методы\s+испытаний)\b', ' ', cleaned)
+    return re.sub(r'\s{2,}', ' ', cleaned).strip(' ;,"«»«»')
+
+
 def _contains_broad_child_clothing(cert_text: str) -> bool:
+    """True только для ДЕЙСТВИТЕЛЬНО широких сертификатов на детскую одежду
+    («Изделия швейные/трикотажные для детей», «Одежда детская»).
+
+    v27.9.x: сертификат со СПЕЦИФИЧНЫМ слоем/типом («первого слоя», «бельевые»,
+    «верхняя одежда» и т.п.) — НЕ широкий: он покрывает только свой слой, и
+    приклеивать к нему другие виды одежды (костюм, платье) нельзя. Раньше слово
+    «бельевые» считалось «широким» и давало ложный OK для костюма против
+    бельевого сертификата. По решению пользователя такие случаи → ПРОВЕРИТЬ ВРУЧНУЮ.
+    """
     low = norm_text(cert_text)
-    broad = ('изделия швейные', 'изделия трикотажные', 'одежда', 'бельевые', 'верхняя одежда', 'одежда верхняя', 'изделия верхние')
+    specific = ('первого слоя', 'второго слоя', 'третьего слоя', 'верхнего слоя',
+                'бельев', 'белье', 'верхняя одежда', 'одежда верхняя', 'изделия верхние')
+    if any(x in low for x in specific):
+        return False
+    broad = ('изделия швейные', 'изделия трикотажные', 'одежда')
     child = ('дет', 'подрост', 'дошколь', 'школь', 'новорожден', 'ясель')
     return any(x in low for x in broad) and any(x in low for x in child)
 
 
-def compare_product_names(product_name: str, cert_product_name: str, brand: str = '', subject: str = '', doc_status: str = '') -> Tuple[str, float, str]:
+# =====================================================================
+# v53 (улучшение №1): СЕМАНТИЧЕСКОЕ сравнение названий (офлайн-эмбеддинги).
+# ---------------------------------------------------------------------
+# Словарь синонимов невозможно дописать до бесконечности — любой новый вид
+# товара даёт ложную «ручную проверку». Маленькая офлайн-модель (sentence-
+# transformers) превращает название в вектор-«смысловой отпечаток» и сравнивает
+# по смыслу: «тельняшка»≈«нательная футболка», «олимпийка»≈«спортивная кофта» —
+# даже если этих слов нет в словаре.
+#
+# ВСТРАИВАНИЕ БЕЗ РИСКА: если библиотека/модель не установлены — слой просто
+# выключен, программа работает на правилах как раньше. Эмбеддинги срабатывают
+# ТОЛЬКО как последняя попытка спасти от «ПРОВЕРИТЬ ВРУЧНУЮ» (после всех правил и
+# при отсутствии конфликтов) — они НЕ переопределяют конфликты и готовые OK.
+#
+# Установка у пользователя (один раз):
+#   pip install sentence-transformers
+#   модель скачается автоматически при первом запуске (нужен интернет 1 раз),
+#   далее работает офлайн. Имя модели — env WB_SEMANTIC_MODEL
+#   (по умолчанию «cointegrated/rubert-tiny2», ~120 МБ, быстрая на CPU).
+# =====================================================================
+
+SEMANTIC_MODEL_NAME = os.environ.get('WB_SEMANTIC_MODEL', 'cointegrated/rubert-tiny2')
+try:
+    SEMANTIC_OK_THRESHOLD = float(os.environ.get('WB_SEMANTIC_THRESHOLD', '0.62'))
+except Exception:
+    SEMANTIC_OK_THRESHOLD = 0.62
+
+# Кастомный эмбеддер можно внедрить (тесты/альтернативные модели): callable,
+# принимает list[str], возвращает list[vector] (нормированные numpy-векторы).
+_SEMANTIC_EMBED_FN = None
+_SEMANTIC_STATE: Dict[str, Any] = {'tried': False, 'model': None, 'name': ''}
+_SEMANTIC_CACHE: Dict[str, Any] = {}
+_SEMANTIC_DISABLED = False  # выставляется из --semantic false
+
+
+def _semantic_model():
+    """Лениво загружает sentence-transformers. None, если недоступно."""
+    if _SEMANTIC_STATE['tried']:
+        return _SEMANTIC_STATE['model']
+    _SEMANTIC_STATE['tried'] = True
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        _SEMANTIC_STATE['model'] = SentenceTransformer(SEMANTIC_MODEL_NAME)
+        _SEMANTIC_STATE['name'] = SEMANTIC_MODEL_NAME
+    except Exception:
+        _SEMANTIC_STATE['model'] = None
+    return _SEMANTIC_STATE['model']
+
+
+def semantic_available() -> bool:
+    return _SEMANTIC_EMBED_FN is not None or _semantic_model() is not None
+
+
+def semantic_status() -> str:
+    if _SEMANTIC_EMBED_FN is not None:
+        return 'семантика: пользовательский эмбеддер активен'
+    if _semantic_model() is not None:
+        return f'семантика ВКЛ (модель: {_SEMANTIC_STATE["name"]})'
+    return ('семантика ВЫКЛ (установите: pip install sentence-transformers — '
+            'тогда сложные названия будут сверяться по смыслу)')
+
+
+def _embed_one(text: str):
+    """Нормированный вектор для одной строки (с кэшем). None если недоступно."""
+    key = norm_text(text)
+    if key in _SEMANTIC_CACHE:
+        return _SEMANTIC_CACHE[key]
+    fn = _SEMANTIC_EMBED_FN
+    try:
+        if fn is not None:
+            vec = fn([key])[0]
+        else:
+            m = _semantic_model()
+            if m is None:
+                return None
+            vec = m.encode([key], normalize_embeddings=True)[0]
+    except Exception:
+        return None
+    import numpy as _np
+    vec = _np.asarray(vec, dtype='float32')
+    n = float((vec * vec).sum()) ** 0.5
+    if n > 0:
+        vec = vec / n
+    if len(_SEMANTIC_CACHE) < 200000:
+        _SEMANTIC_CACHE[key] = vec
+    return vec
+
+
+def semantic_best(card_text: str, cert_text: str) -> float:
+    """Максимальная косинусная близость карточки к ЛЮБОМУ из товаров сертификата
+    (в реестре их бывает много через «; »). Возвращает 0..1, либо -1 если слой
+    семантики недоступен (тогда вызывающий код просто его игнорирует)."""
+    if _SEMANTIC_DISABLED or not card_text or not cert_text:
+        return -1.0
+    cv = _embed_one(card_text)
+    if cv is None:
+        return -1.0
+    best = -1.0
+    parts = [p.strip() for p in re.split(r'[;\n]+', cert_text) if p.strip()][:20] or [cert_text]
+    for part in parts:
+        pv = _embed_one(part)
+        if pv is None:
+            continue
+        sim = float((cv * pv).sum())
+        if sim > best:
+            best = sim
+    return best
+
+
+def compare_product_names(product_name: str, cert_product_name: str, brand: str = '', subject: str = '', doc_status: str = '', cert_tnved: str = '') -> Tuple[str, float, str]:
     """Conservative professional comparison.
 
     The goal is not to force a verdict for every row, but to separate:
@@ -5163,13 +7579,44 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
     сравнения. Карточке WB нельзя приклеивать к недействующему сертификату.
     """
     # v39.5: первичная проверка статуса документа. Документ должен быть «Действует».
+    # v49: «Возобновлён» — это ДЕЙСТВУЮЩИЙ статус (действие документа восстановлено),
+    # его НЕ относим к «НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ».
     status_norm = _normalize_doc_status(doc_status) if doc_status else ''
-    if status_norm and status_norm.lower().replace('ё','е') not in ('действует', ''):
-        # Документ есть и его статус известен и НЕ «Действует» — это серьёзный сигнал.
+    if status_norm and status_norm.lower().replace('ё', 'е') not in ('действует', 'возобновлен', ''):
+        # Документ есть и его статус известен и НЕ действует — это серьёзный сигнал.
         return 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ', 0.0, f'doc_status={status_norm}; документ не действует, проверка соответствия товара не выполняется'
 
     if not cert_product_name:
         return 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА', 0.0, 'В реестре не извлечено поле продукции'
+
+    # v54.4 (улучшение №2): если в поле наименования — ссылка на стандарт/техрегламент
+    # («ГОСТ CISPR 14-2-2016 …»), вырезаем номер стандарта (засоряет сравнение по
+    # словам), оставляя описательный текст. Категорию/коды берём из очищенного.
+    _cert_orig = cert_product_name
+    _cert_stripped = _strip_standard_refs(cert_product_name)
+    if _cert_stripped and _cert_stripped != cert_product_name:
+        cert_product_name = _cert_stripped
+
+    # v48: иногда в поле названия попадает НЕ название, а дамп кодов ТН ВЭД
+    # («КОД ТН ВЭД ЕАЭС: 6203191000, 6203199000, …»). Сравнивать с цифрами нельзя —
+    # это давало ложные конфликты. Если «название» — это коды ТН ВЭД без реальных
+    # товарных слов, честно помечаем как не извлечённое.
+    _cpn_low = str(cert_product_name).lower()
+    _alpha_words = re.findall(r'[а-яёa-z]{4,}', _cpn_low)
+    _meaningful = [w for w in _alpha_words if w not in (
+        'код', 'коды', 'еаэс', 'твэд', 'тнвэд', 'номер', 'прочие', 'прочее')]
+    # v53 (улучшение №2): категория по коду ТН ВЭД — отдельный/из текста.
+    _tnved_cats = set()
+    if cert_tnved:
+        _c = _tnved_category(cert_tnved)
+        if _c:
+            _tnved_cats.add(_c)
+    _tnved_cats |= _tnved_categories_from_text(cert_product_name)
+    if ('тн вэд' in _cpn_low or 'тнвэд' in _cpn_low) and len(_meaningful) < 2:
+        # Раньше тут был тупик «НЕ УДАЛОСЬ ИЗВЛЕЧЬ». Теперь, если из КОДОВ удалось
+        # определить категорию — сравниваем по ней (код = официальный признак товара).
+        if not _tnved_cats:
+            return 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА', 0.0, 'в поле продукции — коды ТН ВЭД, а не название'
 
     card_text = clean_registry_value(' '.join(x for x in [product_name, subject] if x))
     cert_text = clean_registry_value(cert_product_name)
@@ -5178,6 +7625,10 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
 
     card_cats = _detect_categories(card_text)
     cert_cats = _detect_categories(cert_text)
+    # v53 (улучшение №2): код ТН ВЭД — авторитетный признак категории сертификата.
+    # Только ДОБАВЛЯЕМ (объединение), не убираем текстовые категории.
+    if _tnved_cats:
+        cert_cats = set(cert_cats) | _tnved_cats
     card_sub = _detect_subtypes(card_text)
     cert_sub = _detect_subtypes(cert_text)
     card_layers = _detect_layers(card_text)
@@ -5190,19 +7641,45 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
     cert_conflict_domains = _detect_hard_conflict_domain(cert_text)
 
     conflicts: List[str] = []
+    soft_conflicts: List[str] = []  # v27.9.x: «мягкие» (несовпадение слоя) -> ПРОВЕРИТЬ ВРУЧНУЮ
     # Hard domain conflicts: e.g. WB clothing card vs toy/electronics certificate.
-    if 'clothing' in card_cats and cert_conflict_domains:
+    # v48: НЕ конфликтуем, если карточка САМА относится к «чужой» группе сертификата
+    # («Кукла Барби в платье» — это игрушка с платьем: card_cats={clothing,toys},
+    # cert=toys → платье ложно давало «другая группа»). Если карточка разделяет
+    # домен сертификата ИЛИ сертификат тоже про одежду — конфликта нет.
+    if ('clothing' in card_cats and cert_conflict_domains
+            and not (card_cats & cert_conflict_domains)
+            and 'clothing' not in cert_cats
+            and not (card_cats & cert_cats)):
         conflicts.append(f'сертификат относится к другой группе: {sorted(cert_conflict_domains)}')
-    if card_cats and cert_cats and card_cats.isdisjoint(cert_cats):
+    if (card_cats and cert_cats and card_cats.isdisjoint(cert_cats)
+            and not _categories_related(card_cats, cert_cats)):
         conflicts.append(f'категория карточки {sorted(card_cats)} не совпадает с категорией сертификата {sorted(cert_cats)}')
     if card_age == 'child' and cert_age == 'adult':
-        conflicts.append('карточка детская, а сертификат явно для взрослых')
+        # v54.1: детская ОДЕЖДА/обувь (включая подростковую и школьную — это тоже
+        # детская продукция, ТР ТС 007, а не 017) против сертификата для взрослых —
+        # ЯВНОЕ НЕСООТВЕТСТВИЕ. Исключение — НЕ одежда/обувь (постельное бельё,
+        # домашний текстиль, аксессуары): там возраст про размер, а не тех.регламент.
+        _apparel = bool(card_cats & {'clothing', 'footwear'})
+        _both_textile = 'home_textile' in card_cats and 'home_textile' in cert_cats
+        if _apparel and not _both_textile:
+            conflicts.append('карточка детская, а сертификат явно для взрослых')
+        else:
+            soft_conflicts.append('возраст: детское vs взрослый сертификат (не одежда/обувь) — проверить вручную')
     # v41.1: конфликт пола — только когда товарный вид совпадает/пересекается.
     # Иначе «костюм для мальчика» vs «бельё для девочек» — это конфликт вида/слоя,
     # а не пола, и пол лишь добавляет шум. Конфликт пола осмыслен для ОДНОГО вида:
     # «трусы для мальчиков» vs «трусы для девочек».
+    # v48: ОБУВЬ из конфликта пола ИСКЛЮЧЕНА — обувные сертификаты обобщённые
+    # («Обувь повседневная ... для школьников-девочек, для школьников-мальчиков»),
+    # и определение пола по их тексту ненадёжно → давало ложные «НЕСООТВЕТСТВИЕ»
+    # («Сандалии для мальчиков» против детского обувного сертификата). Также не
+    # применяем пол к ШИРОКОМУ сертификату (3+ вида) — он покрывающий, не гендерный.
+    _cert_broad_sub = len(cert_sub) >= 3 or _contains_broad_child_clothing(cert_text)
     if (card_gender in ('male', 'female') and cert_gender in ('male', 'female')
-            and card_gender != cert_gender and (card_sub & cert_sub)):
+            and card_gender != cert_gender and (card_sub & cert_sub)
+            and 'footwear' not in card_cats and 'footwear' not in cert_cats
+            and not _cert_broad_sub):
         conflicts.append(f'пол не совпадает при совпадающем виде: карточка {card_gender}, сертификат {cert_gender}')
     # v41.1: конфликт несовместимых подтипов — ТОЛЬКО когда ОБЕ стороны узкие
     # (не более 2 подтипов каждая). Если сертификат перечисляет много видов (широкий) —
@@ -5216,10 +7693,22 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
                 conflicts.append(f'несовместимый вид: карточка {sorted(card_sub)}, сертификат {sorted(cert_sub)}')
                 break
     # Layer conflict is meaningful only when both sides are apparel and both layers known.
-    if 'clothing' in card_cats and 'clothing' in cert_cats and card_layers and cert_layers and card_layers.isdisjoint(cert_layers):
+    # v52: ШИРОКИЙ сертификат (перечисляет 3+ видов одежды, ИЛИ покрывает несколько
+    # слоёв, ИЛИ это общая детская одёжная группа) — покрывающий: к нему относятся
+    # разные виды/слои, поэтому несовпадение слоя НЕ является даже «мягким» сигналом.
+    # Это убирало сотни ложных «ПРОВЕРИТЬ ВРУЧНУЮ» (спорт-штаны/шорты/свитшот против
+    # бельевого сертификата, который сам перечисляет брюки/толстовки/футболки).
+    _cert_broad_cover = (len(cert_sub) >= 3 or len(cert_layers) >= 2
+                         or _contains_broad_child_clothing(cert_text))
+    if ('clothing' in card_cats and 'clothing' in cert_cats and card_layers
+            and cert_layers and card_layers.isdisjoint(cert_layers)
+            and not _cert_broad_cover):
         # Allow if exact subtype still overlaps (e.g. комбинезон can be different layer depending on context).
         if not (card_sub & cert_sub):
-            conflicts.append(f'слой/вид одежды не совпадает: карточка {sorted(card_layers)}, сертификат {sorted(cert_layers)}')
+            # v27.9.x: несовпадение слоя — «мягкий» сигнал. Узкий сертификат (напр.
+            # «бельё первого слоя») vs другой вид одежды (костюм/свитшот/платье) —
+            # это НЕ доказанное несоответствие, а повод ПРОВЕРИТЬ ВРУЧНУЮ.
+            soft_conflicts.append(f'слой/вид одежды не совпадает: карточка {sorted(card_layers)}, сертификат {sorted(cert_layers)}')
 
     card_tokens = _tokens_for_compare(card_text)
     cert_tokens = _tokens_for_compare(cert_text)
@@ -5274,6 +7763,11 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
         return 'OK', max(score, 78.0), 'Костюм покрыт компонентами сертификата (верх + низ); ' + detail_base
     if 'clothing' in card_cats and 'clothing' in cert_cats and card_layers & cert_layers and (cert_age in {'child', 'unknown'} or card_age != 'child'):
         return 'OK', max(score, 78.0), 'Совпал слой/класс детской одежды; ' + detail_base
+    # v27.9.x: «мягкий» конфликт слоя (без жёстких конфликтов и без точного
+    # совпадения вида/слоя) — не авто-OK и не доказанное несоответствие.
+    # Решение пользователя: узкий сертификат vs другой вид одежды → ПРОВЕРИТЬ ВРУЧНУЮ.
+    if soft_conflicts:
+        return 'ПРОВЕРИТЬ ВРУЧНУЮ', score, 'soft_conflicts=' + '; '.join(soft_conflicts) + '; ' + detail_base
     if 'clothing' in card_cats and _contains_broad_child_clothing(cert_text) and not card_layers:
         return 'OK', max(score, 72.0), 'Сертификат содержит широкую группу детской одежды, явных конфликтов нет; ' + detail_base
 
@@ -5333,8 +7827,26 @@ def compare_product_names(product_name: str, cert_product_name: str, brand: str 
             return 'OK', max(score, 82.0), f'Совпал вид + категория {sorted(shared_any)}; ' + detail_base
         return 'OK', max(score, 72.0), f'Совпадает товарная категория {sorted(shared_any)}, конфликтов нет; ' + detail_base
 
+    # v46: «родственные» категории (electronics ↔ appliances) — одна предметная
+    # область. Реестр часто пишет общий префикс «приборы бытового назначения»
+    # (appliances), а WB — конкретику «зарядка/колонка/мышь» (electronics).
+    if _categories_related(card_cats, cert_cats) and not conflicts:
+        if card_sub & cert_sub:
+            return 'OK', max(score, 80.0), f'Совпал вид; родственные категории {sorted(card_cats)}/{sorted(cert_cats)}; ' + detail_base
+        return 'OK', max(score, 70.0), f'Родственные товарные категории {sorted(card_cats)}/{sorted(cert_cats)}, конфликтов нет; ' + detail_base
+
     if score >= 78:
         return 'OK', score, 'Высокое суммарное совпадение без конфликтов; ' + detail_base
+    # v53 (улучшение №1): СЕМАНТИЧЕСКОЕ спасение от ручной проверки. Правила не
+    # дали OK и конфликтов нет — спросим офлайн-модель о смысловой близости
+    # названий. Если она высокая (≥ порога) — это OK (модель «понимает» виды
+    # товара, которых нет в словаре). Без модели semantic_best вернёт -1 и ничего
+    # не изменится. Конфликты сюда не доходят — переопределения вердиктов нет.
+    if not conflicts:
+        _sim = semantic_best(card_text, cert_text)
+        if _sim >= SEMANTIC_OK_THRESHOLD:
+            return 'OK', max(score, round(_sim * 100.0, 1)), \
+                f'Семантическое совпадение названий ({_sim:.2f} ≥ {SEMANTIC_OK_THRESHOLD:.2f}); ' + detail_base
     if score >= 40:
         return 'ПРОВЕРИТЬ ВРУЧНУЮ', score, 'Частичное совпадение, но недостаточно для автоматического OK; ' + detail_base
     return 'ПРОВЕРИТЬ ВРУЧНУЮ', score, 'Низкое совпадение без доказанного конфликта; ' + detail_base
@@ -5898,6 +8410,69 @@ async def _wait_until_fsa_rendered(page, timeout_ms: int = 20000) -> bool:
         return False
 
 
+async def _fetch_fsa_via_browser_page(page, url: str) -> Optional[Dict[str, str]]:
+    """v27.9.x: тянет JSON-API ФСА ЧЕРЕЗ САМ БРАУЗЕР (same-origin fetch со страницы
+    pub.fsa.gov.ru).
+
+    Зачем: когда антибот ФСА блокирует curl_cffi (HTTP 403 → срабатывает circuit
+    breaker), весь парсинг уходит в скрейп рендера, который НЕ добирает часть
+    полей (ИНН заявителя, изготовитель, схема, техрегламент — они на других
+    вкладках/в JSON). Но страницы ФСА в браузере открываются нормально, значит
+    same-origin fetch к /api/v1/... несёт настоящие cookie/TLS браузера и
+    проходит там, где curl_cffi падает. Ответ — структурированный JSON со ВСЕМИ
+    полями, парсим его тем же parse_fsa_json.
+
+    Требование: страница уже должна быть на домене pub.fsa.gov.ru (иначе fetch
+    будет cross-origin). Возвращает dict полей (как parse_fsa_json) или None.
+    """
+    kind, doc_id = extract_fsa_kind_id(url)
+    if not kind or not doc_id:
+        return None
+    for _label, api_url in _fsa_candidates(kind, doc_id, aggressive=True):
+        try:
+            data = await page.evaluate(
+                """async (u) => {
+                    try {
+                        const r = await fetch(u, {headers: {'Accept': 'application/json'}, credentials: 'include'});
+                        if (!r.ok) return {__status: r.status};
+                        return await r.json();
+                    } catch (e) { return {__error: String(e)}; }
+                }""",
+                api_url,
+            )
+        except Exception:
+            continue
+        if isinstance(data, dict) and "__status" not in data and "__error" not in data:
+            try:
+                parsed = parse_fsa_json(data, url, kind, doc_id)
+            except Exception:
+                parsed = None
+            if parsed and parsed.get("doc_number"):
+                parsed["source"] = f"browser_page_fetch:{api_url}"
+                return parsed
+    return None
+
+
+async def _harvest_fsa_cookies(page) -> None:
+    """v45.2: снимает куки сессии pub.fsa.gov.ru с браузерного контекста в общий
+    кэш _FSA_SESSION_COOKIES. Вызывается после успешной загрузки FSA-документа —
+    браузер к этому моменту уже прошёл JS-антибот и получил валидную сессию.
+    С этими куками curl_cffi обращается к API ФСА напрямую (быстрый путь)."""
+    global _FSA_SESSION_COOKIES
+    try:
+        ck = await page.context.cookies("https://pub.fsa.gov.ru")
+    except Exception:
+        return
+    jar = {}
+    for c in ck or []:
+        name = c.get("name")
+        val = c.get("value")
+        if name and val is not None:
+            jar[str(name)] = str(val)
+    if jar:
+        _FSA_SESSION_COOKIES = jar
+
+
 async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str, str, str, str, str]:
     """v39.5: возвращает (cert_number, product_name, doc_type, doc_status, detail).
 
@@ -5907,53 +8482,77 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     прогон, и парсинг идёт сразу через браузер. Это убирает ~10-20 сек бесполезных
     HTTP-запросов перед каждым документом.
     """
-    global _FSA_HTTP_FAILS, _FSA_HTTP_DISABLED
-    # v40.2: HTTP fast-path через curl_cffi, с circuit breaker
-    if bool(getattr(args, 'fsa_http_fast_path', True)) and not _FSA_HTTP_DISABLED:
+    global _FSA_HTTP_FAILS, _FSA_HTTP_DISABLED, _FSA_COOKIE_HTTP_OK, _FSA_COOKIE_HTTP_FAIL
+
+    def _apply_http_result(result) -> Optional[Tuple[str, str, str, str, str]]:
+        """Раскладывает успешный HTTP-результат в кортеж + кэш расширенных полей."""
+        if not (result and result.get('doc_number')):
+            return None
+        _FSA_EXTENDED_FIELDS_CACHE[url] = {
+            'document_date_start': result.get('date_start', ''),
+            'document_date_end': result.get('date_end', ''),
+            'applicant_name': _clean_org_name(result.get('applicant', '')),
+            'applicant_inn': result.get('applicant_inn', ''),
+            'manufacturer_name': _clean_org_name(result.get('manufacturer', '')),
+            'tnved': _clean_tnved_code(result.get('tnved', '')),
+            'scheme': result.get('scheme', ''),
+            'technical_regulation': result.get('technical_regulation', ''),
+        }
+        return (result.get('doc_number', ''), result.get('product_full', ''),
+                result.get('doc_type', ''), result.get('status', ''),
+                f"fsa_cookie_http_ok; source={result.get('source','')[:120]}")
+
+    # v45.2: БЫСТРЫЙ путь по КУКАМ браузера. Если у нас уже есть сессионные куки ФСА
+    # (сняты с браузера, который прошёл JS-антибот), тянем JSON API напрямую через
+    # curl_cffi — это один лёгкий запрос вместо полной загрузки SPA. Так первый
+    # документ идёт через браузер (и отдаёт куки), а все следующие — мгновенно по HTTP.
+    if (bool(getattr(args, 'fsa_cookie_http', True)) and _FSA_SESSION_COOKIES
+            and is_curl_cffi_available()):
+        try:
+            impersonate = str(getattr(args, 'fsa_curl_cffi_impersonate', 'chrome') or 'chrome')
+            http_timeout = min(8.0, max(4.0, int(getattr(args, 'registry_browser_timeout_ms', 30000)) / 1000.0))
+            result = await asyncio.to_thread(
+                fetch_fsa_via_http, url,
+                timeout_sec=http_timeout, impersonate=impersonate,
+                user_agent=getattr(args, 'user_agent', None),
+                skip_warmup=True, cookies=dict(_FSA_SESSION_COOKIES),
+            )
+            tup = _apply_http_result(result)
+            if tup is not None:
+                _FSA_COOKIE_HTTP_OK += 1
+                return tup
+            # куки не сработали (протухли / API сменил формат) — сбрасываем, дальше
+            # пойдём через браузер, который заодно добудет свежие куки.
+            _FSA_COOKIE_HTTP_FAIL += 1
+            if _FSA_COOKIE_HTTP_FAIL >= 3:
+                _FSA_SESSION_COOKIES.clear()
+                _FSA_COOKIE_HTTP_FAIL = 0
+        except Exception:
+            _FSA_COOKIE_HTTP_FAIL += 1
+
+    # v40.2: «голый» HTTP fast-path без кук (по умолчанию ВЫКЛ — FSA режет по TLS/IP).
+    if bool(getattr(args, 'fsa_http_fast_path', False)) and not _FSA_HTTP_DISABLED:
         try:
             if is_curl_cffi_available():
                 impersonate = str(getattr(args, 'fsa_curl_cffi_impersonate', 'chrome') or 'chrome')
-                # v40.2: короткий таймаут для HTTP-попытки — если FSA блокирует, не висим долго
                 http_timeout = min(8.0, max(4.0, int(getattr(args, 'registry_browser_timeout_ms', 30000)) / 1000.0))
                 result = await asyncio.to_thread(
-                    fetch_fsa_via_http,
-                    url,
-                    timeout_sec=http_timeout,
-                    impersonate=impersonate,
+                    fetch_fsa_via_http, url,
+                    timeout_sec=http_timeout, impersonate=impersonate,
                     user_agent=getattr(args, 'user_agent', None),
                 )
-                if result and result.get('doc_number'):
-                    _FSA_HTTP_FAILS = 0  # успех — сбрасываем счётчик
-                    cert_num = result.get('doc_number', '')
-                    product = result.get('product_full', '')
-                    doc_type = result.get('doc_type', '')
-                    status = result.get('status', '')
-                    # v39.14: сохраняем расширенные поля в глобальный кэш для подстановки в ResultRow
-                    # v27.5: applicant_name/manufacturer_name/tnved чистим от прилипших лейблов.
-                    _FSA_EXTENDED_FIELDS_CACHE[url] = {
-                        'document_date_start': result.get('date_start', ''),
-                        'document_date_end': result.get('date_end', ''),
-                        'applicant_name': _clean_org_name(result.get('applicant', '')),
-                        'applicant_inn': result.get('applicant_inn', ''),
-                        'manufacturer_name': _clean_org_name(result.get('manufacturer', '')),
-                        'tnved': _clean_tnved_code(result.get('tnved', '')),
-                        'scheme': result.get('scheme', ''),
-                        'technical_regulation': result.get('technical_regulation', ''),
-                    }
-                    detail = f"fsa_http_fast_path_ok; source={result.get('source','')[:120]}"
-                    return cert_num, product, doc_type, status, detail
-                else:
-                    # HTTP не дал результат (скорее всего 403 от антибота FSA в этой сети)
-                    _FSA_HTTP_FAILS += 1
-                    if _FSA_HTTP_FAILS >= _FSA_HTTP_FAIL_LIMIT and not _FSA_HTTP_DISABLED:
-                        _FSA_HTTP_DISABLED = True
-                        print(f"⚡ HTTP-парсинг FSA отключён после {_FSA_HTTP_FAILS} неудач подряд "
-                              f"(антибот FSA блокирует HTTP в этой сети). Дальше — только браузер, это быстрее чем зря пытаться.")
+                tup = _apply_http_result(result)
+                if tup is not None:
+                    _FSA_HTTP_FAILS = 0
+                    return tup
+                _FSA_HTTP_FAILS += 1
+                if _FSA_HTTP_FAILS >= _FSA_HTTP_FAIL_LIMIT and not _FSA_HTTP_DISABLED:
+                    _FSA_HTTP_DISABLED = True
+                    print(f"⚡ «Голый» HTTP-парсинг FSA отключён после {_FSA_HTTP_FAILS} неудач подряд.")
         except Exception:
             _FSA_HTTP_FAILS += 1
             if _FSA_HTTP_FAILS >= _FSA_HTTP_FAIL_LIMIT and not _FSA_HTTP_DISABLED:
                 _FSA_HTTP_DISABLED = True
-                print(f"⚡ HTTP-парсинг FSA отключён после {_FSA_HTTP_FAILS} неудач подряд. Дальше — только браузер.")
 
     number_routes, product_routes = fsa_exact_routes(url)
     wait_ms = int(getattr(args, 'registry_browser_wait_ms', 12000))
@@ -5970,6 +8569,116 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     any_goto_succeeded = False  # v39.2: трекаем удалось ли вообще достучаться
     number_route_used = ''
     last_page_url_after_number = ''
+
+    # v27.9.x: ГЛАВНЫЙ путь ФСА — ПЕРЕХВАТ ответа JSON-API, который Angular-SPA
+    # ФСА делает САМА при загрузке страницы (с настоящим Bearer-токеном). Это
+    # даёт ПОЛНЫЙ набор полей (ИНН заявителя, изготовитель, схема, техрегламент)
+    # там, где curl_cffi и «голый» fetch получают 403. page.expect_response
+    # авто-очищается (не течёт между документами). Не вышло — ниже обычный
+    # браузерный парсинг (полный откат).
+    _kind_fsa, _doc_id_fsa = extract_fsa_kind_id(url)
+    if _kind_fsa and _doc_id_fsa and number_routes:
+        def _fsa_api_match(r):
+            u = r.url
+            return ("/api/v1/" in u and str(_doc_id_fsa) in u
+                    and ("certificate" in u or "declaration" in u))
+        try:
+            async with page.expect_response(_fsa_api_match, timeout=min(timeout_ms, 15000)) as _info:
+                await page.goto(number_routes[0], wait_until='domcontentloaded', timeout=timeout_ms)
+                await _wait_until_fsa_rendered(page, timeout_ms=min(timeout_ms, 12000))
+            _resp = await _info.value
+            any_goto_succeeded = True
+            number_route_used = number_routes[0]
+            if _resp.ok:
+                # v45.2: страница прошла JS-антибот ФСА и API ответил 200 — снимаем
+                # сессионные куки браузера в общий кэш. Следующие документы пойдут
+                # быстрым HTTP-путём по этим кукам (без полной загрузки SPA).
+                if bool(getattr(args, 'fsa_cookie_http', True)):
+                    try:
+                        await _harvest_fsa_cookies(page)
+                    except Exception:
+                        pass
+                _cap = await _resp.json()
+                # v27.9.x: один раз за прогон сохраняем сырой JSON ФСА для разбора
+                # структуры (status/scheme/название приходят кодами/в др. полях).
+                global _FSA_SAMPLE_DUMPED
+                if not _FSA_SAMPLE_DUMPED:
+                    try:
+                        Path("fsa_api_sample.json").write_text(
+                            json.dumps(_cap, ensure_ascii=False, indent=2), encoding="utf-8")
+                        _FSA_SAMPLE_DUMPED = True
+                        print("📝 [diag] Структура ответа API ФСА сохранена в fsa_api_sample.json "
+                              "— пришлите этот файл для полного быстрого разбора ФСА.")
+                    except Exception:
+                        pass
+                _parsed = parse_fsa_json(_cap, url, _kind_fsa, _doc_id_fsa)
+                if _parsed.get('doc_number'):
+                    # v27.9.x: разбор по реальной структуре JSON ФСА. В кэш кладём
+                    # все надёжные поля (ИНН, заявитель, изготовитель, схема,
+                    # техрегламент, даты).
+                    _tech_reg = _parsed.get('technical_regulation', '')
+                    # v27.9.x: ТР ТС и ТН ВЭД в JSON ФСА заданы только внутренними
+                    # числовыми id (idTechnicalReglaments / idTnveds), а не текстом.
+                    # Берём настоящие значения из текста уже загруженной страницы.
+                    _tnved = ''
+                    _ptxt = ''
+                    try:
+                        _ptxt = await page.evaluate(
+                            "() => (document.body ? (document.body.innerText || '') : '')")
+                    except Exception:
+                        _ptxt = ''
+                    if not _tech_reg and _ptxt:
+                        _trm = re.findall(r'ТР\s+(?:ТС|ЕАЭС)\s+\d{3}/\d{4}', _ptxt)
+                        if _trm:
+                            _tech_reg = '; '.join(dict.fromkeys(
+                                re.sub(r'\s+', ' ', x).strip() for x in _trm))
+                    if _ptxt:
+                        # после «ТН ВЭД» идёт 4–10-значный код (возможно с пробелами)
+                        _tnm = re.findall(r'ТН\s?ВЭД[^\d]{0,40}?(\d[\d\s]{2,13}\d)', _ptxt)
+                        _codes = []
+                        for _c in _tnm:
+                            _cc = _clean_tnved_code(_c)
+                            if _cc and _cc not in _codes:
+                                _codes.append(_cc)
+                        if _codes:
+                            _tnved = '; '.join(_codes[:10])
+                    # v46: СХЕМА — берём из ТЕКСТА страницы («Схема декларирования: 1д» /
+                    # «Схема сертификации: 1с»). Для деклараций JSON-поле idDeclScheme —
+                    # внутренний id (3581), не номер схемы, поэтому текст надёжнее.
+                    _scheme_val = _parsed.get('scheme', '')
+                    if _ptxt:
+                        _scm = re.search(
+                            r'Схема\s+(?:сертификации|декларирования|подтверждения\s+соответствия)'
+                            r'\D{0,25}?(\d{1,2})\s*([сдСД])', _ptxt)
+                        if _scm:
+                            _scheme_val = f"{_scm.group(1)}{_scm.group(2).lower()}"
+                    _api_ext = {
+                        'document_date_start': _parsed.get('date_start', ''),
+                        'document_date_end': _parsed.get('date_end', ''),
+                        'applicant_name': _clean_org_name(_parsed.get('applicant', '')),
+                        'applicant_inn': _parsed.get('applicant_inn', ''),
+                        'manufacturer_name': _clean_org_name(_parsed.get('manufacturer', '')),
+                        'scheme': _scheme_val,
+                        'technical_regulation': _tech_reg,
+                        'tnved': _tnved,
+                    }
+                    _FSA_EXTENDED_FIELDS_CACHE[url] = {k: v for k, v in _api_ext.items() if v}
+                    _st = _parsed.get('status', '')
+                    _known = bool(_st) and not _st.startswith('Статус ')
+                    if _known and _parsed.get('product_full'):
+                        # Статус ПОДТВЕРЖДЁН (idStatus в словаре, напр. 6=Действует)
+                        # и есть название из product.fullName — отдаём всё из API,
+                        # БЕЗ браузера: быстро и консистентно. Название берём из
+                        # JSON (а не со скачущей вёрстки) — это чинит и сравнение.
+                        details.append('fsa_api_full_ok; via=spa_response')
+                        return (_parsed.get('doc_number', ''), _parsed.get('product_full', ''),
+                                _parsed.get('doc_type', ''), _st, 'fsa_api_capture_ok')
+                    # Статус неизвестен (не код 6) — добираем браузером надёжный
+                    # текст статуса и название (редкий случай: недействующие).
+                    details.append('fsa_api_ext_ok')
+        except Exception as _e:
+            details.append(f'fsa_api_capture_miss={type(_e).__name__}')
+
     for route in number_routes:
         try:
             await page.goto(route, wait_until='domcontentloaded', timeout=timeout_ms)
@@ -5985,6 +8694,7 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             except Exception:
                 _len_now = -1
             details.append(f'number_page_render={"ok" if rendered else "timeout"};number_page_text_len={_len_now}')
+
             await _click_fsa_section_tab_if_exists(page, url, 'number')
 
             # v40.2: до 2 попыток extract (было 3) с короткой паузой — ускоряет парсинг.
@@ -6027,6 +8737,16 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
             # v39.2: вытащить точную причину (net::ERR_NAME_NOT_RESOLVED, net::ERR_CONNECTION_TIMED_OUT и т.п.)
             err_msg = str(e)[:200].replace(';', ',').replace('\n', ' ')
             details.append(f'number_route_error={type(e).__name__}:{err_msg}')
+            # v27.9.x: если это СЕТЕВОЙ сбой (host недоступен/таймаут соединения),
+            # остальные маршруты ТОГО ЖЕ хоста тоже не достучатся — не перебираем их
+            # по 30с каждый. Раньше один недоступный FSA-документ занимал воркер
+            # ~114с (перебор number+product+manufacturer вкладок) и UI «висел».
+            if any(mk in err_msg for mk in (
+                    'ERR_CONNECTION', 'ERR_TIMED_OUT', 'ERR_NAME_NOT_RESOLVED',
+                    'ERR_ADDRESS_UNREACHABLE', 'ERR_INTERNET_DISCONNECTED',
+                    'ERR_NETWORK', 'ERR_ABORTED', 'ERR_SOCKET')):
+                details.append('number_routes_network_abort')
+                break
             continue
 
     # v39.4: если поиск по точному label НЕ нашёл номер — пробуем regex-fallback
@@ -6091,6 +8811,18 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
         except Exception as e:
             details.append(f'number_regex_error={type(e).__name__}')
 
+    # v27.9.x: если НИ ОДИН number-route не достучался — это сетевой сбой host'а
+    # (pub.fsa.gov.ru недоступен/таймаутит). Вкладки /product и /manufacturer того
+    # же хоста тоже не загрузятся, поэтому НЕ тратим ещё 60-90с на заведомо
+    # провальные goto — сразу выходим с пометкой network failure (её ловит
+    # счётчик fsa_network_failures и второй проход FSA). Это убирает «зависание»
+    # этапа 2, когда FSA недоступен: запись падает за ~30-60с, а не за ~114с.
+    if not any_goto_succeeded:
+        details.append('NETWORK_FAILURE_all_goto_failed')
+        doc_type = ('декларация' if '/rds/declaration/' in url.lower()
+                    else ('сертификат' if '/rss/certificate/' in url.lower() else ''))
+        return '', '', doc_type, '', ';'.join(details)
+
     # Шаг 2: название продукции.
     for route in product_routes:
         try:
@@ -6132,12 +8864,22 @@ async def _parse_fsa_with_existing_page_v386(page, url: str, args) -> Tuple[str,
     # v44: добираем поля с дополнительных вкладок FSA (изготовитель, ТР ТС, заявитель/ИНН).
     # Эти данные НЕ на /baseInfo и /product — поэтому раньше manufacturer/tech_reg/date_end были 0%.
     # Заходим только за теми полями, которых ещё нет.
-    need_more = any(k not in ext_vals for k in
-                    ("manufacturer_name", "technical_regulation", "applicant_name", "document_date_end"))
+    # v46: по требованию НЕ собираем заявителя/изготовителя/ИНН/ТН ВЭД. Это убирает
+    # ЗАХОД НА ДОПОЛНИТЕЛЬНЫЕ ВКЛАДКИ ФСА (изготовитель/заявитель лежат не на
+    # /baseInfo и /product) — меньше запросов к ФСА, ниже риск блокировки. Номер,
+    # статус, даты, схема, техрегламент и название продукции остаются.
+    _fsa_skip_org = bool(getattr(args, 'fsa_skip_org_fields', True))
+    _ext_want = (("technical_regulation", "document_date_end") if _fsa_skip_org
+                 else ("manufacturer_name", "technical_regulation", "applicant_name", "document_date_end"))
+    # v46: при skip-org НЕ ходим на доп. вкладки ФСА (/manufacturer, /applicant и т.п.)
+    # ВООБЩЕ. Изготовитель/заявитель не нужны, а техрегламент/даты берутся из JSON и
+    # baseInfo. Раньше движок всё равно лез на /manufacturer искать недостающие поля —
+    # именно там воркеры подвисали по 100с и шли ошибки/блокировки на больших прогонах.
+    need_more = (not _fsa_skip_org) and any(k not in ext_vals for k in _ext_want)
     if need_more:
         for ext_route in fsa_extended_routes(url):
             # какие поля ищем на этой вкладке
-            still_missing = [k for k in FSA_EXTENDED_LABELS if k not in ext_vals]
+            still_missing = [k for k in FSA_EXTENDED_LABELS if k not in ext_vals and k in _ext_want]
             if not still_missing:
                 break
             try:
@@ -6415,6 +9157,7 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
     out: Dict[str, str] = {}
     homogeneous: List[str] = []
     full_products: List[str] = []
+    generic_products: List[str] = []  # v27.9.x: запасной захват наименования продукции
     tnved_codes: List[str] = []
 
     if not BeautifulSoup:
@@ -6464,12 +9207,22 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
         # --- Сведения о продукции / Товар N (раздел может быть любым) ---
         if "однородное наименование продукции" in label:
             v = _trim_product_value(value)
-            if _looks_like_product_value(v):
+            if _looks_like_product_value(v, known_product_label=True):
                 homogeneous.append(v)
         elif "полное наименование продукции" in label and "идентификац" in label:
             v = _trim_product_value(value)
-            if _looks_like_product_value(v) and not _swis_value_is_not_product(v):
+            if _looks_like_product_value(v, known_product_label=True) and not _swis_value_is_not_product(v):
                 full_products.append(v)
+        # v27.9.x: ЗАПАСНОЙ захват наименования продукции для других вёрсток SWIS
+        # (KGZ-National / упрощённые декларации), где нет слов «однородное» или
+        # «идентификац». Срабатывает только если выше точные метки не подошли —
+        # это чинит пустое «название из реестра» по части киргизских документов.
+        elif (("наименование продукции" in label or "наименование товара" in label
+               or "наименование объекта" in label)
+              and "однородн" not in label):
+            v = _trim_product_value(value)
+            if _looks_like_product_value(v, known_product_label=True) and not _swis_value_is_not_product(v):
+                generic_products.append(v)
         elif "схема сертификации" in label and not out.get("scheme"):
             out["scheme"] = value[:40]
         elif ("обозначение тр" in label or "технического регламента" in label or
@@ -6486,6 +9239,9 @@ def parse_swis_http_full(text: str, url: str = "") -> Dict[str, str]:
     product_parts: List[str] = []
     product_parts.extend(homogeneous[:5])
     product_parts.extend(full_products[:20])
+    # v27.9.x: если точные метки ничего не дали — берём запасные наименования.
+    if not product_parts and generic_products:
+        product_parts.extend(_unique_keep_order(generic_products)[:10])
     if product_parts:
         out["product"] = "; ".join(_unique_keep_order(product_parts))
     if tnved_codes:
@@ -6654,6 +9410,221 @@ async def _parse_other_registry_http_v386(session, url: str, args) -> Tuple[str,
     return best_cert, best_product, best_type, '', 'other_http_legacy'
 
 
+# =============================================================================
+# v27.9.x: БРАУЗЕРНЫЙ сбор FSA БЕЗ блокировок (без прокси). Маскируем headless под
+# обычный Chrome (stealth), прогреваем сессию (cookies) и держим человеческий темп
+# (случайные паузы) — так антибот FSA не банит IP, и данные собираются стабильно.
+# =============================================================================
+_FSA_STEALTH_JS = r"""
+(() => {
+  try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch(e){}
+  try { Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru','en-US','en']}); } catch(e){}
+  try { Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]}); } catch(e){}
+  try { window.chrome = window.chrome || {runtime: {}}; } catch(e){}
+  try {
+    const q = window.navigator.permissions && window.navigator.permissions.query;
+    if (q) window.navigator.permissions.query = (p) =>
+      (p && p.name === 'notifications') ? Promise.resolve({state: Notification.permission}) : q(p);
+  } catch(e){}
+  try {
+    const gp = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p){
+      if (p === 37445) return 'Intel Inc.';
+      if (p === 37446) return 'Intel Iris OpenGL Engine';
+      return gp.call(this, p);
+    };
+  } catch(e){}
+  try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8}); } catch(e){}
+  try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch(e){}
+})();
+"""
+
+
+async def _apply_stealth(ctx) -> None:
+    """Навешивает stealth-init-script на контекст — прячет признаки автоматизации."""
+    try:
+        await ctx.add_init_script(_FSA_STEALTH_JS)
+    except Exception:
+        pass
+
+
+async def _fsa_warmup_context(page, timeout_ms: int = 15000) -> None:
+    """Прогрев сессии: заходим на главную FSA (cookies/токены), чтобы дальнейшие
+    запросы к документам выглядели продолжением обычного визита."""
+    try:
+        await page.goto("https://pub.fsa.gov.ru/", wait_until='domcontentloaded', timeout=timeout_ms)
+        try:
+            await page.wait_for_timeout(random.randint(700, 1600))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _fsa_human_delay_range_ms(raw: str, default=(300, 1400)) -> Tuple[float, float]:
+    """Разбирает строку «min,max» (мс) в диапазон секунд (lo, hi)."""
+    try:
+        parts = [int(x) for x in re.split(r'[,\s]+', str(raw).strip()) if x]
+        lo = parts[0] if parts else default[0]
+        hi = parts[1] if len(parts) > 1 else lo
+        return max(0, lo) / 1000.0, max(lo, hi) / 1000.0
+    except Exception:
+        return default[0] / 1000.0, default[1] / 1000.0
+
+
+def _fsa_human_delay_range(args) -> Tuple[float, float]:
+    """Диапазон случайной паузы между FSA-документами (сек). --fsa-human-delay-ms «min,max»."""
+    return _fsa_human_delay_range_ms(getattr(args, 'fsa_human_delay_ms', '300,1400') or '300,1400')
+
+
+def _load_prior_registry_parsed(xlsx_path: Path) -> Dict[str, Tuple[str, str, str, str, str]]:
+    """v46: читает предыдущий result.xlsx (лист «Подробности») и возвращает
+    {registry_url: (cert, prod, typ, doc_status, detail)} — чтобы «Повторить
+    упавшие FSA» НЕ пере-парсил уже успешно собранные реестры, а переносил их
+    как есть и трогал только упавшие FSA-ссылки."""
+    out: Dict[str, Tuple[str, str, str, str, str]] = {}
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return out
+    if not xlsx_path.exists():
+        return out
+    try:
+        wb = load_workbook(str(xlsx_path), read_only=True, data_only=True)
+    except Exception:
+        return out
+    try:
+        ws = wb['Подробности'] if 'Подробности' in wb.sheetnames else wb[wb.sheetnames[-1]]
+        rows_iter = ws.iter_rows(values_only=True)
+        hdr = list(next(rows_iter))
+        ru2field = {v: k for k, v in DETAILS_HEADERS_RU_V39.items()}
+        idx: Dict[str, int] = {}
+        for n, h in enumerate(hdr):
+            f = ru2field.get(h)
+            if f is not None:
+                idx[f] = n
+        if 'registry_url' not in idx:
+            return out
+        def _cell(r, field):
+            j = idx.get(field)
+            return '' if j is None or j >= len(r) or r[j] is None else str(r[j])
+        for r in rows_iter:
+            url = clean_url(_cell(r, 'registry_url'))
+            if not url or url in out:
+                continue
+            out[url] = (
+                _cell(r, 'certificate_number'), _cell(r, 'certificate_product_name'),
+                _cell(r, 'document_type'), _cell(r, 'document_status'),
+                _cell(r, 'details') or 'prior_result',
+            )
+            # v47: восстанавливаем расширенные поля документа в глобальный кэш —
+            # иначе перенесённые при resume строки теряли «Действует с/до», схему
+            # и техрегламент (они подставляются в ResultRow из этого кэша).
+            _ext = {k: _cell(r, k) for k in (
+                'document_date_start', 'document_date_end', 'applicant_name',
+                'applicant_inn', 'manufacturer_name', 'tnved', 'scheme',
+                'technical_regulation')}
+            _ext = {k: v for k, v in _ext.items() if v}
+            if _ext and url not in _FSA_EXTENDED_FIELDS_CACHE:
+                _FSA_EXTENDED_FIELDS_CACHE[url] = _ext
+    except Exception:
+        return out
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return out
+
+
+class RegistryCache:
+    """v53 (улучшение №7): ПОСТОЯННЫЙ кэш распарсенных реестров между запусками.
+
+    Один документ (сертификат/декларация) часто покрывает СОТНИ карточек разных
+    продавцов и повторяется из прогона в прогон. Реестр — самое медленное место
+    этапа 2. Кэш на встроенном SQLite (ничего ставить не нужно) хранит результат
+    парсинга по ссылке на реестр и мгновенно отдаёт его при повторной встрече.
+
+    СВЕЖЕСТЬ: у записи есть метка времени. Статус документа может измениться, поэтому
+    запись старше ttl_days (по умолчанию 7) считается несвежей и документ парсится
+    заново (что обновляет и статус, и остальные поля). Стабильные поля (название,
+    даты, ТН ВЭД) у действующего документа не меняются — внутри окна свежести берём
+    всё из кэша. Кэшируем только ПОЛНЫЕ успешные разборы (номер+название+статус).
+    """
+
+    # v54.2: версия парсера реестров. При её смене старые записи кэша считаются
+    # устаревшими и СБРАСЫВАЮТСЯ — иначе после обновления программы из кэша могли
+    # отдаваться старые разборы (напр. одно наименование вместо нескольких из
+    # киргизского реестра). Поднимать при изменениях логики парсинга реестров.
+    PARSER_VERSION = "2026-06-19-parse4"
+
+    def __init__(self, path: Any, ttl_days: float = 7.0):
+        self.path = Path(path)
+        self.ttl = float(ttl_days) * 86400.0
+        self._conn = sqlite3.connect(str(self.path))
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS registry ("
+            "url TEXT PRIMARY KEY, cert TEXT, product TEXT, doc_type TEXT, "
+            "doc_status TEXT, detail TEXT, ext_json TEXT, ts REAL)")
+        self._conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+        # инвалидация по версии парсера
+        cur = self._conn.execute("SELECT v FROM meta WHERE k='parser_version'")
+        row = cur.fetchone()
+        stored = row[0] if row else None
+        if stored != self.PARSER_VERSION:
+            self._conn.execute("DELETE FROM registry")
+            self._conn.execute("INSERT OR REPLACE INTO meta VALUES ('parser_version', ?)",
+                               (self.PARSER_VERSION,))
+            if stored is not None:
+                print(f"🗃  Версия парсера изменилась ({stored} → {self.PARSER_VERSION}): "
+                      f"кэш реестров сброшен — документы будут перепарсены свежей логикой.")
+        self._conn.commit()
+
+    def get(self, url: str):
+        """(tuple5, ext_dict) если есть и СВЕЖАЯ; иначе None (→ парсить заново)."""
+        try:
+            cur = self._conn.execute(
+                "SELECT cert,product,doc_type,doc_status,detail,ext_json,ts "
+                "FROM registry WHERE url=?", (url,))
+            row = cur.fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        cert, product, doc_type, doc_status, detail, ext_json, ts = row
+        if self.ttl > 0 and (time.time() - float(ts or 0)) > self.ttl:
+            return None
+        try:
+            ext = json.loads(ext_json) if ext_json else {}
+        except Exception:
+            ext = {}
+        return (cert or '', product or '', doc_type or '', doc_status or '',
+                (detail or '') + ';from_cache'), ext
+
+    def put(self, url: str, val5, ext: Optional[Dict[str, str]] = None):
+        cert, product, doc_type, doc_status, detail = val5
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO registry VALUES (?,?,?,?,?,?,?,?)",
+                (url, cert, product, doc_type, doc_status, detail,
+                 json.dumps(ext or {}, ensure_ascii=False), time.time()))
+        except Exception:
+            pass
+
+    def commit(self):
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._conn.commit()
+            self._conn.close()
+        except Exception:
+            pass
+
+
 async def run_registry_stage(args):
     """v38.6: visible-browser registry stage with first-stage-like progress.
 
@@ -6661,6 +9632,80 @@ async def run_registry_stage(args):
     HTTP is used only for other allowed registries.
     """
     _run_started_at = time.time()
+
+    # v46: загружаем таблицу статусов киргизских документов на территории РФ.
+    # Явный путь из --kg-rf-status-file, иначе kg_rf_status.xlsx рядом с программой.
+    _kg_file = (getattr(args, 'kg_rf_status_file', '') or '').strip()
+    if not _kg_file:
+        for _cand in ('kg_rf_status.xlsx', 'kg_rf_status.csv'):
+            if Path(_cand).exists():
+                _kg_file = _cand
+                break
+    if _kg_file:
+        try:
+            _kg_n = load_kg_rf_status(_kg_file)
+            if _kg_n:
+                print(f"🇰🇬 Таблица статусов КГ-документов в РФ загружена: {_kg_n} записей "
+                      f"(совпавшие получат «Статус на территории РФ» и вердикт «{STATUS_INVALID_IN_RF}»).")
+        except Exception as _e:
+            print(f"⚠️  Таблица статусов КГ-РФ не загружена: {type(_e).__name__}: {_e}")
+
+    # v54.4 (улучшения №9, №11): пользовательский словарь видов товаров и доп. карта
+    # ТН ВЭД — подгружаются из файлов рядом с программой (если есть). Расширяют
+    # распознавание без правки кода.
+    try:
+        for _dpath in (getattr(args, 'user_dictionary_file', '') or '', 'dictionary.csv', 'user_dictionary.csv'):
+            if _dpath and Path(_dpath).exists():
+                _dn = load_user_dictionary(_dpath)
+                if _dn:
+                    print(f"📖 Пользовательский словарь: +{_dn} терминов из {Path(_dpath).name}")
+                break
+        for _tpath in (getattr(args, 'tnved_map_file', '') or '', 'tnved_map.csv'):
+            if _tpath and Path(_tpath).exists():
+                _tn = load_tnved_map(_tpath)
+                if _tn:
+                    print(f"📖 Доп. карта ТН ВЭД: +{_tn} префиксов из {Path(_tpath).name}")
+                break
+    except Exception:
+        pass
+
+    # v53 (улучшение №1): включаем/выключаем семантический слой и сообщаем статус.
+    global _SEMANTIC_DISABLED
+    _SEMANTIC_DISABLED = not bool(getattr(args, 'semantic', True))
+    try:
+        print("🧠 " + ("семантика отключена (--semantic false)"
+                        if _SEMANTIC_DISABLED else semantic_status()))
+    except Exception:
+        pass
+
+    # v27.9.x: глушим КОСМЕТИЧЕСКИЕ ошибки event-loop'а вида «Future exception was
+    # never retrieved» с net::ERR_ABORTED / «frame was detached». Они возникают,
+    # когда жёсткий per-record timeout отменяет навигацию Playwright в момент
+    # перехода между вкладками FSA (например .../manufacturer): навигация затем
+    # завершается с ERR_ABORTED, но её результат уже никто не ждёт. На итог это
+    # не влияет, но в логе выглядит как «программа выдала ошибку». Прочие ошибки
+    # пропускаем дальше без изменений.
+    try:
+        _loop = asyncio.get_running_loop()
+        _prev_exc_handler = _loop.get_exception_handler()
+
+        def _quiet_nav_exc_handler(loop, context):
+            exc = context.get('exception')
+            text = f"{context.get('message', '')} {type(exc).__name__ if exc else ''}: {exc if exc else ''}"
+            for marker in ('ERR_ABORTED', 'frame was detached',
+                           'Target page, context or browser has been closed',
+                           'ERR_CONNECTION_TIMED_OUT', 'ERR_TIMED_OUT', 'ERR_NETWORK_CHANGED'):
+                if marker in text:
+                    return  # косметика отменённой/упавшей навигации — не шумим
+            if _prev_exc_handler is not None:
+                _prev_exc_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        _loop.set_exception_handler(_quiet_nav_exc_handler)
+    except Exception:
+        pass
+
     input_csv = Path(args.input_links_csv)
     if not input_csv.exists():
         raise FileNotFoundError(input_csv)
@@ -6689,6 +9734,93 @@ async def run_registry_stage(args):
         print('Нет строк с registry_url для второго этапа.')
         return
 
+    # v46: режим «Повторить упавшие FSA». Раньше второй этап ПОЛНОСТЬЮ
+    # перезапускался — пере-парсил ВСЕ реестры (включая уже успешные). Теперь в
+    # этом режиме из предыдущего result.xlsx переносятся все успешные документы,
+    # а пере-проверяются ТОЛЬКО упавшие FSA-ссылки (нет номера/названия/статуса).
+    _retry_seed: Dict[str, Tuple[str, str, str, str, str]] = {}
+    if bool(getattr(args, 'registry_fsa_retry', False)):
+        prior = _load_prior_registry_parsed(Path(args.output))
+        if not prior:
+            print("🔁 Повтор FSA: предыдущий result.xlsx не найден/не прочитан — выполняю обычный полный второй этап.")
+        else:
+            def _fsa_failed_prior(u: str) -> bool:
+                if hostname(u) != 'pub.fsa.gov.ru':
+                    return False
+                cert, prod, typ, dst, det = prior.get(u, ('', '', '', '', ''))
+                return not (cert or '').strip() or not (prod or '').strip() or not (dst or '').strip()
+            failed = [u for u in unique_urls if _fsa_failed_prior(u)]
+            if not failed:
+                print(f"🔁 Повтор FSA: упавших FSA-ссылок в предыдущем result.xlsx не найдено — "
+                      f"перепроверять нечего. Файл будет пересобран из прежних данных.")
+            else:
+                print(f"🔁 Повтор FSA: из {len(unique_urls)} реестров будут пере-проверены только "
+                      f"{len(failed)} упавших FSA-ссылок; остальные перенесены из предыдущего result.xlsx.")
+            # Сидируем прежними значениями ВСЁ, кроме упавших (их соберём заново).
+            _failed_set = set(failed)
+            for u, val in prior.items():
+                if u not in _failed_set:
+                    _retry_seed[u] = val
+            # Первый проход трогает только упавшие FSA-ссылки.
+            unique_urls = failed
+    elif bool(getattr(args, 'registry_resume', True)):
+        # v47: RESUME этапа 2 — фундамент больших прогонов (20 000+ карточек).
+        # Если прогон оборвался (свет/сеть/перезагрузка) — при перезапуске НЕ
+        # парсим заново уже собранные реестры: переносим их из существующего
+        # result.xlsx и парсим только остаток. Берём только СВЕЖИЙ файл
+        # (по умолчанию до 72ч) и только ПОЛНОЦЕННО собранные документы
+        # (номер + название + статус). Отключение: --registry-resume false.
+        _out_p = Path(args.output)
+        _max_age_h = float(getattr(args, 'registry_resume_max_age_hours', 72) or 0)
+        _fresh = (_out_p.exists() and _max_age_h > 0
+                  and (time.time() - _out_p.stat().st_mtime) <= _max_age_h * 3600)
+        if _fresh:
+            prior = _load_prior_registry_parsed(_out_p)
+            _cur = set(unique_urls)
+
+            def _complete(val) -> bool:
+                cert, prod, typ, dst, det = val
+                return bool((cert or '').strip()) and bool((prod or '').strip()) \
+                    and bool((dst or '').strip())
+            done_urls = {u for u, v in prior.items() if u in _cur and _complete(v)}
+            if done_urls:
+                for u in done_urls:
+                    _retry_seed[u] = prior[u]
+                unique_urls = [u for u in unique_urls if u not in done_urls]
+                print(f"⏯  Resume этапа 2: {len(done_urls)} из {len(_cur)} реестров уже "
+                      f"собраны в {_out_p.name} — переношу как есть, парсить осталось "
+                      f"{len(unique_urls)}. (Полный пере-парсинг: --registry-resume false)")
+
+    # v53 (улучшение №7): ПОСТОЯННЫЙ КЭШ реестров между запусками (SQLite).
+    # Документы массово повторяются между прогонами — берём их из кэша мгновенно,
+    # без обращения к реестру. Свежесть статуса — окно ttl (по умолчанию 7 дней).
+    _reg_cache = None
+    if bool(getattr(args, 'registry_cache', True)):
+        try:
+            _cache_path = (getattr(args, 'registry_cache_file', '') or '').strip() \
+                or str(Path(args.output).with_name('registry_cache.sqlite'))
+            _ttl_days = float(getattr(args, 'registry_cache_ttl_days', 7.0) or 0)
+            _reg_cache = RegistryCache(_cache_path, _ttl_days)
+            _cur_n = len(unique_urls)
+            _hit = 0
+            for u in list(unique_urls):
+                got = _reg_cache.get(u)
+                if not got:
+                    continue
+                val5, ext = got
+                _retry_seed[u] = val5
+                if ext and u not in _FSA_EXTENDED_FIELDS_CACHE:
+                    _FSA_EXTENDED_FIELDS_CACHE[u] = {k: v for k, v in ext.items() if v}
+                _hit += 1
+            if _hit:
+                unique_urls = [u for u in unique_urls if u not in _retry_seed]
+                print(f"🗃  Кэш реестров: {_hit} из {_cur_n} документов взяты из кэша "
+                      f"(свежесть ≤ {_ttl_days:g} дн.), парсить осталось {len(unique_urls)}. "
+                      f"(Отключить: --registry-cache false)")
+        except Exception as _e:
+            print(f"⚠️  Кэш реестров недоступен ({type(_e).__name__}: {_e}) — работаю без него.")
+            _reg_cache = None
+
     # Default second stage to browser-visible parsing for main registries. It is slower, but substantially more reliable for FSA SPA.
     browser_workers = max(1, int(getattr(args, 'registry_browser_workers', 2)))
     args.registry_headless = getattr(args, 'registry_headless', True)
@@ -6696,9 +9828,42 @@ async def run_registry_stage(args):
     args.registry_browser_timeout_ms = int(getattr(args, 'registry_browser_timeout_ms', 30000))
 
     parsed: Dict[str, Tuple[str, str, str, str]] = {}
-    q: asyncio.Queue[str] = asyncio.Queue()
+    # v46: переносим успешные документы из предыдущего прогона (режим повтора FSA),
+    # чтобы их строки записались без повторного парсинга реестра.
+    for _u, _val in _retry_seed.items():
+        parsed.setdefault(_u, _val)
+
+    # v54.2: ИНКРЕМЕНТАЛЬНАЯ запись кэша. Раньше кэш писался ОДНИМ батчем в самом
+    # конце — на длинном прогоне файл «не обновлялся» часами, а при обрыве терялся
+    # весь прогресс кэша. Теперь пишем по ходу (в saver_loop) и в конце.
+    _cached_urls: Set[str] = set(_retry_seed.keys())
+
+    def _flush_cache() -> int:
+        if _reg_cache is None:
+            return 0
+        n = 0
+        for _u, _val in list(parsed.items()):
+            if _u in _cached_urls:
+                continue
+            _c, _p, _t, _ds, _det = _val
+            if not (str(_c).strip() and str(_p).strip() and str(_ds).strip()):
+                continue  # неполное/ошибка — закэшируем когда доберём
+            if 'belgiss' in (_det or ''):
+                continue
+            _reg_cache.put(_u, _val, _FSA_EXTENDED_FIELDS_CACHE.get(_u, {}))
+            _cached_urls.add(_u)
+            n += 1
+        if n:
+            _reg_cache.commit()
+        return n
+    # v47: ДВЕ очереди. ФСА — браузерным воркерам (антибот/темп), а SWIS/BelGISS/
+    # прочие HTTP-реестры — отдельному HTTP-пулу. Раньше ВСЁ шло через
+    # registry_browser_workers (по умолчанию 2), и SWIS-тяжёлые прогоны (тысячи
+    # киргизских документов на 20k карточек) ползли часами через узкое горло.
+    q: asyncio.Queue[str] = asyncio.Queue()       # ФСА (браузер)
+    q_http: asyncio.Queue[str] = asyncio.Queue()  # SWIS/BelGISS/прочие (HTTP)
     for u in unique_urls:
-        q.put_nowait(u)
+        (q if hostname(u) == 'pub.fsa.gov.ru' else q_http).put_nowait(u)
 
     # v39.1: группируем rows по registry_url, чтобы сразу как только реестр распарсен
     # записать в out_store все ResultRow для всех товаров с этим реестром.
@@ -6712,6 +9877,8 @@ async def run_registry_stage(args):
         'started_at': time.time(), 'done': 0, 'ok': 0, 'empty': 0, 'errors': 0,
         'fsa': sum(1 for u in unique_urls if hostname(u) == 'pub.fsa.gov.ru'),
         'swis': sum(1 for u in unique_urls if hostname(u) in {'swis.trade.kg', 'trade.kg'}),
+        # v27.9.x: счётчик BelGISS/ЕАЭС — чтобы он попадал в живой график «Реестры».
+        'belgiss': sum(1 for u in unique_urls if hostname(u) in _BELGISS_EAEU_HOSTS),
         'rows_written': 0,
         # v39.2: счётчики для раннего детекта сетевой недоступности FSA
         'fsa_done': 0,
@@ -6733,22 +9900,34 @@ async def run_registry_stage(args):
         v39.14: подставляем расширенные поля из _FSA_EXTENDED_FIELDS_CACHE + WB-поля из row."""
         # v39.14: достаём расширенные поля документа из глобального кэша
         ext = _FSA_EXTENDED_FIELDS_CACHE.get(url, {})
+        _host = hostname(url)
+        _skip_org_fields = bool(getattr(args, 'fsa_skip_org_fields', True))
         for row in rows_by_url.get(url, []):
-            verdict, score, cmp_details = compare_product_names(
-                row.get('product_name', ''), prod,
-                brand=row.get('brand', ''), subject=row.get('subject', ''),
-                doc_status=doc_status,
-            )
-            # v27.6: BelGISS теперь даёт только номер сертификата — это нормально.
-            # Если есть cert и реестр = BelGISS — статус «номер извлечён», не «не удалось».
-            _host = hostname(url)
-            if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
-                if cert and _host in ('belgiss.by', 'www.belgiss.by', 'tsouz.belgiss.by'):
-                    verdict = 'НОМЕР ИЗВЛЕЧЁН ИЗ РЕЕСТРА'
-                    score = 0.5
-                else:
+            # v27.9.x: BelGISS/ЕАЭС по требованию НЕ парсим — просто оставляем
+            # ссылку на реестр (статус «собрана»), без вердикта «не удалось».
+            if _host in _BELGISS_EAEU_HOSTS:
+                verdict, score, cmp_details = STATUS_LINK_COLLECTED, 0.0, 'belgiss_link_only'
+            else:
+                verdict, score, cmp_details = compare_product_names(
+                    row.get('product_name', ''), prod,
+                    brand=row.get('brand', ''), subject=row.get('subject', ''),
+                    doc_status=doc_status, cert_tnved=ext.get('tnved', ''),
+                )
+                if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                     verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'
                     score = 0.0
+            # v46: киргизский документ из таблицы статусов РФ — отдельный вердикт
+            rf_status = kg_rf_status_text(cert)
+            if rf_status:
+                verdict = STATUS_INVALID_IN_RF
+            # v48: ВСЕ карточки без плашки «Документы проверены» (docs_verified=Нет)
+            # попадают в отдельную категорию «ДОКУМЕНТ НЕ ПРОВЕРЕН» — независимо от
+            # вердикта сравнения. Применяем ТОЛЬКО при ЯВНОМ «Нет» (старые CSV без
+            # признака не трогаем). Деталь сравнения/статус документа остаются в
+            # колонках «Примечания» и «Статус документа».
+            _row_dv = str(row.get('docs_verified') or '').strip().lower()
+            if _row_dv == 'нет':
+                verdict = STATUS_DOC_NOT_VERIFIED
             rr = ResultRow(
                 query=row.get('query', ''),
                 nm_id=safe_int(row.get('nm_id')),
@@ -6762,6 +9941,8 @@ async def run_registry_stage(args):
                 sale_price_rub=safe_float(row.get('sale_price_rub')),
                 seller_name=row.get('seller_name', ''),
                 is_original=row.get('is_original', ''),
+                # пусто (старый CSV без признака) → «Нет»: бейдж не зафиксирован
+                docs_verified=row.get('docs_verified') or 'Нет',
                 supplier_id=row.get('supplier_id', ''),
                 rating=safe_float(row.get('rating')),
                 feedbacks=safe_int(row.get('feedbacks')),
@@ -6771,15 +9952,16 @@ async def run_registry_stage(args):
                 certificate_number=cert,
                 document_type=typ,
                 document_status=doc_status,
+                rf_status=rf_status,
                 certificate_product_name=prod,
                 # v39.14: расширенные поля FSA-документа
                 # v27.5: двойная защита — дожимаем орг-поля и ТН ВЭД, если в кэше остался мусор.
                 document_date_start=ext.get('document_date_start', ''),
                 document_date_end=ext.get('document_date_end', ''),
-                applicant_name=_clean_org_name(ext.get('applicant_name', '')),
-                applicant_inn=ext.get('applicant_inn', ''),
-                manufacturer_name=_clean_org_name(ext.get('manufacturer_name', '')),
-                tnved=_clean_tnved_code(ext.get('tnved', '')),
+                applicant_name=('' if _skip_org_fields else _clean_org_name(ext.get('applicant_name', ''))),
+                applicant_inn=('' if _skip_org_fields else ext.get('applicant_inn', '')),
+                manufacturer_name=('' if _skip_org_fields else _clean_org_name(ext.get('manufacturer_name', ''))),
+                tnved=('' if _skip_org_fields else _clean_tnved_code(ext.get('tnved', ''))),
                 scheme=ext.get('scheme', ''),
                 technical_regulation=ext.get('technical_regulation', ''),
                 score=score,
@@ -6800,8 +9982,11 @@ async def run_registry_stage(args):
                     f"Реестры: {stats['done']}/{len(unique_urls)}, скорость≈{speed:.1f}/мин, "
                     f"извлечено={stats['ok']}, пусто={stats['empty']}, ошибки={stats['errors']}, "
                     f"строк_в_xlsx={stats['rows_written']}/{len(rows)}, "
-                    f"очередь={q.qsize()}, FSA={stats['fsa']}, SWIS={stats['swis']}, активные=[{act}]"
+                    f"очередь_фса={q.qsize()}, очередь_http={q_http.qsize()}, "
+                    f"FSA={stats['fsa']}, SWIS={stats['swis']}, "
+                    f"BELGISS={stats['belgiss']}, активные=[{act}]"
                 )
+                emit_progress("registry", stats['done'], len(unique_urls))
                 await asyncio.sleep(max(5, min(30, int(getattr(args, 'progress_interval_sec', 15)))))
         except asyncio.CancelledError:
             return
@@ -6809,10 +9994,14 @@ async def run_registry_stage(args):
     # v39.1: отдельная фоновая задача — периодически сохраняет xlsx.
     # Это критично: без него файл появляется только в конце прогона.
     async def saver_loop():
-        save_interval = max(30, min(120, int(getattr(args, 'progress_interval_sec', 15)) * 2))
+        base_interval = max(30, min(120, int(getattr(args, 'progress_interval_sec', 15)) * 2))
         last_saved = 0
         try:
             while stats['done'] < len(unique_urls):
+                # v47: интервал растёт с объёмом — на 20k+ строк каждая запись xlsx
+                # занимает десятки секунд (в отдельном потоке), сохранять каждые 30с
+                # бессмысленно: пишем реже, теряем при сбое не больше пары минут работы.
+                save_interval = min(300, base_interval + stats['rows_written'] // 200)
                 await asyncio.sleep(save_interval)
                 if stats['rows_written'] > last_saved:
                     try:
@@ -6821,6 +10010,13 @@ async def run_registry_stage(args):
                         print(f"💾 Промежуточное сохранение: {last_saved}/{len(rows)} строк в {Path(args.output).name}")
                     except Exception as e:
                         print(f"⚠️  Ошибка сохранения xlsx: {type(e).__name__}: {e}")
+                # v54.2: попутно пополняем кэш реестров (инкрементально)
+                try:
+                    _nc = _flush_cache()
+                    if _nc:
+                        print(f"🗃  Кэш реестров пополнен: +{_nc} (всего {len(_cached_urls)})")
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             return
 
@@ -6835,30 +10031,94 @@ async def run_registry_stage(args):
         if async_playwright is None:
             raise RuntimeError('playwright не установлен. Выполните: python -m pip install playwright && python -m playwright install chromium')
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
+            # v45: FSA парсится ТОЛЬКО через браузер (без прокси). Чтобы не нарваться
+            # на блокировку — маскируем headless-Chromium под обычный браузер (stealth),
+            # прогреваем сессию на главной FSA (cookies) и делаем человекоподобные
+            # случайные паузы между документами.
+            _has_fsa = any(hostname(u) == 'pub.fsa.gov.ru' for u in unique_urls)
+            # v45.4: замок бутстрапа кук FSA — пока кук нет, браузерные FSA-документы
+            # идут по одному (а не залпом из 5 сессий), чтобы первый прошёл антибот и
+            # отдал куки; дальше всё летит быстрым HTTP параллельно.
+            _fsa_bootstrap_sem = asyncio.Semaphore(1)
+            # v46: МЕДЛЕННЫЙ РЕЖИМ ФСА — для больших прогонов (до 10k) без блокировок.
+            _fsa_slow_mode = bool(getattr(args, 'fsa_slow_mode', False))
+            _fsa_serial_sem = asyncio.Semaphore(1)  # ФСА строго по одному при slow-mode
+            _fsa_last_req = [0.0]  # время последнего запроса к ФСА (для РЕАЛЬНОЙ паузы между запросами)
+            _fsa_slow_lo, _fsa_slow_hi = _fsa_human_delay_range_ms(
+                getattr(args, 'fsa_slow_delay_ms', '2000,3500') or '2000,3500')
+            if _fsa_slow_mode and _has_fsa:
+                print(f"🐢 МЕДЛЕННЫЙ режим ФСА: документы по одному, пауза "
+                      f"{_fsa_slow_lo:.1f}-{_fsa_slow_hi:.1f}с + адаптивный бэкофф. "
+                      f"Без блокировок, но небыстро (≈{60.0/max(0.1,(_fsa_slow_lo+_fsa_slow_hi)/2):.0f} док/мин). "
+                      f"SWIS/прочие реестры идут параллельно.")
+            _launch_kwargs = dict(
                 headless=getattr(args, 'registry_headless', True),
                 args=['--disable-dev-shm-usage', '--no-sandbox', '--disable-blink-features=AutomationControlled'],
             )
+            browser = await p.chromium.launch(**_launch_kwargs)
+            _browser_restart = [0.0]  # v46: метка последнего перезапуска браузера (анти-дребезг)
 
             async def worker(wid: int):
+                global _FSA_CONSEC_FAILS, _FSA_COOLDOWN_UNTIL, _FSA_COOLDOWN_CYCLES, _FSA_SESSION_COOKIES
+                global _FSA_SLOW_MULT, _FSA_SLOW_OK, _FSA_RECOVER_STREAK, _FSA_FORCE_PACE
                 # v39: единая функция пересоздания контекста + страницы. Если что-то падает —
                 # вернёт хотя бы пустой page, чтобы worker не умер.
                 async def _fresh_context_and_page(old_ctx):
+                    nonlocal browser
                     try:
                         if old_ctx is not None:
                             await old_ctx.close()
                     except Exception:
                         pass
-                    new_ctx = await browser.new_context(
-                        user_agent=args.user_agent,
-                        viewport={'width': 1440, 'height': 1000},
-                        locale='ru-RU',
-                    )
+                    try:
+                        new_ctx = await browser.new_context(
+                            user_agent=args.user_agent,
+                            viewport={'width': 1440, 'height': 1000},
+                            locale='ru-RU',
+                        )
+                    except Exception:
+                        # v46: Chromium мог упасть (OOM на длинных FSA-прогонах). Раньше это
+                        # валило всех воркеров и прогон завершался кодом 1. Перезапускаем
+                        # браузер и продолжаем — частичный результат уже сохранён.
+                        if time.time() - _browser_restart[0] > 8:
+                            _browser_restart[0] = time.time()
+                            try:
+                                await browser.close()
+                            except Exception:
+                                pass
+                            try:
+                                browser = await p.chromium.launch(**_launch_kwargs)
+                                print("⚠️  Браузер этапа 2 перезапущен (Chromium упал) — прогон продолжается.")
+                            except Exception:
+                                pass
+                        else:
+                            await asyncio.sleep(1.0)
+                        new_ctx = await browser.new_context(
+                            user_agent=args.user_agent,
+                            viewport={'width': 1440, 'height': 1000},
+                            locale='ru-RU',
+                        )
+                    # v45: stealth — прячем признаки headless/автоматизации, чтобы FSA
+                    # не отдавал капчу/блок. Навешиваем ДО первой навигации.
+                    await _apply_stealth(new_ctx)
                     new_pg = await new_ctx.new_page()
+                    # v45.1: прогрев сессии (заход на главную FSA) — ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН.
+                    # Главная FSA — тяжёлый Angular-SPA, который при загрузке делает десятки
+                    # запросов к API. Когда 5 воркеров стартуют ОДНОВРЕМЕННО и каждый грузит
+                    # главную — это залп из ~5 тяжёлых загрузок в первую же секунду, и FSA
+                    # включает rate-limit СРАЗУ (блок «с порога»). Проверенное рабочее
+                    # поведение (как в старых версиях) — идти СРАЗУ на страницу документа,
+                    # без захода на главную. Прогрев можно включить флагом --fsa-warmup.
+                    if _has_fsa and bool(getattr(args, 'fsa_warmup', False)):
+                        await _fsa_warmup_context(
+                            new_pg,
+                            timeout_ms=int(getattr(args, 'registry_browser_timeout_ms', 30000)),
+                        )
                     return new_ctx, new_pg
 
                 context, page = await _fresh_context_and_page(None)
                 processed_by_worker = 0
+                _fsa_delay_lo, _fsa_delay_hi = _fsa_human_delay_range(args)
                 # v39: ctx_refresh_every на 2 этапе — лечит постепенное «толстеющее» SPA-состояние
                 ctx_refresh_every_stage2 = max(20, int(getattr(args, 'registry_ctx_refresh_every', 50)))
                 try:
@@ -6869,22 +10129,83 @@ async def run_registry_stage(args):
                             if q.empty():
                                 break
                             continue
+                        # v45.6: АВТО-ПАУЗА FSA. Если включён cooldown (FSA массово
+                        # блокировал) — возвращаем FSA-ссылку в очередь и ждём, не
+                        # трогая её, пока пауза не кончится. Не-FSA ссылки идут как обычно.
+                        if (hostname(url) == 'pub.fsa.gov.ru'
+                                and _FSA_COOLDOWN_UNTIL > time.time()):
+                            await q.put(url)
+                            q.task_done()
+                            await asyncio.sleep(min(3.0, max(0.5, _FSA_COOLDOWN_UNTIL - time.time())))
+                            continue
+                        # v46: МЕДЛЕННЫЙ режим — ФСА реально ПО ОДНОМУ. Если ФСА сейчас
+                        # занят другим воркером, НЕ ждём в очереди (иначе все 5 воркеров
+                        # встанут на ФСА залпом) — возвращаем ссылку и берём НЕ-ФСА (SWIS
+                        # и пр. идут параллельно). Так ФСА строго последовательный, без залпа.
+                        # v47: «темп» включён, если пользователь выбрал медленный режим
+                        # ИЛИ FSA уже блокировал и режим самозалип (_FSA_FORCE_PACE).
+                        _fsa_paced = _fsa_slow_mode or _FSA_FORCE_PACE
+                        if (_fsa_paced and hostname(url) == 'pub.fsa.gov.ru'
+                                and _fsa_serial_sem.locked()):
+                            await q.put(url)
+                            q.task_done()
+                            await asyncio.sleep(0.4)
+                            continue
                         active[f'w{wid}'] = (url, time.time())
                         cert = prod = typ = detail = ''
                         doc_status = ''  # v39.5
                         # v39: жёсткий timeout на один реестр. До этого если playwright/FSA
                         # подвисал на bizarre input — worker мог стоять бесконечно.
-                        per_registry_timeout = max(
-                            30,
-                            int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30,
-                        )
+                        # v46: для ФСА таймаут КОРОЧЕ (≤60с): без захода на доп. вкладки
+                        # один документ — это ~1 загрузка + перехват API (≤30с). 100-секундные
+                        # зависания на больших прогонах душили прогресс и валили watchdog.
+                        _h0 = hostname(url)
+                        if _h0 == 'pub.fsa.gov.ru':
+                            per_registry_timeout = max(
+                                30, min(60, int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 2 + 10))
+                        else:
+                            per_registry_timeout = max(
+                                30,
+                                int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30,
+                            )
                         try:
                             h = hostname(url)
                             if h == 'pub.fsa.gov.ru':
-                                cert, prod, typ, doc_status, detail = await asyncio.wait_for(
-                                    _parse_fsa_with_existing_page_v386(page, url, args),
-                                    timeout=per_registry_timeout,
-                                )
+                                # v46/47: ТЕМПОВЫЙ РЕЖИМ — держим темп ниже лимита ФСА.
+                                # Пауза между документами + АДАПТИВНЫЙ бэкофф. Парсинг ФСА —
+                                # СЕРИЙНО (Semaphore 1), чтобы не было всплеска из нескольких
+                                # сессий. Включается медленным режимом ИЛИ авто-залипанием
+                                # после первой блокировки (_FSA_FORCE_PACE).
+                                if _fsa_paced:
+                                    async with _fsa_serial_sem:
+                                        # РЕАЛЬНАЯ пауза МЕЖДУ запросами к ФСА (а не параллельно
+                                        # в каждом воркере). Множитель самонастраивается:
+                                        # 1.0 при чистом темпе, растёт при сбоях, спадает при успехах.
+                                        _gap = random.uniform(_fsa_slow_lo, _fsa_slow_hi) * _FSA_SLOW_MULT
+                                        _wait = (_fsa_last_req[0] + _gap) - time.time()
+                                        if _wait > 0:
+                                            await asyncio.sleep(_wait)
+                                        _fsa_last_req[0] = time.time()
+                                        cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                            _parse_fsa_with_existing_page_v386(page, url, args),
+                                            timeout=per_registry_timeout,
+                                        )
+                                else:
+                                    # обычный режим: человекоподобная пауза + бутстрап-замок кук
+                                    if _fsa_delay_hi > 0:
+                                        await asyncio.sleep(random.uniform(_fsa_delay_lo, _fsa_delay_hi))
+                                    if (bool(getattr(args, 'fsa_cookie_http', True))
+                                            and not _FSA_SESSION_COOKIES):
+                                        async with _fsa_bootstrap_sem:
+                                            cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                                _parse_fsa_with_existing_page_v386(page, url, args),
+                                                timeout=per_registry_timeout,
+                                            )
+                                    else:
+                                        cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                            _parse_fsa_with_existing_page_v386(page, url, args),
+                                            timeout=per_registry_timeout,
+                                        )
                             elif h in {'swis.trade.kg', 'trade.kg'}:
                                 # v27.7: киргизский SWIS — ТОЛЬКО HTTP (требование).
                                 # Страница серверного рендеринга, браузер не нужен.
@@ -6892,12 +10213,10 @@ async def run_registry_stage(args):
                                     _parse_swis_http_v277(session, url, args),
                                     timeout=per_registry_timeout,
                                 )
-                            elif h in {'belgiss.by', 'www.belgiss.by', 'tsouz.belgiss.by'}:
-                                # v42: Belgiss — SPA как FSA, парсим браузером (раньше шёл в HTTP-only и не извлекал ничего)
-                                cert, prod, typ, doc_status, detail = await asyncio.wait_for(
-                                    _parse_belgiss_with_existing_page_v42(page, url, args),
-                                    timeout=per_registry_timeout,
-                                )
+                            elif h in _BELGISS_EAEU_HOSTS:
+                                # v27.9.x: BelGISS/ЕАЭС по требованию НЕ парсим —
+                                # оставляем только ссылку. Экономит ~2-4с на документ.
+                                cert, prod, typ, doc_status, detail = '', '', '', '', 'belgiss_link_only'
                             else:
                                 cert, prod, typ, doc_status, detail = await asyncio.wait_for(
                                     _parse_other_registry_http_v386(session, url, args),
@@ -6925,6 +10244,65 @@ async def run_registry_stage(args):
                                 stats['fsa_done'] += 1
                                 if 'NETWORK_FAILURE_all_goto_failed' in (detail or ''):
                                     stats['fsa_network_failures'] += 1
+                                # v45.6: АВТО-ВОССТАНОВЛЕНИЕ. Считаем неудачи подряд (пусто/
+                                # сетевая ошибка/таймаут). Успех — сбрасываем счётчик. Когда
+                                # неудач подряд накопилось много — ставим FSA на паузу
+                                # (cooldown), чистим отравленную сессию (куки), и после паузы
+                                # FSA пробуется заново. Это снимает временный rate-limit сам.
+                                _cd_base = float(getattr(args, 'fsa_cooldown_sec', 90.0) or 0)
+                                _cd_fails = max(2, int(getattr(args, 'fsa_cooldown_fails', 8)))
+                                _cd_max = max(0, int(getattr(args, 'fsa_max_cooldowns', 3)))
+                                if prod:
+                                    _FSA_CONSEC_FAILS = 0
+                                    # v47: FSA восстановился — «возвращаем» бюджет пауз.
+                                    # Череда успехов после паузы уменьшает счётчик циклов,
+                                    # чтобы FSA не бросался навсегда на длинных прогонах, где
+                                    # блокировки чередуются с восстановлением.
+                                    if _FSA_COOLDOWN_CYCLES > 0:
+                                        _FSA_RECOVER_STREAK += 1
+                                        if _FSA_RECOVER_STREAK >= 12:
+                                            _FSA_COOLDOWN_CYCLES = max(0, _FSA_COOLDOWN_CYCLES - 1)
+                                            _FSA_RECOVER_STREAK = 0
+                                            stats['fsa_gaveup_shown'] = False
+                                    # v46/47: самонастройка темпа — череда успехов
+                                    # => осторожно ускоряемся (множитель паузы к базовому).
+                                    if _fsa_paced:
+                                        _FSA_SLOW_OK += 1
+                                        if _FSA_SLOW_OK >= 20 and _FSA_SLOW_MULT > 1.0:
+                                            _FSA_SLOW_MULT = max(1.0, _FSA_SLOW_MULT - 0.3)
+                                            _FSA_SLOW_OK = 0
+                                else:
+                                    _FSA_RECOVER_STREAK = 0
+                                    _FSA_CONSEC_FAILS += 1
+                                    # v46/47: сбой ФСА в темповом режиме => тормозим заранее
+                                    # (ещё до полной авто-паузы), увеличивая паузу между запросами.
+                                    if _fsa_paced:
+                                        _FSA_SLOW_MULT = min(5.0, _FSA_SLOW_MULT + 0.4)
+                                        _FSA_SLOW_OK = 0
+                                    if (_cd_base > 0 and _FSA_CONSEC_FAILS >= _cd_fails
+                                            and _FSA_COOLDOWN_UNTIL <= time.time()
+                                            and _FSA_COOLDOWN_CYCLES < _cd_max):
+                                        _FSA_COOLDOWN_CYCLES += 1
+                                        _dur = min(900.0, _cd_base * (2 ** (_FSA_COOLDOWN_CYCLES - 1)))
+                                        _FSA_COOLDOWN_UNTIL = time.time() + _dur
+                                        _FSA_CONSEC_FAILS = 0
+                                        _FSA_SESSION_COOKIES = {}  # сбросить отравленную сессию
+                                        _FSA_FORCE_PACE = True      # v47: дальше FSA строго с паузой
+                                        _FSA_SLOW_MULT = min(5.0, _FSA_SLOW_MULT + 0.6)
+                                        print("=" * 80)
+                                        print(f"⏸  FSA массово блокирует ({_cd_fails} неудач подряд). "
+                                              f"АВТО-ПАУЗА {int(_dur)}с — попытка {_FSA_COOLDOWN_CYCLES}/{_cd_max} "
+                                              f"снять rate-limit. Остальные реестры (SWIS и др.) продолжают идти.")
+                                        print(f"   После паузы FSA идёт строго по одному с паузой между запросами "
+                                              f"(устойчивый темп). Череда успехов вернёт бюджет пауз.")
+                                        print("=" * 80)
+                                    elif (_cd_base > 0 and _FSA_CONSEC_FAILS >= _cd_fails
+                                          and _FSA_COOLDOWN_CYCLES >= _cd_max
+                                          and not stats.get('fsa_gaveup_shown')):
+                                        stats['fsa_gaveup_shown'] = True
+                                        print(f"🔴 FSA не восстановился после {_cd_max} авто-пауз — похоже на сетевой "
+                                              f"бан IP. Недобранные FSA добей кнопкой «Повторить упавшие FSA» "
+                                              f"(после смены сети / паузы).")
                                 # Раннее предупреждение: если первые 10 FSA — все network failure,
                                 # FSA недоступен в принципе и тратить время дальше бессмысленно
                                 if (not stats['fsa_warning_shown']
@@ -6977,6 +10355,11 @@ async def run_registry_stage(args):
                 try:
                     while stats['done'] < len(unique_urls):
                         await asyncio.sleep(10)
+                        # v46: во время АВТО-ПАУЗЫ FSA (cooldown) прогресс намеренно стоит —
+                        # это не зависание, поэтому watchdog не должен дёргать рестарт.
+                        if _FSA_COOLDOWN_UNTIL > time.time():
+                            last_change = time.time()
+                            continue
                         current = stats['done']
                         if current != last_done:
                             last_done = current
@@ -6989,6 +10372,7 @@ async def run_registry_stage(args):
                             print("=" * 80)
                             print(f"⚠️  WATCHDOG-2 #{restart_count[0]}: нет прогресса {int(stuck_for)}с (порог {stall_restart_sec_stage2}с)")
                             print(f"   Прогресс: {stats['done']}/{len(unique_urls)} реестров")
+                            emit_progress("registry", stats['done'], len(unique_urls))
                             print(f"   Зависшие: {stuck_workers}")
                             print(f"   Действие: cancel воркеров + перезапуск")
                             print("=" * 80)
@@ -7007,22 +10391,75 @@ async def run_registry_stage(args):
                 except asyncio.CancelledError:
                     return
 
+            async def http_worker(hwid: int):
+                """v47: HTTP-воркер — SWIS/BelGISS/прочие НЕ-ФСА реестры без браузера.
+                Лёгкий HTTP-парсинг, можно много параллельно (антибот ФСА не при чём).
+                Кратно ускоряет SWIS-тяжёлые прогоны (тысячи киргизских документов)."""
+                while True:
+                    try:
+                        url = await asyncio.wait_for(q_http.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if q_http.empty():
+                            break
+                        continue
+                    active[f'h{hwid}'] = (url, time.time())
+                    cert = prod = typ = doc_status = detail = ''
+                    _per_to = max(30, int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30)
+                    try:
+                        h = hostname(url)
+                        if h in {'swis.trade.kg', 'trade.kg'}:
+                            cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                _parse_swis_http_v277(session, url, args), timeout=_per_to)
+                        elif h in _BELGISS_EAEU_HOSTS:
+                            cert, prod, typ, doc_status, detail = '', '', '', '', 'belgiss_link_only'
+                        else:
+                            cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                _parse_other_registry_http_v386(session, url, args), timeout=_per_to)
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        detail = f'registry_hard_timeout_{_per_to}s'
+                        stats['errors'] += 1
+                    except Exception as e:
+                        detail = f'registry_worker_error={type(e).__name__}: {str(e)[:180]}'
+                        stats['errors'] += 1
+                    finally:
+                        parsed[url] = (cert or '', prod or '', typ or '', doc_status or '', detail or '')
+                        stats['done'] += 1
+                        if prod:
+                            stats['ok'] += 1
+                        else:
+                            stats['empty'] += 1
+                        try:
+                            await _flush_url_to_store(url, cert or '', prod or '', typ or '',
+                                                      doc_status or '', detail or '')
+                        except Exception as e:
+                            print(f"⚠️  flush_url_to_store ошибка: {type(e).__name__}: {e}")
+                        active.pop(f'h{hwid}', None)
+                        q_http.task_done()
+
             if stall_restart_sec_stage2 > 0:
                 print(f"🛡  Watchdog 2 этапа активен: рестарт воркеров при отсутствии прогресса > {stall_restart_sec_stage2}с")
             watchdog_task = asyncio.create_task(watchdog_loop())
 
             workers = [asyncio.create_task(worker(i + 1)) for i in range(browser_workers)]
+            _n_http_workers = max(1, int(getattr(args, 'registry_http_workers', 6)))
+            http_tasks = [asyncio.create_task(http_worker(i + 1)) for i in range(_n_http_workers)]
+            if q_http.qsize() > 0:
+                print(f"⚡ HTTP-пул этапа 2: {_n_http_workers} воркеров на {q_http.qsize()} "
+                      f"НЕ-ФСА реестров (SWIS/BelGISS/прочие) — параллельно с ФСА.")
 
             # Ждём пока все реестры обработаны ИЛИ все воркеры умерли
             while stats['done'] < len(unique_urls):
                 await asyncio.sleep(1.0)
-                if all(w.done() for w in workers):
+                if all(w.done() for w in workers) and all(t.done() for t in http_tasks):
                     # Воркеры могли быть перезапущены watchdog'ом — проверим через 1 сек
                     await asyncio.sleep(1.0)
-                    if all(w.done() for w in workers):
-                        # Реально все умерли. Если очередь не пуста — лог и выход
-                        if not q.empty():
-                            print(f"⚠️  Все воркеры завершились, но в очереди ещё {q.qsize()} реестров")
+                    if all(w.done() for w in workers) and all(t.done() for t in http_tasks):
+                        # Реально все умерли. Если очереди не пусты — лог и выход
+                        if not q.empty() or not q_http.empty():
+                            print(f"⚠️  Все воркеры завершились, но в очередях ещё "
+                                  f"{q.qsize() + q_http.qsize()} реестров")
                         break
 
             # Отменяем watchdog
@@ -7031,11 +10468,159 @@ async def run_registry_stage(args):
                 await watchdog_task
             except asyncio.CancelledError:
                 pass
-            # Ждём завершения воркеров (они должны сами выйти когда очередь пуста)
-            await asyncio.gather(*workers, return_exceptions=True)
+            # Ждём завершения воркеров (они должны сами выйти когда очереди пусты)
+            await asyncio.gather(*workers, *http_tasks, return_exceptions=True)
+
+            # v27.9.x: ВТОРОЙ ПРОХОД для FSA-ссылок, упавших по сетевой ошибке.
+            # По умолчанию ВЫКЛючен — запускается ТОЛЬКО по кнопке в окне
+            # (--registry-fsa-retry true). Раньше он шёл автоматически и «висел»
+            # после 100%, когда FSA недоступен. Теперь повтор — осознанное действие
+            # пользователя (когда FSA снова заработает).
+            if not bool(getattr(args, 'registry_fsa_retry', False)):
+                # считаем и совсем не извлечённые, и ЧАСТИЧНЫЕ (есть название, но нет
+                # номера/статуса) — кнопка «Повторить упавшие FSA» дозаберёт и те, и те.
+                _fsa_fail_n = sum(1 for u, v in parsed.items()
+                                  if hostname(u) == 'pub.fsa.gov.ru'
+                                  and (not (v[1] or '').strip()
+                                       or not (v[0] or '').strip()
+                                       or not (v[3] or '').strip()))
+                if _fsa_fail_n:
+                    print(f"ℹ️  {_fsa_fail_n} FSA-документ(ов) извлеклись не полностью (нет названия/номера/статуса). "
+                          f"Когда FSA снова заработает — нажми в окне «🔁 Повторить упавшие FSA» (дозаберёт).")
+            try:
+                if not bool(getattr(args, 'registry_fsa_retry', False)):
+                    raise _SkipSecondPass()
+                def _is_transient_fsa_fail(detail_str: str) -> bool:
+                    d = detail_str or ''
+                    return any(k in d for k in (
+                        'ERR_CONNECTION_TIMED_OUT', 'ERR_TIMED_OUT', 'ERR_CONNECTION',
+                        'ERR_NETWORK', 'ERR_ABORTED', 'registry_hard_timeout',
+                        'NETWORK_FAILURE_all_goto_failed', 'TimeoutError',
+                    ))
+
+                def _fsa_partial(val) -> bool:
+                    # v46: ЧАСТИЧНО извлечённый документ — название продукции есть,
+                    # но не добрались номер ИЛИ статус (медленная загрузка/таймаут).
+                    # Такие тоже дозабираем повторным заходом.
+                    return bool((val[1] or '').strip()) and (
+                        not (val[0] or '').strip() or not (val[3] or '').strip())
+
+                retry_urls = [
+                    u for u, val in list(parsed.items())
+                    if hostname(u) == 'pub.fsa.gov.ru'
+                    and (
+                        (not (val[1] or '').strip() and _is_transient_fsa_fail(val[4]))  # совсем не извлеклось
+                        or _fsa_partial(val)  # частично: есть название, но нет номера/статуса
+                    )
+                ]
+                # v27.9.x: РАЗЛИЧАЕМ «FSA недоступен» и «FSA нестабилен».
+                #  • если НИ ОДНА FSA-ссылка не извлеклась (fsa_ok==0) — host реально
+                #    недоступен в этой сети, повтор бесполезен → пропускаем;
+                #  • если что-то ИЗВЛЕКЛОСЬ (fsa_ok>0) — соединение просто нестабильное
+                #    (флапает), и повтор упавших обычно частично спасает → делаем его,
+                #    но в рамках жёсткого таймбюджета и с ранним обрывом.
+                fsa_total = sum(1 for u in parsed if hostname(u) == 'pub.fsa.gov.ru')
+                fsa_ok = sum(1 for u, v in parsed.items()
+                             if hostname(u) == 'pub.fsa.gov.ru' and (v[1] or '').strip())
+                if fsa_total and fsa_ok == 0:
+                    print(f"🔁 Второй проход FSA ПРОПУЩЕН: ни одна из {fsa_total} FSA-ссылок не извлеклась — "
+                          f"похоже pub.fsa.gov.ru недоступен в этой сети (VPN с РФ-IP / мобильный интернет). "
+                          f"Повтор не поможет; ссылки сохранены — перезапустите позже.")
+                    retry_urls = []
+                max_retry = int(getattr(args, 'registry_fsa_retry_max', 80) or 0)
+                if retry_urls and max_retry > 0:
+                    retry_urls = retry_urls[:max_retry]
+                    print("=" * 80)
+                    print(f"🔁 Второй проход FSA: повтор {len(retry_urls)} ссылок (упавшие + частично извлечённые: нет номера/статуса)")
+                    print("=" * 80)
+                    per_registry_timeout = max(
+                        30, int(getattr(args, 'registry_browser_timeout_ms', 30000) / 1000) * 3 + 30)
+                    rctx = await browser.new_context(
+                        user_agent=args.user_agent, viewport={'width': 1440, 'height': 1000}, locale='ru-RU')
+                    rpage = await rctx.new_page()
+                    recovered = 0
+                    # v27.9.x: жёсткий ТАЙМБЮДЖЕТ на весь второй проход + ранний обрыв,
+                    # чтобы после 100% окно НЕ «висело» минутами и графики прогрузились.
+                    retry_budget_sec = float(getattr(args, 'registry_fsa_retry_budget_sec', 150) or 150)
+                    retry_started = time.time()
+                    consecutive_fail = 0
+                    try:
+                        for _i, ru in enumerate(retry_urls, 1):
+                            if time.time() - retry_started > retry_budget_sec:
+                                print(f"🔁 Второй проход FSA остановлен по таймбюджету "
+                                      f"{retry_budget_sec:.0f}с ({_i-1}/{len(retry_urls)} обработано, "
+                                      f"восстановлено {recovered})")
+                                break
+                            if consecutive_fail >= 8:
+                                print("🔁 Второй проход FSA прерван: 8 повторов подряд без результата "
+                                      "(FSA всё ещё недоступен). Ссылки сохранены — перезапустите позже.")
+                                break
+                            cert = prod = typ = doc_status = detail = ''
+                            try:
+                                cert, prod, typ, doc_status, detail = await asyncio.wait_for(
+                                    _parse_fsa_with_existing_page_v386(rpage, ru, args),
+                                    timeout=per_registry_timeout,
+                                )
+                            except asyncio.TimeoutError:
+                                detail = 'fsa_retry_hard_timeout'
+                                try:
+                                    await rctx.close()
+                                except Exception:
+                                    pass
+                                rctx = await browser.new_context(
+                                    user_agent=args.user_agent, viewport={'width': 1440, 'height': 1000}, locale='ru-RU')
+                                rpage = await rctx.new_page()
+                            except Exception as e:
+                                detail = f'fsa_retry_error={type(e).__name__}'
+                            if (prod or '').strip():
+                                # заменяем устаревшие (пустые) строки этого url на свежие
+                                cu = clean_url(ru)
+                                async with out_store.lock:
+                                    out_store.rows = [r for r in out_store.rows
+                                                      if clean_url(r.registry_url) != cu]
+                                parsed[ru] = (cert or '', prod or '', typ or '',
+                                              doc_status or '', (detail or '') + ';fsa_retry_ok')
+                                await _flush_url_to_store(
+                                    ru, cert or '', prod or '', typ or '', doc_status or '',
+                                    (detail or '') + ';fsa_retry_ok')
+                                recovered += 1
+                                consecutive_fail = 0
+                            else:
+                                consecutive_fail += 1
+                            # держим живым прогресс/лог, чтобы окно не казалось зависшим
+                            print(f"🔁 Второй проход FSA: {_i}/{len(retry_urls)}, восстановлено {recovered}")
+                            emit_progress("registry", stats['done'], len(unique_urls))
+                    finally:
+                        try:
+                            await rctx.close()
+                        except Exception:
+                            pass
+                    print(f"🔁 Второй проход FSA: восстановлено {recovered}/{len(retry_urls)}")
+                    try:
+                        await out_store.save()
+                    except Exception:
+                        pass
+            except _SkipSecondPass:
+                pass
+            except Exception as _e:
+                print(f"⚠️  Второй проход FSA пропущен: {type(_e).__name__}: {_e}")
+
             await browser.close()
             if restart_count[0] > 0:
                 print(f"🛡  Watchdog 2 этапа сработал {restart_count[0]} раз за прогон")
+
+    # v53/v54.2: финальный сброс кэша реестров (на случай документов, собранных
+    # после последнего инкрементального flush). Инкрементально кэш уже пополнялся
+    # в saver_loop, так что файл обновляется по ходу прогона, а не одним батчем.
+    if _reg_cache is not None:
+        try:
+            _saved = _flush_cache()
+            _reg_cache.close()
+            if _saved:
+                print(f"🗃  Кэш реестров: финально дописано +{_saved} документов "
+                      f"(всего {len(_cached_urls)}).")
+        except Exception as _e:
+            print(f"⚠️  Не удалось пополнить кэш реестров: {type(_e).__name__}: {_e}")
 
     progress_task.cancel()
     saver_task.cancel()
@@ -7057,19 +10642,27 @@ async def run_registry_stage(args):
         # Этот url не был записан — допишем как «not_parsed»
         # v39.5: unpack 5-tuple (cert, prod, typ, doc_status, detail)
         cert, prod, typ, doc_status, parse_detail = parsed.get(url, ('', '', '', '', 'not_parsed'))
-        verdict, score, cmp_details = compare_product_names(
-            row.get('product_name', ''), prod, brand=row.get('brand', ''), subject=row.get('subject', ''),
-            doc_status=doc_status,
-        )
-        # v27.6: BelGISS — специальный статус «номер извлечён» вместо «не удалось»
         _host = hostname(url)
-        if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
-            if cert and _host in ('belgiss.by', 'www.belgiss.by', 'tsouz.belgiss.by'):
-                verdict = 'НОМЕР ИЗВЛЕЧЁН ИЗ РЕЕСТРА'
-                score = 0.5
-            else:
+        if _host in _BELGISS_EAEU_HOSTS:
+            # v27.9.x: BelGISS/ЕАЭС не парсим — только ссылка.
+            verdict, score, cmp_details = STATUS_LINK_COLLECTED, 0.0, 'belgiss_link_only'
+        else:
+            verdict, score, cmp_details = compare_product_names(
+                row.get('product_name', ''), prod, brand=row.get('brand', ''), subject=row.get('subject', ''),
+                doc_status=doc_status, cert_tnved=_FSA_EXTENDED_FIELDS_CACHE.get(url, {}).get('tnved', ''),
+            )
+            if not prod and verdict != 'НЕДЕЙСТВУЮЩИЙ ДОКУМЕНТ':
                 verdict = 'НЕ УДАЛОСЬ ИЗВЛЕЧЬ НАЗВАНИЕ ИЗ РЕЕСТРА'
                 score = 0.0
+        # v46: киргизский документ из таблицы статусов РФ — отдельный вердикт
+        rf_status = kg_rf_status_text(cert)
+        if rf_status:
+            verdict = STATUS_INVALID_IN_RF
+        # v48: ВСЕ карточки без плашки «Документы проверены» → «ДОКУМЕНТ НЕ
+        # ПРОВЕРЕН» (только при ЯВНОМ «Нет»; старые CSV без признака не трогаем).
+        _row_dv = str(row.get('docs_verified') or '').strip().lower()
+        if _row_dv == 'нет':
+            verdict = STATUS_DOC_NOT_VERIFIED
         # v39.14: достаём расширенные поля FSA из глобального кэша
         ext = _FSA_EXTENDED_FIELDS_CACHE.get(url, {})
         rr = ResultRow(
@@ -7084,6 +10677,8 @@ async def run_registry_stage(args):
             sale_price_rub=safe_float(row.get('sale_price_rub')),
             seller_name=row.get('seller_name', ''),
             is_original=row.get('is_original', ''),
+            # пусто (старый CSV без признака) → «Нет»: бейдж не зафиксирован
+            docs_verified=row.get('docs_verified') or 'Нет',
             supplier_id=row.get('supplier_id', ''),
             rating=safe_float(row.get('rating')),
             feedbacks=safe_int(row.get('feedbacks')),
@@ -7093,14 +10688,15 @@ async def run_registry_stage(args):
             certificate_number=cert,
             document_type=typ,
             document_status=doc_status,
+            rf_status=rf_status,
             certificate_product_name=prod,
             document_date_start=ext.get('document_date_start', ''),
             document_date_end=ext.get('document_date_end', ''),
-            # v27.5: двойная защита от мусора в орг-полях.
-            applicant_name=_clean_org_name(ext.get('applicant_name', '')),
-            applicant_inn=ext.get('applicant_inn', ''),
-            manufacturer_name=_clean_org_name(ext.get('manufacturer_name', '')),
-            tnved=_clean_tnved_code(ext.get('tnved', '')),
+            # v46: по требованию орг-поля и ТН ВЭД можно не собирать (по умолчанию не собираем).
+            applicant_name=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else _clean_org_name(ext.get('applicant_name', ''))),
+            applicant_inn=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else ext.get('applicant_inn', '')),
+            manufacturer_name=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else _clean_org_name(ext.get('manufacturer_name', ''))),
+            tnved=('' if bool(getattr(args, 'fsa_skip_org_fields', True)) else _clean_tnved_code(ext.get('tnved', ''))),
             scheme=ext.get('scheme', ''),
             technical_regulation=ext.get('technical_regulation', ''),
             score=score,
@@ -7111,11 +10707,16 @@ async def run_registry_stage(args):
         missed_count += 1
     if missed_count:
         print(f"Допишу {missed_count} строк, которые не успели сохраниться при парсинге.")
-    await out_store.save()
+    await out_store.save(final=True)
     print(
         f"Готово. Excel сохранён: {Path(args.output).resolve()}. "
         f"Извлечено названий по уникальным реестрам: {stats['ok']}/{len(unique_urls)}; пусто={stats['empty']}; ошибки={stats['errors']}"
     )
+    # v45.2: сводка по быстрому HTTP-пути (куки браузера). Показывает, сколько
+    # FSA-документов добыто лёгким HTTP вместо полной загрузки SPA.
+    if _FSA_COOKIE_HTTP_OK > 0:
+        print(f"⚡ FSA: {_FSA_COOKIE_HTTP_OK} документ(ов) добыто быстрым HTTP по кукам браузера "
+              f"(без полной загрузки страницы — кратно быстрее и меньше запросов к FSA).")
     # v39.2: явная сводка по FSA, чтобы было видно — это сетевая проблема или парсинга
     if stats['fsa_done'] > 0:
         fsa_net_pct = 100.0 * stats['fsa_network_failures'] / stats['fsa_done']
@@ -7175,11 +10776,18 @@ def apply_speed_profile(args):
 def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", default="", help="Поисковый запрос WB")
+    ap.add_argument("--catalog-sweep", type=str_to_bool, default=False,
+                    help="v48: ПОИСК БЕЗ ЗАПРОСА. Программа сама формирует запросы, сметая "
+                         "каталог WB по типам товаров. Укажи только --limit (и опционально "
+                         "--catalog-categories). Идеально для массового сбора 50k+ карточек.")
+    ap.add_argument("--catalog-categories", default="",
+                    help="v48: категории для сметания каталога через запятую (одежда,обувь,"
+                         "игрушки,…). Пусто = ВСЕ категории.")
     ap.add_argument("--query-profile", default="auto",
-                    choices=["auto", "clothing", "одежда", "shoes", "обувь",
-                             "toys", "игрушки", "cosmetics", "косметика",
-                             "electronics", "электроника", "home"],
-                    help="v39.7: домен товаров для умной генерации запросов. auto = определяется по запросу.")
+                    help="v39.7: домен товаров для умной генерации запросов. auto = определяется по запросу. "
+                         "Можно несколько через запятую (напр. clothing,shoes). Поддержка: clothing/одежда, "
+                         "shoes/обувь, toys/игрушки, kids_accessories, baby_gear, cosmetics/косметика, "
+                         "electronics/электроника, appliances/бытовая техника, home/дом, kitchenware/посуда, food/продукты.")
     ap.add_argument("--strict-domain-filter", type=lambda s: s.lower() in ('1','true','yes','y','on'),
                     default=True,
                     help="v39.7: фильтровать карточки по subject-id WB строго в рамках домена. Лечит ситуацию когда по запросу «детские игрушки» приходят платья. true/false (default true).")
@@ -7199,6 +10807,12 @@ def build_parser():
     # v27.5: проверка плашки «Оригинальный товар» через wb_enhanced. По умолчанию включено.
     ap.add_argument("--check-original", type=str_to_bool, default=True,
                     help="Проверять плашку «Оригинальный товар» через HTML-страницу WB и basket card.json (wb_enhanced).")
+    ap.add_argument("--dump-viewflags", type=str_to_bool, default=True,
+                    help="v46: диагностика — сохранять viewFlags собранных карточек в wb_viewflags.csv "
+                         "(для вычисления бита «Документы проверены»). Лёгкий CSV, не влияет на скорость.")
+    ap.add_argument("--check-docs-verified", type=str_to_bool, default=True,
+                    help="v46: собирать бейдж «Документ проверен WB» (Да/Нет) из card.json "
+                         "(certificate.verified). Отдельный лёгкий HTTP-проход по basket-CDN.")
     ap.add_argument("--check-original-workers", type=int, default=20,
                     help="Сколько параллельных воркеров для проверки оригинальности. v27.7: поднято 10→20 — после сведения проверки к одному домену (ru) нагрузка на карточку упала ~4×, можно больше параллелизма.")
     ap.add_argument("--check-original-domains", default="ru",
@@ -7248,7 +10862,86 @@ def build_parser():
     ap.add_argument("--registry-browser-only", type=str_to_bool, default=False, help="Открывать поддерживаемые реестры браузером и извлекать данные только из видимой страницы; для ФСА и SWIS это самый точный режим, но медленнее HTTP")
     ap.add_argument("--fsa-exact-browser-fallback", type=str_to_bool, default=True, help="Для ФСА по умолчанию открыть /baseInfo|/common и /product браузером, если HTTP не достал точные поля")
     ap.add_argument("--registry-browser-workers", type=int, default=6, help="Сколько Chromium одновременно можно использовать для второго этапа/ФСА browser fallback")
+    ap.add_argument("--registry-http-workers", type=int, default=6,
+                    help="v47: отдельный HTTP-пул этапа 2 для НЕ-ФСА реестров (SWIS/BelGISS/прочие). "
+                         "Работает параллельно с браузерными воркерами ФСА — кратно ускоряет "
+                         "SWIS-тяжёлые прогоны на больших объёмах.")
     ap.add_argument("--registry-headless", type=str_to_bool, default=True)
+    ap.add_argument("--registry-fsa-retry", type=str_to_bool, default=False,
+                    help="v27.9.x: второй проход по упавшим FSA-ссылкам. По умолчанию FALSE — "
+                         "запускается ТОЛЬКО по кнопке в окне (когда FSA снова доступен).")
+    ap.add_argument("--registry-resume", type=str_to_bool, default=True,
+                    help="v47: продолжение этапа 2 после обрыва — реестры, полноценно собранные "
+                         "в существующем result.xlsx (номер+название+статус), переносятся как есть, "
+                         "парсится только остаток. Фундамент больших прогонов (20k+).")
+    ap.add_argument("--registry-resume-max-age-hours", type=float, default=72.0,
+                    help="v47: максимальный возраст result.xlsx для resume этапа 2, часов. Старше — "
+                         "полный пере-парсинг (статусы документов могли поменяться).")
+    ap.add_argument("--registry-cache", type=str_to_bool, default=True,
+                    help="v53 (улучшение №7): постоянный кэш распарсенных реестров между "
+                         "запусками (SQLite). Документы массово повторяются — берём их из кэша "
+                         "мгновенно, без обращения к реестру. Отключить: --registry-cache false.")
+    ap.add_argument("--registry-cache-file", default="",
+                    help="v53: путь к файлу кэша реестров. Пусто = registry_cache.sqlite рядом "
+                         "с файлом результата.")
+    ap.add_argument("--registry-cache-ttl-days", type=float, default=7.0,
+                    help="v53: срок свежести записи кэша, дней (по умолчанию 7). Старше — документ "
+                         "парсится заново, чтобы обновить статус. 0 = кэш бессрочный.")
+    ap.add_argument("--semantic", type=str_to_bool, default=True,
+                    help="v53 (улучшение №1): семантическое сравнение названий офлайн-моделью "
+                         "(если установлена sentence-transformers). Спасает сложные названия от "
+                         "ложной «ПРОВЕРИТЬ ВРУЧНУЮ». Без модели работает на правилах. "
+                         "Модель: env WB_SEMANTIC_MODEL (по умолч. cointegrated/rubert-tiny2).")
+    ap.add_argument("--user-dictionary-file", default="",
+                    help="v54.4 (улучшение №9): CSV-словарь видов товаров (слово,категория) "
+                         "для расширения распознавания. Пусто — ищется dictionary.csv рядом.")
+    ap.add_argument("--tnved-map-file", default="",
+                    help="v54.4 (улучшение №11): CSV доп. карты ТН ВЭД (префикс,категория). "
+                         "Пусто — ищется tnved_map.csv рядом.")
+    ap.add_argument("--fsa-human-delay-ms", default="300,1400",
+                    help="v45: случайная человекоподобная пауза между документами FSA, мс, в формате "
+                         "«min,max» (по умолчанию 300,1400). Снижает риск блокировки за слишком ровный "
+                         "автоматический темп. 0,0 — без паузы (быстрее, но рискованнее).")
+    ap.add_argument("--kg-rf-status-file", default="",
+                    help="v46: путь к таблице (xlsx/csv) статусов КИРГИЗСКИХ документов на территории "
+                         "РФ (колонки number + id_status_in_rf: 14=прекращён, 15=приостановлен). Если не "
+                         "задан, ищется kg_rf_status.xlsx рядом с программой. Совпавшие по номеру "
+                         "документы получают колонку «Статус на территории РФ» и вердикт «НЕДЕЙСТВУЕТ В РФ».")
+    ap.add_argument("--fsa-slow-mode", type=str_to_bool, default=False,
+                    help="v46: МЕДЛЕННЫЙ режим ФСА для больших прогонов (до 10k) без блокировок. "
+                         "ФСА парсится строго ПО ОДНОМУ документу с паузой (--fsa-slow-delay-ms) и "
+                         "адаптивным бэкоффом. SWIS/прочие реестры идут параллельно. Медленно (часы для "
+                         "10k), но ФСА не банит IP.")
+    ap.add_argument("--fsa-slow-delay-ms", default="2000,3500",
+                    help="v46: пауза между документами ФСА в медленном режиме, мс, «min,max» "
+                         "(по умолчанию 2000,3500 ≈ 22 док/мин). Меньше — быстрее, но выше риск бана; "
+                         "при блокировках пауза сама растёт (адаптивный бэкофф).")
+    ap.add_argument("--fsa-skip-org-fields", type=str_to_bool, default=True,
+                    help="v46: НЕ собирать заявителя/изготовителя/ИНН/ТН ВЭД из ФСА. По умолчанию TRUE: "
+                         "это убирает заход на ДОПОЛНИТЕЛЬНЫЕ вкладки ФСА (где лежат изготовитель/заявитель) "
+                         "— меньше запросов к ФСА и ниже риск блокировки. Номер, статус, даты, схема, "
+                         "техрегламент и название продукции собираются как обычно.")
+    ap.add_argument("--fsa-cookie-http", type=str_to_bool, default=False,
+                    help="v45.8: ПО УМОЛЧАНИЮ FALSE — ФСА идёт ТОЛЬКО через браузер (по требованию: "
+                         "другие способы пока не помогают). Браузерные документы парсятся ПАРАЛЛЕЛЬНО, "
+                         "как раньше. true — включить быстрый HTTP-путь по кукам браузера (первый "
+                         "документ через браузер отдаёт куки, остальные тянутся лёгким HTTP); при "
+                         "включении первые документы идут по одному (бутстрап кук).")
+    ap.add_argument("--fsa-warmup", type=str_to_bool, default=False,
+                    help="v45.1: прогрев сессии заходом на главную pub.fsa.gov.ru перед документами. "
+                         "ПО УМОЛЧАНИЮ FALSE: при старте нескольких воркеров одновременная загрузка "
+                         "тяжёлой главной = залп запросов, и FSA блокирует сразу. Без прогрева (как в "
+                         "старых рабочих версиях) браузер идёт прямо на документ — надёжнее.")
+    ap.add_argument("--fsa-cooldown-sec", type=float, default=90.0,
+                    help="v45.6: АВТО-ВОССТАНОВЛЕНИЕ FSA. Базовая пауза (сек), когда FSA начал "
+                         "массово блокировать; с каждым разом удваивается (90→180→360…). 0 — выключить.")
+    ap.add_argument("--fsa-cooldown-fails", type=int, default=8,
+                    help="v45.6: сколько неудач FSA подряд включают авто-паузу.")
+    ap.add_argument("--fsa-max-cooldowns", type=int, default=6,
+                    help="v45.6/47: сколько авто-пауз FSA подряд БЕЗ восстановления допускается. "
+                         "Череда успехов возвращает бюджет пауз (FSA не бросается на длинных "
+                         "прогонах). После исчерпания без восстановления — FSA "
+                         "отпускается (недобранное добивается кнопкой «Повторить упавшие FSA»).")
     # v27.6: уменьшен с 45000 до 28000 — раньше FSA-карточка занимала 165с
     ap.add_argument("--registry-browser-timeout-ms", type=int, default=28000)
     ap.add_argument("--registry-browser-wait-ms", type=int, default=8000,
@@ -7267,8 +10960,8 @@ def build_parser():
                     help="v40.3: дотягивать имена продавцов (seller_name) через card.wb.ru detail API. WB-поиск отдаёт только supplierId. true/false (default true).")
     ap.add_argument("--cert-timeout-sec", type=float, default=6.0,
                     help="таймаут одного запроса к basket-NN.wbbasket.ru/certificate.json")
-    ap.add_argument("--cert-max-hosts", type=int, default=8,
-                    help="сколько basket-шардов пробовать на карточку (1..30). v27.7: уменьшено 30→8. Первым идёт детерминированно вычисленный по vol шард, затем соседи ±2 и популярные 13/12/14 — этого хватает практически всегда, а худший случай (карточка без документа) ускоряется ~4×: было до 30 последовательных 404, стало 8. Для максимальной надёжности можно вернуть 30.")
+    ap.add_argument("--cert-max-hosts", type=int, default=16,
+                    help="сколько basket-шардов пробовать на карточку. v27.9.x: перебор стал ПАРАЛЛЕЛЬНЫМ, поэтому большее число шардов почти не стоит времени, но заметно повышает покрытие — особенно для товаров с высоким vol (новые nm_id), где границы шардов известны хуже. Дефолт поднят 8→16. Можно повышать до 30+ для максимальной надёжности.")
     ap.add_argument("--no-docs-confirm-404", type=int, default=0,
                     help="v40: устарел (логика теперь автоматическая: все честные 404 = нет документов, сетевая ошибка = повтор). Оставлен для совместимости команд.")
     # v39.13: HTTP fast-path для FSA-парсинга на 2 этапе
@@ -7313,10 +11006,11 @@ async def main_async():
         await run_registry_stage(args)
         return
 
-    if not args.query and not args.input_csv:
+    # v48: режим «без запроса» (catalog sweep) не требует query.
+    if not args.query and not args.input_csv and not getattr(args, 'catalog_sweep', False):
         args.query = input("Введите поисковый запрос: ").strip()
-    if not args.query and not args.input_csv:
-        raise SystemExit("Не указан query или input-csv")
+    if not args.query and not args.input_csv and not getattr(args, 'catalog_sweep', False):
+        raise SystemExit("Не указан query, catalog-sweep или input-csv")
 
     await run_link_collection(args)
 

@@ -33,6 +33,9 @@ python wb_checker.py
 | Файл | Назначение |
 |---|---|
 | `wb_checker.py` | Главное pywebview-приложение с UI |
+| `preflight.py` | Диагностика окружения: `python preflight.py [--network]` |
+| `tests/run_all.py` | Офлайн-тесты одной командой: `python tests/run_all.py` |
+| `ИЗМЕНЕНИЯ.md` | Описание правок и чек-лист проверки |
 | `main_v39.py` | WB query-движок (поиск по запросу + реестры) |
 | `main_brand.py` | WB brand-движок (поиск по бренду) |
 | `ozon_parser.py` | Ozon-парсер (mobile API + карточки + реестры) |

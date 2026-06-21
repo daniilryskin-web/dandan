@@ -667,7 +667,7 @@ STATUS_ERROR = "ОШИБКА"
 STATUS_DOC_NOT_VERIFIED = "ДОКУМЕНТ НЕ ПРОВЕРЕН"
 
 # v27.6-playwright: версия движка для шапки расширенного отчёта.
-APP_VERSION = "2026-06-21-v54.5"
+APP_VERSION = "2026-06-21-v54.6"
 
 ALLOWED_REGISTRY_HOSTS = {
     "pub.fsa.gov.ru",
@@ -4212,9 +4212,13 @@ def _build_diff_sheet_v39(wb_obj, rows: List["ResultRow"], prev: Dict[str, dict]
 
 class ResultStore:
     def __init__(self, xlsx_path: Path, csv_path: Optional[Path] = None,
-                 expiry_warning_days: int = 30, make_report_xlsx: bool = True):
+                 expiry_warning_days: int = 30, make_report_xlsx: bool = True,
+                 write_prev_snapshot: bool = True):
         self.xlsx_path = xlsx_path
         self.csv_path = csv_path
+        # v54.6 (доработка №1): можно отключить запись дифф-снимка (для параллельного
+        # частичного прохода конвейера, чтобы он не перезаписал снимок прошлого прогона).
+        self._snapshot_enabled = bool(write_prev_snapshot)
         # v25-reporting: параметры отчётного слоя.
         self.expiry_warning_days = max(0, int(expiry_warning_days or 0))
         self.make_report_xlsx = bool(make_report_xlsx)
@@ -4242,7 +4246,7 @@ class ResultStore:
 
     def _write_prev_snapshot(self, rows: List["ResultRow"]) -> None:
         p = getattr(self, "_prev_path", None)
-        if not p:
+        if not p or not getattr(self, "_snapshot_enabled", True):
             return
         snap: Dict[str, dict] = {}
         for r in rows:
@@ -5314,6 +5318,57 @@ async def progress_loop(queue: asyncio.Queue, store: ResultStore, args, progress
     except asyncio.CancelledError:
         return
 
+
+# =============================================================================
+# v54.6 (доработка №3): ПРЕДСТАРТОВАЯ оценка времени прогона. Грубо, по числу
+# карточек/документов и эмпирическим скоростям — чтобы пользователь заранее знал,
+# что прогон многочасовой, и не было сюрприза «11 часов». Это НЕ живой ETA
+# (живой считается в emit_progress по фактическому темпу), а прикидка ДО запуска.
+# =============================================================================
+# Эмпирические скорости (единиц в минуту). Намеренно консервативные.
+ETA_RATE_STAGE1 = 1200.0      # HTTP-сбор ссылок (certificate.json, ~30 воркеров)
+ETA_RATE_FSA_SLOW = 25.0      # ФСА в медленном режиме (--fsa-slow-mode)
+ETA_RATE_FSA_FAST = 110.0     # ФСА обычный (браузерный)
+ETA_RATE_OTHER_REG = 280.0    # SWIS/прочие HTTP-реестры
+
+
+def _human_duration_ru(seconds: float) -> str:
+    """Человекочитаемая длительность: '~3 ч 20 мин', '~12 мин', '< 1 мин'."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return "< 1 мин"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    if h and m:
+        return f"~{h} ч {m} мин"
+    if h:
+        return f"~{h} ч"
+    return f"~{m} мин"
+
+
+def _estimate_stage1_eta(n_cards: int) -> str:
+    if n_cards <= 0:
+        return ""
+    sec = n_cards / max(1.0, ETA_RATE_STAGE1) * 60.0
+    return (f"⏱  Предварительная оценка этапа 1 (сбор ссылок): {n_cards} карточек → "
+            f"{_human_duration_ru(sec)} (грубо).")
+
+
+def _estimate_stage2_eta(n_fsa: int, n_other: int, slow_mode: bool) -> str:
+    """Грубая оценка времени этапа 2 по числу несоставленных из кэша документов."""
+    if n_fsa <= 0 and n_other <= 0:
+        return ""
+    fsa_rate = ETA_RATE_FSA_SLOW if slow_mode else ETA_RATE_FSA_FAST
+    sec = n_fsa / max(1.0, fsa_rate) * 60.0 + n_other / max(1.0, ETA_RATE_OTHER_REG) * 60.0
+    parts = []
+    if n_fsa:
+        parts.append(f"ФСА: {n_fsa}" + (" (медленный режим ~25/мин)" if slow_mode else ""))
+    if n_other:
+        parts.append(f"СВИС/прочие: {n_other}")
+    return (f"⏱  Предварительная оценка этапа 2 (реестры): {', '.join(parts)} → "
+            f"{_human_duration_ru(sec)} (грубо). Кэш и уже собранные документы сокращают время.")
+
+
 async def run_link_collection(args):
     if async_playwright is None:
         raise RuntimeError("Playwright не установлен. Выполните: python -m pip install playwright && python -m playwright install chromium")
@@ -5328,6 +5383,9 @@ async def run_link_collection(args):
         cards = [c for c in cards if brand_matches_v39(getattr(c, "brand", ""), _brand_wanted, _brand_mode)]
         print(f"Бренд-фильтр ({_brand_mode}, '{_brand_wanted}'): отфильтровано {before - len(cards)} карточек, осталось {len(cards)}")
     print(f"К проверке подготовлено карточек: {len(cards)}")
+    _eta1 = _estimate_stage1_eta(len(cards))
+    if _eta1:
+        print(_eta1)
     if cards[:10]:
         print("Первые nm_id:", ", ".join(str(c.nm_id) for c in cards[:10]))
 
@@ -10379,6 +10437,11 @@ async def run_registry_stage(args):
     # киргизских документов на 20k карточек) ползли часами через узкое горло.
     q: asyncio.Queue[str] = asyncio.Queue()       # ФСА (браузер)
     q_http: asyncio.Queue[str] = asyncio.Queue()  # SWIS/BelGISS/прочие (HTTP)
+    _n_fsa = sum(1 for u in unique_urls if hostname(u) == 'pub.fsa.gov.ru')
+    _n_other = len(unique_urls) - _n_fsa
+    _eta2 = _estimate_stage2_eta(_n_fsa, _n_other, bool(getattr(args, 'fsa_slow_mode', False)))
+    if _eta2:
+        print(_eta2)
     for u in unique_urls:
         (q if hostname(u) == 'pub.fsa.gov.ru' else q_http).put_nowait(u)
 
@@ -10408,6 +10471,7 @@ async def run_registry_stage(args):
         None,
         expiry_warning_days=getattr(args, "expiry_warning_days", 30),
         make_report_xlsx=getattr(args, "make_report_xlsx", True),
+        write_prev_snapshot=bool(getattr(args, "diff_snapshot", True)),
     )
 
     async def _flush_url_to_store(url: str, cert: str, prod: str, typ: str, doc_status: str, parse_detail: str):
@@ -11413,6 +11477,10 @@ def build_parser():
     ap.add_argument("--card-cache-ttl-days", type=float, default=7.0,
                     help="Доработка №8: срок свежести записи кэша карточек, дней (по умолч. 7). "
                          "Старше — карточка перепроверяется (ссылка обновится). 0 = бессрочно.")
+    ap.add_argument("--diff-snapshot", type=str_to_bool, default=True,
+                    help="Доработка №7: писать снимок вердиктов <output>.prev.json для листа "
+                         "«Изменения». Конвейерный параллельный проход ставит false, чтобы не "
+                         "перезаписать снимок прошлого прогона (его пишет финальный проход).")
     ap.add_argument("--semantic", type=str_to_bool, default=True,
                     help="v53 (улучшение №1): семантическое сравнение названий офлайн-моделью "
                          "(если установлена sentence-transformers). Спасает сложные названия от "
@@ -11544,10 +11612,16 @@ def main():
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
+        # Чистая остановка пользователем — НЕ считаем сбоем (код 0), супервизор/GUI
+        # не должны перезапускать прогон, который остановили намеренно.
         print("\nОстановлено пользователем. Уже сохранённые CSV/XLSX остаются на диске.")
     except Exception as e:
+        # v54.6 (доработка №2): критическая ошибка → НЕНУЛЕВОЙ код выхода, чтобы
+        # GUI/супервизор увидели сбой и перезапустили прогон (resume/кэш продолжат
+        # с чекпойнта). Раньше процесс падал, но выходил с кодом 0 — сбой был незаметен.
         print(f"Критическая ошибка: {type(e).__name__}: {e}")
         traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

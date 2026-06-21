@@ -73,6 +73,18 @@ def _resolve_python() -> str:
 PYTHON = _resolve_python()
 SETTINGS_PATH = APP_DIR / "wb_checker_settings.json"
 
+# v54.6 (доработка №2): сколько раз авто-перезапускать прогон после АНОМАЛЬНОГО
+# завершения движка (ненулевой код = краш/убит процесс). Resume + кэш реестров/
+# карточек продолжают с чекпойнта. Чистый выход (0) и остановка пользователем
+# перезапуск НЕ вызывают.
+AUTO_RESTART_MAX = 3
+
+# v54.6 (доработка №1): конвейер — этап 2 стартует, как только этап 1 собрал столько
+# ссылок (параллельно хвосту этапа 1). Затем финальный проход этапа 2 добирает остаток
+# (уже распарсенное берётся из кэша реестров мгновенно).
+OVERLAP_MIN_LINKS = 300      # порог ссылок для раннего старта этапа 2
+OVERLAP_POLL_SEC = 2.0       # как часто проверять файл ссылок
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -210,6 +222,12 @@ class RunSpec:
     unified_report: bool = True
     """В unified-режиме: объединять WB и Ozon в один XLSX."""
 
+    pipeline_overlap: bool = True
+    """v54.6 (доработка №1): этап 2 стартует параллельно хвосту этапа 1 (конвейер)."""
+
+    diff_snapshot: bool = True
+    """v54.6: писать дифф-снимок (false для параллельного частичного прохода)."""
+
     def wb_args(self) -> List[str]:
         """Формирует CLI-аргументы для WB-движка (query или brand)."""
         if self.mode == "brand":
@@ -274,6 +292,8 @@ class RunSpec:
                 args += ["--fsa-slow-delay-ms", f"{int(_v*1000)},{int(_v*2000)}"]
             if self.strict_brand and self.strict_brand_match != "any":
                 args += ["--brand", self.strict_brand, "--brand-match", self.strict_brand_match]
+            if not self.diff_snapshot:
+                args += ["--diff-snapshot", "false"]
             return args
         # query_full / unified (WB-часть)
         out = self.output or ("wb_result.xlsx" if self.mode == "unified" else "result.xlsx")
@@ -618,12 +638,16 @@ class EngineRunner:
                                 "output_links_csv": "registry_links.csv",
                                 "output": "links.xlsx"})
                 _lbl1 = "🧭 Этап 1 — сбор каталога WB (без запроса)" if _is_auto else "🔍 Этап 1 — сбор ссылок WB"
-                rc = self._run_one(s1.wb_args(), _lbl1)
-                if rc != 0 or self._stop_flag.is_set():
-                    return
                 s2 = RunSpec(**{**asdict(spec), "mode": "query_stage2",
                                 "input_links_csv": "registry_links.csv"})
-                self._run_one(s2.wb_args(), "📋 Этап 2 — парсинг реестров WB")
+                if getattr(spec, "pipeline_overlap", True):
+                    # v54.6 (доработка №1): конвейер — этап 2 параллельно хвосту этапа 1.
+                    self._run_overlapped(s1, s2, _lbl1, "📋 Этап 2 — парсинг реестров WB")
+                else:
+                    rc = self._run_one(s1.wb_args(), _lbl1)
+                    if rc != 0 or self._stop_flag.is_set():
+                        return
+                    self._run_one(s2.wb_args(), "📋 Этап 2 — парсинг реестров WB")
             elif spec.mode == "ozon":
                 self._run_one(spec.ozon_args(), "🛒 Ozon — поиск и проверка")
             elif spec.mode == "brand":
@@ -641,12 +665,16 @@ class EngineRunner:
                                 "query_profile": _profile,
                                 "output_links_csv": "registry_links.csv",
                                 "output": "links.xlsx"})
-                rc = self._run_one(s1.wb_args(), "🔍 Этап 1 — сбор карточек бренда WB")
-                if rc != 0 or self._stop_flag.is_set():
-                    return
                 s2 = RunSpec(**{**asdict(spec), "mode": "query_stage2",
                                 "input_links_csv": "registry_links.csv"})
-                self._run_one(s2.wb_args(), "📋 Этап 2 — парсинг реестров WB")
+                if getattr(spec, "pipeline_overlap", True):
+                    self._run_overlapped(s1, s2, "🔍 Этап 1 — сбор карточек бренда WB",
+                                         "📋 Этап 2 — парсинг реестров WB")
+                else:
+                    rc = self._run_one(s1.wb_args(), "🔍 Этап 1 — сбор карточек бренда WB")
+                    if rc != 0 or self._stop_flag.is_set():
+                        return
+                    self._run_one(s2.wb_args(), "📋 Этап 2 — парсинг реестров WB")
             else:
                 label_map = {
                     "query_stage1": "🔍 Этап 1 — сбор ссылок",
@@ -728,7 +756,100 @@ class EngineRunner:
             self.state.output_path = str(wb_xlsx) if wb_xlsx.exists() else ""
         self.state.ozon_output_path = str(ozon_xlsx) if ozon_xlsx.exists() else ""
 
+    def _run_overlapped(self, s1: "RunSpec", s2: "RunSpec", s1_label: str, s2_label: str) -> int:
+        """v54.6 (доработка №1): КОНВЕЙЕР — этап 2 стартует параллельно хвосту этапа 1.
+
+        Этап 1 пишет registry_links.csv (атомарно). Как только ссылок ≥ OVERLAP_MIN_LINKS,
+        запускаем параллельный проход этапа 2 по уже собранному — он прогревает кэш
+        реестров. После завершения обоих делаем ФИНАЛЬНЫЙ проход этапа 2 по полному
+        списку: распарсенное берётся из кэша мгновенно, остаток добирается, пишется
+        дифф-снимок. Корректность не страдает: источник истины — финальный проход,
+        параллельный лишь ускоряет (в худшем случае — без эффекта).
+        """
+        links_csv = APP_DIR / (s1.output_links_csv or "registry_links.csv")
+        s2_pass1 = RunSpec(**{**asdict(s2), "diff_snapshot": False})
+        s1_rc = {"rc": 0}
+        t1 = t2 = None
+
+        def _count_links(after_ts: float) -> int:
+            try:
+                st = links_csv.stat()
+                if st.st_mtime < after_ts - 1:
+                    return 0  # файл от ПРОШЛОГО прогона — ждём свежей записи
+                with links_csv.open("r", encoding="utf-8-sig", newline="") as f:
+                    return max(0, sum(1 for _ in f) - 1)
+            except Exception:
+                return 0
+
+        try:
+            t_start = time.time()
+
+            def run_s1():
+                s1_rc["rc"] = self._run_one_collect(s1.wb_args(), s1_label, [])
+            t1 = threading.Thread(target=run_s1, daemon=True, name="stage1")
+            t1.start()
+
+            # ждём порог ссылок (или конца этапа 1 / остановки)
+            while t1.is_alive() and not self._stop_flag.is_set():
+                if _count_links(t_start) >= OVERLAP_MIN_LINKS:
+                    break
+                time.sleep(OVERLAP_POLL_SEC)
+
+            # параллельный проход этапа 2 — только если этап 1 ещё идёт
+            if t1.is_alive() and not self._stop_flag.is_set():
+                self.state.log_lines.append(
+                    f"⚡ Конвейер: этап 2 пошёл параллельно (собрано ≥{OVERLAP_MIN_LINKS} ссылок), "
+                    f"этап 1 продолжает сбор…")
+                self._write_full_log("⚡ Конвейер: параллельный старт этапа 2")
+
+                def run_s2p1():
+                    self._run_one_collect(s2_pass1.wb_args(), s2_label + " · параллельный проход", [])
+                t2 = threading.Thread(target=run_s2p1, daemon=True, name="stage2_pass1")
+                t2.start()
+        finally:
+            if t1 is not None:
+                t1.join()
+            if t2 is not None:
+                t2.join()
+
+        if self._stop_flag.is_set():
+            return s1_rc.get("rc") or 0
+        if (s1_rc.get("rc") or 0) != 0:
+            self.state.log_lines.append(f"⚠️  Этап 1 завершился кодом {s1_rc['rc']} — этап 2 добирает собранное.")
+        # финальный проход (авто-перезапуск, дифф-снимок)
+        return self._run_one(s2.wb_args(), s2_label + " · финальный проход")
+
     def _run_one(self, args: List[str], label: str) -> int:
+        """v54.6 (доработка №2): запуск движка с АВТО-ВОЗОБНОВЛЕНИЕМ после сбоя.
+
+        Если процесс завершился аномально (ненулевой код = краш/убит — например,
+        из-за памяти или сети), перезапускаем ту же команду до AUTO_RESTART_MAX раз:
+        resume (CSV ссылок) и постоянные кэши реестров/карточек продолжают прогон
+        с чекпойнта. Чистое завершение (код 0) и остановка пользователем перезапуск
+        НЕ вызывают.
+        """
+        attempts = max(0, int(AUTO_RESTART_MAX))
+        attempt = 0
+        while True:
+            lbl = label if attempt == 0 else f"{label} · перезапуск {attempt}/{attempts}"
+            rc = self._run_one_once(args, lbl)
+            if rc == 0 or self._stop_flag.is_set() or attempt >= attempts:
+                return rc
+            attempt += 1
+            delay = min(30, 3 * attempt)
+            msg = (f"⚠️  Прогон оборвался (код {rc}). Авто-перезапуск {attempt}/{attempts} "
+                   f"через {delay} с — продолжу с чекпойнта (resume + кэш).")
+            self.state.log_lines.append(msg)
+            self._write_full_log(msg)
+            self.state.error = ""  # чтобы успешный перезапуск не выглядел как провал
+            waited = 0.0
+            while waited < delay:
+                if self._stop_flag.is_set():
+                    return rc
+                time.sleep(0.5)
+                waited += 0.5
+
+    def _run_one_once(self, args: List[str], label: str) -> int:
         """Запускает один subprocess, читает stdout, возвращает код возврата."""
         self.state.stage_label = label
         self.state.log_lines.append(f"\n━━━ {label} ━━━")

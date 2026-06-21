@@ -57,6 +57,7 @@ MODULES = [
     "test_progress",
     "test_report_e2e",
     "test_v55_features",
+    "test_v546_pipeline",
     "test_preflight",
     "test_fsa_parse",
     "test_fsa_json_parse",

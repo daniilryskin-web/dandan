@@ -19,8 +19,8 @@ LOD-выражений, поведение которых зависит от р
 
 Создаёт:
     datalens_dataset.csv   — витрина назначений, её и грузим в DataLens
-    datalens_dataset.xlsx  — то же самое плюс листы «Сотрудники», «Роли»,
-                             «Проекты», «Вакансии», «Проверки»
+    datalens_dataset.xlsx  — то же самое плюс листы «Сотрудники», «Оценка ЗП»,
+                             «Роли», «Проекты», «Вакансии», «Проверки»
 
 Никаких данных внутри скрипта нет: он работает с тем файлом, который ему передали.
 Описание всех листов и столбцов — в 07-dataset-reference.md.
@@ -116,7 +116,7 @@ COLUMN_ORDER = [
     "База сравнения", "Уровень сравнения",
     "Compa-ratio", "Отклонение руб", "Z-score",
     "Граница выброса вверх", "Граница выброса вниз", "Выброс по IQR",
-    "Флаг ЗП", "Цвет флага", "Требует внимания", "Доплата до порога",
+    "Оценка ЗП", "Группа оценки", "Требует внимания", "Доплата до порога",
     "Оценка стоимости вакансии",
     "Людей на продукте", "Bus factor",
 ]
@@ -304,30 +304,38 @@ def build_assignments(df: pd.DataFrame) -> pd.DataFrame:
         "Выброс вниз"
     )
 
-    def flag(row):
+    def rating(row):
+        """Оценка зарплаты относительно медианы её проектной роли.
+
+        Цифровой префикс нужен, чтобы легенда и оси сортировались от
+        недоплаты к переплате, а не по алфавиту.
+        """
         if row["В анализе справедливости"] != 1 or pd.isna(row["Compa-ratio"]):
-            return "0. Не сравнивается"
+            return "0. Не оценивается"
         compa = row["Compa-ratio"]
         if compa < 0.80:
-            return "1. Сильно ниже роли"
+            return "1. Недоплата"
         if compa < LOWER_THRESHOLD:
             return "2. Ниже роли"
         if compa <= 1.15:
-            return "3. Норма"
+            return "3. Соответствует роли"
         if compa <= UPPER_THRESHOLD:
             return "4. Выше роли"
-        return "5. Сильно выше роли"
+        return "5. Переплата"
 
-    df["Флаг ЗП"] = df.apply(flag, axis=1)
-    df["Цвет флага"] = df["Флаг ЗП"].map(
+    df["Оценка ЗП"] = df.apply(rating, axis=1)
+
+    # Три класса для раскраски чартов: пять цветов человек надёжно не
+    # различает, поэтому цвет несёт направление, а текст — степень.
+    df["Группа оценки"] = df["Оценка ЗП"].map(
         {
-            "1. Сильно ниже роли": "Ниже роли",
-            "2. Ниже роли": "Ниже роли",
-            "3. Норма": "Норма",
-            "4. Выше роли": "Выше роли",
-            "5. Сильно выше роли": "Выше роли",
+            "1. Недоплата": "Недоплата",
+            "2. Ниже роли": "Недоплата",
+            "3. Соответствует роли": "Соответствует роли",
+            "4. Выше роли": "Переплата",
+            "5. Переплата": "Переплата",
         }
-    ).fillna("Не сравнивается")
+    ).fillna("Не оценивается")
 
     df["Требует внимания"] = (
         in_scope
@@ -390,7 +398,7 @@ def sheet_people(df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "Сотрудник", "Проектная роль", "Уровень роли", "ЗП", "ЗП подтверждена",
         "База сравнения", "Уровень сравнения", "Compa-ratio", "Отклонение руб",
-        "Z-score", "Выброс по IQR", "Флаг ЗП", "Требует внимания",
+        "Z-score", "Выброс по IQR", "Оценка ЗП", "Требует внимания",
         "Доплата до порога", "Организация", "Штатная должность",
         "Блок", "Проект", "Руководитель",
         "Назначений у сотрудника", "Проектов у сотрудника",
@@ -415,6 +423,43 @@ def sheet_roles(df: pd.DataFrame) -> pd.DataFrame:
         {True: "да", False: "нет, откат на уровень"}
     )
     return table
+
+
+def sheet_rating(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Три среза оценки зарплат: по категориям, по ролям, по проектам."""
+    scored = df[df["В анализе справедливости"] == 1]
+    total = len(scored)
+
+    by_rating = scored.groupby("Оценка ЗП").agg(
+        людей=("Сотрудник", "count"),
+        медиана_ЗП=("ЗП", "median"),
+        медиана_базы=("База сравнения", "median"),
+        сумма_отклонения=("Отклонение руб", "sum"),
+        доплата_до_порога=("Доплата до порога", "sum"),
+        подтверждённых_ЗП=("ЗП подтверждена", "sum"),
+    )
+    by_rating["доля, %"] = (by_rating["людей"] / total * 100).round(1)
+    by_rating["сумма_отклонения_год"] = by_rating["сумма_отклонения"] * 12
+    by_rating = by_rating[[
+        "людей", "доля, %", "подтверждённых_ЗП", "медиана_ЗП", "медиана_базы",
+        "сумма_отклонения", "сумма_отклонения_год", "доплата_до_порога",
+    ]].round(0)
+
+    by_role = pd.crosstab(
+        [scored["Уровень роли №"], scored["Проектная роль"]],
+        scored["Оценка ЗП"],
+        margins=True,
+        margins_name="Всего",
+    )
+
+    by_project = pd.crosstab(
+        [scored["Блок"], scored["Проект"]],
+        scored["Группа оценки"],
+        margins=True,
+        margins_name="Всего",
+    )
+
+    return by_rating, by_role, by_project
 
 
 def sheet_projects(df: pd.DataFrame) -> pd.DataFrame:
@@ -530,10 +575,25 @@ def main() -> None:
     assignments.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     roles = sheet_roles(assignments)
+    by_rating, by_role, by_project = sheet_rating(assignments)
+
     xlsx_path = args.out.with_suffix(".xlsx")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         assignments.to_excel(writer, sheet_name="Назначения", index=False)
         sheet_people(assignments).to_excel(writer, sheet_name="Сотрудники", index=False)
+
+        # Три таблицы на одном листе, разделённые пустыми строками
+        sheet = "Оценка ЗП"
+        row = 0
+        for title, table in (
+            ("Сводка по категориям оценки", by_rating),
+            ("Разбивка по проектным ролям", by_role),
+            ("Разбивка по проектам", by_project),
+        ):
+            pd.DataFrame({title: []}).to_excel(writer, sheet_name=sheet, startrow=row)
+            table.to_excel(writer, sheet_name=sheet, startrow=row + 1)
+            row += len(table) + 4
+
         roles.to_excel(writer, sheet_name="Роли")
         sheet_projects(assignments).to_excel(writer, sheet_name="Проекты")
         sheet_vacancies(assignments).to_excel(writer, sheet_name="Вакансии", index=False)
@@ -555,10 +615,9 @@ def main() -> None:
     )
     print("Монотонность:", "ОК" if monotone else "НАРУШЕНА — проверьте ROLE_LEVELS")
 
-    scored = assignments[assignments["В анализе справедливости"] == 1]
     print()
-    print("Светофор:")
-    print(scored["Флаг ЗП"].value_counts().sort_index().to_string())
+    print("Оценка зарплат (относительно медианы проектной роли):")
+    print(by_rating[["людей", "доля, %", "подтверждённых_ЗП", "сумма_отклонения"]].to_string())
 
 
 if __name__ == "__main__":

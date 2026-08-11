@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pandas as pd
 
-# Как называются столбцы в исходнике → как они называются дальше
+# Обязательные столбцы: исходное имя → имя в датасете
 SOURCE_COLUMNS = {
     "№": "Строка",
     "Ответственный за направление": "Блок",
@@ -34,30 +34,80 @@ SOURCE_COLUMNS = {
     "Проект / фукнция": "Проект",
     "Продукт (кратко)": "Продукт кратко",
     "Продукт": "Продукт",
-    "Роль": "Должность",
+    "Роль": "Проектная роль",
     "ФИО (штат)": "Сотрудник",
     "Текущая ЗП, gross": "ЗП исходная",
     "Комментарий": "Комментарий",
 }
 
-VACANCY_MARKER = "вакансия"
-
-# Иерархия должностей: единственная порядковая шкала, которую можно вывести
-# из имеющихся данных. Заменяет отсутствующий грейд при сравнении зарплат.
-POSITION_LEVELS = {
-    "Руководитель функции": (4, "L4 · Руководство функцией"),
-    "Руководитель проекта": (4, "L4 · Руководство функцией"),
-    "Руководитель продукта": (3, "L3 · Руководство продуктом"),
-    "Исполнитель функции": (3, "L3 · Руководство продуктом"),
-    "Администратор проекта": (2, "L2 · Исполнение"),
-    "Аналитик": (2, "L2 · Исполнение"),
-    "Специалист": (1, "L1 · Начальный"),
-    "Стажер": (0, "L0 · Стажировка"),
+# Столбцы, которых может не быть в старых версиях файла
+OPTIONAL_COLUMNS = {
+    "Организация": "Организация",
+    "Должность": "Штатная должность",
 }
 
-# Должности с плоской тарифной ставкой: разброса нет, сравнивать не с чем.
-# Их исключаем из анализа справедливости, иначе они забьют «норму» и сдвинут медианы.
-FLAT_RATE_POSITIONS = {"Стажер"}
+VACANCY_MARKER = "вакансия"
+EMPTY_MARKERS = {"", "#n/a", "#н/д", "n/a", "нет данных", "-", "—"}
+
+# Грейд по штатной должности. Правила проверяются сверху вниз, первое
+# сработавшее выигрывает — поэтому специфичные формулировки идут раньше общих
+# («главный специалист-эксперт» должен пойматься до «специалист»).
+#
+# Уровни назначены по смыслу названия должности, а НЕ по зарплате: вывести
+# грейд из зарплаты нельзя, иначе мы будем сравнивать зарплату с группой,
+# составленной по зарплате. Монотонность медиан по грейдам — это проверка
+# классификации, и она печатается в листе «Грейды».
+GRADE_RULES = [
+    (0, "G0 · Стажировка", ["стажер", "стажёр"]),
+    (6, "G6 · Топ-менеджмент", [
+        "начальник центра",
+        "руководитель центра компетенций",
+        "заместитель руководителя мвпо",
+    ]),
+    (5, "G5 · Руководство проектом / направлением", [
+        "заместитель руководителя центра",
+        "заместитель начальника управления",
+        "директор проект",
+        "руководитель проект",
+        "руководитель направлен",
+    ]),
+    (4, "G4 · Руководство отделом / продуктом", [
+        "директор по продукту",
+        "руководитель продукт",
+        "начальник отдела",
+    ]),
+    (3, "G3 · Ведущий / заместитель", [
+        "ведущий эксперт",
+        "главный эксперт",
+        "заместитель начальника отдела",
+        "руководитель группы",
+        "аналитик",
+    ]),
+    (2, "G2 · Исполнение", [
+        "главный специалист",
+        "администратор проект",
+        "координатор проект",
+        "эксперт",
+    ]),
+    (1, "G1 · Специалист", ["специалист"]),
+]
+
+# Запасная шкала: применяется, когда столбца «Должность» в файле нет и грейд
+# приходится выводить из проектной роли.
+ROLE_FALLBACK_GRADES = {
+    "Руководитель функции": (5, "G5 · Руководство проектом / направлением"),
+    "Руководитель проекта": (5, "G5 · Руководство проектом / направлением"),
+    "Руководитель продукта": (4, "G4 · Руководство отделом / продуктом"),
+    "Исполнитель функции": (3, "G3 · Ведущий / заместитель"),
+    "Аналитик": (3, "G3 · Ведущий / заместитель"),
+    "Администратор проекта": (2, "G2 · Исполнение"),
+    "Специалист": (1, "G1 · Специалист"),
+    "Стажер": (0, "G0 · Стажировка"),
+}
+
+# Грейды с плоской тарифной ставкой: разброса нет, сравнивать не с чем.
+# Исключаем из анализа справедливости, иначе они забьют «норму» и сдвинут медианы.
+FLAT_RATE_GRADES = {0}
 
 # Комментарии, означающие «числу в столбце ЗП верить нельзя»
 UNCONFIRMED_PATTERNS = [
@@ -85,8 +135,8 @@ def clean_text(value) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def load_source(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, dtype=str)
+def load_source(path: Path, sheet: str | int = 0) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=sheet, dtype=str)
     df.columns = [clean_text(c) for c in df.columns]
 
     missing = [c for c in SOURCE_COLUMNS if c not in df.columns]
@@ -98,10 +148,34 @@ def load_source(path: Path) -> pd.DataFrame:
             + ", ".join(df.columns)
         )
 
-    df = df[list(SOURCE_COLUMNS)].rename(columns=SOURCE_COLUMNS)
+    present_optional = {k: v for k, v in OPTIONAL_COLUMNS.items() if k in df.columns}
+    for name in OPTIONAL_COLUMNS:
+        if name not in present_optional:
+            print(f"Внимание: столбца «{name}» нет — соответствующие разрезы будут пустыми")
+
+    keep = list(SOURCE_COLUMNS) + list(present_optional)
+    df = df[keep].rename(columns={**SOURCE_COLUMNS, **present_optional})
     for column in df.columns:
         df[column] = df[column].map(clean_text)
+
+    for target in OPTIONAL_COLUMNS.values():
+        if target not in df.columns:
+            df[target] = ""
+        df.loc[df[target].str.lower().isin(EMPTY_MARKERS), target] = ""
     return df
+
+
+def classify_grade(position: str, role: str) -> tuple[int, str]:
+    """Грейд по штатной должности; при её отсутствии — по проектной роли."""
+    text = position.lower()
+    if text:
+        for level, label, keywords in GRADE_RULES:
+            if any(keyword in text for keyword in keywords):
+                return level, label
+    fallback = ROLE_FALLBACK_GRADES.get(role)
+    if fallback:
+        return fallback
+    return -1, "Не классифицировано"
 
 
 def build_assignments(df: pd.DataFrame) -> pd.DataFrame:
@@ -131,12 +205,19 @@ def build_assignments(df: pd.DataFrame) -> pd.DataFrame:
         r"^Вакансия\s*\(?", "Вакансия: ", regex=True
     ).str.rstrip(")")
 
-    # --- уровень должности ---------------------------------------------------
-    levels = df["Должность"].map(POSITION_LEVELS)
-    df["Уровень"] = levels.map(lambda v: v[0] if isinstance(v, tuple) else -1)
-    df["Уровень должности"] = levels.map(
-        lambda v: v[1] if isinstance(v, tuple) else "Не классифицировано"
+    # --- грейд по штатной должности ------------------------------------------
+    grades = df.apply(
+        lambda r: classify_grade(r["Штатная должность"], r["Проектная роль"]), axis=1
     )
+    df["Грейд №"] = grades.map(lambda v: v[0])
+    df["Грейд"] = grades.map(lambda v: v[1])
+    df.loc[df["Вакансия"] == 1, ["Грейд №", "Грейд"]] = [-1, "Вакансия"]
+
+    # Ключ сравнения: грейд отвечает за «сколько человек стоит по штатному
+    # расписанию», проектная роль — за «что он делает в проекте». Организация
+    # в ключ не входит: медианы по организациям внутри одного грейда совпадают,
+    # а добавление её в ключ только дробит группы (см. 05-adaptation.md, §2).
+    df["Группа сравнения"] = df["Грейд"] + " · " + df["Проектная роль"]
 
     # --- доля занятости: поровну между продуктами сотрудника -----------------
     people = df["Вакансия"] == 0
@@ -165,42 +246,43 @@ def build_assignments(df: pd.DataFrame) -> pd.DataFrame:
         (df["Вакансия"] == 0)
         & (df["Первичное назначение"] == 1)
         & df["ЗП"].notna()
-        & ~df["Должность"].isin(FLAT_RATE_POSITIONS)
+        & ~df["Грейд №"].isin(FLAT_RATE_GRADES)
+        & (df["Грейд №"] >= 0)
     ).astype(int)
 
     base = df[df["В анализе справедливости"] == 1]
-    stats = base.groupby("Должность")["ЗП"].agg(
+    stats = base.groupby("Группа сравнения")["ЗП"].agg(
         **{
-            "Медиана должности": "median",
-            "Среднее должности": "mean",
-            "СКО должности": "std",
-            "Людей в должности": "count",
+            "Медиана группы": "median",
+            "Среднее группы": "mean",
+            "СКО группы": "std",
+            "Людей в группе": "count",
         }
     )
-    stats["Q1 должности"] = base.groupby("Должность")["ЗП"].quantile(0.25)
-    stats["Q3 должности"] = base.groupby("Должность")["ЗП"].quantile(0.75)
+    stats["Q1 группы"] = base.groupby("Группа сравнения")["ЗП"].quantile(0.25)
+    stats["Q3 группы"] = base.groupby("Группа сравнения")["ЗП"].quantile(0.75)
 
-    # Группа меньше порога — статистики нет, откатываемся на уровень должности
-    level_median = base.groupby("Уровень должности")["ЗП"].median()
-    df = df.join(stats, on="Должность")
-    df["Медиана уровня"] = df["Уровень должности"].map(level_median)
+    # Группа меньше порога — статистики нет, откатываемся на грейд целиком
+    grade_median = base.groupby("Грейд")["ЗП"].median()
+    df = df.join(stats, on="Группа сравнения")
+    df["Медиана грейда"] = df["Грейд"].map(grade_median)
 
-    small = df["Людей в должности"].fillna(0) < MIN_GROUP_SIZE
-    df["База сравнения"] = df["Медиана должности"].where(~small, df["Медиана уровня"])
-    df["Уровень сравнения"] = "Должность"
-    df.loc[small, "Уровень сравнения"] = "Уровень должности (мало данных)"
+    small = df["Людей в группе"].fillna(0) < MIN_GROUP_SIZE
+    df["База сравнения"] = df["Медиана группы"].where(~small, df["Медиана грейда"])
+    df["Уровень сравнения"] = "Грейд + проектная роль"
+    df.loc[small, "Уровень сравнения"] = "Грейд (мало данных)"
     df.loc[df["В анализе справедливости"] == 0, "Уровень сравнения"] = "Не сравнивается"
 
     in_scope = df["В анализе справедливости"] == 1
     df.loc[in_scope, "Compa-ratio"] = (df["ЗП"] / df["База сравнения"]).round(3)
     df.loc[in_scope, "Отклонение руб"] = (df["ЗП"] - df["База сравнения"]).round(0)
     df.loc[in_scope, "Z-score"] = (
-        (df["ЗП"] - df["Среднее должности"]) / df["СКО должности"]
+        (df["ЗП"] - df["Среднее группы"]) / df["СКО группы"]
     ).round(2)
 
-    iqr = df["Q3 должности"] - df["Q1 должности"]
-    df["Граница выброса вверх"] = df["Q3 должности"] + 1.5 * iqr
-    df["Граница выброса вниз"] = df["Q1 должности"] - 1.5 * iqr
+    iqr = df["Q3 группы"] - df["Q1 группы"]
+    df["Граница выброса вверх"] = df["Q3 группы"] + 1.5 * iqr
+    df["Граница выброса вниз"] = df["Q1 группы"] - 1.5 * iqr
 
     def flag(row):
         if row["В анализе справедливости"] != 1:
@@ -264,9 +346,10 @@ def build_checks(df: pd.DataFrame) -> pd.DataFrame:
     unique_people = people[people["Первичное назначение"] == 1]
 
     salary_conflicts = people.groupby("Сотрудник")["ЗП"].nunique()
-    role_conflicts = people.groupby("Сотрудник")["Должность"].nunique()
+    role_conflicts = people.groupby("Сотрудник")["Штатная должность"].nunique()
+    org_conflicts = people.groupby("Сотрудник")["Организация"].nunique()
     owners = df.groupby("Проект")["Блок"].nunique()
-    duplicates = df.groupby(["Сотрудник", "Продукт ключ", "Должность"]).size()
+    duplicates = df.groupby(["Сотрудник", "Продукт ключ", "Проектная роль"]).size()
     duplicates = duplicates[duplicates.index.get_level_values(0) != ""]
 
     checks = [
@@ -275,7 +358,9 @@ def build_checks(df: pd.DataFrame) -> pd.DataFrame:
         ("Уникальных сотрудников", int(unique_people.shape[0]), ""),
         ("Проектов", df["Проект"].nunique(), ""),
         ("Продуктов", df["Продукт ключ"].nunique(), ""),
-        ("Должностей", df["Должность"].nunique(), ""),
+        ("Проектных ролей", df["Проектная роль"].nunique(), ""),
+        ("Штатных должностей", people["Штатная должность"].nunique(), ""),
+        ("Организаций", people["Организация"].nunique(), ""),
         (
             "ЗП не подтверждена (людей)",
             int((unique_people["ЗП подтверждена"] == 0).sum()),
@@ -288,16 +373,21 @@ def build_checks(df: pd.DataFrame) -> pd.DataFrame:
             "должно быть 0",
         ),
         (
-            "Разные должности у одного сотрудника",
+            "Разные штатные должности у одного сотрудника",
             int((role_conflicts > 1).sum()),
-            "проверить, это совмещение или ошибка",
+            "должно быть 0: должность — атрибут человека",
+        ),
+        (
+            "Разные организации у одного сотрудника",
+            int((org_conflicts > 1).sum()),
+            "должно быть 0",
         ),
         ("Проектов с несколькими блоками", int((owners > 1).sum()), "должно быть 0"),
         ("Дублей назначений", int((duplicates > 1).sum()), "должно быть 0"),
         (
-            "Должностей вне классификатора",
-            int((df["Уровень"] == -1).sum()),
-            "дополнить POSITION_LEVELS в скрипте",
+            "Должностей вне классификатора грейдов",
+            int((people["Грейд №"] == -1).sum()),
+            "дополнить GRADE_RULES в скрипте",
         ),
         (
             "Продуктов с одним человеком",
@@ -311,10 +401,11 @@ def build_checks(df: pd.DataFrame) -> pd.DataFrame:
 def build_people_sheet(df: pd.DataFrame) -> pd.DataFrame:
     people = df[(df["Вакансия"] == 0) & (df["Первичное назначение"] == 1)]
     columns = [
-        "Сотрудник", "Должность", "Уровень должности", "Блок", "Проект",
-        "Руководитель", "ЗП", "ЗП подтверждена", "База сравнения",
-        "Уровень сравнения", "Compa-ratio", "Отклонение руб", "Z-score",
-        "Флаг ЗП", "Требует внимания", "Доплата до порога",
+        "Сотрудник", "Организация", "Штатная должность", "Грейд", "Проектная роль",
+        "Блок", "Проект", "Руководитель", "ЗП", "ЗП подтверждена",
+        "Группа сравнения", "База сравнения", "Уровень сравнения",
+        "Compa-ratio", "Отклонение руб", "Z-score", "Флаг ЗП",
+        "Требует внимания", "Доплата до порога",
         "Назначений у сотрудника", "Проектов у сотрудника",
     ]
     return people[columns].sort_values("Отклонение руб")
@@ -325,13 +416,19 @@ def main() -> None:
     parser.add_argument("source", type=Path, help="исходный .xlsx")
     parser.add_argument("--out", type=Path, default=Path("datalens_dataset"))
     parser.add_argument(
+        "--sheet",
+        default=0,
+        help="имя или номер листа с данными (по умолчанию первый)",
+    )
+    parser.add_argument(
         "--snapshot",
         default="",
         help="дата среза в формате ГГГГ-ММ-ДД; заполняет столбец «Дата среза»",
     )
     args = parser.parse_args()
 
-    raw = load_source(args.source)
+    sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
+    raw = load_source(args.source, sheet)
     assignments = build_assignments(raw)
     if args.snapshot:
         assignments.insert(0, "Дата среза", args.snapshot)
@@ -339,24 +436,44 @@ def main() -> None:
     csv_path = args.out.with_suffix(".csv")
     assignments.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
+    scored = assignments[assignments["В анализе справедливости"] == 1]
+    grades = (
+        scored.groupby(["Грейд №", "Грейд"])["ЗП"]
+        .agg(["count", "min", "median", "mean", "max", "std"])
+        .round(0)
+    )
+
     xlsx_path = args.out.with_suffix(".xlsx")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         assignments.to_excel(writer, sheet_name="Назначения", index=False)
         build_people_sheet(assignments).to_excel(writer, sheet_name="Сотрудники", index=False)
+        grades.to_excel(writer, sheet_name="Грейды")
         (
-            assignments[assignments["В анализе справедливости"] == 1]
-            .groupby(["Уровень должности", "Должность"])["ЗП"]
-            .agg(["count", "min", "median", "mean", "max", "std"])
+            scored.groupby(["Грейд", "Штатная должность"])["ЗП"]
+            .agg(["count", "min", "median", "max"])
             .round(0)
             .to_excel(writer, sheet_name="Должности")
         )
+        (
+            scored.groupby(["Грейд", "Организация"])["ЗП"]
+            .agg(["count", "median"])
+            .round(0)
+            .to_excel(writer, sheet_name="Грейд x организация")
+        )
         build_checks(assignments).to_excel(writer, sheet_name="Проверки", index=False)
 
-    checks = build_checks(assignments)
     print(f"Записано: {csv_path}  ({len(assignments)} строк)")
     print(f"Записано: {xlsx_path}")
     print()
-    print(checks.to_string(index=False))
+    print(build_checks(assignments).to_string(index=False))
+
+    # Проверка классификации: медианы по грейдам обязаны расти монотонно.
+    # Если нет — грейд назначен неверно, и на нём нельзя строить сравнение.
+    medians = grades["median"].tolist()
+    monotone = all(a <= b for a, b in zip(medians, medians[1:]))
+    print()
+    print("Медианы по грейдам:", " → ".join(f"{m:,.0f}".replace(",", " ") for m in medians))
+    print("Монотонность:", "ОК" if monotone else "НАРУШЕНА — проверьте GRADE_RULES")
 
 
 if __name__ == "__main__":

@@ -7,11 +7,13 @@
 поведение которых зависит от разреза чарта.
 
 Запуск:
-    python3 prepare_dataset.py вход.xlsx --out datalens_dataset
+    python3 prepare_dataset.py                      # берёт Datalens.xlsx рядом со скриптом
+    python3 prepare_dataset.py другой_файл.xlsx     # или указанный файл
 
 Создаёт:
     datalens_dataset.csv   — витрина назначений (основная таблица для DataLens)
-    datalens_dataset.xlsx  — то же самое + листы «Сотрудники», «Роли», «Проверки»
+    datalens_dataset.xlsx  — то же самое + листы «Сотрудники», «Роли», «Грейды»,
+                             «Роль x грейд», «Типы отклонений», «Проверки»
 
 Никаких данных внутри скрипта нет: он работает с тем файлом, который ему передали.
 """
@@ -25,6 +27,10 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+
+# Имя исходной выгрузки по умолчанию: кладём файл рядом со скриптом и
+# запускаем без аргументов.
+DEFAULT_SOURCE = Path("Datalens.xlsx")
 
 # Обязательные столбцы: исходное имя → имя в датасете
 SOURCE_COLUMNS = {
@@ -148,7 +154,29 @@ def clean_text(value) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def load_source(path: Path, sheet: str | int = 0) -> pd.DataFrame:
+def pick_sheet(path: Path) -> str:
+    """Находит лист с данными: первый, где есть все обязательные столбцы.
+
+    В файле обычно лежат и служебные листы (сводные, справочники), причём
+    вперёд они попадают чаще, чем сам реестр. Брать просто первый нельзя.
+    """
+    book = pd.read_excel(path, sheet_name=None, dtype=str, nrows=0)
+    for name, frame in book.items():
+        columns = {clean_text(c) for c in frame.columns}
+        if set(SOURCE_COLUMNS).issubset(columns):
+            return name
+    sys.exit(
+        "Ни на одном листе нет полного набора обязательных столбцов.\n"
+        "Листы в файле: " + ", ".join(book) + "\n"
+        "Нужны: " + ", ".join(SOURCE_COLUMNS)
+    )
+
+
+def load_source(path: Path, sheet: str | int | None = None) -> pd.DataFrame:
+    if sheet is None:
+        sheet = pick_sheet(path)
+        print(f"Лист с данными: «{sheet}»")
+
     df = pd.read_excel(path, sheet_name=sheet, dtype=str)
     df.columns = [clean_text(c) for c in df.columns]
 
@@ -497,12 +525,18 @@ def build_people_sheet(df: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path, help="исходный .xlsx")
+    parser.add_argument(
+        "source",
+        type=Path,
+        nargs="?",
+        default=DEFAULT_SOURCE,
+        help=f"исходный .xlsx (по умолчанию {DEFAULT_SOURCE})",
+    )
     parser.add_argument("--out", type=Path, default=Path("datalens_dataset"))
     parser.add_argument(
         "--sheet",
-        default=0,
-        help="имя или номер листа с данными (по умолчанию первый)",
+        default=None,
+        help="имя или номер листа; по умолчанию определяется автоматически",
     )
     parser.add_argument(
         "--snapshot",
@@ -511,7 +545,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not args.source.exists():
+        sys.exit(
+            f"Файл не найден: {args.source}\n"
+            f"Положите исходную выгрузку рядом со скриптом под именем {DEFAULT_SOURCE} "
+            "или укажите путь первым аргументом."
+        )
+
     sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
+    print(f"Читаю: {args.source}")
     raw = load_source(args.source, sheet)
     assignments = build_assignments(raw)
     if args.snapshot:

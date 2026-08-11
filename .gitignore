@@ -9,3 +9,7 @@ __pycache__/
 # Virtual envs
 .venv/
 venv/
+
+# данные и подготовленные выгрузки не коммитим
+docs/hr-dashboard/*.xlsx
+docs/hr-dashboard/datalens_dataset.*

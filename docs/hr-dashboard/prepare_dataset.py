@@ -276,12 +276,32 @@ def build_assignments(df: pd.DataFrame) -> pd.DataFrame:
     stats["Q1 роли"] = scored.groupby("Проектная роль")["ЗП"].quantile(0.25)
     stats["Q3 роли"] = scored.groupby("Проектная роль")["ЗП"].quantile(0.75)
 
-    level_median = scored.groupby("Уровень роли")["ЗП"].median()
+    # Медиана уровня — запасная база, когда в роли слишком мало людей.
+    # Считаем её по СОСЕДНИМ ролям уровня, исключая собственную роль человека:
+    # иначе роль частично сравнивалась бы сама с собой. Для роли из одного
+    # человека это особенно важно — его же зарплата попадала бы в базу.
+    level_median_full = scored.groupby("Уровень роли")["ЗП"].median()
+    neighbour_median = {}
+    for level, group in scored.groupby("Уровень роли"):
+        for role in group["Проектная роль"].unique():
+            others = group[group["Проектная роль"] != role]["ЗП"]
+            # Если уровень состоит из одной роли, соседей нет — берём уровень целиком
+            neighbour_median[(level, role)] = (
+                others.median() if len(others) else level_median_full[level]
+            )
+
     df = df.join(stats, on="Проектная роль")
-    df["Медиана уровня роли"] = df["Уровень роли"].map(level_median)
+    df["Медиана уровня роли"] = [
+        neighbour_median.get((lvl, role), level_median_full.get(lvl))
+        for lvl, role in zip(df["Уровень роли"], df["Проектная роль"])
+    ]
 
     small = df["Людей в роли"].fillna(0) < MIN_GROUP_SIZE
     df["База сравнения"] = df["Медиана роли"].where(~small, df["Медиана уровня роли"])
+    # Показываем запасную базу только там, где она реально применилась: иначе
+    # в строках крупных ролей стоит число, которое никуда не идёт, и вызывает
+    # закономерный вопрос «откуда оно взялось».
+    df.loc[~small, "Медиана уровня роли"] = pd.NA
     df["Уровень сравнения"] = "Проектная роль"
     df.loc[small, "Уровень сравнения"] = "Уровень роли (мало данных)"
     df.loc[df["В анализе справедливости"] == 0, "Уровень сравнения"] = "Не сравнивается"
@@ -617,13 +637,20 @@ def main() -> None:
 
     # Проверка классификации ролей: медианы по уровням обязаны расти монотонно.
     # Если нет — уровень назначен неверно, и откат на него будет искажать базу.
-    medians = roles.groupby(level=0)["медиана"].median().tolist()
+    #
+    # Считаем по всем людям уровня, а не как медиану медиан ролей: второе даёт
+    # другое число и расходится со столбцом «Медиана уровня роли» в витрине.
+    scored = assignments[assignments["В анализе справедливости"] == 1]
+    level_medians = (
+        scored.groupby(["Уровень роли №", "Уровень роли"])["ЗП"]
+        .agg(людей="count", медиана="median")
+        .round(0)
+    )
+    medians = level_medians["медиана"].tolist()
     monotone = all(a <= b for a, b in zip(medians, medians[1:]))
     print()
-    print(
-        "Медианы по уровням ролей:",
-        " → ".join(f"{m:,.0f}".replace(",", " ") for m in medians),
-    )
+    print("Медианы ЗП по уровням ролей:")
+    print(level_medians.to_string())
     print("Монотонность:", "ОК" if monotone else "НАРУШЕНА — проверьте ROLE_LEVELS")
 
     print()

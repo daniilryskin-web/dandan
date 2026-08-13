@@ -499,9 +499,18 @@ def sheet_projects(df: pd.DataFrame) -> pd.DataFrame:
     table = people.groupby(["Блок", "Проект"]).agg(
         сотрудников=("Сотрудник", "nunique"),
         FTE=("Доля занятости", "sum"),
-        продуктов=("Продукт ключ", "nunique"),
         ФОТ_мес=("ФОТ аллоцированный", "sum"),
     )
+
+    # Продукты считаем по всем строкам, включая вакансии: продукт существует
+    # независимо от того, укомплектован он или нет. Отдельной колонкой
+    # показываем те, что держатся на одних вакансиях, — их не видно иначе.
+    all_products = df.groupby(["Блок", "Проект"])["Продукт ключ"].nunique()
+    staffed_products = people.groupby(["Блок", "Проект"])["Продукт ключ"].nunique()
+    table["продуктов"] = all_products.reindex(table.index).fillna(0).astype(int)
+    table["продуктов без людей"] = (
+        table["продуктов"] - staffed_products.reindex(table.index).fillna(0)
+    ).astype(int)
     # Округляем ДО расчёта производных, а не после: иначе показанные FTE и ФОТ
     # не дают показанную стоимость FTE, и цифру невозможно перепроверить руками.
     table["FTE"] = table["FTE"].round(4)
@@ -513,6 +522,10 @@ def sheet_projects(df: pd.DataFrame) -> pd.DataFrame:
         table.index.get_level_values("Проект").map(vacancies).fillna(0).astype(int)
     )
     table["доля ФОТ, %"] = (table["ФОТ_мес"] / table["ФОТ_мес"].sum() * 100).round(1)
+    table = table[[
+        "сотрудников", "FTE", "продуктов", "продуктов без людей",
+        "ФОТ_мес", "стоимость FTE", "вакансий", "доля ФОТ, %",
+    ]]
     return table.sort_values("ФОТ_мес", ascending=False)
 
 

@@ -502,11 +502,18 @@ def sheet_projects(df: pd.DataFrame) -> pd.DataFrame:
         продуктов=("Продукт ключ", "nunique"),
         ФОТ_мес=("ФОТ аллоцированный", "sum"),
     )
-    table["стоимость FTE"] = table["ФОТ_мес"] / table["FTE"]
+    # Округляем ДО расчёта производных, а не после: иначе показанные FTE и ФОТ
+    # не дают показанную стоимость FTE, и цифру невозможно перепроверить руками.
+    table["FTE"] = table["FTE"].round(4)
+    table["ФОТ_мес"] = table["ФОТ_мес"].round(2)
+    table["стоимость FTE"] = (table["ФОТ_мес"] / table["FTE"]).round(2)
+
     vacancies = df[df["Вакансия"] == 1].groupby("Проект").size()
-    table["вакансий"] = table.index.get_level_values("Проект").map(vacancies).fillna(0)
+    table["вакансий"] = (
+        table.index.get_level_values("Проект").map(vacancies).fillna(0).astype(int)
+    )
     table["доля ФОТ, %"] = (table["ФОТ_мес"] / table["ФОТ_мес"].sum() * 100).round(1)
-    return table.round(1).sort_values("ФОТ_мес", ascending=False)
+    return table.sort_values("ФОТ_мес", ascending=False)
 
 
 def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:

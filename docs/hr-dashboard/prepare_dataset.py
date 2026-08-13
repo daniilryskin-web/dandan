@@ -122,6 +122,27 @@ COLUMN_ORDER = [
 ]
 
 
+def shares_to_100(values: pd.Series, decimals: int = 1) -> pd.Series:
+    """Округляет доли так, чтобы их сумма была ровно 100%.
+
+    Независимое округление каждой доли даёт в сумме 99,9 или 100,1 — это
+    не ошибка расчёта, но в таблице выглядит как ошибка. Метод наибольших
+    остатков распределяет расхождение: округляем вниз, а недостающие
+    единицы последнего знака отдаём тем строкам, у которых отброшенный
+    остаток был самым большим.
+    """
+    if values.empty or values.sum() == 0:
+        return values
+    scale = 10 ** decimals
+    scaled = values / values.sum() * 100 * scale
+    floors = scaled.apply(lambda x: int(x))
+    remainder = int(round(100 * scale - floors.sum()))
+    if remainder > 0:
+        order = (scaled - floors).sort_values(ascending=False).index[:remainder]
+        floors.loc[order] += 1
+    return floors / scale
+
+
 def clean_text(value) -> str:
     """Убирает переносы строк, неразрывные пробелы и двойные пробелы.
 
@@ -469,12 +490,14 @@ def sheet_rating(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataF
         доплата_до_порога=("Доплата до порога", "sum"),
         подтверждённых_ЗП=("ЗП подтверждена", "sum"),
     )
-    by_rating["доля, %"] = (by_rating["людей"] / total * 100).round(1)
     by_rating["сумма_отклонения_год"] = by_rating["сумма_отклонения"] * 12
     by_rating = by_rating[[
-        "людей", "доля, %", "подтверждённых_ЗП", "медиана_ЗП", "медиана_базы",
+        "людей", "подтверждённых_ЗП", "медиана_ЗП", "медиана_базы",
         "сумма_отклонения", "сумма_отклонения_год", "доплата_до_порога",
     ]].round(0)
+    # Доли считаем после округления остальных колонок: иначе двойное
+    # округление сдвигает значения (63,46 → 63,5 → 64).
+    by_rating.insert(1, "доля, %", shares_to_100(by_rating["людей"]))
 
     by_role = pd.crosstab(
         [scored["Уровень роли №"], scored["Проектная роль"]],
@@ -521,7 +544,7 @@ def sheet_projects(df: pd.DataFrame) -> pd.DataFrame:
     table["вакансий"] = (
         table.index.get_level_values("Проект").map(vacancies).fillna(0).astype(int)
     )
-    table["доля ФОТ, %"] = (table["ФОТ_мес"] / table["ФОТ_мес"].sum() * 100).round(1)
+    table["доля ФОТ, %"] = shares_to_100(table["ФОТ_мес"])
     table = table[[
         "сотрудников", "FTE", "продуктов", "продуктов без людей",
         "ФОТ_мес", "стоимость FTE", "вакансий", "доля ФОТ, %",

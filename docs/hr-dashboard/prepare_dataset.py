@@ -18,7 +18,8 @@ LOD-выражений, поведение которых зависит от р
     python3 prepare_dataset.py другой.xlsx        # или указанный файл
 
 Создаёт:
-    datalens_dataset.csv   — витрина назначений, её и грузим в DataLens
+    datalens_dataset.csv        — основная таблица назначений, её грузим в DataLens
+    datalens_dataset_roles.csv  — по одной строке на роль, для чарта разброса
     datalens_dataset.xlsx  — то же самое плюс листы «Сотрудники», «Оценка ЗП»,
                              «Роли», «Проекты», «Вакансии», «Проверки»
 
@@ -99,7 +100,7 @@ MIN_GROUP_SIZE = 4          # минимум людей в роли, чтобы 
 LOWER_THRESHOLD = 0.90      # ниже — «ниже роли»
 UPPER_THRESHOLD = 1.30      # выше — «переплата»
 
-# Порядок столбцов в витрине: сначала «где и кто», потом «сколько платят»,
+# Порядок столбцов в основной таблице: сначала «где и кто», потом «сколько платят»,
 # потом расчёты и в конце риски.
 COLUMN_ORDER = [
     "Дата среза", "Строка",
@@ -111,8 +112,8 @@ COLUMN_ORDER = [
     "Мультипродуктовый", "Мультипроектный",
     "Доля занятости", "Первичное назначение", "ФОТ аллоцированный",
     "В анализе справедливости",
-    "Людей в роли", "Медиана роли", "Среднее роли", "СКО роли",
-    "Q1 роли", "Q3 роли", "Медиана уровня роли",
+    "Людей в роли", "Минимум роли", "Q1 роли", "Медиана роли", "Q3 роли",
+    "Максимум роли", "Среднее роли", "СКО роли", "Медиана уровня роли",
     "База сравнения", "Уровень сравнения",
     "Compa-ratio", "Отклонение руб", "Z-score",
     "Граница выброса вверх", "Граница выброса вниз", "Выброс по IQR",
@@ -288,7 +289,9 @@ def build_assignments(df: pd.DataFrame) -> pd.DataFrame:
     scored = df[df["В анализе справедливости"] == 1]
     stats = scored.groupby("Проектная роль")["ЗП"].agg(
         **{
+            "Минимум роли": "min",
             "Медиана роли": "median",
+            "Максимум роли": "max",
             "Среднее роли": "mean",
             "СКО роли": "std",
             "Людей в роли": "count",
@@ -472,7 +475,7 @@ def sheet_roles(df: pd.DataFrame) -> pd.DataFrame:
     )
     table["разброс, раз"] = (table["максимум"] / table["минимум"]).round(1)
 
-    # Границы выброса по правилу IQR — те же, что в витрине. Нужны здесь,
+    # Границы выброса по правилу IQR — те же, что в листе «Назначения». Нужны здесь,
     # чтобы лист был самодостаточным: по нему рисуются «усы» на чарте разброса
     # и проверяется, кто помечен как выброс.
     iqr = table["Q3"] - table["Q1"]
@@ -659,6 +662,14 @@ def main() -> None:
     csv_path = args.out.with_suffix(".csv")
     assignments.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
+    # Лист «Роли» отдельным файлом: одна строка на роль — ровно та
+    # детализация, которая нужна чарту разброса («ящик с усами»).
+    # Загружается в DataLens как второй датасет.
+    roles_csv = args.out.with_name(args.out.stem + "_roles").with_suffix(".csv")
+    sheet_roles(assignments).reset_index().to_csv(
+        roles_csv, index=False, encoding="utf-8-sig"
+    )
+
     roles = sheet_roles(assignments)
     by_rating, by_role, by_project = sheet_rating(assignments)
 
@@ -685,6 +696,7 @@ def main() -> None:
         sheet_checks(assignments).to_excel(writer, sheet_name="Проверки", index=False)
 
     print(f"Записано: {csv_path}  ({len(assignments)} строк)")
+    print(f"Записано: {roles_csv}  (по одной строке на роль, для чарта разброса)")
     print(f"Записано: {xlsx_path}")
     print()
     print(sheet_checks(assignments).to_string(index=False))

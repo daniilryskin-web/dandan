@@ -39,6 +39,12 @@ var NODE_W = [200, 206, 200, 396];     // ширина узла по уровн�
 var NODE_H = 30;                       // высота узла, px
 var STRIP  = 5;                        // толщина полосы состава, px
 
+// Высота видимой области на дашборде. Полное дерево из 57 строк — около
+// 2000 px, и виджет обычной высоты его обрежет. Если полотно выше этого
+// значения, чарт остаётся заданной высоты, а дерево прокручивается внутри
+// него. Поставьте 0, чтобы всегда рисовать целиком (для выгрузки в PDF).
+var VIEW_HEIGHT = 720;
+
 // Порядковая шкала ролей: один тон, разная светлота. Нижнюю ступень не
 // доводим до почти-белого — иначе сегмент стажёров читается как пустое место.
 var LEVELS = [
@@ -353,15 +359,21 @@ var legend = LEVELS.map(function (item) {
         '</span>';
 }).join('');
 
+var fullHeight = totalRows * ROW + 62;
+var viewHeight = (VIEW_HEIGHT && fullHeight > VIEW_HEIGHT) ? VIEW_HEIGHT : fullHeight;
+
 module.exports = {
     chart: {
         type: 'scatter',
-        height: totalRows * ROW + 62,
+        height: viewHeight,
         backgroundColor: THEME.sunk,
         marginTop: 40, marginBottom: 12, marginLeft: 12, marginRight: 12,
         scrollablePlotArea: {
             minWidth: COL_X[3] + NODE_W[3] + 40,
-            scrollPositionX: 0
+            minHeight: fullHeight,
+            scrollPositionX: 0,
+            scrollPositionY: 0,
+            opacity: 1
         },
         events: { render: drawTree }
     },

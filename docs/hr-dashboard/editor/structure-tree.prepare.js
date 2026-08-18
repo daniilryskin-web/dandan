@@ -138,11 +138,39 @@ function readSource(log) {
         log.push('Имена колонок не найдены, используется порядок из COLUMNS');
     }
 
-    log.push('Колонки: ' + names.join(' · '));
-
     if (!rows.length) {
         log.push('Ни один известный формат ответа не дал строк.');
+        log.push('Колонки: ' + names.join(' · '));
+        return { fields: names, rows: rows };
     }
+
+    // Приводим строки к массивам значений. Строка может прийти тремя видами:
+    // массивом, объектом {values: [...]} или объектом, где ключи — названия
+    // колонок. В последнем случае обращение по индексу давало undefined:
+    // дерево строилось, но все названия оказывались пустыми, а числа нулями.
+    var first = rows[0];
+    if (Array.isArray(first)) {
+        log.push('Строка — массив из ' + first.length + ' значений');
+    } else if (first && Array.isArray(first.values)) {
+        rows = rows.map(function (r) { return r.values; });
+        log.push('Строка — объект values, значений: ' + rows[0].length);
+    } else if (first && typeof first === 'object') {
+        // Ключи объекта и есть настоящие названия колонок — они точнее,
+        // чем всё, что можно вытащить из Type или fields.
+        var keys = Object.keys(first);
+        names = keys;
+        rows = rows.map(function (r) {
+            return keys.map(function (k) { return r[k]; });
+        });
+        log.push('Строка — объект с ключами, значений: ' + keys.length);
+    } else {
+        log.push('Строка неизвестного вида: ' + (typeof first));
+    }
+
+    log.push('Колонки: ' + names.join(' · '));
+    log.push('Первая строка: ' + (rows[0] || []).map(function (v) {
+        return v === null || v === undefined ? '(пусто)' : String(v);
+    }).join(' · '));
 
     return { fields: names, rows: rows };
 }
@@ -289,7 +317,9 @@ function buildScene(source) {
             return { color: level.color, label: level.label };
         }),
         nodes: [],
-        links: []
+        links: [],
+        blocks: root.children.length,
+        people: root.children.reduce(function (sum, b) { return sum + b.people; }, 0)
     };
 
     function pushNode(level, row, options) {
@@ -417,13 +447,24 @@ var failure = null;
 if (source.rows.length) {
     try {
         scene = buildScene(source);
-        log.push('Построено узлов: ' + scene.nodes.length);
+        log.push('Построено узлов: ' + scene.nodes.length +
+                 ', направлений: ' + scene.blocks +
+                 ', людей суммарно: ' + scene.people);
+
         if (!scene.nodes.length) {
             failure = 'Строки пришли, но ни одного узла не построилось.';
+        } else if (scene.blocks === 1 && source.rows.length > 5 && !scene.people) {
+            // Ровно этот случай выглядел как «дерево нарисовалось, но пустое»:
+            // значения из строк не читались, всё схлопывалось в одну ветку.
+            failure = 'Строки пришли, но значения в них не читаются: ' +
+                      'всё схлопнулось в одну ветку, людей — ноль. ' +
+                      'Скорее всего названия колонок в ответе отличаются ' +
+                      'от ожидаемых — сверьте список ниже.';
         }
     } catch (e) {
         failure = e.message;
     }
+    if (failure) { scene = null; }
 } else {
     failure = 'Источник не вернул ни одной строки.';
 }

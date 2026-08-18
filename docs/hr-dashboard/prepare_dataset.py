@@ -640,6 +640,60 @@ def sheet_projects(df: pd.DataFrame) -> pd.DataFrame:
     return table.sort_values("ФОТ_мес", ascending=False)
 
 
+def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
+    """Иерархия «блок → проект → продукт» с составом команды по уровням ролей.
+
+    Повторяет схему из drawio-референса: колонка — проект, внутри — продукты,
+    у каждого продукта состав команды пятью числами. Пять чисел — это пять
+    уровней ролей R4…R0, от руководства к стажировке; порядок совпадает
+    с классификатором ROLE_LEVELS, поэтому строка «Состав» читается без
+    легенды, если знать, что старшие роли слева.
+    """
+    people = df[df["Вакансия"] == 0]
+    index = ["Блок", "Проект", "Продукт кратко"]
+
+    table = people.groupby(index).agg(
+        людей=("Сотрудник", "nunique"),
+        ФОТ_мес=("ФОТ аллоцированный", "sum"),
+        медиана_ЗП=("ЗП", "median"),
+    )
+    table["ФОТ_мес"] = table["ФОТ_мес"].round(2)
+    table["медиана_ЗП"] = table["медиана_ЗП"].round(2)
+
+    levels = people.pivot_table(
+        index=index, columns="Уровень роли №", values="Сотрудник",
+        aggfunc="nunique", fill_value=0,
+    )
+    order = sorted(ROLE_LEVELS.values(), key=lambda v: -v[0])
+    seen: list[int] = []
+    for number, _ in order:
+        if number not in seen:
+            seen.append(number)
+    for number in seen:
+        column = f"R{number}"
+        table[column] = (
+            levels[number].reindex(table.index).fillna(0).astype(int)
+            if number in levels else 0
+        )
+    table["Состав"] = table[[f"R{n}" for n in seen]].astype(str).agg("-".join, axis=1)
+
+    vacancies = df[df["Вакансия"] == 1].groupby(index).size()
+    table["вакансий"] = vacancies.reindex(table.index).fillna(0).astype(int)
+
+    # Тот же светофор незаменимости, что и в основной таблице, но на уровне
+    # продукта: на схеме он даёт цвет рамки.
+    table["риск"] = pd.cut(
+        table["людей"], bins=[-1, 1, 2, 10_000],
+        labels=["Критично: 1 человек", "Риск: 2 человека", "ОК"],
+    ).astype(str)
+
+    columns = [f"R{n}" for n in seen] + [
+        "Состав", "людей", "вакансий", "ФОТ_мес", "медиана_ЗП", "риск",
+    ]
+    return table[columns].sort_values(["Блок", "Проект", "людей"],
+                                      ascending=[True, True, False])
+
+
 def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:
     """Открытые позиции и во что обойдётся их закрытие."""
     vacancies = df[df["Вакансия"] == 1]
@@ -747,6 +801,14 @@ def main() -> None:
         roles_csv, index=False, encoding="utf-8-sig"
     )
 
+    # Лист «Иерархия» отдельным файлом: одна строка на продукт с составом
+    # команды по уровням ролей. Из него строится сводная таблица «проект →
+    # продукт» и древовидная карта — то же, что нарисовано в drawio-схеме.
+    tree_csv = args.out.with_name(args.out.stem + "_tree").with_suffix(".csv")
+    sheet_hierarchy(assignments).reset_index().to_csv(
+        tree_csv, index=False, encoding="utf-8-sig"
+    )
+
     roles = sheet_roles(assignments)
     by_rating, by_role, by_project = sheet_rating(assignments)
 
@@ -769,11 +831,13 @@ def main() -> None:
 
         roles.to_excel(writer, sheet_name="Роли")
         sheet_projects(assignments).to_excel(writer, sheet_name="Проекты")
+        sheet_hierarchy(assignments).to_excel(writer, sheet_name="Иерархия")
         sheet_vacancies(assignments).to_excel(writer, sheet_name="Вакансии", index=False)
         sheet_checks(assignments).to_excel(writer, sheet_name="Проверки", index=False)
 
     print(f"Записано: {csv_path}  ({len(assignments)} строк)")
     print(f"Записано: {roles_csv}  (по одной строке на роль, для чарта разброса)")
+    print(f"Записано: {tree_csv}  (по одной строке на продукт, для иерархии)")
     print(f"Записано: {xlsx_path}")
     print()
     print(sheet_checks(assignments).to_string(index=False))

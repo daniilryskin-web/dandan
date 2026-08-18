@@ -3,23 +3,23 @@
  * Дерево структуры: Ответственный за направление → Проект → Руководитель → Продукт
  *
  * Полная инструкция по вкладкам — 10-structure-tree-howto.md.
- * Здесь содержимое ТОЛЬКО вкладки Prepare. Для Meta, Params, Sources
- * и Controls есть отдельные файлы structure-tree.<вкладка>.js.
+ * Здесь содержимое ТОЛЬКО вкладки Prepare.
  *
  * Как устроено. Advanced-чарт исполняет функцию render в песочнице QuickJS
  * на стороне клиента: DOM там нет, браузерных API нет, доступны только
  * строки, Math и то, что передали аргументом. Поэтому разделение такое:
  *
- *   сервер (этот файл, вне wrapFn) — разбор данных, дерево, раскладка,
- *                                    подрезка подписей; на выходе scene —
- *                                    плоский список готовых примитивов;
- *   клиент (fn внутри wrapFn)      — сборка SVG-строки из scene.
+ *   сервер (весь код вне wrapFn) — разбор ответа, дерево, раскладка,
+ *                                  подрезка подписей; на выходе scene —
+ *                                  плоский список готовых примитивов;
+ *   клиент (fn внутри wrapFn)    — сборка SVG-строки из scene.
  *
- * Функция fn не видит переменных этого файла: всё, что ей нужно, приходит
- * через args. Поэтому внутри неё нет ни одной внешней ссылки.
+ * Функция fn не видит переменных этого файла: всё приходит через args.
  *
- * ИСТОЧНИК — датасет «HR · Иерархия» (datalens_dataset_tree.csv).
- * Порядок колонок задаётся на вкладке Sources и продублирован в COLUMNS.
+ * ЕСЛИ ДАННЫЕ НЕ ПРИШЛИ, чарт не молчит: вместо дерева он рисует отчёт
+ * о том, что именно вернул источник — какие ключи, какие поля, сколько
+ * строк. Раньше в этом случае отрисовывалась одна легенда, и понять
+ * причину было невозможно.
  */
 
 // --------------------------------------------------------------------------
@@ -57,52 +57,113 @@ var THEME = {
     crit: '#A8382A', critBg: '#F6E3DF',
     white72: 'rgba(255,255,255,.72)',
     white60: 'rgba(255,255,255,.6)',
-    font: "Golos Text, Helvetica Neue, Arial, sans-serif",
-    mono: "JetBrains Mono, SFMono-Regular, Consolas, monospace"
+    font: 'Golos Text, Helvetica Neue, Arial, sans-serif',
+    mono: 'JetBrains Mono, SFMono-Regular, Consolas, monospace'
 };
 
-// Порядок колонок ОБЯЗАН совпадать с массивом columns на вкладке Sources:
-// имена полей в ответе датасета приходят в Type, но подстраховываемся этим
-// списком, если структура ответа окажется другой.
+// Порядок колонок должен совпадать со списком полей на вкладке Sources.
+// Используется как запасной вариант, если имена не удалось взять из ответа.
 var COLUMNS = [
     'Блок', 'Проект', 'Руководитель', 'Продукт кратко', 'риск',
     'R4', 'R3', 'R2', 'R1', 'R0', 'людей', 'вакансий', 'ФОТ_мес'
 ];
 
 // --------------------------------------------------------------------------
-// Чтение данных
+// Разбор ответа источника
 // --------------------------------------------------------------------------
 
-function readSource() {
-    var loaded = Editor.getLoadedData();
-    var key = Object.keys(loaded)[0];
-    var result = loaded[key].result || loaded[key];
-    var data = result.data || {};
-
-    // Имена колонок в порядке ответа лежат в Type:
-    //   ["ListType", ["StructType", [["Блок", ...], ["Проект", ...], ...]]]
-    var names = COLUMNS;
+/**
+ * Форматы ответа между версиями DataLens отличаются, поэтому пробуем
+ * все известные и записываем в журнал, какой сработал. Журнал попадает
+ * в отчёт, если данных не окажется.
+ */
+function readSource(log) {
+    var loaded;
     try {
-        var struct = data.Type[1][1];
-        if (struct && struct.length) {
-            names = struct.map(function (item) { return item[0]; });
-        }
+        loaded = Editor.getLoadedData();
     } catch (e) {
-        // Структура ответа другая — работаем по объявленному порядку колонок.
+        log.push('Editor.getLoadedData() бросил ошибку: ' + e.message);
+        return { fields: COLUMNS, rows: [] };
     }
 
-    return { fields: names, rows: data.Data || [] };
+    var keys = Object.keys(loaded || {});
+    log.push('Ключи источников: ' + (keys.length ? keys.join(', ') : '(пусто)'));
+    if (!keys.length) {
+        log.push('Источник не вернул ничего. Проверьте вкладки Meta и Sources.');
+        return { fields: COLUMNS, rows: [] };
+    }
+
+    var src = loaded[keys[0]] || {};
+    log.push('Ключи внутри «' + keys[0] + '»: ' + Object.keys(src).join(', '));
+
+    var result = src.result || src;
+    var data = result.data || {};
+    var rows = [];
+    var names = null;
+
+    // 1. Документированный формат: result.data.Data + result.data.Type
+    if (data.Data && data.Data.length) {
+        rows = data.Data;
+        log.push('Формат: result.data.Data, строк — ' + rows.length);
+        try {
+            names = data.Type[1][1].map(function (item) { return item[0]; });
+        } catch (e) {
+            log.push('Имена колонок из Type взять не удалось');
+        }
+    }
+
+    // 2. Старый формат: result_data[0].rows = [{values: [...]}, ...]
+    if (!rows.length && src.result_data && src.result_data[0]) {
+        var raw = src.result_data[0].rows || [];
+        rows = raw.map(function (r) { return r.values || r; });
+        if (rows.length) { log.push('Формат: result_data[0].rows, строк — ' + rows.length); }
+    }
+
+    // 3. Плоский массив строк
+    if (!rows.length && src.rows && src.rows.length) {
+        rows = src.rows.map(function (r) { return r.values || r; });
+        log.push('Формат: rows, строк — ' + rows.length);
+    }
+
+    // Имена колонок: из Type, иначе из описания полей, иначе объявленный порядок
+    if (!names) {
+        var fields = result.fields || src.fields;
+        if (fields && fields.length) {
+            names = fields.map(function (f) { return f.title || f.guid; });
+            log.push('Имена колонок взяты из fields');
+        }
+    }
+    if (!names) {
+        names = COLUMNS;
+        log.push('Имена колонок не найдены, используется порядок из COLUMNS');
+    }
+
+    log.push('Колонки: ' + names.join(' · '));
+
+    if (!rows.length) {
+        log.push('Ни один известный формат ответа не дал строк.');
+    }
+
+    return { fields: names, rows: rows };
 }
 
 function indexer(fields) {
     return function (name) {
         var i = fields.indexOf(name);
         if (i < 0) {
-            throw new Error('Нет колонки «' + name + '». Пришли: ' + fields.join(', '));
+            throw new Error(
+                'В ответе нет колонки «' + name + '». Пришли: ' + fields.join(' · ') +
+                '. Проверьте, что названия полей на вкладке Sources совпадают ' +
+                'с названиями в датасете побуквенно, включая регистр.'
+            );
         }
         return i;
     };
 }
+
+// --------------------------------------------------------------------------
+// Вспомогательное
+// --------------------------------------------------------------------------
 
 function money(value) {
     return String(Math.round(Number(value) || 0))
@@ -124,252 +185,275 @@ function compose(counts) {
     return LEVELS.map(function (level) { return counts[level.key]; }).join('-');
 }
 
-var source = readSource();
-
-// ОТЛАДКА. Если чарт пустой, раскомментируйте — увидите имена колонок
-// и число строк, которые реально пришли из датасета.
-// module.exports = {
-//     render: Editor.wrapFn({
-//         fn: function (options, info) { return info; },
-//         args: [source.fields.join(' | ') + ' — строк: ' + source.rows.length]
-//     })
-// };
-
-var at = indexer(source.fields);
-
-// --------------------------------------------------------------------------
-// Дерево
-// --------------------------------------------------------------------------
-
-function makeNode(name) {
-    return {
-        name: name, children: [], childIndex: {},
-        counts: emptyCounts(), people: 0, vacancies: 0, fot: 0
-    };
-}
-
-function childOf(parent, name) {
-    if (parent.childIndex[name] === undefined) {
-        parent.childIndex[name] = parent.children.length;
-        parent.children.push(makeNode(name));
-    }
-    return parent.children[parent.childIndex[name]];
-}
-
-var root = makeNode('');
-
-source.rows.forEach(function (row) {
-    var counts = emptyCounts();
-    LEVELS.forEach(function (level) {
-        counts[level.key] = Number(row[at(level.key)]) || 0;
-    });
-
-    var product = {
-        name: String(row[at('Продукт кратко')] || ''),
-        counts: counts,
-        people: Number(row[at('людей')]) || 0,
-        vacancies: Number(row[at('вакансий')]) || 0,
-        fot: Number(row[at('ФОТ_мес')]) || 0,
-        risk: String(row[at('риск')] || ''),
-        children: []
-    };
-
-    var block = childOf(root, String(row[at('Блок')] || '—'));
-    var project = childOf(block, String(row[at('Проект')] || '—'));
-    var chief = childOf(project, String(row[at('Руководитель')] || '—'));
-
-    chief.children.push(product);
-
-    // Состав ветки — сумма составов её продуктов: у направления сразу видно,
-    // на ком оно держится, без разворачивания.
-    [chief, project, block].forEach(function (node) {
-        addCounts(node.counts, counts);
-        node.people += product.people;
-        node.vacancies += product.vacancies;
-        node.fot += product.fot;
-    });
-});
-
-// Крупные ветки выше: дерево читают сверху вниз.
-function sortBranch(node, depth) {
-    node.children.sort(function (a, b) {
-        return depth === 2 ? (b.people - a.people) : (b.fot - a.fot);
-    });
-    if (depth < 2) {
-        node.children.forEach(function (child) { sortBranch(child, depth + 1); });
-    }
-}
-sortBranch(root, 0);
-
-// Раскладка: листья занимают строки подряд, родитель встаёт по центру
-// диапазона своих потомков.
-var leafRow = 0;
-root.children.forEach(function (block) {
-    var blockFrom = leafRow;
-    block.children.forEach(function (project) {
-        var projectFrom = leafRow;
-        project.children.forEach(function (chief) {
-            var chiefFrom = leafRow;
-            chief.children.forEach(function (product) {
-                product.row = leafRow;
-                leafRow += 1;
-            });
-            chief.row = (chiefFrom + leafRow - 1) / 2;
-        });
-        project.row = (projectFrom + leafRow - 1) / 2;
-    });
-    block.row = (blockFrom + leafRow - 1) / 2;
-});
-var totalRows = leafRow;
-
-// --------------------------------------------------------------------------
-// Сцена: плоский список примитивов для отрисовки
-// --------------------------------------------------------------------------
-
-var scene = {
-    width: COL_X[3] + NODE_W[3] + 24,
-    height: totalRows * ROW + PAD_TOP + 12,
-    padTop: PAD_TOP,
-    background: THEME.sunk,
-    font: THEME.font,
-    mono: THEME.mono,
-    legend: LEVELS.map(function (level) {
-        return { color: level.color, label: level.label };
-    }),
-    note: 'рамка продукта: красная — один человек, жёлтая — двое',
-    noteCrit: THEME.crit,
-    noteWarn: THEME.warn,
-    noteColor: THEME.inkFaint,
-    nodes: [],
-    links: []
-};
-
-function pushNode(level, row, options) {
-    var x = 12 + COL_X[level];
-    var y = PAD_TOP + row * ROW + ROW / 2 - NODE_H / 2;
-    var width = NODE_W[level];
-
-    var badge = null;
-    var strip = [];
-    var total = LEVELS.reduce(function (sum, item) {
-        return sum + options.counts[item.key];
-    }, 0);
-
-    if (total > 0) {
-        badge = compose(options.counts);
-        var badgeWidth = badge.length * META_CH + 8;
-        var stripX = x + 9;
-        var stripW = width - 18 - badgeWidth;
-        LEVELS.forEach(function (item) {
-            var n = options.counts[item.key];
-            if (!n) { return; }
-            var w = stripW * n / total;
-            strip.push({
-                x: stripX, w: Math.max(w - 1, 1), color: item.color
-            });
-            stripX += w;
-        });
-    }
-
-    // Подрезаем название так, чтобы оно не наехало на числа справа.
-    var metaWidth = options.meta ? options.meta.length * META_CH + 10 : 0;
-    var maxChars = Math.floor((width - 18 - metaWidth) / TITLE_CH);
-    var title = options.title.length > maxChars
-        ? options.title.slice(0, Math.max(maxChars - 1, 3)) + '…'
-        : options.title;
-
-    var node = {
-        x: x, y: y, w: width, h: NODE_H,
-        fill: options.fill,
-        stroke: options.stroke || 'none',
-        sw: options.stroke ? 1.5 : 0,
-        title: title,
-        titleColor: options.color,
-        titleSize: options.size || 11,
-        titleWeight: options.weight || 600,
-        meta: options.meta || '',
-        metaColor: options.metaColor || THEME.inkFaint,
-        badge: badge,
-        badgeColor: options.badgeColor || THEME.inkFaint,
-        stripY: y + NODE_H - STRIP - 5,
-        stripH: STRIP,
-        strip: strip
-    };
-    scene.nodes.push(node);
-    return node;
-}
-
-function pushLink(from, to) {
-    var x1 = from.x + from.w;
-    var y1 = from.y + from.h / 2;
-    var x2 = to.x;
-    var y2 = to.y + to.h / 2;
-    var mid = x1 + (x2 - x1) / 2;
-    scene.links.push(
-        'M' + x1 + ' ' + y1 + 'L' + mid + ' ' + y1 +
-        'L' + mid + ' ' + y2 + 'L' + x2 + ' ' + y2
-    );
-}
-
 function vacancyMark(count) {
     return count ? ' +' + count + ' вак' : '';
 }
 
-root.children.forEach(function (block) {
-    var blockBox = pushNode(0, block.row, {
-        counts: block.counts, fill: THEME.block, color: '#FFFFFF',
-        title: block.name, size: 12, weight: 700,
-        meta: block.people + ' чел',
-        metaColor: THEME.white72, badgeColor: THEME.white60
+// --------------------------------------------------------------------------
+// Дерево и сцена
+// --------------------------------------------------------------------------
+
+function buildScene(source) {
+    var at = indexer(source.fields);
+
+    function makeNode(name) {
+        return {
+            name: name, children: [], childIndex: {},
+            counts: emptyCounts(), people: 0, vacancies: 0, fot: 0
+        };
+    }
+
+    function childOf(parent, name) {
+        if (parent.childIndex[name] === undefined) {
+            parent.childIndex[name] = parent.children.length;
+            parent.children.push(makeNode(name));
+        }
+        return parent.children[parent.childIndex[name]];
+    }
+
+    var root = makeNode('');
+
+    source.rows.forEach(function (row) {
+        var counts = emptyCounts();
+        LEVELS.forEach(function (level) {
+            counts[level.key] = Number(row[at(level.key)]) || 0;
+        });
+
+        var product = {
+            name: String(row[at('Продукт кратко')] || ''),
+            counts: counts,
+            people: Number(row[at('людей')]) || 0,
+            vacancies: Number(row[at('вакансий')]) || 0,
+            fot: Number(row[at('ФОТ_мес')]) || 0,
+            risk: String(row[at('риск')] || ''),
+            children: []
+        };
+
+        var block = childOf(root, String(row[at('Блок')] || '—'));
+        var project = childOf(block, String(row[at('Проект')] || '—'));
+        var chief = childOf(project, String(row[at('Руководитель')] || '—'));
+
+        chief.children.push(product);
+
+        // Состав ветки — сумма составов её продуктов: у направления сразу
+        // видно, на ком оно держится, без разворачивания.
+        [chief, project, block].forEach(function (node) {
+            addCounts(node.counts, counts);
+            node.people += product.people;
+            node.vacancies += product.vacancies;
+            node.fot += product.fot;
+        });
     });
 
-    block.children.forEach(function (project) {
-        var projectBox = pushNode(1, project.row, {
-            counts: project.counts, fill: THEME.project, color: '#FFFFFF',
-            title: project.name, meta: project.people + ' чел',
+    // Крупные ветки выше: дерево читают сверху вниз.
+    function sortBranch(node, depth) {
+        node.children.sort(function (a, b) {
+            return depth === 2 ? (b.people - a.people) : (b.fot - a.fot);
+        });
+        if (depth < 2) {
+            node.children.forEach(function (child) { sortBranch(child, depth + 1); });
+        }
+    }
+    sortBranch(root, 0);
+
+    // Раскладка: листья занимают строки подряд, родитель встаёт по центру
+    // диапазона своих потомков.
+    var leafRow = 0;
+    root.children.forEach(function (block) {
+        var blockFrom = leafRow;
+        block.children.forEach(function (project) {
+            var projectFrom = leafRow;
+            project.children.forEach(function (chief) {
+                var chiefFrom = leafRow;
+                chief.children.forEach(function (product) {
+                    product.row = leafRow;
+                    leafRow += 1;
+                });
+                chief.row = (chiefFrom + leafRow - 1) / 2;
+            });
+            project.row = (projectFrom + leafRow - 1) / 2;
+        });
+        block.row = (blockFrom + leafRow - 1) / 2;
+    });
+
+    var scene = {
+        width: COL_X[3] + NODE_W[3] + 24,
+        height: leafRow * ROW + PAD_TOP + 12,
+        background: THEME.sunk,
+        font: THEME.font,
+        mono: THEME.mono,
+        linkColor: THEME.link,
+        noteColor: THEME.inkFaint,
+        note: 'рамка продукта: красная — один человек, жёлтая — двое',
+        legend: LEVELS.map(function (level) {
+            return { color: level.color, label: level.label };
+        }),
+        nodes: [],
+        links: []
+    };
+
+    function pushNode(level, row, options) {
+        var x = 12 + COL_X[level];
+        var y = PAD_TOP + row * ROW + ROW / 2 - NODE_H / 2;
+        var width = NODE_W[level];
+
+        var badge = null;
+        var strip = [];
+        var total = LEVELS.reduce(function (sum, item) {
+            return sum + options.counts[item.key];
+        }, 0);
+
+        if (total > 0) {
+            badge = compose(options.counts);
+            var badgeWidth = badge.length * META_CH + 8;
+            var stripX = x + 9;
+            var stripW = width - 18 - badgeWidth;
+            LEVELS.forEach(function (item) {
+                var n = options.counts[item.key];
+                if (!n) { return; }
+                var w = stripW * n / total;
+                strip.push({ x: stripX, w: Math.max(w - 1, 1), color: item.color });
+                stripX += w;
+            });
+        }
+
+        // Подрезаем название, чтобы оно не наехало на числа справа.
+        var metaWidth = options.meta ? options.meta.length * META_CH + 10 : 0;
+        var maxChars = Math.floor((width - 18 - metaWidth) / TITLE_CH);
+        var title = options.title.length > maxChars
+            ? options.title.slice(0, Math.max(maxChars - 1, 3)) + '…'
+            : options.title;
+
+        var node = {
+            x: x, y: y, w: width, h: NODE_H,
+            fill: options.fill,
+            stroke: options.stroke || 'none',
+            sw: options.stroke ? 1.5 : 0,
+            title: title,
+            titleColor: options.color,
+            titleSize: options.size || 11,
+            titleWeight: options.weight || 600,
+            meta: options.meta || '',
+            metaColor: options.metaColor || THEME.inkFaint,
+            badge: badge,
+            badgeColor: options.badgeColor || THEME.inkFaint,
+            stripY: y + NODE_H - STRIP - 5,
+            stripH: STRIP,
+            strip: strip
+        };
+        scene.nodes.push(node);
+        return node;
+    }
+
+    function pushLink(from, to) {
+        var x1 = from.x + from.w;
+        var y1 = from.y + from.h / 2;
+        var x2 = to.x;
+        var y2 = to.y + to.h / 2;
+        var mid = x1 + (x2 - x1) / 2;
+        scene.links.push(
+            'M' + x1 + ' ' + y1 + 'L' + mid + ' ' + y1 +
+            'L' + mid + ' ' + y2 + 'L' + x2 + ' ' + y2
+        );
+    }
+
+    root.children.forEach(function (block) {
+        var blockBox = pushNode(0, block.row, {
+            counts: block.counts, fill: THEME.block, color: '#FFFFFF',
+            title: block.name, size: 12, weight: 700,
+            meta: block.people + ' чел',
             metaColor: THEME.white72, badgeColor: THEME.white60
         });
-        pushLink(blockBox, projectBox);
 
-        project.children.forEach(function (chief) {
-            var chiefBox = pushNode(2, chief.row, {
-                counts: chief.counts, fill: THEME.chief, stroke: THEME.chiefLine,
-                color: THEME.ink, title: chief.name,
-                meta: chief.people + ' чел'
+        block.children.forEach(function (project) {
+            var projectBox = pushNode(1, project.row, {
+                counts: project.counts, fill: THEME.project, color: '#FFFFFF',
+                title: project.name, meta: project.people + ' чел',
+                metaColor: THEME.white72, badgeColor: THEME.white60
             });
-            pushLink(projectBox, chiefBox);
+            pushLink(blockBox, projectBox);
 
-            chief.children.forEach(function (product) {
-                var fill = THEME.card;
-                var stroke = THEME.rule;
-                var color = THEME.ink;
-                if (product.risk.indexOf('Критично') === 0) {
-                    fill = THEME.critBg; stroke = THEME.crit; color = THEME.crit;
-                } else if (product.risk.indexOf('Риск') === 0) {
-                    fill = THEME.warnBg; stroke = THEME.warn; color = THEME.inkSoft;
-                }
-                var productBox = pushNode(3, product.row, {
-                    counts: product.counts, fill: fill, stroke: stroke,
-                    color: color, title: product.name, weight: 500,
-                    meta: product.people + ' чел' + vacancyMark(product.vacancies) +
-                          ' · ' + money(product.fot) + ' ₽'
+            project.children.forEach(function (chief) {
+                var chiefBox = pushNode(2, chief.row, {
+                    counts: chief.counts, fill: THEME.chief,
+                    stroke: THEME.chiefLine, color: THEME.ink,
+                    title: chief.name, meta: chief.people + ' чел'
                 });
-                pushLink(chiefBox, productBox);
+                pushLink(projectBox, chiefBox);
+
+                chief.children.forEach(function (product) {
+                    var fill = THEME.card;
+                    var stroke = THEME.rule;
+                    var color = THEME.ink;
+                    if (product.risk.indexOf('Критично') === 0) {
+                        fill = THEME.critBg; stroke = THEME.crit; color = THEME.crit;
+                    } else if (product.risk.indexOf('Риск') === 0) {
+                        fill = THEME.warnBg; stroke = THEME.warn; color = THEME.inkSoft;
+                    }
+                    var productBox = pushNode(3, product.row, {
+                        counts: product.counts, fill: fill, stroke: stroke,
+                        color: color, title: product.name, weight: 500,
+                        meta: product.people + ' чел' + vacancyMark(product.vacancies) +
+                              ' · ' + money(product.fot) + ' ₽'
+                    });
+                    pushLink(chiefBox, productBox);
+                });
             });
         });
     });
-});
 
-scene.linkColor = THEME.link;
+    return scene;
+}
 
 // --------------------------------------------------------------------------
-// Отрисовка (клиент, песочница QuickJS)
+// Сборка
 // --------------------------------------------------------------------------
+
+var log = [];
+var source = readSource(log);
+var scene = null;
+var failure = null;
+
+if (source.rows.length) {
+    try {
+        scene = buildScene(source);
+        log.push('Построено узлов: ' + scene.nodes.length);
+        if (!scene.nodes.length) {
+            failure = 'Строки пришли, но ни одного узла не построилось.';
+        }
+    } catch (e) {
+        failure = e.message;
+    }
+} else {
+    failure = 'Источник не вернул ни одной строки.';
+}
+
+var report = {
+    title: failure || '',
+    lines: log,
+    hint: [
+        'Проверьте по порядку:',
+        '1. Meta — id датасета скопирован целиком и без пробелов.',
+        '2. Sources — названия полей совпадают с датасетом побуквенно, ' +
+            'включая регистр: «людей», «вакансий», «риск» со строчной буквы, ' +
+            '«ФОТ_мес» с подчёркиванием.',
+        '3. Датасет открывается и показывает 57 строк.',
+        '4. Кнопка «Выполнить» нажата после правки вкладок.'
+    ],
+    background: THEME.sunk,
+    font: THEME.font,
+    mono: THEME.mono,
+    ink: THEME.ink,
+    inkSoft: THEME.inkSoft,
+    crit: THEME.crit,
+    card: THEME.card,
+    rule: THEME.rule
+};
 
 module.exports = {
     render: Editor.wrapFn({
-        // options — размеры виджета от DataLens, дальше идут значения из args
-        fn: function (options, scene) {
+        // options — размеры виджета от DataLens, дальше значения из args
+        fn: function (options, scene, report) {
             function esc(value) {
                 return String(value === null || value === undefined ? '' : value)
                     .replace(/&/g, '&amp;')
@@ -378,6 +462,38 @@ module.exports = {
                     .replace(/"/g, '&quot;');
             }
 
+            // ---- отчёт вместо дерева, когда данных нет --------------------
+            if (!scene) {
+                var rows = report.lines.map(function (line) {
+                    return '<div style="margin:2px 0">' + esc(line) + '</div>';
+                }).join('');
+                var hints = report.hint.map(function (line) {
+                    return '<div style="margin:3px 0">' + esc(line) + '</div>';
+                }).join('');
+
+                return Editor.generateHtml(
+                    '<div style="width:' + options.width + 'px;height:' +
+                    options.height + 'px;overflow:auto;background:' +
+                    report.background + ';padding:16px;box-sizing:border-box;' +
+                    'font-family:' + report.font + '">' +
+                      '<div style="background:' + report.card + ';border:1px solid ' +
+                      report.rule + ';border-radius:6px;padding:14px 16px;max-width:820px">' +
+                        '<div style="font-size:14px;font-weight:700;color:' +
+                        report.crit + ';margin-bottom:8px">Дерево не построено</div>' +
+                        '<div style="font-size:12px;color:' + report.ink +
+                        ';margin-bottom:12px">' + esc(report.title) + '</div>' +
+                        '<div style="font-family:' + report.mono +
+                        ';font-size:11px;color:' + report.inkSoft +
+                        ';border-top:1px solid ' + report.rule +
+                        ';padding-top:10px;margin-bottom:12px">' + rows + '</div>' +
+                        '<div style="font-size:12px;color:' + report.ink + '">' +
+                        hints + '</div>' +
+                      '</div>' +
+                    '</div>'
+                );
+            }
+
+            // ---- дерево ---------------------------------------------------
             var parts = [];
 
             parts.push(
@@ -386,12 +502,11 @@ module.exports = {
                 'xmlns="http://www.w3.org/2000/svg">'
             );
 
-            // Легенда
             var lx = 12;
             scene.legend.forEach(function (item) {
                 parts.push(
-                    '<rect x="' + lx + '" y="10" width="11" height="6" rx="1" ' +
-                    'fill="' + item.color + '"/>'
+                    '<rect x="' + lx + '" y="10" width="11" height="6" rx="1" fill="' +
+                    item.color + '"/>'
                 );
                 parts.push(
                     '<text x="' + (lx + 16) + '" y="16" font-family="' + scene.font +
@@ -406,7 +521,6 @@ module.exports = {
                 esc(scene.note) + '</text>'
             );
 
-            // Связи
             scene.links.forEach(function (d) {
                 parts.push(
                     '<path d="' + d + '" fill="none" stroke="' + scene.linkColor +
@@ -414,7 +528,6 @@ module.exports = {
                 );
             });
 
-            // Узлы
             scene.nodes.forEach(function (node) {
                 parts.push(
                     '<rect x="' + node.x + '" y="' + node.y + '" width="' + node.w +
@@ -458,14 +571,14 @@ module.exports = {
 
             parts.push('</svg>');
 
-            // Дерево выше и шире виджета — прокручиваем его внутри обёртки,
-            // иначе DataLens просто обрежет полотно по размеру ячейки.
+            // Дерево выше и шире виджета — прокручиваем внутри обёртки,
+            // иначе DataLens обрежет полотно по размеру ячейки.
             return Editor.generateHtml(
                 '<div style="width:' + options.width + 'px;height:' + options.height +
                 'px;overflow:auto;background:' + scene.background + '">' +
                 parts.join('') + '</div>'
             );
         },
-        args: [scene]
+        args: [scene, report]
     })
 };

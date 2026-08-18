@@ -144,19 +144,27 @@ function readSource(log) {
         return { fields: names, rows: rows };
     }
 
-    // Приводим строки к массивам значений. Строка может прийти тремя видами:
-    // массивом, объектом {values: [...]} или объектом, где ключи — названия
-    // колонок. В последнем случае обращение по индексу давало undefined:
-    // дерево строилось, но все названия оказывались пустыми, а числа нулями.
+    // Приводим строки к массивам значений. Известные виды строки:
+    //   [значение, ...]                     — массив
+    //   {values: [...]}                     — старый формат
+    //   {data: [...], legend: [...]}        — текущий формат DataLens:
+    //                                         значения в data, а legend —
+    //                                         служебные id, не колонки
+    //   {Блок: '...', Проект: '...'}        — объект с ключами-названиями
+    //
+    // Именно из-за формата с data вся строка раньше принималась за две
+    // колонки «data» и «legend», и ни одно поле не находилось.
     var first = rows[0];
     if (Array.isArray(first)) {
         log.push('Строка — массив из ' + first.length + ' значений');
     } else if (first && Array.isArray(first.values)) {
         rows = rows.map(function (r) { return r.values; });
         log.push('Строка — объект values, значений: ' + rows[0].length);
+    } else if (first && Array.isArray(first.data)) {
+        rows = rows.map(function (r) { return r.data; });
+        log.push('Строка — объект data + legend, значений: ' + rows[0].length);
     } else if (first && typeof first === 'object') {
-        // Ключи объекта и есть настоящие названия колонок — они точнее,
-        // чем всё, что можно вытащить из Type или fields.
+        // Ключи объекта и есть настоящие названия колонок.
         var keys = Object.keys(first);
         names = keys;
         rows = rows.map(function (r) {
@@ -165,6 +173,17 @@ function readSource(log) {
         log.push('Строка — объект с ключами, значений: ' + keys.length);
     } else {
         log.push('Строка неизвестного вида: ' + (typeof first));
+    }
+
+    // Сверяем число колонок с числом значений. fields в ответе может
+    // описывать весь датасет, а не только запрошенные поля, — тогда имена
+    // не совпадут со значениями по позиции, и надёжнее взять порядок,
+    // объявленный на вкладке Sources.
+    var width = (rows[0] || []).length;
+    if (names.length !== width) {
+        log.push('Имён колонок ' + names.length + ', а значений в строке ' +
+                 width + ' — беру порядок из COLUMNS');
+        names = COLUMNS.slice(0, width);
     }
 
     log.push('Колонки: ' + names.join(' · '));

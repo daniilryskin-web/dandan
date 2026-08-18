@@ -275,6 +275,10 @@ module.exports = {
     credits: { enabled: false },
     legend: { enabled: false },
     xAxis: {
+        // startOnTick/endOnTick по умолчанию включены: Highcharts расширяет
+        // min/max до целых делений, и шаг слота становится меньше заданного
+        // (в первой сборке 190 px превращались в 143). Отключаем.
+        startOnTick: false, endOnTick: false,
         min: -0.5,
         max: columns.length - 0.5,
         tickInterval: 1,
@@ -284,6 +288,7 @@ module.exports = {
         labels: { enabled: false }
     },
     yAxis: {
+        startOnTick: false, endOnTick: false,
         reversed: true,
         min: -1.6,
         max: Math.max(maxRows - 0.5, 0.5),
@@ -301,8 +306,12 @@ module.exports = {
                 enabled: true,
                 useHTML: true,
                 allowOverlap: true,
+                // По верхнему краю слота, а не по центру: карточка с названием
+                // в две строки выше остальных и центрированная наезжала бы
+                // на карточку сверху.
                 align: 'center',
-                verticalAlign: 'middle',
+                verticalAlign: 'top',
+                y: -SLOT / 2 + 5,
                 padding: 0,
                 style: { textOutline: 'none', fontWeight: 'normal' },
                 formatter: function () { return this.point.label; }

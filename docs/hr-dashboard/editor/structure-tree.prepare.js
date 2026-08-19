@@ -81,8 +81,12 @@ var THEME = {
 // Порядок колонок должен совпадать со списком полей на вкладке Sources.
 var COLUMNS = [
     'Блок', 'Проект', 'Руководитель', 'Продукт кратко', 'риск',
-    'R4', 'R3', 'R2', 'R1', 'R0', 'людей', 'вакансий', 'ФОТ_мес'
+    'R4', 'R3', 'R2', 'R1', 'R0', 'людей', 'вакансий', 'ФОТ_мес',
+    'заместитель', 'команда'
 ];
+
+// Колонки, без которых чарт работает: их может не быть в старой выгрузке.
+var OPTIONAL = ['заместитель', 'команда'];
 
 // Параметр селектора → колонка, по которой он фильтрует.
 //
@@ -249,6 +253,7 @@ function readSource(log) {
 function indexer(fields) {
     return function (name) {
         var i = fields.indexOf(name);
+        if (i < 0 && OPTIONAL.indexOf(name) >= 0) { return -1; }
         if (i < 0) {
             throw new Error(
                 'В ответе нет колонки «' + name + '». Пришли: ' + fields.join(' · ') +
@@ -361,6 +366,12 @@ function applyFilters(source, log) {
 // Вспомогательное
 // --------------------------------------------------------------------------
 
+// Значение по индексу, полученному от indexer: -1 означает, что колонки
+// нет в выгрузке — необязательные поля просто пустые.
+function cell(row, index) {
+    return index < 0 ? '' : row[index];
+}
+
 function money(value) {
     return String(Math.round(Number(value) || 0))
         .replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
@@ -424,7 +435,13 @@ function buildScene(fields, rows, active, unknown, dump) {
             counts[level.key] = Number(row[at(level.key)]) || 0;
         });
 
+        var team = String(cell(row, at('команда')) || '')
+            .split(';')
+            .map(function (item) { return item.trim(); })
+            .filter(function (item) { return item.length > 0; });
+
         var product = {
+            team: team,
             name: String(row[at('Продукт кратко')] || ''),
             counts: counts,
             people: Number(row[at('людей')]) || 0,
@@ -437,6 +454,11 @@ function buildScene(fields, rows, active, unknown, dump) {
         var block = childOf(root, String(row[at('Блок')] || '—'));
         var project = childOf(block, String(row[at('Проект')] || '—'));
         var chief = childOf(project, String(row[at('Руководитель')] || '—'));
+        // Заместитель — атрибут руководителя: первое непустое значение
+        // по его ветке.
+        if (!chief.deputy) {
+            chief.deputy = String(cell(row, at('заместитель')) || '').trim();
+        }
 
         chief.children.push(product);
 
@@ -493,6 +515,10 @@ function buildScene(fields, rows, active, unknown, dump) {
         mono: THEME.mono,
         linkColor: THEME.link,
         noteColor: THEME.inkFaint,
+        deputyColor: THEME.inkFaint,
+        panelBg: THEME.card,
+        panelLine: THEME.chiefLine,
+        panelInk: THEME.ink,
         note: 'рамка продукта: красная — один человек, жёлтая — двое',
         filters: active,
         unknown: unknown || [],
@@ -517,6 +543,9 @@ function buildScene(fields, rows, active, unknown, dump) {
             titleColor: options.color,
             titleSize: options.size || 11,
             titleWeight: options.weight || 600,
+            id: options.id || '',
+            deputy: options.deputy || '',
+            team: options.team || [],
             meta: options.meta || '',
             metaColor: options.metaColor || THEME.inkFaint,
             badge: compose(options.counts),
@@ -554,7 +583,8 @@ function buildScene(fields, rows, active, unknown, dump) {
                 var chiefBox = pushNode(2, chief.row, {
                     counts: chief.counts, fill: THEME.chief,
                     stroke: THEME.chiefLine, color: THEME.ink,
-                    title: chief.name, meta: chief.people + ' чел'
+                    title: chief.name, meta: chief.people + ' чел',
+                    deputy: chief.deputy
                 });
                 pushLink(projectBox, chiefBox);
 
@@ -568,6 +598,8 @@ function buildScene(fields, rows, active, unknown, dump) {
                         fill = THEME.warnBg; stroke = THEME.warn; color = THEME.inkSoft;
                     }
                     var productBox = pushNode(3, product.row, {
+                        id: 'p' + scene.nodes.length,
+                        team: product.team,
                         counts: product.counts, fill: fill, stroke: stroke,
                         color: color, title: product.name, weight: 500,
                         meta: product.people + ' чел' + vacancyMark(product.vacancies) +
@@ -762,16 +794,35 @@ module.exports = {
                 );
             });
 
+            // Что раскрыто по клику. Состояние живёт в самом чарте: клик
+            // кладёт в него id продукта, render читает и дорисовывает панель.
+            var state = {};
+            try {
+                if (typeof Chart !== 'undefined' && Chart.getState) {
+                    state = Chart.getState() || {};
+                }
+            } catch (e) { state = {}; }
+            var openId = state.open || '';
+            var openNode = null;
+
             // Узлы
             scene.nodes.forEach(function (node) {
                 var x = colX[node.level];
                 var w = colW[node.level];
                 var y = nodeY(node.row);
 
+                // data-id вешаем на каждый элемент карточки: клик может
+                // прийтись и на подпись, и на полосу состава, а не только
+                // на прямоугольник.
+                var tag = node.id ? ' data-id="' + node.id + '"' : '';
+                if (node.id === openId) { openNode = { node: node, x: x, y: y, w: w }; }
+
                 parts.push(
                     '<rect x="' + x + '" y="' + y + '" width="' + w +
                     '" height="' + scene.nodeH + '" rx="4" fill="' + node.fill +
-                    '" stroke="' + node.stroke + '" stroke-width="' + node.sw + '"/>'
+                    '" stroke="' + (node.id === openId ? scene.panelInk : node.stroke) +
+                    '" stroke-width="' + (node.id === openId ? 2 : node.sw) + '"' +
+                    tag + (node.id ? ' cursor="pointer"' : '') + '/>'
                 );
 
                 // Подрезаем название под фактическую ширину колонки.
@@ -785,7 +836,7 @@ module.exports = {
                     '<text x="' + (x + 9) + '" y="' + (y + 13) +
                     '" font-family="' + scene.font + '" font-size="' + node.titleSize +
                     '" font-weight="' + node.titleWeight + '" fill="' + node.titleColor +
-                    '">' + esc(title) + '</text>'
+                    '"' + tag + '>' + esc(title) + '</text>'
                 );
 
                 if (node.meta) {
@@ -795,6 +846,25 @@ module.exports = {
                         '" font-size="10" fill="' + node.metaColor + '">' +
                         esc(node.meta) + '</text>'
                     );
+                }
+
+                // Заместитель — в свободном месте между именем и счётчиком.
+                if (node.deputy) {
+                    var afterTitle = x + 9 + title.length * scene.titleCh + 12;
+                    var beforeMeta = x + w - 9 - metaWidth - 6;
+                    var room = beforeMeta - afterTitle;
+                    if (room > 60) {
+                        var dep = 'зам. ' + node.deputy;
+                        var depMax = Math.floor(room / scene.metaCh);
+                        if (dep.length > depMax) {
+                            dep = dep.slice(0, Math.max(depMax - 1, 5)) + '…';
+                        }
+                        parts.push(
+                            '<text x="' + afterTitle + '" y="' + (y + 13) +
+                            '" font-family="' + scene.font + '" font-size="10" fill="' +
+                            scene.deputyColor + '">' + esc(dep) + '</text>'
+                        );
+                    }
                 }
 
                 var total = 0;
@@ -811,7 +881,7 @@ module.exports = {
                     parts.push(
                         '<rect x="' + stripX + '" y="' + stripY +
                         '" width="' + Math.max(sw - 1, 1) + '" height="' + scene.stripH +
-                        '" rx="1" fill="' + segment.color + '"/>'
+                        '" rx="1" fill="' + segment.color + '"' + tag + '/>'
                     );
                     stripX += sw;
                 });
@@ -824,6 +894,40 @@ module.exports = {
                 );
             });
 
+            // Панель команды рисуется последней — она ложится поверх узлов
+            // ниже по дереву, не сдвигая раскладку.
+            if (openNode && openNode.node.team.length) {
+                var members = openNode.node.team;
+                var lineH = 17;
+                var panelH = 26 + members.length * lineH + 8;
+                var panelW = openNode.w;
+                var panelX = openNode.x;
+                var panelY = openNode.y + scene.nodeH + 4;
+                if (panelY + panelH > scene.height) {
+                    panelY = Math.max(scene.padTop, openNode.y - panelH - 4);
+                }
+
+                parts.push(
+                    '<rect x="' + panelX + '" y="' + panelY + '" width="' + panelW +
+                    '" height="' + panelH + '" rx="5" fill="' + scene.panelBg +
+                    '" stroke="' + scene.panelLine + '" stroke-width="1.5"/>'
+                );
+                parts.push(
+                    '<text x="' + (panelX + 10) + '" y="' + (panelY + 17) +
+                    '" font-family="' + scene.font + '" font-size="10" font-weight="600" ' +
+                    'fill="' + scene.noteColor + '">Команда · ' + members.length +
+                    ' чел   (клик по продукту — свернуть)</text>'
+                );
+                members.forEach(function (member, i) {
+                    parts.push(
+                        '<text x="' + (panelX + 10) + '" y="' +
+                        (panelY + 26 + (i + 1) * lineH - 4) + '" font-family="' +
+                        scene.font + '" font-size="11" fill="' + scene.panelInk +
+                        '">' + esc(member) + '</text>'
+                    );
+                });
+            }
+
             parts.push('</svg>');
 
             return Editor.generateHtml(
@@ -833,5 +937,32 @@ module.exports = {
             );
         },
         args: [scene, report]
-    })
+    }),
+
+    // Клик по продукту раскрывает состав его команды. Состояние хранится
+    // в самом чарте: setState вызывает повторный render, и панель появляется
+    // или исчезает. Повторный клик по тому же продукту сворачивает список.
+    events: {
+        click: Editor.wrapFn({
+            fn: function (event) {
+                var target = event && event.target;
+                var id = null;
+                // Клик мог прийтись на подпись внутри карточки — поднимаемся
+                // к ближайшему предку с data-id.
+                for (var i = 0; target && i < 4; i += 1) {
+                    if (target.getAttribute) { id = target.getAttribute('data-id'); }
+                    if (id) { break; }
+                    target = target.parentNode;
+                }
+                if (!id) { return; }
+
+                var api = (typeof Chart !== 'undefined' && Chart.setState)
+                    ? Chart : null;
+                if (!api) { return; }
+
+                var current = (api.getState && api.getState()) || {};
+                api.setState({ open: current.open === id ? '' : id });
+            }
+        })
+    }
 };

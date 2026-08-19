@@ -59,6 +59,9 @@ SOURCE_COLUMNS = {
 OPTIONAL_COLUMNS = {
     "Организация": "Организация",
     "Должность": "Штатная должность",
+    # Заместитель руководителя продукта. Заполняется вручную в исходнике;
+    # если столбца нет, дерево просто не покажет строку «зам.».
+    "Заместитель": "Заместитель",
 }
 
 VACANCY_MARKER = "вакансия"
@@ -681,6 +684,37 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
         )
     table["Состав"] = table[[f"R{n}" for n in seen]].astype(str).agg("-".join, axis=1)
 
+    # Заместитель — атрибут руководителя, а не продукта: берём первое
+    # непустое значение по ветке. Пустая строка, если столбца нет в исходнике.
+    if "Заместитель" in people.columns:
+        deputy = (
+            people.assign(_d=people["Заместитель"].fillna("").astype(str).str.strip())
+            .groupby(index)["_d"]
+            .agg(lambda values: next((v for v in values if v), ""))
+        )
+        table["заместитель"] = deputy.reindex(table.index).fillna("")
+    else:
+        table["заместитель"] = ""
+
+    # Состав команды одной строкой: по нему чарт разворачивает список
+    # по клику на продукт, без второго источника данных.
+    def roster(rows: pd.DataFrame) -> str:
+        members = (
+            rows.sort_values(["Уровень роли №", "Сотрудник"], ascending=[False, True])
+            .drop_duplicates("Сотрудник")
+        )
+        return "; ".join(
+            f"{member.Сотрудник} — {member._2}"
+            for member in members[["Сотрудник", "Проектная роль"]].itertuples()
+        )
+
+    table["команда"] = (
+        people.groupby(index)[["Сотрудник", "Проектная роль", "Уровень роли №"]]
+        .apply(roster)
+        .reindex(table.index)
+        .fillna("")
+    )
+
     vacancies = df[df["Вакансия"] == 1].groupby(index).size()
     table["вакансий"] = vacancies.reindex(table.index).fillna(0).astype(int)
 
@@ -693,6 +727,7 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
 
     columns = [f"R{n}" for n in seen] + [
         "Состав", "людей", "вакансий", "ФОТ_мес", "медиана_ЗП", "риск",
+        "заместитель", "команда",
     ]
     return table[columns].sort_values(["Блок", "Проект", "людей"],
                                       ascending=[True, True, False])

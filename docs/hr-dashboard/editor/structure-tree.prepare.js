@@ -33,7 +33,7 @@
 var ROW      = 34;    // высота строки листа, px
 var NODE_H   = 30;    // высота узла, px
 var STRIP    = 5;     // толщина полосы состава, px
-var PAD_TOP  = 34;    // полоса легенды сверху, px
+var PAD_TOP  = 50;    // полоса легенды и служебной строки сверху, px
 var PAD_SIDE = 12;    // поля слева и справа, px
 var GAP      = 16;    // зазор между колонками, px
 
@@ -44,6 +44,11 @@ var COL_RATIO = [0.20, 0.21, 0.20, 0.39];
 // Ниже этой ширины сетка не сжимается — включается горизонтальная прокрутка,
 // иначе на узком виджете названия превращаются в многоточия.
 var MIN_WIDTH = 900;
+
+// Показать в шапке всё, что пришло в параметрах, с значениями. Включайте,
+// когда селектор не фильтрует: сразу видно, под каким именем приезжает
+// значение и приезжает ли вообще.
+var DEBUG_PARAMS = false;
 
 // Ширину текста считаем по числу символов: в песочнице измерить её нечем.
 var META_CH  = 5.6;
@@ -103,14 +108,14 @@ function readSource(log) {
         loaded = Editor.getLoadedData();
     } catch (e) {
         log.push('Editor.getLoadedData() бросил ошибку: ' + e.message);
-        return { fields: COLUMNS, rows: [] };
+        return { fields: COLUMNS, rows: [], guidByTitle: {} };
     }
 
     var keys = Object.keys(loaded || {});
     log.push('Ключи источников: ' + (keys.length ? keys.join(', ') : '(пусто)'));
     if (!keys.length) {
         log.push('Источник не вернул ничего. Проверьте вкладки Meta и Sources.');
-        return { fields: COLUMNS, rows: [] };
+        return { fields: COLUMNS, rows: [], guidByTitle: {} };
     }
 
     var src = loaded[keys[0]] || {};
@@ -143,8 +148,18 @@ function readSource(log) {
         log.push('Формат: rows, строк — ' + rows.length);
     }
 
+    // Карта «название поля → id». Селектор на основе датасета передаёт
+    // значение параметра под ID поля, а не под его названием, поэтому без
+    // этой карты фильтр не сработал бы ни при каком имени.
+    var guidByTitle = {};
+    var fields = result.fields || src.fields;
+    if (fields && fields.length) {
+        fields.forEach(function (f) {
+            if (f && f.title && f.guid) { guidByTitle[f.title] = f.guid; }
+        });
+    }
+
     if (!names) {
-        var fields = result.fields || src.fields;
         if (fields && fields.length) {
             names = fields.map(function (f) { return f.title || f.guid; });
             log.push('Имена колонок взяты из fields');
@@ -158,7 +173,7 @@ function readSource(log) {
     if (!rows.length) {
         log.push('Ни один известный формат ответа не дал строк.');
         log.push('Колонки: ' + names.join(' · '));
-        return { fields: names, rows: rows };
+        return { fields: names, rows: rows, guidByTitle: guidByTitle };
     }
 
     // Известные виды строки:
@@ -201,7 +216,7 @@ function readSource(log) {
         return v === null || v === undefined ? '(пусто)' : String(v);
     }).join(' · '));
 
-    return { fields: names, rows: rows };
+    return { fields: names, rows: rows, guidByTitle: guidByTitle };
 }
 
 function indexer(fields) {
@@ -249,7 +264,7 @@ function applyFilters(source, log) {
         params = Editor.getParams() || {};
     } catch (e) {
         log.push('Editor.getParams() недоступен, фильтры пропущены');
-        return { rows: source.rows, active: [], unknown: [] };
+        return { rows: source.rows, active: [], unknown: [], dump: 'getParams() недоступен' };
     }
 
     var at = indexer(source.fields);
@@ -257,9 +272,16 @@ function applyFilters(source, log) {
     var active = [];
     var used = {};
 
+    var guids = source.guidByTitle || {};
+
     FILTERS.forEach(function (filter) {
         var values = [];
-        filter.keys.forEach(function (key) {
+        // Латинское имя, название поля и его ID: селектор может прислать
+        // значение под любым из трёх, в зависимости от того, как настроен.
+        var accepted = filter.keys.slice();
+        if (guids[filter.column]) { accepted.push(guids[filter.column]); }
+
+        accepted.forEach(function (key) {
             if (params[key] === undefined) { return; }
             used[key] = true;
             asList(params[key]).forEach(function (v) {
@@ -290,7 +312,16 @@ function applyFilters(source, log) {
         log.push('Параметры без фильтра: ' + unknown.join(', '));
     }
 
-    return { rows: rows, active: active, unknown: unknown };
+    // Полный список того, что пришло, — для строки отладки в шапке.
+    var dump = Object.keys(params).map(function (key) {
+        var raw = params[key];
+        var text = Array.isArray(raw) ? raw.join(', ') : String(raw);
+        return key + ' = ' + (text || '(пусто)');
+    }).join('   ·   ');
+    log.push('Параметры: ' + (dump || '(ни одного)'));
+
+    return { rows: rows, active: active, unknown: unknown,
+             dump: dump || 'ни одного параметра не пришло' };
 }
 
 // --------------------------------------------------------------------------
@@ -334,7 +365,7 @@ function vacancyMark(count) {
 // Дерево и сцена
 // --------------------------------------------------------------------------
 
-function buildScene(fields, rows, active, unknown) {
+function buildScene(fields, rows, active, unknown, dump) {
     var at = indexer(fields);
 
     function makeNode(name) {
@@ -432,6 +463,8 @@ function buildScene(fields, rows, active, unknown) {
         note: 'рамка продукта: красная — один человек, жёлтая — двое',
         filters: active,
         unknown: unknown || [],
+        debugParams: DEBUG_PARAMS ? String(dump || '') : '',
+        warnColor: THEME.crit,
         legend: LEVELS.map(function (level) {
             return { color: level.color, label: level.label };
         }),
@@ -532,8 +565,8 @@ if (source.rows.length) {
             failure = 'Под выбранные фильтры не попало ни одной строки. ' +
                       'Снимите часть значений в селекторах.';
         } else {
-            scene = buildScene(source.fields, filtered.rows,
-                               filtered.active, filtered.unknown);
+            scene = buildScene(source.fields, filtered.rows, filtered.active,
+                               filtered.unknown, filtered.dump);
             log.push('Построено узлов: ' + scene.nodes.length +
                      ', направлений: ' + scene.blocks +
                      ', людей суммарно: ' + scene.people);
@@ -657,14 +690,30 @@ module.exports = {
             var note = scene.filters.length
                 ? 'фильтр — ' + scene.filters.join(' · ')
                 : scene.note;
-            if (scene.unknown.length) {
-                note += '   ⚠ параметры без фильтра: ' + scene.unknown.join(', ');
-            }
             parts.push(
                 '<text x="' + lx + '" y="16" font-family="' + scene.font +
                 '" font-size="11" fill="' + scene.noteColor + '">' +
                 esc(note) + '</text>'
             );
+
+            // Служебная строка отдельно от легенды: приписанная в конец
+            // первой строки, она уезжала за край и оставалась незамеченной.
+            var service = '';
+            if (scene.unknown.length) {
+                service = '⚠ параметр пришёл, но фильтра под него нет: ' +
+                          scene.unknown.join(', ') +
+                          '  — добавьте это имя в FILTERS и Params';
+            } else if (scene.debugParams) {
+                service = 'параметры: ' + scene.debugParams;
+            }
+            if (service) {
+                parts.push(
+                    '<text x="' + scene.padSide + '" y="34" font-family="' +
+                    scene.mono + '" font-size="10" fill="' +
+                    (scene.unknown.length ? scene.warnColor : scene.noteColor) +
+                    '">' + esc(service) + '</text>'
+                );
+            }
 
             // Связи
             scene.links.forEach(function (link) {

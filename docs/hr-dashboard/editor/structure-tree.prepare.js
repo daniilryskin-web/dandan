@@ -80,11 +80,17 @@ var COLUMNS = [
 ];
 
 // Параметр селектора → колонка, по которой он фильтрует.
+//
+// Имён у каждого фильтра несколько: DataLens подставляет в параметры то
+// латинское имя, что объявлено на вкладке Params, то название поля датасета —
+// зависит от того, как настроен селектор (на основе датасета или ручным
+// вводом) и от версии. Принимаем оба варианта, чтобы селектор заработал
+// при любой настройке.
 var FILTERS = [
-    { param: 'block',   column: 'Блок',           label: 'направление' },
-    { param: 'project', column: 'Проект',         label: 'проект' },
-    { param: 'chief',   column: 'Руководитель',   label: 'руководитель' },
-    { param: 'product', column: 'Продукт кратко', label: 'продукт' }
+    { keys: ['block',   'Блок'],           column: 'Блок',           label: 'направление' },
+    { keys: ['project', 'Проект'],         column: 'Проект',         label: 'проект' },
+    { keys: ['chief',   'Руководитель'],   column: 'Руководитель',   label: 'руководитель' },
+    { keys: ['product', 'Продукт кратко'], column: 'Продукт кратко', label: 'продукт' }
 ];
 
 // --------------------------------------------------------------------------
@@ -219,12 +225,17 @@ function indexer(fields) {
 // Значения параметров — всегда массивы строк. Пустая строка, «null» и
 // служебное «_ALL_» означают «все»: селектор в таком состоянии не должен
 // отсекать ничего.
+//
+// Селектор передаёт значение с префиксом операции: «__in_Транспорт» при
+// множественном выборе, «__eq_Транспорт» при выборе одного значения.
+// Без снятия префикса ни одно значение не совпало бы с данными.
 function asList(value) {
     if (value === undefined || value === null) { return []; }
     var list = Array.isArray(value) ? value : [value];
     var out = [];
     list.forEach(function (item) {
         var text = String(item === null || item === undefined ? '' : item).trim();
+        text = text.replace(/^__[a-z]+_/, '');
         if (text && text !== 'null' && text !== 'undefined' && text !== '_ALL_') {
             out.push(text);
         }
@@ -238,26 +249,48 @@ function applyFilters(source, log) {
         params = Editor.getParams() || {};
     } catch (e) {
         log.push('Editor.getParams() недоступен, фильтры пропущены');
-        return { rows: source.rows, active: [] };
+        return { rows: source.rows, active: [], unknown: [] };
     }
 
     var at = indexer(source.fields);
     var rows = source.rows;
     var active = [];
+    var used = {};
 
     FILTERS.forEach(function (filter) {
-        var values = asList(params[filter.param]);
+        var values = [];
+        filter.keys.forEach(function (key) {
+            if (params[key] === undefined) { return; }
+            used[key] = true;
+            asList(params[key]).forEach(function (v) {
+                if (values.indexOf(v) < 0) { values.push(v); }
+            });
+        });
         if (!values.length) { return; }
+
         var column = at(filter.column);
         rows = rows.filter(function (row) {
             return values.indexOf(String(row[column])) >= 0;
         });
         active.push(filter.label + ': ' + values.join(', '));
-        log.push('Фильтр ' + filter.param + ' → ' + values.join(', ') +
+        log.push('Фильтр ' + filter.keys[0] + ' → ' + values.join(', ') +
                  ', осталось строк: ' + rows.length);
     });
 
-    return { rows: rows, active: active };
+    // Параметр пришёл, но ни под один фильтр не подошёл — почти всегда это
+    // опечатка в имени. Молчать нельзя: чарт нарисуется целиком, и человек
+    // решит, что селектор просто не работает.
+    var unknown = [];
+    Object.keys(params).forEach(function (key) {
+        if (used[key]) { return; }
+        if (!asList(params[key]).length) { return; }
+        unknown.push(key);
+    });
+    if (unknown.length) {
+        log.push('Параметры без фильтра: ' + unknown.join(', '));
+    }
+
+    return { rows: rows, active: active, unknown: unknown };
 }
 
 // --------------------------------------------------------------------------
@@ -301,7 +334,7 @@ function vacancyMark(count) {
 // Дерево и сцена
 // --------------------------------------------------------------------------
 
-function buildScene(fields, rows, active) {
+function buildScene(fields, rows, active, unknown) {
     var at = indexer(fields);
 
     function makeNode(name) {
@@ -398,6 +431,7 @@ function buildScene(fields, rows, active) {
         noteColor: THEME.inkFaint,
         note: 'рамка продукта: красная — один человек, жёлтая — двое',
         filters: active,
+        unknown: unknown || [],
         legend: LEVELS.map(function (level) {
             return { color: level.color, label: level.label };
         }),
@@ -498,7 +532,8 @@ if (source.rows.length) {
             failure = 'Под выбранные фильтры не попало ни одной строки. ' +
                       'Снимите часть значений в селекторах.';
         } else {
-            scene = buildScene(source.fields, filtered.rows, filtered.active);
+            scene = buildScene(source.fields, filtered.rows,
+                               filtered.active, filtered.unknown);
             log.push('Построено узлов: ' + scene.nodes.length +
                      ', направлений: ' + scene.blocks +
                      ', людей суммарно: ' + scene.people);
@@ -622,6 +657,9 @@ module.exports = {
             var note = scene.filters.length
                 ? 'фильтр — ' + scene.filters.join(' · ')
                 : scene.note;
+            if (scene.unknown.length) {
+                note += '   ⚠ параметры без фильтра: ' + scene.unknown.join(', ');
+            }
             parts.push(
                 '<text x="' + lx + '" y="16" font-family="' + scene.font +
                 '" font-size="11" fill="' + scene.noteColor + '">' +

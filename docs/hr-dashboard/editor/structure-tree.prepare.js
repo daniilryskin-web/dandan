@@ -91,6 +91,16 @@ var COLUMNS = [
 // зависит от того, как настроен селектор (на основе датасета или ручным
 // вводом) и от версии. Принимаем оба варианта, чтобы селектор заработал
 // при любой настройке.
+// Если автоматическое распознавание не сработало, id полей можно прописать
+// руками: откройте датасет, у нужного поля скопируйте ID и вставьте сюда.
+// Пустая строка означает «не задано» — тогда работает автоопределение.
+var FIELD_IDS = {
+    'Блок': '',
+    'Проект': '',
+    'Руководитель': '',
+    'Продукт кратко': ''
+};
+
 var FILTERS = [
     { keys: ['block',   'Блок'],           column: 'Блок',           label: 'направление' },
     { keys: ['project', 'Проект'],         column: 'Проект',         label: 'проект' },
@@ -108,14 +118,14 @@ function readSource(log) {
         loaded = Editor.getLoadedData();
     } catch (e) {
         log.push('Editor.getLoadedData() бросил ошибку: ' + e.message);
-        return { fields: COLUMNS, rows: [], guidByTitle: {} };
+        return { fields: COLUMNS, rows: [], aliasToTitle: {} };
     }
 
     var keys = Object.keys(loaded || {});
     log.push('Ключи источников: ' + (keys.length ? keys.join(', ') : '(пусто)'));
     if (!keys.length) {
         log.push('Источник не вернул ничего. Проверьте вкладки Meta и Sources.');
-        return { fields: COLUMNS, rows: [], guidByTitle: {} };
+        return { fields: COLUMNS, rows: [], aliasToTitle: {} };
     }
 
     var src = loaded[keys[0]] || {};
@@ -148,15 +158,32 @@ function readSource(log) {
         log.push('Формат: rows, строк — ' + rows.length);
     }
 
-    // Карта «название поля → id». Селектор на основе датасета передаёт
-    // значение параметра под ID поля, а не под его названием, поэтому без
-    // этой карты фильтр не сработал бы ни при каком имени.
-    var guidByTitle = {};
+    // Карта «идентификатор поля → название». Селектор на основе датасета
+    // передаёт значение параметра под ID поля, а не под названием, и ключ,
+    // в котором этот ID лежит, между версиями называется по-разному: guid,
+    // id, fieldId. Поэтому не угадываем ключ, а собираем ВСЕ строковые
+    // свойства описания поля и оставляем те значения, которые встречаются
+    // ровно у одного поля. Так отсеиваются datasetId и data_type — они
+    // одинаковы у всех полей и идентификаторами быть не могут.
     var fields = result.fields || src.fields;
+    var aliasToTitle = {};
     if (fields && fields.length) {
+        var seen = {};
         fields.forEach(function (f) {
-            if (f && f.title && f.guid) { guidByTitle[f.title] = f.guid; }
+            if (!f || !f.title) { return; }
+            Object.keys(f).forEach(function (key) {
+                if (key === 'title') { return; }
+                var value = f[key];
+                if (typeof value !== 'string' || !value) { return; }
+                if (!seen[value]) { seen[value] = []; }
+                if (seen[value].indexOf(f.title) < 0) { seen[value].push(f.title); }
+            });
         });
+        Object.keys(seen).forEach(function (value) {
+            if (seen[value].length === 1) { aliasToTitle[value] = seen[value][0]; }
+        });
+        log.push('Идентификаторов полей распознано: ' +
+                 Object.keys(aliasToTitle).length);
     }
 
     if (!names) {
@@ -173,7 +200,7 @@ function readSource(log) {
     if (!rows.length) {
         log.push('Ни один известный формат ответа не дал строк.');
         log.push('Колонки: ' + names.join(' · '));
-        return { fields: names, rows: rows, guidByTitle: guidByTitle };
+        return { fields: names, rows: rows, aliasToTitle: aliasToTitle };
     }
 
     // Известные виды строки:
@@ -216,7 +243,7 @@ function readSource(log) {
         return v === null || v === undefined ? '(пусто)' : String(v);
     }).join(' · '));
 
-    return { fields: names, rows: rows, guidByTitle: guidByTitle };
+    return { fields: names, rows: rows, aliasToTitle: aliasToTitle };
 }
 
 function indexer(fields) {
@@ -272,14 +299,20 @@ function applyFilters(source, log) {
     var active = [];
     var used = {};
 
-    var guids = source.guidByTitle || {};
+    // Идентификатор поля → название колонки, которую он фильтрует.
+    var aliases = source.aliasToTitle || {};
 
     FILTERS.forEach(function (filter) {
         var values = [];
-        // Латинское имя, название поля и его ID: селектор может прислать
-        // значение под любым из трёх, в зависимости от того, как настроен.
+        // Латинское имя, название поля и все его идентификаторы: селектор
+        // может прислать значение под любым из них.
         var accepted = filter.keys.slice();
-        if (guids[filter.column]) { accepted.push(guids[filter.column]); }
+        if (FIELD_IDS[filter.column]) { accepted.push(FIELD_IDS[filter.column]); }
+        Object.keys(aliases).forEach(function (alias) {
+            if (aliases[alias] === filter.column && accepted.indexOf(alias) < 0) {
+                accepted.push(alias);
+            }
+        });
 
         accepted.forEach(function (key) {
             if (params[key] === undefined) { return; }

@@ -833,9 +833,17 @@ def main() -> None:
             table.to_excel(writer, sheet_name=sheet, startrow=row + 1)
             row += len(table) + 4
 
-        roles.to_excel(writer, sheet_name="Роли")
-        sheet_projects(assignments).to_excel(writer, sheet_name="Проекты")
-        sheet_hierarchy(assignments).to_excel(writer, sheet_name="Иерархия")
+        # Индекс разворачиваем в обычные столбцы: при записи многоуровневого
+        # индекса Excel оставляет повторяющиеся значения пустыми, и DataLens
+        # при импорте листа читает их как пропуски — дерево схлопывалось
+        # в одну ветку, а группировки на листах «Роли» и «Проекты» ломались.
+        roles.reset_index().to_excel(writer, sheet_name="Роли", index=False)
+        sheet_projects(assignments).reset_index().to_excel(
+            writer, sheet_name="Проекты", index=False
+        )
+        sheet_hierarchy(assignments).reset_index().to_excel(
+            writer, sheet_name="Иерархия", index=False
+        )
         sheet_vacancies(assignments).to_excel(writer, sheet_name="Вакансии", index=False)
         sheet_checks(assignments).to_excel(writer, sheet_name="Проверки", index=False)
 

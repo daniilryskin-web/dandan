@@ -70,6 +70,7 @@ var THEME = {
     block: '#16233A', project: '#2C4670',
     chief: '#EDF1F6', chiefLine: '#9FB3CA',
     link: '#B7C4D2', rule: '#DFE4EA',
+    deputy: '#12665A', deputyBg: '#D5EBE5',
     warn: '#C79A4A', warnBg: '#F7EEDC',
     crit: '#A8382A', critBg: '#F6E3DF',
     white72: 'rgba(255,255,255,.72)',
@@ -515,7 +516,8 @@ function buildScene(fields, rows, active, unknown, dump) {
         mono: THEME.mono,
         linkColor: THEME.link,
         noteColor: THEME.inkFaint,
-        deputyColor: THEME.inkFaint,
+        deputyColor: THEME.deputy,
+        deputyBg: THEME.deputyBg,
         panelBg: THEME.card,
         panelLine: THEME.chiefLine,
         panelInk: THEME.ink,
@@ -855,14 +857,23 @@ module.exports = {
                     var room = beforeMeta - afterTitle;
                     if (room > 60) {
                         var dep = 'зам. ' + node.deputy;
-                        var depMax = Math.floor(room / scene.metaCh);
+                        var depMax = Math.floor((room - 12) / scene.metaCh);
                         if (dep.length > depMax) {
                             dep = dep.slice(0, Math.max(depMax - 1, 5)) + '…';
                         }
+                        // Плашка, а не просто серый текст: на светлой карточке
+                        // руководителя серое по серому не читалось.
+                        var depW = dep.length * scene.metaCh + 12;
                         parts.push(
-                            '<text x="' + afterTitle + '" y="' + (y + 13) +
-                            '" font-family="' + scene.font + '" font-size="10" fill="' +
-                            scene.deputyColor + '">' + esc(dep) + '</text>'
+                            '<rect x="' + afterTitle + '" y="' + (y + 4) +
+                            '" width="' + depW + '" height="16" rx="8" fill="' +
+                            scene.deputyBg + '"/>'
+                        );
+                        parts.push(
+                            '<text x="' + (afterTitle + 6) + '" y="' + (y + 15) +
+                            '" font-family="' + scene.font + '" font-size="10" ' +
+                            'font-weight="600" fill="' + scene.deputyColor + '">' +
+                            esc(dep) + '</text>'
                         );
                     }
                 }

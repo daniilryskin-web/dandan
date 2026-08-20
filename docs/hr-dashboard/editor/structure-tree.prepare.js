@@ -64,6 +64,19 @@ var LEVELS = [
     { key: 'R0', color: '#B9CEE6', label: 'R0 стажировка' }
 ];
 
+// Роль → уровень: нужно, чтобы в списке команды точка рядом с фамилией
+// была того же цвета, что и сегмент этой роли в полосе состава.
+var ROLE_TO_LEVEL = {
+    'Руководитель проекта': 'R4',
+    'Руководитель функции': 'R4',
+    'Руководитель продукта': 'R3',
+    'Аналитик': 'R3',
+    'Исполнитель функции': 'R3',
+    'Администратор проекта': 'R2',
+    'Специалист': 'R1',
+    'Стажер': 'R0'
+};
+
 var THEME = {
     ink: '#141C2B', inkSoft: '#4A5568', inkFaint: '#7C8899',
     sunk: '#EDF0F3', card: '#FFFFFF',
@@ -71,6 +84,7 @@ var THEME = {
     chief: '#EDF1F6', chiefLine: '#9FB3CA',
     link: '#B7C4D2', rule: '#DFE4EA',
     deputy: '#12665A', deputyBg: '#D5EBE5',
+    panelHead: '#F2F5F9', zebra: '#F7F9FB',
     warn: '#C79A4A', warnBg: '#F7EEDC',
     crit: '#A8382A', critBg: '#F6E3DF',
     white72: 'rgba(255,255,255,.72)',
@@ -78,6 +92,13 @@ var THEME = {
     font: 'Golos Text, Helvetica Neue, Arial, sans-serif',
     mono: 'JetBrains Mono, SFMono-Regular, Consolas, monospace'
 };
+
+var ROLE_COLOR = {};
+Object.keys(ROLE_TO_LEVEL).forEach(function (role) {
+    LEVELS.forEach(function (level) {
+        if (level.key === ROLE_TO_LEVEL[role]) { ROLE_COLOR[role] = level.color; }
+    });
+});
 
 // Порядок колонок должен совпадать со списком полей на вкладке Sources.
 var COLUMNS = [
@@ -519,9 +540,12 @@ function buildScene(fields, rows, active, unknown, dump) {
         deputyColor: THEME.deputy,
         deputyBg: THEME.deputyBg,
         panelBg: THEME.card,
+        headBg: THEME.panelHead,
+        zebra: THEME.zebra,
+        roleColor: ROLE_COLOR,
         panelLine: THEME.chiefLine,
         panelInk: THEME.ink,
-        note: 'рамка продукта: красная — один человек, жёлтая — двое',
+        note: 'клик по продукту — состав команды',
         filters: active,
         unknown: unknown || [],
         debugParams: DEBUG_PARAMS ? String(dump || '') : '',
@@ -591,14 +615,13 @@ function buildScene(fields, rows, active, unknown, dump) {
                 pushLink(projectBox, chiefBox);
 
                 chief.children.forEach(function (product) {
+                    // Подсветка по нехватке людей убрана по просьбе заказчика:
+                    // риск незаменимости считается на листе «Иерархия» и
+                    // разбирается отдельным чартом, а в дереве цвет только
+                    // мешал читать состав.
                     var fill = THEME.card;
                     var stroke = THEME.rule;
                     var color = THEME.ink;
-                    if (product.risk.indexOf('Критично') === 0) {
-                        fill = THEME.critBg; stroke = THEME.crit; color = THEME.crit;
-                    } else if (product.risk.indexOf('Риск') === 0) {
-                        fill = THEME.warnBg; stroke = THEME.warn; color = THEME.inkSoft;
-                    }
                     var productBox = pushNode(3, product.row, {
                         id: 'p' + scene.nodes.length,
                         team: product.team,
@@ -908,33 +931,95 @@ module.exports = {
             // Панель команды рисуется последней — она ложится поверх узлов
             // ниже по дереву, не сдвигая раскладку.
             if (openNode && openNode.node.team.length) {
-                var members = openNode.node.team;
-                var lineH = 17;
-                var panelH = 26 + members.length * lineH + 8;
+                var node = openNode.node;
+                var members = node.team.map(function (item) {
+                    var cut = item.indexOf(' — ');
+                    return cut < 0
+                        ? { name: item, role: '' }
+                        : { name: item.slice(0, cut), role: item.slice(cut + 3) };
+                });
+
+                var lineH = 19;
+                var headH = 52;
+                var panelH = headH + members.length * lineH + 10;
                 var panelW = openNode.w;
                 var panelX = openNode.x;
-                var panelY = openNode.y + scene.nodeH + 4;
+                var panelY = openNode.y + scene.nodeH + 6;
                 if (panelY + panelH > scene.height) {
-                    panelY = Math.max(scene.padTop, openNode.y - panelH - 4);
+                    panelY = Math.max(scene.padTop, openNode.y - panelH - 6);
                 }
 
                 parts.push(
                     '<rect x="' + panelX + '" y="' + panelY + '" width="' + panelW +
-                    '" height="' + panelH + '" rx="5" fill="' + scene.panelBg +
-                    '" stroke="' + scene.panelLine + '" stroke-width="1.5"/>'
+                    '" height="' + panelH + '" rx="6" fill="' + scene.panelBg +
+                    '" stroke="' + scene.panelInk + '" stroke-width="1.5"/>'
+                );
+
+                // Шапка панели: название продукта и его числа
+                parts.push(
+                    '<rect x="' + panelX + '" y="' + panelY + '" width="' + panelW +
+                    '" height="' + headH + '" rx="6" fill="' + scene.headBg + '"/>'
                 );
                 parts.push(
-                    '<text x="' + (panelX + 10) + '" y="' + (panelY + 17) +
-                    '" font-family="' + scene.font + '" font-size="10" font-weight="600" ' +
-                    'fill="' + scene.noteColor + '">Команда · ' + members.length +
-                    ' чел   (клик по продукту — свернуть)</text>'
+                    '<rect x="' + panelX + '" y="' + (panelY + headH - 6) + '" width="' +
+                    panelW + '" height="6" fill="' + scene.headBg + '"/>'
                 );
+                parts.push(
+                    '<text x="' + (panelX + 12) + '" y="' + (panelY + 20) +
+                    '" font-family="' + scene.font + '" font-size="12" font-weight="700" ' +
+                    'fill="' + scene.panelInk + '">' + esc(node.title) + '</text>'
+                );
+                parts.push(
+                    '<text x="' + (panelX + 12) + '" y="' + (panelY + 38) +
+                    '" font-family="' + scene.mono + '" font-size="10" fill="' +
+                    scene.noteColor + '">' + esc(node.meta) + '</text>'
+                );
+
+                // Крестик: закрыть можно, не попадая в сам продукт. При фильтре
+                // по одному продукту панель перекрывала его, и свернуть список
+                // было нечем.
+                var cx = panelX + panelW - 20;
+                var cy = panelY + 18;
+                parts.push(
+                    '<rect x="' + (cx - 11) + '" y="' + (cy - 11) + '" width="22" ' +
+                    'height="22" rx="11" fill="' + scene.panelBg + '" stroke="' +
+                    scene.panelLine + '" stroke-width="1" data-id="close" ' +
+                    'cursor="pointer"/>'
+                );
+                parts.push(
+                    '<path d="M' + (cx - 4) + ' ' + (cy - 4) + 'L' + (cx + 4) + ' ' +
+                    (cy + 4) + 'M' + (cx + 4) + ' ' + (cy - 4) + 'L' + (cx - 4) + ' ' +
+                    (cy + 4) + '" stroke="' + scene.panelInk + '" stroke-width="1.6" ' +
+                    'stroke-linecap="round" data-id="close" cursor="pointer"/>'
+                );
+
+                // Строки состава: полоска через всю ширину под чётными,
+                // цветная точка уровня роли, фамилия и роль.
                 members.forEach(function (member, i) {
+                    var rowY = panelY + headH + i * lineH;
+                    if (i % 2 === 1) {
+                        parts.push(
+                            '<rect x="' + (panelX + 1) + '" y="' + rowY + '" width="' +
+                            (panelW - 2) + '" height="' + lineH + '" fill="' +
+                            scene.zebra + '"/>'
+                        );
+                    }
+                    var color = scene.roleColor[member.role] || scene.noteColor;
                     parts.push(
-                        '<text x="' + (panelX + 10) + '" y="' +
-                        (panelY + 26 + (i + 1) * lineH - 4) + '" font-family="' +
-                        scene.font + '" font-size="11" fill="' + scene.panelInk +
-                        '">' + esc(member) + '</text>'
+                        '<circle cx="' + (panelX + 18) + '" cy="' + (rowY + 10) +
+                        '" r="4" fill="' + color + '"/>'
+                    );
+                    parts.push(
+                        '<text x="' + (panelX + 30) + '" y="' + (rowY + 14) +
+                        '" font-family="' + scene.font + '" font-size="11" ' +
+                        'font-weight="600" fill="' + scene.panelInk + '">' +
+                        esc(member.name) + '</text>'
+                    );
+                    parts.push(
+                        '<text x="' + (panelX + panelW - 12) + '" y="' + (rowY + 14) +
+                        '" text-anchor="end" font-family="' + scene.font +
+                        '" font-size="11" fill="' + scene.noteColor + '">' +
+                        esc(member.role) + '</text>'
                     );
                 });
             }
@@ -970,6 +1055,8 @@ module.exports = {
                 var api = (typeof Chart !== 'undefined' && Chart.setState)
                     ? Chart : null;
                 if (!api) { return; }
+
+                if (id === 'close') { api.setState({ open: '' }); return; }
 
                 var current = (api.getState && api.getState()) || {};
                 api.setState({ open: current.open === id ? '' : id });

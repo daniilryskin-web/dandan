@@ -33,7 +33,7 @@
 var ROW      = 34;    // высота строки листа, px
 var NODE_H   = 30;    // высота узла, px
 var STRIP    = 5;     // толщина полосы состава, px
-var PAD_TOP  = 50;    // полоса легенды и служебной строки сверху, px
+var PAD_TOP  = 52;    // легенда, строка итогов и служебная строка сверху
 var PAD_SIDE = 12;    // поля слева и справа, px
 var GAP      = 16;    // зазор между колонками, px
 
@@ -431,8 +431,35 @@ function vacancyMark(count) {
 // Дерево и сцена
 // --------------------------------------------------------------------------
 
+function millions(value) {
+    var n = Number(value) || 0;
+    if (n >= 1e6) { return (n / 1e6).toFixed(2).replace('.', ',') + ' млн ₽'; }
+    return money(n) + ' ₽';
+}
+
 function buildScene(fields, rows, active, unknown, dump) {
     var at = indexer(fields);
+
+    // Уникальные сотрудники среза. Колонка «людей» считает назначения:
+    // человек на двух продуктах даёт двойку. Настоящую численность даёт
+    // только перебор фамилий из колонки «команда».
+    var uniquePeople = {};
+    var uniqueCount = 0;
+    var rosterKnown = at('команда') >= 0;
+    if (rosterKnown) {
+        rows.forEach(function (row) {
+            String(cell(row, at('команда')) || '').split(';').forEach(function (item) {
+                var text = item.trim();
+                if (!text) { return; }
+                var cut = text.indexOf(' — ');
+                var name = cut < 0 ? text : text.slice(0, cut);
+                if (!uniquePeople[name]) {
+                    uniquePeople[name] = true;
+                    uniqueCount += 1;
+                }
+            });
+        });
+    }
 
     function makeNode(name) {
         return {
@@ -525,9 +552,46 @@ function buildScene(fields, rows, active, unknown, dump) {
         block.row = (blockFrom + leafRow - 1) / 2;
     });
 
+    var totals = {
+        blocks: root.children.length,
+        projects: 0,
+        chiefs: 0,
+        products: 0,
+        assignments: 0,
+        vacancies: 0,
+        fot: 0
+    };
+    root.children.forEach(function (block) {
+        totals.projects += block.children.length;
+        totals.assignments += block.people;
+        totals.vacancies += block.vacancies;
+        totals.fot += block.fot;
+        block.children.forEach(function (project) {
+            totals.chiefs += project.children.length;
+            project.children.forEach(function (chief) {
+                totals.products += chief.children.length;
+            });
+        });
+    });
+
+    // Строка итогов: сколько объектов и людей в текущем срезе.
+    var summary = [
+        totals.blocks + ' направл.',
+        totals.projects + ' проект.',
+        totals.chiefs + ' руковод.',
+        totals.products + ' продукт.',
+        rosterKnown
+            ? uniqueCount + ' сотрудников'
+            : totals.assignments + ' назначений',
+        millions(totals.fot)
+    ];
+    if (totals.vacancies) { summary.push('+' + totals.vacancies + ' вакансий'); }
+
     var scene = {
         rows: leafRow,
+        summary: 'в срезе:  ' + summary.join('  ·  '),
         height: leafRow * ROW + PAD_TOP + 12,
+        warnRoom: (unknown && unknown.length) || (DEBUG_PARAMS ? 1 : 0) ? 16 : 0,
         rowH: ROW, nodeH: NODE_H, stripH: STRIP,
         padTop: PAD_TOP, padSide: PAD_SIDE, gap: GAP,
         ratio: COL_RATIO, minWidth: MIN_WIDTH,
@@ -593,14 +657,15 @@ function buildScene(fields, rows, active, unknown, dump) {
         var blockBox = pushNode(0, block.row, {
             counts: block.counts, fill: THEME.block, color: '#FFFFFF',
             title: block.name, size: 12, weight: 700,
-            meta: block.people + ' чел',
+            meta: block.people + ' чел · ' + millions(block.fot),
             metaColor: THEME.white72, badgeColor: THEME.white60
         });
 
         block.children.forEach(function (project) {
             var projectBox = pushNode(1, project.row, {
                 counts: project.counts, fill: THEME.project, color: '#FFFFFF',
-                title: project.name, meta: project.people + ' чел',
+                title: project.name,
+                meta: project.people + ' чел · ' + millions(project.fot),
                 metaColor: THEME.white72, badgeColor: THEME.white60
             });
             pushLink(blockBox, projectBox);
@@ -609,7 +674,8 @@ function buildScene(fields, rows, active, unknown, dump) {
                 var chiefBox = pushNode(2, chief.row, {
                     counts: chief.counts, fill: THEME.chief,
                     stroke: THEME.chiefLine, color: THEME.ink,
-                    title: chief.name, meta: chief.people + ' чел',
+                    title: chief.name,
+                    meta: chief.people + ' чел · ' + millions(chief.fot),
                     deputy: chief.deputy
                 });
                 pushLink(projectBox, chiefBox);
@@ -751,17 +817,15 @@ module.exports = {
                 cursor += colW[i] + scene.gap;
             }
             var canvasW = cursor - scene.gap + scene.padSide;
+            var canvasH = scene.height;
 
             function nodeY(row) {
                 return scene.padTop + row * scene.rowH + scene.rowH / 2 - scene.nodeH / 2;
             }
 
+            // Тело собираем отдельно от тега svg: его высота известна только
+            // после того, как посчитана раскрытая панель.
             var parts = [];
-            parts.push(
-                '<svg width="' + canvasW + '" height="' + scene.height + '" ' +
-                'viewBox="0 0 ' + canvasW + ' ' + scene.height + '" ' +
-                'xmlns="http://www.w3.org/2000/svg">'
-            );
 
             // Легенда и строка активных фильтров
             var lx = scene.padSide;
@@ -786,6 +850,13 @@ module.exports = {
                 esc(note) + '</text>'
             );
 
+            // Строка итогов среза — вторая сверху, всегда.
+            parts.push(
+                '<text x="' + scene.padSide + '" y="34" font-family="' + scene.mono +
+                '" font-size="10.5" fill="' + scene.panelInk + '">' +
+                esc(scene.summary) + '</text>'
+            );
+
             // Служебная строка отдельно от легенды: приписанная в конец
             // первой строки, она уезжала за край и оставалась незамеченной.
             var service = '';
@@ -798,7 +869,7 @@ module.exports = {
             }
             if (service) {
                 parts.push(
-                    '<text x="' + scene.padSide + '" y="34" font-family="' +
+                    '<text x="' + scene.padSide + '" y="48" font-family="' +
                     scene.mono + '" font-size="10" fill="' +
                     (scene.unknown.length ? scene.warnColor : scene.noteColor) +
                     '">' + esc(service) + '</text>'
@@ -944,10 +1015,11 @@ module.exports = {
                 var panelH = headH + members.length * lineH + 10;
                 var panelW = openNode.w;
                 var panelX = openNode.x;
+                // Панель всегда под узлом, а полотно растёт под неё. Раньше
+                // при фильтре по одному продукту высота считалась только по
+                // дереву — панель не помещалась, и состав был не виден.
                 var panelY = openNode.y + scene.nodeH + 6;
-                if (panelY + panelH > scene.height) {
-                    panelY = Math.max(scene.padTop, openNode.y - panelH - 6);
-                }
+                canvasH = Math.max(canvasH, panelY + panelH + 12);
 
                 parts.push(
                     '<rect x="' + panelX + '" y="' + panelY + '" width="' + panelW +
@@ -1024,12 +1096,14 @@ module.exports = {
                 });
             }
 
-            parts.push('</svg>');
+            var svg =
+                '<svg width="' + canvasW + '" height="' + canvasH + '" ' +
+                'viewBox="0 0 ' + canvasW + ' ' + canvasH + '" ' +
+                'xmlns="http://www.w3.org/2000/svg">' + parts.join('') + '</svg>';
 
             return Editor.generateHtml(
                 '<div style="width:' + options.width + 'px;height:' + options.height +
-                'px;overflow:auto;background:' + scene.background + '">' +
-                parts.join('') + '</div>'
+                'px;overflow:auto;background:' + scene.background + '">' + svg + '</div>'
             );
         },
         args: [scene, report]

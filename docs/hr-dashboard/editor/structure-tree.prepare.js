@@ -84,6 +84,7 @@ var THEME = {
     chief: '#EDF1F6', chiefLine: '#9FB3CA',
     link: '#B7C4D2', rule: '#DFE4EA',
     deputy: '#12665A', deputyBg: '#D5EBE5',
+    hit: '#8A4B12', hitBg: '#FBEBD6',
     panelHead: '#F2F5F9', zebra: '#F7F9FB',
     warn: '#C79A4A', warnBg: '#F7EEDC',
     crit: '#A8382A', critBg: '#F6E3DF',
@@ -138,6 +139,11 @@ var FILTERS = [
     { keys: ['chief',   'Руководитель'],   column: 'Руководитель',   label: 'руководитель' },
     { keys: ['product', 'Продукт кратко'], column: 'Продукт кратко', label: 'продукт' }
 ];
+
+// Имена параметра поиска по ФИО. Первое — то, что объявлено в Controls
+// и Params; остальные приняты на случай, если поиск вешают на отдельный
+// селектор дашборда с другим названием.
+var SEARCH_KEYS = ['search', 'сотрудник', 'Сотрудник', 'поиск', 'ФИО'];
 
 // --------------------------------------------------------------------------
 // Разбор ответа источника
@@ -323,7 +329,8 @@ function applyFilters(source, log) {
         params = Editor.getParams() || {};
     } catch (e) {
         log.push('Editor.getParams() недоступен, фильтры пропущены');
-        return { rows: source.rows, active: [], unknown: [], dump: 'getParams() недоступен' };
+        return { rows: source.rows, active: [], unknown: [], search: null,
+                 dump: 'getParams() недоступен' };
     }
 
     var at = indexer(source.fields);
@@ -364,6 +371,67 @@ function applyFilters(source, log) {
                  ', осталось строк: ' + rows.length);
     });
 
+    // Поиск по ФИО. Ищем не только в составе команд, но и среди
+    // руководителей и заместителей: человека ищут целиком, а не по роли.
+    // Регистр и «ё» не важны, достаточно куска фамилии или табельного
+    // номера — совпадение по вхождению подстроки.
+    var query = '';
+    SEARCH_KEYS.forEach(function (key) {
+        if (params[key] === undefined) { return; }
+        used[key] = true;
+        var raw = params[key];
+        var text = (Array.isArray(raw) ? raw.join(' ') : String(raw)).trim();
+        text = text.replace(/^__[a-z]+_/, '').trim();
+        if (!query && text && text !== 'null' && text !== 'undefined' &&
+            text !== '_ALL_') {
+            query = text;
+        }
+    });
+
+    var search = null;
+    if (query) {
+        var needle = fold(query);
+        // Сотрудники обезличены табельными номерами, и поиск по вхождению
+        // на них ведёт себя плохо: «11» цепляет 110…119. Чисто цифровой
+        // запрос ищем совпадением целиком, всё остальное — по вхождению,
+        // чтобы хватало куска фамилии.
+        var exact = /^\d+$/.test(needle);
+        var matches = function (value) {
+            var text = fold(value);
+            return exact ? text === needle : text.indexOf(needle) >= 0;
+        };
+        var hits = {};
+        var teamAt = at('команда');
+        var deputyAt = at('заместитель');
+        var chiefAt = at('Руководитель');
+
+        rows = rows.filter(function (row) {
+            var found = [];
+            parseRoster(cell(row, teamAt)).forEach(function (member) {
+                if (matches(member.name)) {
+                    found.push({ name: member.name, role: member.role });
+                }
+            });
+            var chief = String(row[chiefAt] || '').trim();
+            if (chief && matches(chief)) {
+                found.push({ name: chief, role: 'руководитель' });
+            }
+            var deputy = String(cell(row, deputyAt) || '').trim();
+            if (deputy && matches(deputy)) {
+                found.push({ name: deputy, role: 'заместитель' });
+            }
+            found.forEach(function (item) {
+                if (!hits[item.name]) { hits[item.name] = item.role; }
+            });
+            return found.length > 0;
+        });
+
+        search = { query: query, hits: hits, names: Object.keys(hits).sort() };
+        active.push('поиск: ' + query);
+        log.push('Поиск «' + query + '» → совпало людей: ' + search.names.length +
+                 ', строк: ' + rows.length);
+    }
+
     // Параметр пришёл, но ни под один фильтр не подошёл — почти всегда это
     // опечатка в имени. Молчать нельзя: чарт нарисуется целиком, и человек
     // решит, что селектор просто не работает.
@@ -385,7 +453,7 @@ function applyFilters(source, log) {
     }).join('   ·   ');
     log.push('Параметры: ' + (dump || '(ни одного)'));
 
-    return { rows: rows, active: active, unknown: unknown,
+    return { rows: rows, active: active, unknown: unknown, search: search,
              dump: dump || 'ни одного параметра не пришло' };
 }
 
@@ -430,6 +498,22 @@ function segments(counts) {
 
 function vacancyMark(count) {
     return count ? ' +' + count + ' вак' : '';
+}
+
+// Приведение к виду, в котором ищем: регистр и «ё» не должны мешать найти
+// человека, а лишние пробелы в выгрузке встречаются регулярно.
+function fold(text) {
+    return String(text === null || text === undefined ? '' : text)
+        .toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+
+function plural(count, one, few, many) {
+    var n = Math.abs(count) % 100;
+    var tail = n % 10;
+    if (n > 10 && n < 20) { return count + ' ' + many; }
+    if (tail > 1 && tail < 5) { return count + ' ' + few; }
+    if (tail === 1) { return count + ' ' + one; }
+    return count + ' ' + many;
 }
 
 // --------------------------------------------------------------------------
@@ -488,7 +572,7 @@ function millions(value) {
     return money(n) + ' ₽';
 }
 
-function buildScene(fields, rows, active, unknown, dump) {
+function buildScene(fields, rows, active, unknown, dump, search) {
     var at = indexer(fields);
 
     // Колонки «людей» и R4…R0 приходят по продуктам. Складывать их вверх по
@@ -664,13 +748,45 @@ function buildScene(fields, rows, active, unknown, dump) {
     ];
     if (totals.vacancies) { summary.push('+' + totals.vacancies + ' вакансий'); }
 
+    // Строка результата поиска. Показывает, кого нашли и в скольких местах:
+    // человек на двух продуктах — это не два человека, а один в двух местах,
+    // и увидеть это нужно сразу, не пересчитывая карточки глазами.
+    var searchLine = '';
+    var hitNames = {};
+    if (search) {
+        search.names.forEach(function (name) { hitNames[name] = true; });
+        var who;
+        if (!search.names.length) {
+            who = 'никого не нашли';
+        } else if (search.names.length === 1) {
+            var only = search.names[0];
+            who = only + (search.hits[only] ? ' — ' + search.hits[only] : '');
+        } else {
+            who = plural(search.names.length, 'совпадение', 'совпадения', 'совпадений') +
+                  ': ' + search.names.slice(0, 8).join(', ') +
+                  (search.names.length > 8 ? ' …' : '');
+        }
+        searchLine = 'поиск «' + search.query + '»:  ' + who;
+        if (search.names.length) {
+            searchLine += '  ·  ' +
+                plural(totals.products, 'продукт', 'продукта', 'продуктов') +
+                '  ·  ' +
+                plural(totals.blocks, 'направление', 'направления', 'направлений');
+        }
+    }
+    var padTop = PAD_TOP + (searchLine ? 14 : 0);
+
     var scene = {
         rows: leafRow,
         summary: 'в срезе:  ' + summary.join('  ·  '),
-        height: leafRow * ROW + PAD_TOP + 12,
+        searchLine: searchLine,
+        hitNames: hitNames,
+        hitColor: THEME.hit,
+        hitBg: THEME.hitBg,
+        height: leafRow * ROW + padTop + 12,
         warnRoom: (unknown && unknown.length) || (DEBUG_PARAMS ? 1 : 0) ? 16 : 0,
         rowH: ROW, nodeH: NODE_H, stripH: STRIP,
-        padTop: PAD_TOP, padSide: PAD_SIDE, gap: GAP,
+        padTop: padTop, padSide: PAD_SIDE, gap: GAP,
         ratio: COL_RATIO, minWidth: MIN_WIDTH,
         metaCh: META_CH, titleCh: TITLE_CH,
         background: THEME.sunk,
@@ -792,16 +908,26 @@ var log = [];
 var source = readSource(log);
 var scene = null;
 var failure = null;
+// Пустой результат поиска — не поломка, а нормальный ответ. Показываем его
+// короткой запиской, без технической выкладки и списка «что проверить»:
+// иначе человек, опечатавшийся в фамилии, идёт чинить вкладку Sources.
+var quiet = false;
 
 if (source.rows.length) {
     try {
         var filtered = applyFilters(source, log);
-        if (!filtered.rows.length) {
+        if (!filtered.rows.length && filtered.search) {
+            quiet = true;
+            failure = 'По запросу «' + filtered.search.query + '» никого не нашли. ' +
+                      'Хватит куска фамилии или табельного номера целиком, ' +
+                      'регистр и «ё» не важны. Если кроме поиска стоят ' +
+                      'селекторы — поиск идёт внутри их среза, снимите лишние.';
+        } else if (!filtered.rows.length) {
             failure = 'Под выбранные фильтры не попало ни одной строки. ' +
                       'Снимите часть значений в селекторах.';
         } else {
             scene = buildScene(source.fields, filtered.rows, filtered.active,
-                               filtered.unknown, filtered.dump);
+                               filtered.unknown, filtered.dump, filtered.search);
             log.push('Построено узлов: ' + scene.nodes.length +
                      ', направлений: ' + scene.blocks +
                      ', людей в срезе: ' + scene.people);
@@ -825,8 +951,10 @@ if (source.rows.length) {
 
 var report = {
     title: failure || '',
-    lines: log,
-    hint: [
+    heading: quiet ? 'Никого не нашли' : 'Дерево не построено',
+    headColor: quiet ? THEME.hit : THEME.crit,
+    lines: quiet ? [] : log,
+    hint: quiet ? [] : [
         'Проверьте по порядку:',
         '1. Meta — id датасета скопирован целиком и без пробелов.',
         '2. Sources — названия полей совпадают с датасетом побуквенно, ' +
@@ -869,15 +997,20 @@ module.exports = {
                       '<div style="background:' + report.card + ';border:1px solid ' +
                       report.rule + ';border-radius:6px;padding:14px 16px;max-width:820px">' +
                         '<div style="font-size:14px;font-weight:700;color:' +
-                        report.crit + ';margin-bottom:8px">Дерево не построено</div>' +
+                        report.headColor + ';margin-bottom:8px">' +
+                        esc(report.heading) + '</div>' +
                         '<div style="font-size:12px;color:' + report.ink +
                         ';margin-bottom:12px">' + esc(report.title) + '</div>' +
-                        '<div style="font-family:' + report.mono +
-                        ';font-size:11px;color:' + report.inkSoft +
-                        ';border-top:1px solid ' + report.rule +
-                        ';padding-top:10px;margin-bottom:12px">' + lines + '</div>' +
-                        '<div style="font-size:12px;color:' + report.ink + '">' +
-                        hints + '</div>' +
+                        (lines
+                            ? '<div style="font-family:' + report.mono +
+                              ';font-size:11px;color:' + report.inkSoft +
+                              ';border-top:1px solid ' + report.rule +
+                              ';padding-top:10px;margin-bottom:12px">' + lines + '</div>'
+                            : '') +
+                        (hints
+                            ? '<div style="font-size:12px;color:' + report.ink + '">' +
+                              hints + '</div>'
+                            : '') +
                       '</div>' +
                     '</div>'
                 );
@@ -936,6 +1069,18 @@ module.exports = {
                 esc(scene.summary) + '</text>'
             );
 
+            // Результат поиска по ФИО — третьей строкой, сразу под итогами.
+            var afterSummary = 48;
+            if (scene.searchLine) {
+                parts.push(
+                    '<text x="' + scene.padSide + '" y="' + afterSummary +
+                    '" font-family="' + scene.mono + '" font-size="10.5" ' +
+                    'font-weight="600" fill="' + scene.hitColor + '">' +
+                    esc(scene.searchLine) + '</text>'
+                );
+                afterSummary += 14;
+            }
+
             // Служебная строка отдельно от легенды: приписанная в конец
             // первой строки, она уезжала за край и оставалась незамеченной.
             var service = '';
@@ -948,8 +1093,8 @@ module.exports = {
             }
             if (service) {
                 parts.push(
-                    '<text x="' + scene.padSide + '" y="48" font-family="' +
-                    scene.mono + '" font-size="10" fill="' +
+                    '<text x="' + scene.padSide + '" y="' + afterSummary +
+                    '" font-family="' + scene.mono + '" font-size="10" fill="' +
                     (scene.unknown.length ? scene.warnColor : scene.noteColor) +
                     '">' + esc(service) + '</text>'
                 );
@@ -1148,7 +1293,16 @@ module.exports = {
                 // цветная точка уровня роли, фамилия и роль.
                 members.forEach(function (member, i) {
                     var rowY = panelY + headH + i * lineH;
-                    if (i % 2 === 1) {
+                    // Найденный поиском — своей заливкой на всю строку: в
+                    // команде из двадцати человек нужного иначе не выхватить.
+                    var isHit = scene.hitNames[member.name] === true;
+                    if (isHit) {
+                        parts.push(
+                            '<rect x="' + (panelX + 1) + '" y="' + rowY + '" width="' +
+                            (panelW - 2) + '" height="' + lineH + '" fill="' +
+                            scene.hitBg + '"/>'
+                        );
+                    } else if (i % 2 === 1) {
                         parts.push(
                             '<rect x="' + (panelX + 1) + '" y="' + rowY + '" width="' +
                             (panelW - 2) + '" height="' + lineH + '" fill="' +
@@ -1163,13 +1317,15 @@ module.exports = {
                     parts.push(
                         '<text x="' + (panelX + 30) + '" y="' + (rowY + 14) +
                         '" font-family="' + scene.font + '" font-size="11" ' +
-                        'font-weight="600" fill="' + scene.panelInk + '">' +
+                        'font-weight="' + (isHit ? 700 : 600) + '" fill="' +
+                        (isHit ? scene.hitColor : scene.panelInk) + '">' +
                         esc(member.name) + '</text>'
                     );
                     parts.push(
                         '<text x="' + (panelX + panelW - 12) + '" y="' + (rowY + 14) +
                         '" text-anchor="end" font-family="' + scene.font +
-                        '" font-size="11" fill="' + scene.noteColor + '">' +
+                        '" font-size="11" fill="' +
+                        (isHit ? scene.hitColor : scene.noteColor) + '">' +
                         esc(member.role) + '</text>'
                     );
                 });

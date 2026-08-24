@@ -100,6 +100,11 @@ Object.keys(ROLE_TO_LEVEL).forEach(function (role) {
     });
 });
 
+// Ранг уровня: 0 — старший. Нужен, когда человек на разных продуктах числится
+// в разных ролях: на узле выше продукта его учитываем по старшей.
+var LEVEL_RANK = {};
+LEVELS.forEach(function (level, index) { LEVEL_RANK[level.key] = index; });
+
 // Порядок колонок должен совпадать со списком полей на вкладке Sources.
 var COLUMNS = [
     'Блок', 'Проект', 'Руководитель', 'Продукт кратко', 'риск',
@@ -428,6 +433,52 @@ function vacancyMark(count) {
 }
 
 // --------------------------------------------------------------------------
+// Состав по людям, а не по назначениям
+// --------------------------------------------------------------------------
+
+// «Фамилия — Роль; Фамилия — Роль» → список участников продукта.
+function parseRoster(text) {
+    var out = [];
+    String(text || '').split(';').forEach(function (item) {
+        var line = item.trim();
+        if (!line) { return; }
+        var cut = line.indexOf(' — ');
+        var name = (cut < 0 ? line : line.slice(0, cut)).trim();
+        var role = cut < 0 ? '' : line.slice(cut + 3).trim();
+        if (!name) { return; }
+        out.push({ name: name, role: role, level: ROLE_TO_LEVEL[role] || '' });
+    });
+    return out;
+}
+
+// Слияние составов веток: один человек — одна запись. Если на разных
+// продуктах у него разные роли, остаётся старшая.
+function mergeMembers(target, members) {
+    members.forEach(function (member) {
+        var known = target[member.name];
+        if (!known) {
+            target[member.name] = member;
+            return;
+        }
+        var rank = LEVEL_RANK[member.level];
+        var kept = LEVEL_RANK[known.level];
+        if (rank !== undefined && (kept === undefined || rank < kept)) {
+            target[member.name] = member;
+        }
+    });
+}
+
+// Полоса состава по уникальным людям: каждый попадает ровно в один сегмент.
+function countsOfMembers(members) {
+    var counts = emptyCounts();
+    Object.keys(members).forEach(function (name) {
+        var level = members[name].level;
+        if (counts[level] !== undefined) { counts[level] += 1; }
+    });
+    return counts;
+}
+
+// --------------------------------------------------------------------------
 // Дерево и сцена
 // --------------------------------------------------------------------------
 
@@ -440,30 +491,38 @@ function millions(value) {
 function buildScene(fields, rows, active, unknown, dump) {
     var at = indexer(fields);
 
-    // Уникальные сотрудники среза. Колонка «людей» считает назначения:
-    // человек на двух продуктах даёт двойку. Настоящую численность даёт
-    // только перебор фамилий из колонки «команда».
-    var uniquePeople = {};
-    var uniqueCount = 0;
+    // Колонки «людей» и R4…R0 приходят по продуктам. Складывать их вверх по
+    // дереву нельзя: человек, занятый на двух продуктах, даст двойку и на
+    // руководителе, и на проекте, и на направлении. Настоящую численность
+    // даёт только перебор фамилий из колонки «команда».
     var rosterKnown = at('команда') >= 0;
-    if (rosterKnown) {
-        rows.forEach(function (row) {
-            String(cell(row, at('команда')) || '').split(';').forEach(function (item) {
-                var text = item.trim();
-                if (!text) { return; }
-                var cut = text.indexOf(' — ');
-                var name = cut < 0 ? text : text.slice(0, cut);
-                if (!uniquePeople[name]) {
-                    uniquePeople[name] = true;
-                    uniqueCount += 1;
-                }
-            });
+    var rosters = rows.map(function (row) {
+        return rosterKnown ? parseRoster(cell(row, at('команда'))) : [];
+    });
+
+    // Пересчёт по фамилиям делаем, только если состав читается целиком:
+    // у каждого участника распознана роль и число фамилий совпадает с
+    // колонкой «людей». Иначе честнее оставить суммы — они хотя бы не
+    // потеряют людей.
+    var rosterUsable = rosterKnown;
+    rosters.forEach(function (members, index) {
+        if (!rosterUsable) { return; }
+        if (members.length !== (Number(rows[index][at('людей')]) || 0)) {
+            rosterUsable = false;
+            return;
+        }
+        members.forEach(function (member) {
+            if (!member.level) { rosterUsable = false; }
         });
-    }
+    });
+
+    var uniquePeople = {};
+    rosters.forEach(function (members) { mergeMembers(uniquePeople, members); });
+    var uniqueCount = Object.keys(uniquePeople).length;
 
     function makeNode(name) {
         return {
-            name: name, children: [], childIndex: {},
+            name: name, children: [], childIndex: {}, members: {},
             counts: emptyCounts(), people: 0, vacancies: 0, fot: 0
         };
     }
@@ -478,7 +537,7 @@ function buildScene(fields, rows, active, unknown, dump) {
 
     var root = makeNode('');
 
-    rows.forEach(function (row) {
+    rows.forEach(function (row, index) {
         var counts = emptyCounts();
         LEVELS.forEach(function (level) {
             counts[level.key] = Number(row[at(level.key)]) || 0;
@@ -511,15 +570,33 @@ function buildScene(fields, rows, active, unknown, dump) {
 
         chief.children.push(product);
 
-        // Состав ветки — сумма составов её продуктов: у направления сразу
-        // видно, на ком оно держится, без разворачивания.
+        // Состав ветки: у направления сразу видно, на ком оно держится, без
+        // разворачивания. ФОТ аллоцирован по назначениям, поэтому его как раз
+        // складываем — сумма долей и есть месячный ФОТ ветки.
         [chief, project, block].forEach(function (node) {
             addCounts(node.counts, counts);
             node.people += product.people;
             node.vacancies += product.vacancies;
             node.fot += product.fot;
+            mergeMembers(node.members, rosters[index]);
         });
     });
+
+    // Замена сумм на пересчёт по уникальным фамилиям — на всех узлах выше
+    // продукта. Лист трогать не нужно: там «людей» уже уникальные.
+    function dedupe(node) {
+        node.people = Object.keys(node.members).length;
+        node.counts = countsOfMembers(node.members);
+    }
+    if (rosterUsable) {
+        root.children.forEach(function (block) {
+            dedupe(block);
+            block.children.forEach(function (project) {
+                dedupe(project);
+                project.children.forEach(dedupe);
+            });
+        });
+    }
 
     // Крупные ветки выше: дерево читают сверху вниз.
     function sortBranch(node, depth) {
@@ -620,7 +697,9 @@ function buildScene(fields, rows, active, unknown, dump) {
         nodes: [],
         links: [],
         blocks: root.children.length,
-        people: root.children.reduce(function (sum, b) { return sum + b.people; }, 0)
+        people: rosterUsable
+            ? uniqueCount
+            : root.children.reduce(function (sum, b) { return sum + b.people; }, 0)
     };
 
     function pushNode(level, row, options) {
@@ -725,7 +804,7 @@ if (source.rows.length) {
                                filtered.unknown, filtered.dump);
             log.push('Построено узлов: ' + scene.nodes.length +
                      ', направлений: ' + scene.blocks +
-                     ', людей суммарно: ' + scene.people);
+                     ', людей в срезе: ' + scene.people);
 
             if (!scene.nodes.length) {
                 failure = 'Строки пришли, но ни одного узла не построилось.';

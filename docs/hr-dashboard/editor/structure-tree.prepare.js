@@ -110,11 +110,11 @@ LEVELS.forEach(function (level, index) { LEVEL_RANK[level.key] = index; });
 var COLUMNS = [
     'Блок', 'Проект', 'Руководитель', 'Продукт кратко', 'риск',
     'R4', 'R3', 'R2', 'R1', 'R0', 'людей', 'вакансий', 'ФОТ_мес',
-    'заместитель', 'команда'
+    'заместитель', 'команда', 'Сотрудник'
 ];
 
 // Колонки, без которых чарт работает: их может не быть в старой выгрузке.
-var OPTIONAL = ['заместитель', 'команда'];
+var OPTIONAL = ['заместитель', 'команда', 'Сотрудник'];
 
 // Параметр селектора → колонка, по которой он фильтрует.
 //
@@ -130,20 +130,26 @@ var FIELD_IDS = {
     'Блок': '',
     'Проект': '',
     'Руководитель': '',
-    'Продукт кратко': ''
+    'Продукт кратко': '',
+    'Сотрудник': ''
 };
 
 var FILTERS = [
     { keys: ['block',   'Блок'],           column: 'Блок',           label: 'направление' },
     { keys: ['project', 'Проект'],         column: 'Проект',         label: 'проект' },
     { keys: ['chief',   'Руководитель'],   column: 'Руководитель',   label: 'руководитель' },
-    { keys: ['product', 'Продукт кратко'], column: 'Продукт кратко', label: 'продукт' }
+    { keys: ['product', 'Продукт кратко'], column: 'Продукт кратко', label: 'продукт' },
+    // Пятый селектор — выпадающий список сотрудников. Колонка «Сотрудник»
+    // появилась в выгрузке ради него: одна строка на пару «продукт —
+    // человек». Если её нет, фильтр просто пропускается.
+    { keys: ['employee', 'Сотрудник', 'ФИО'], column: 'Сотрудник', label: 'сотрудник' }
 ];
 
-// Имена параметра поиска по ФИО. Первое — то, что объявлено в Controls
-// и Params; остальные приняты на случай, если поиск вешают на отдельный
-// селектор дашборда с другим названием.
-var SEARCH_KEYS = ['search', 'сотрудник', 'Сотрудник', 'поиск', 'ФИО'];
+// Имена параметра свободного поиска по ФИО — поля ввода со вкладки
+// Controls. Имена «Сотрудник» и «ФИО» здесь намеренно не перечислены:
+// они заняты фильтром выпадающего селектора выше, а он ищет точным
+// совпадением, а не по куску строки.
+var SEARCH_KEYS = ['search', 'поиск'];
 
 // --------------------------------------------------------------------------
 // Разбор ответа источника
@@ -330,7 +336,7 @@ function applyFilters(source, log) {
     } catch (e) {
         log.push('Editor.getParams() недоступен, фильтры пропущены');
         return { rows: source.rows, active: [], unknown: [], search: null,
-                 dump: 'getParams() недоступен' };
+                 skipped: [], dump: 'getParams() недоступен' };
     }
 
     var at = indexer(source.fields);
@@ -340,6 +346,12 @@ function applyFilters(source, log) {
 
     // Идентификатор поля → название колонки, которую он фильтрует.
     var aliases = source.aliasToTitle || {};
+
+    // Кого выбрали в выпадающем селекторе «Сотрудник»: этих людей потом
+    // подсвечиваем в составе команд и показываем строкой результата.
+    var picked = [];
+    // Фильтры, которые пришлось пропустить: колонки нет в выгрузке.
+    var skipped = [];
 
     FILTERS.forEach(function (filter) {
         var values = [];
@@ -363,9 +375,19 @@ function applyFilters(source, log) {
         if (!values.length) { return; }
 
         var column = at(filter.column);
+        // Колонки может не быть в старой выгрузке — тогда фильтр по ней
+        // отсекал бы всё подряд. Пропускаем и говорим об этом вслух.
+        if (column < 0) {
+            skipped.push(filter.label + ' (нет колонки «' + filter.column + '»)');
+            log.push('Фильтр ' + filter.keys[0] + ' пропущен: в выгрузке нет ' +
+                     'колонки «' + filter.column + '»');
+            return;
+        }
+
         rows = rows.filter(function (row) {
             return values.indexOf(String(row[column])) >= 0;
         });
+        if (filter.column === 'Сотрудник') { picked = values.slice(); }
         active.push(filter.label + ': ' + values.join(', '));
         log.push('Фильтр ' + filter.keys[0] + ' → ' + values.join(', ') +
                  ', осталось строк: ' + rows.length);
@@ -426,10 +448,28 @@ function applyFilters(source, log) {
             return found.length > 0;
         });
 
-        search = { query: query, hits: hits, names: Object.keys(hits).sort() };
+        search = { query: query, hits: hits, names: Object.keys(hits).sort(),
+                   kind: 'поиск' };
         active.push('поиск: ' + query);
         log.push('Поиск «' + query + '» → совпало людей: ' + search.names.length +
                  ', строк: ' + rows.length);
+    }
+
+    // Выбор в выпадающем селекторе показываем так же, как результат поиска:
+    // строкой сверху и подсветкой в составе команды. Фильтр уже применён
+    // выше по колонке «Сотрудник», здесь остаётся только достать роли —
+    // в колонке их нет, они лежат в составе команды.
+    if (picked.length && !search) {
+        var roles = {};
+        var rosterAt = at('команда');
+        picked.forEach(function (name) { roles[name] = ''; });
+        rows.forEach(function (row) {
+            parseRoster(cell(row, rosterAt)).forEach(function (member) {
+                if (roles[member.name] === '') { roles[member.name] = member.role; }
+            });
+        });
+        search = { query: picked.join(', '), hits: roles, names: picked.slice(),
+                   kind: 'выбор' };
     }
 
     // Параметр пришёл, но ни под один фильтр не подошёл — почти всегда это
@@ -454,6 +494,7 @@ function applyFilters(source, log) {
     log.push('Параметры: ' + (dump || '(ни одного)'));
 
     return { rows: rows, active: active, unknown: unknown, search: search,
+             skipped: skipped,
              dump: dump || 'ни одного параметра не пришло' };
 }
 
@@ -572,8 +613,26 @@ function millions(value) {
     return money(n) + ' ₽';
 }
 
-function buildScene(fields, rows, active, unknown, dump, search) {
+function buildScene(fields, rows, active, unknown, dump, search, skipped) {
     var at = indexer(fields);
+
+    // В выгрузке одна строка на пару «продукт — сотрудник»: так устроен
+    // выпадающий селектор «Сотрудник». Дереву нужен продукт, поэтому строки
+    // схлопываем обратно по ключу ветки. Показатели продукта на всех его
+    // строках одинаковы, берём первую.
+    if (at('Сотрудник') >= 0) {
+        var seenPath = {};
+        var unique = [];
+        var path = [at('Блок'), at('Проект'), at('Руководитель'),
+                    at('Продукт кратко')];
+        rows.forEach(function (row) {
+            var key = path.map(function (i) { return String(row[i]); }).join(' ');
+            if (seenPath[key]) { return; }
+            seenPath[key] = true;
+            unique.push(row);
+        });
+        rows = unique;
+    }
 
     // Колонки «людей» и R4…R0 приходят по продуктам. Складывать их вверх по
     // дереву нельзя: человек, занятый на двух продуктах, даст двойку и на
@@ -755,19 +814,34 @@ function buildScene(fields, rows, active, unknown, dump, search) {
     var hitNames = {};
     if (search) {
         search.names.forEach(function (name) { hitNames[name] = true; });
+        var picked = search.kind === 'выбор';
+        var count = search.names.length;
+
+        // Один человек — с ролью: «68 — Руководитель проекта». Несколько —
+        // просто перечислением, роли в строку не влезут.
         var who;
-        if (!search.names.length) {
+        if (!count) {
             who = 'никого не нашли';
-        } else if (search.names.length === 1) {
+        } else if (count === 1) {
             var only = search.names[0];
             who = only + (search.hits[only] ? ' — ' + search.hits[only] : '');
         } else {
-            who = plural(search.names.length, 'совпадение', 'совпадения', 'совпадений') +
-                  ': ' + search.names.slice(0, 8).join(', ') +
-                  (search.names.length > 8 ? ' …' : '');
+            who = search.names.slice(0, 8).join(', ') + (count > 8 ? ' …' : '');
+            if (!picked) {
+                who = plural(count, 'совпадение', 'совпадения', 'совпадений') +
+                      ': ' + who;
+            }
         }
-        searchLine = 'поиск «' + search.query + '»:  ' + who;
-        if (search.names.length) {
+
+        var head;
+        if (picked) {
+            head = count === 1 ? 'выбран:  ' : 'выбрано ' + count + ':  ';
+        } else {
+            head = 'поиск «' + search.query + '»:  ';
+        }
+
+        searchLine = head + who;
+        if (count) {
             searchLine += '  ·  ' +
                 plural(totals.products, 'продукт', 'продукта', 'продуктов') +
                 '  ·  ' +
@@ -784,7 +858,8 @@ function buildScene(fields, rows, active, unknown, dump, search) {
         hitColor: THEME.hit,
         hitBg: THEME.hitBg,
         height: leafRow * ROW + padTop + 12,
-        warnRoom: (unknown && unknown.length) || (DEBUG_PARAMS ? 1 : 0) ? 16 : 0,
+        warnRoom: (unknown && unknown.length) || (skipped && skipped.length) ||
+                  (DEBUG_PARAMS ? 1 : 0) ? 16 : 0,
         rowH: ROW, nodeH: NODE_H, stripH: STRIP,
         padTop: padTop, padSide: PAD_SIDE, gap: GAP,
         ratio: COL_RATIO, minWidth: MIN_WIDTH,
@@ -805,6 +880,7 @@ function buildScene(fields, rows, active, unknown, dump, search) {
         note: 'клик по продукту — состав команды',
         filters: active,
         unknown: unknown || [],
+        skipped: skipped || [],
         debugParams: DEBUG_PARAMS ? String(dump || '') : '',
         warnColor: THEME.crit,
         legend: LEVELS.map(function (level) {
@@ -927,7 +1003,8 @@ if (source.rows.length) {
                       'Снимите часть значений в селекторах.';
         } else {
             scene = buildScene(source.fields, filtered.rows, filtered.active,
-                               filtered.unknown, filtered.dump, filtered.search);
+                               filtered.unknown, filtered.dump, filtered.search,
+                               filtered.skipped);
             log.push('Построено узлов: ' + scene.nodes.length +
                      ', направлений: ' + scene.blocks +
                      ', людей в срезе: ' + scene.people);
@@ -1084,10 +1161,15 @@ module.exports = {
             // Служебная строка отдельно от легенды: приписанная в конец
             // первой строки, она уезжала за край и оставалась незамеченной.
             var service = '';
+            var alarm = scene.unknown.length > 0 || scene.skipped.length > 0;
             if (scene.unknown.length) {
                 service = '⚠ параметр пришёл, но фильтра под него нет: ' +
                           scene.unknown.join(', ') +
                           '  — добавьте это имя в FILTERS и Params';
+            } else if (scene.skipped.length) {
+                service = '⚠ фильтр пропущен: ' + scene.skipped.join(', ') +
+                          '  — перегенерируйте выгрузку и добавьте поле ' +
+                          'на вкладку Sources';
             } else if (scene.debugParams) {
                 service = 'параметры: ' + scene.debugParams;
             }
@@ -1095,7 +1177,7 @@ module.exports = {
                 parts.push(
                     '<text x="' + scene.padSide + '" y="' + afterSummary +
                     '" font-family="' + scene.mono + '" font-size="10" fill="' +
-                    (scene.unknown.length ? scene.warnColor : scene.noteColor) +
+                    (alarm ? scene.warnColor : scene.noteColor) +
                     '">' + esc(service) + '</text>'
                 );
             }

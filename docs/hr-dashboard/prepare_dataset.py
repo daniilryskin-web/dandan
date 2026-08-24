@@ -729,8 +729,29 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
         "Состав", "людей", "вакансий", "ФОТ_мес", "медиана_ЗП", "риск",
         "заместитель", "команда",
     ]
-    return table[columns].sort_values(["Блок", "Проект", "людей"],
-                                      ascending=[True, True, False])
+    table = table[columns].sort_values(["Блок", "Проект", "людей"],
+                                       ascending=[True, True, False])
+
+    # Разворот по сотрудникам: одна строка на пару «продукт — человек».
+    # Нужен ради выпадающего селектора «Сотрудник» на дашборде. Селектор
+    # на основе датасета берёт значения из колонки, а колонки с одним
+    # человеком в строке до этого не было: состав лежал строкой в «команда».
+    #
+    # Показатели продукта (людей, R4…R0, ФОТ_мес, команда) повторяются на
+    # каждой строке продукта. Чарт схлопывает строки обратно по ключу
+    # «Блок · Проект · Руководитель · Продукт кратко», поэтому в дереве
+    # ничего не задваивается. В Excel по этому листу нельзя суммировать
+    # ФОТ_мес напрямую — для сумм есть лист «Проекты».
+    staff = (
+        people.groupby(index)["Сотрудник"]
+        .apply(lambda values: sorted(set(values)))
+        .reindex(table.index)
+    )
+    table = table.assign(Сотрудник=staff)
+    table["Сотрудник"] = table["Сотрудник"].apply(
+        lambda value: value if isinstance(value, list) and value else [""]
+    )
+    return table.explode("Сотрудник")
 
 
 def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:
@@ -840,13 +861,23 @@ def main() -> None:
         roles_csv, index=False, encoding="utf-8-sig"
     )
 
-    # Лист «Иерархия» отдельным файлом: одна строка на продукт с составом
-    # команды по уровням ролей. Из него строится сводная таблица «проект →
-    # продукт» и древовидная карта — то же, что нарисовано в drawio-схеме.
+    # Лист «Иерархия» отдельным файлом: одна строка на пару «продукт —
+    # сотрудник», показатели продукта повторяются. Из него строится дерево
+    # структуры и выпадающий селектор «Сотрудник» на дашборде.
     tree_csv = args.out.with_name(args.out.stem + "_tree").with_suffix(".csv")
-    sheet_hierarchy(assignments).reset_index().to_csv(
-        tree_csv, index=False, encoding="utf-8-sig"
+    tree = sheet_hierarchy(assignments)
+    tree.reset_index().to_csv(tree_csv, index=False, encoding="utf-8-sig")
+
+    # Список сотрудников для селектора «Ручной ввод» — на случай, если
+    # перезаливать файл в DataLens прямо сейчас не хочется: значения
+    # вставляются в селектор списком. Селектор на основе датасета лучше,
+    # он обновляется сам, но требует нового поля в датасете.
+    staff_txt = args.out.with_name(args.out.stem + "_employees").with_suffix(".txt")
+    staff_list = sorted(
+        {name for name in tree["Сотрудник"] if str(name).strip()},
+        key=lambda name: (len(str(name)), str(name)),
     )
+    staff_txt.write_text("\n".join(staff_list) + "\n", encoding="utf-8")
 
     roles = sheet_roles(assignments)
     by_rating, by_role, by_project = sheet_rating(assignments)
@@ -876,15 +907,14 @@ def main() -> None:
         sheet_projects(assignments).reset_index().to_excel(
             writer, sheet_name="Проекты", index=False
         )
-        sheet_hierarchy(assignments).reset_index().to_excel(
-            writer, sheet_name="Иерархия", index=False
-        )
+        tree.reset_index().to_excel(writer, sheet_name="Иерархия", index=False)
         sheet_vacancies(assignments).to_excel(writer, sheet_name="Вакансии", index=False)
         sheet_checks(assignments).to_excel(writer, sheet_name="Проверки", index=False)
 
     print(f"Записано: {csv_path}  ({len(assignments)} строк)")
     print(f"Записано: {roles_csv}  (по одной строке на роль, для чарта разброса)")
-    print(f"Записано: {tree_csv}  (по одной строке на продукт, для иерархии)")
+    print(f"Записано: {tree_csv}  ({len(tree)} строк: продукт × сотрудник, для иерархии)")
+    print(f"Записано: {staff_txt}  ({len(staff_list)} сотрудников для селектора)")
     print(f"Записано: {xlsx_path}")
     print()
     print(sheet_checks(assignments).to_string(index=False))

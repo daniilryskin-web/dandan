@@ -626,7 +626,12 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
         var path = [at('Блок'), at('Проект'), at('Руководитель'),
                     at('Продукт кратко')];
         rows.forEach(function (row) {
-            var key = path.map(function (i) { return String(row[i]); }).join(' ');
+            // Ключ склеиваем через JSON, а не через разделитель: название
+            // продукта может содержать любой символ, а склейка «через
+            // палочку» дала бы одинаковый ключ разным веткам.
+            var key = JSON.stringify(path.map(function (i) {
+                return String(row[i]);
+            }));
             if (seenPath[key]) { return; }
             seenPath[key] = true;
             unique.push(row);
@@ -959,13 +964,24 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
                     var fill = THEME.card;
                     var stroke = THEME.rule;
                     var color = THEME.ink;
+
+                    // Продукт, на котором пока никого нет: он в дереве есть —
+                    // иначе набор на него не с чем связать, — но раскрывать
+                    // у него нечего, поэтому и курсор не обещает состав.
+                    var empty = !product.team.length;
+                    var meta = empty
+                        ? 'команды нет' + vacancyMark(product.vacancies)
+                        : product.people + ' чел' + vacancyMark(product.vacancies) +
+                          ' · ' + money(product.fot) + ' ₽';
+
                     var productBox = pushNode(3, product.row, {
-                        id: 'p' + scene.nodes.length,
+                        id: empty ? '' : 'p' + scene.nodes.length,
                         team: product.team,
                         counts: product.counts, fill: fill, stroke: stroke,
-                        color: color, title: product.name, weight: 500,
-                        meta: product.people + ' чел' + vacancyMark(product.vacancies) +
-                              ' · ' + money(product.fot) + ' ₽'
+                        color: empty ? THEME.inkFaint : color,
+                        title: product.name, weight: 500,
+                        meta: meta,
+                        metaColor: empty ? THEME.warn : THEME.inkFaint
                     });
                     pushLink(chiefBox, productBox);
                 });
@@ -1037,7 +1053,7 @@ var report = {
         '2. Sources — названия полей совпадают с датасетом побуквенно, ' +
             'включая регистр: «людей», «вакансий», «риск» со строчной буквы, ' +
             '«ФОТ_мес» с подчёркиванием.',
-        '3. Датасет открывается и показывает 57 строк.',
+        '3. Датасет открывается и показывает 218 строк.',
         '4. Кнопка «Выполнить» нажата после правки вкладок.'
     ],
     background: THEME.sunk, font: THEME.font, mono: THEME.mono,

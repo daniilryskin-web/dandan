@@ -685,13 +685,20 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     # это верно, команда у него действительно разделена.
     index = ["Блок", "Проект", "Руководитель", "Продукт кратко"]
 
-    table = people.groupby(index).agg(
+    # Скелет дерева строим по ВСЕМ строкам, включая вакансии: продукт, на
+    # котором пока нет ни одного человека, существует и в дереве должен быть
+    # виден. Иначе набор на него не с чем связать — он просто исчезал,
+    # и число вакансий в дереве не сходилось с выгрузкой.
+    table = pd.DataFrame(index=df.groupby(index).size().index)
+
+    metrics = people.groupby(index).agg(
         людей=("Сотрудник", "nunique"),
         ФОТ_мес=("ФОТ аллоцированный", "sum"),
         медиана_ЗП=("ЗП", "median"),
-    )
-    table["ФОТ_мес"] = table["ФОТ_мес"].round(2)
-    table["медиана_ЗП"] = table["медиана_ЗП"].round(2)
+    ).reindex(table.index)
+    table["людей"] = metrics["людей"].fillna(0).astype(int)
+    table["ФОТ_мес"] = metrics["ФОТ_мес"].fillna(0.0).round(2)
+    table["медиана_ЗП"] = metrics["медиана_ЗП"].round(2)
 
     levels = people.pivot_table(
         index=index, columns="Уровень роли №", values="Сотрудник",
@@ -712,9 +719,9 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
 
     # Заместитель — атрибут руководителя, а не продукта: берём первое
     # непустое значение по ветке. Пустая строка, если столбца нет в исходнике.
-    if "Заместитель" in people.columns:
+    if "Заместитель" in df.columns:
         deputy = (
-            people.assign(_d=people["Заместитель"].fillna("").astype(str).str.strip())
+            df.assign(_d=df["Заместитель"].fillna("").astype(str).str.strip())
             .groupby(index)["_d"]
             .agg(lambda values: next((v for v in values if v), ""))
         )
@@ -744,11 +751,12 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     vacancies = df[df["Вакансия"] == 1].groupby(index).size()
     table["вакансий"] = vacancies.reindex(table.index).fillna(0).astype(int)
 
-    # Тот же светофор незаменимости, что и в основной таблице, но на уровне
-    # продукта: на схеме он даёт цвет рамки.
+    # Тот же светофор незаменимости, что и в основной таблице, и с той же
+    # градацией: нулевая ступень нужна продуктам, которые пока держатся
+    # на одних вакансиях.
     table["риск"] = pd.cut(
-        table["людей"], bins=[-1, 1, 2, 10_000],
-        labels=["Критично: 1 человек", "Риск: 2 человека", "ОК"],
+        table["людей"], bins=[-1, 0, 1, 2, 10_000],
+        labels=["Только вакансии", "Критично: 1 человек", "Риск: 2 человека", "ОК"],
     ).astype(str)
 
     columns = [f"R{n}" for n in seen] + [
@@ -822,7 +830,7 @@ def sheet_checks(df: pd.DataFrame) -> pd.DataFrame:
          "справочно: единица учёта — «Продукт (кратко)»"),
         ("Продуктов без единого сотрудника",
          int(df["Продукт ключ"].nunique() - people["Продукт ключ"].nunique()),
-         "в дерево структуры не попадают: оно строится по людям"),
+         "держатся на одних вакансиях; в дереве видны с пометкой «0 чел»"),
         ("Полных названий продуктов", df["Продукт"].nunique(),
          "справочно: под одним коротким именем бывает несколько систем"),
         ("Проектных ролей", df["Проектная роль"].nunique(), "справочно"),

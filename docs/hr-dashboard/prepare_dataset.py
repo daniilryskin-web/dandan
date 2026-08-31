@@ -22,11 +22,13 @@ LOD-выражений, поведение которых зависит от р
     datalens_dataset.csv          — основная таблица назначений, её грузим в DataLens
     datalens_dataset_roles.csv    — по одной строке на роль, для чарта разброса
     datalens_dataset_tree.csv     — пара «продукт — сотрудник», для дерева структуры
+    datalens_dataset_alignment.csv — кому доплачивать, развёрнуто по сценариям
     datalens_dataset_history.csv  — все накопленные срезы одним файлом, для динамики
     datalens_dataset_changes.csv  — что изменилось с прошлого среза
     datalens_dataset.xlsx         — то же самое плюс листы «Сотрудники», «Оценка ЗП»,
                                     «Роли», «Проекты», «Иерархия», «Вакансии»,
-                                    «Выравнивание», «Изменения», «Проверки»
+                                    «Выравнивание · сводка», «Выравнивание · люди»,
+                                    «Изменения», «Проверки»
     history/ГГГГ-ММ-ДД.csv        — архив срезов; из него собирается история
 
 История. Каждый запуск кладёт копию среза в history/ и пересобирает
@@ -826,43 +828,81 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     return table.explode("Сотрудник")
 
 
+# Три сценария выравнивания. Порог — максимальный уровень «Сценария
+# выравнивания», который сценарий в себя включает, поэтому сценарии
+# автоматически вложены: A ⊂ B ⊂ C.
 ALIGNMENT_SCENARIOS = [
-    ("A · Обязательный минимум",
-     ["1. Недоплата, ЗП подтверждена"],
+    ("A", "A · обязательный минимум", 1,
      "Compa-ratio ниже 0,80, зарплата подтверждена"),
-    ("B · Полное по проверенным данным",
-     ["1. Недоплата, ЗП подтверждена", "2. Ниже роли, ЗП подтверждена"],
+    ("B", "B · по проверенным данным", 2,
      "все ниже порога 0,90 с подтверждённой зарплатой"),
-    ("C · Верхняя оценка",
-     ["1. Недоплата, ЗП подтверждена", "2. Ниже роли, ЗП подтверждена",
-      "3. ЗП не подтверждена"],
+    ("C", "C · верхняя оценка", 3,
      "плюс неподтверждённые зарплаты — сначала уточнить в источнике"),
 ]
+
+# «Сценарий выравнивания» → номер ступени. Номер уже стоит префиксом
+# в самом значении, но раскладка перечислена явно: префикс существует ради
+# сортировки и может однажды измениться, а молчаливая поломка фильтра —
+# худший вид поломки.
+ALIGNMENT_LEVELS = {
+    "1. Недоплата, ЗП подтверждена": 1,
+    "2. Ниже роли, ЗП подтверждена": 2,
+    "3. ЗП не подтверждена": 3,
+}
 
 
 def sheet_alignment(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Сколько стоит выравнивание зарплат — тремя вложенными сценариями.
 
-    Возвращает две таблицы: сводку по сценариям и поимённый список тех, кому
-    доплата полагается. Доплата уже посчитана в столбце «Доплата до порога»
-    и лежит только на первичном назначении, поэтому суммируется без риска
-    задвоения.
+    Возвращает две таблицы, связанные ключом «Код сценария»: сводку (одна
+    строка на сценарий) и поимённый список.
+
+    Список РАЗВЁРНУТ по сценариям: человек из ступени 1 попадает в A, B и C,
+    то есть даёт три строки. Так вложенность становится частью данных, и
+    обычный селектор по колонке «Сценарий» работает накопительно — без
+    параметров датасета и вычисляемых полей в BI.
+
+    Плата за это — обязательный разрез по сценарию. Сумма «Доплаты до порога»
+    по всему листу без группировки посчитает ступень 1 трижды. Для итогов
+    есть лист сводки, он для того и отделён.
 
     Доплата считается до нижнего порога (0,90 от базы сравнения), а не до
     самой базы: цель — убрать провалы, а не выровнять всех в одну точку.
-    Суммы указаны gross, без страховых взносов: ставка зависит от юрлица
-    и в исходных данных её нет.
+    Суммы gross, без страховых взносов: ставка зависит от юрлица, а его
+    в исходных данных нет.
     """
     people = df[(df["Вакансия"] == 0) & (df["Первичное назначение"] == 1)]
     fot = people["ЗП"].sum()
 
+    listing = people[people["Доплата до порога"] > 0].copy()
+    listing["Уровень выравнивания"] = (
+        listing["Сценарий выравнивания"].map(ALIGNMENT_LEVELS).astype(int)
+    )
+    listing["ЗП после выравнивания"] = (
+        listing["ЗП"] + listing["Доплата до порога"]
+    ).round(2)
+    listing["Compa-ratio после"] = (
+        listing["ЗП после выравнивания"] / listing["База сравнения"]
+    ).round(3)
+
+    columns = [
+        "Код сценария", "Сценарий", "Уровень выравнивания",
+        "Сценарий выравнивания", "Сотрудник", "Проектная роль", "Уровень роли",
+        "Блок", "Проект", "ЗП", "ЗП подтверждена", "База сравнения",
+        "Уровень сравнения", "Compa-ratio", "Оценка ЗП", "Доплата до порога",
+        "ЗП после выравнивания", "Compa-ratio после", "Комментарий",
+    ]
+
     summary = []
-    for name, groups, comment in ALIGNMENT_SCENARIOS:
-        rows = people[people["Сценарий выравнивания"].isin(groups)]
+    expanded = []
+    for code, name, threshold, comment in ALIGNMENT_SCENARIOS:
+        rows = listing[listing["Уровень выравнивания"] <= threshold]
         cost = rows["Доплата до порога"].sum()
         summary.append({
+            "Код сценария": code,
             "Сценарий": name,
             "Кого включает": comment,
+            "Включает ступени": ", ".join(str(n) for n in range(1, threshold + 1)),
             "Людей": len(rows),
             "Доплата, мес": round(cost, 2),
             "Доплата, год": round(cost * 12, 2),
@@ -871,25 +911,13 @@ def sheet_alignment(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             "Максимальная доплата": round(rows["Доплата до порога"].max(), 0)
             if len(rows) else 0.0,
         })
+        block = rows.assign(**{"Код сценария": code, "Сценарий": name})
+        expanded.append(block[[c for c in columns if c in block.columns]])
 
-    listing = people[people["Доплата до порога"] > 0].copy()
-    listing["ЗП после выравнивания"] = (
-        listing["ЗП"] + listing["Доплата до порога"]
-    ).round(2)
-    listing["Compa-ratio после"] = (
-        listing["ЗП после выравнивания"] / listing["База сравнения"]
-    ).round(3)
-    columns = [
-        "Сценарий выравнивания", "Сотрудник", "Проектная роль", "Уровень роли",
-        "Блок", "Проект", "ЗП", "ЗП подтверждена", "База сравнения",
-        "Уровень сравнения", "Compa-ratio", "Оценка ЗП", "Доплата до порога",
-        "ЗП после выравнивания", "Compa-ratio после", "Комментарий",
-    ]
-    listing = listing[[c for c in columns if c in listing.columns]]
-    listing = listing.sort_values(
-        ["Сценарий выравнивания", "Доплата до порога"], ascending=[True, False]
+    people_sheet = pd.concat(expanded, ignore_index=True).sort_values(
+        ["Код сценария", "Доплата до порога"], ascending=[True, False]
     )
-    return pd.DataFrame(summary), listing
+    return pd.DataFrame(summary), people_sheet
 
 
 def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:
@@ -1166,7 +1194,7 @@ def sheet_checks(df: pd.DataFrame) -> pd.DataFrame:
          "риск незаменимости"),
         ("Выравнивание, руб/мес",
          round(unique_people["Доплата до порога"].sum(), 2),
-         "верхняя оценка; три сценария — на листе «Выравнивание»"),
+         "сценарий C; A и B — на листе «Выравнивание · сводка»"),
         ("Расхождение ФОТ, руб",
          round(people["ФОТ аллоцированный"].sum() - unique_people["ЗП"].sum(), 2),
          "должно быть 0: ФОТ на листе «Проекты» минус сумма ЗП на листе «Сотрудники»"),
@@ -1240,6 +1268,13 @@ def main() -> None:
     tree = sheet_hierarchy(assignments)
     tree.reset_index().to_csv(tree_csv, index=False, encoding="utf-8-sig")
 
+    # Поимённый список выравнивания отдельным файлом: он развёрнут по
+    # сценариям, поэтому в DataLens подключается своим датасетом, а не
+    # мешается с основной таблицей.
+    align_summary, align_list = sheet_alignment(assignments)
+    align_csv = args.out.with_name(args.out.stem + "_alignment").with_suffix(".csv")
+    align_list.to_csv(align_csv, index=False, encoding="utf-8-sig")
+
     # Список сотрудников для селектора «Ручной ввод» — на случай, если
     # перезаливать файл в DataLens прямо сейчас не хочется: значения
     # вставляются в селектор списком. Селектор на основе датасета лучше,
@@ -1268,7 +1303,6 @@ def main() -> None:
 
     roles = sheet_roles(assignments)
     by_rating, by_role, by_project = sheet_rating(assignments)
-    align_summary, align_list = sheet_alignment(assignments)
 
     xlsx_path = args.out.with_suffix(".xlsx")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
@@ -1298,17 +1332,15 @@ def main() -> None:
         tree.reset_index().to_excel(writer, sheet_name="Иерархия", index=False)
         sheet_vacancies(assignments).to_excel(writer, sheet_name="Вакансии", index=False)
 
-        # Выравнивание: сводка по трём сценариям сверху, поимённый список ниже.
-        sheet = "Выравнивание"
-        pd.DataFrame({"Сколько стоит выравнивание зарплат": []}).to_excel(
-            writer, sheet_name=sheet, startrow=0
+        # Выравнивание двумя листами: сводка и поимённый список. Связаны
+        # ключом «Код сценария»; список развёрнут по вложенности сценариев,
+        # поэтому итоги берутся только со сводки.
+        align_summary.to_excel(
+            writer, sheet_name="Выравнивание · сводка", index=False
         )
-        align_summary.to_excel(writer, sheet_name=sheet, startrow=1, index=False)
-        start = len(align_summary) + 5
-        pd.DataFrame({"Кому и сколько доплачивать": []}).to_excel(
-            writer, sheet_name=sheet, startrow=start
+        align_list.to_excel(
+            writer, sheet_name="Выравнивание · люди", index=False
         )
-        align_list.to_excel(writer, sheet_name=sheet, startrow=start + 1, index=False)
 
         if changes is not None:
             changes.to_excel(writer, sheet_name="Изменения", index=False)
@@ -1317,6 +1349,7 @@ def main() -> None:
     print(f"Записано: {csv_path}  ({len(assignments)} строк)")
     print(f"Записано: {roles_csv}  (по одной строке на роль, для чарта разброса)")
     print(f"Записано: {tree_csv}  ({len(tree)} строк: продукт × сотрудник, для иерархии)")
+    print(f"Записано: {align_csv}  ({len(align_list)} строк: сценарий × сотрудник)")
     print(f"Записано: {staff_txt}  ({len(staff_list)} сотрудников для селектора)")
     if history:
         print(f"Записано: {history_csv}  ({len(history)} срезов, "

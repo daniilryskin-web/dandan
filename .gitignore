@@ -13,3 +13,6 @@ venv/
 # данные и подготовленные выгрузки не коммитим
 docs/hr-dashboard/*.xlsx
 docs/hr-dashboard/datalens_dataset.*
+# архив срезов — это зарплаты за все месяцы сразу, в репозиторий им нельзя
+history/
+docs/hr-dashboard/history/

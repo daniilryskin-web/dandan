@@ -16,12 +16,29 @@ LOD-выражений, поведение которых зависит от р
 Запуск:
     python3 prepare_dataset.py                    # берёт Datalens.xlsx рядом со скриптом
     python3 prepare_dataset.py другой.xlsx        # или указанный файл
+    python3 prepare_dataset.py --snapshot 2026-09-30   # пересобрать срез задним числом
 
 Создаёт:
-    datalens_dataset.csv        — основная таблица назначений, её грузим в DataLens
-    datalens_dataset_roles.csv  — по одной строке на роль, для чарта разброса
-    datalens_dataset.xlsx  — то же самое плюс листы «Сотрудники», «Оценка ЗП»,
-                             «Роли», «Проекты», «Вакансии», «Проверки»
+    datalens_dataset.csv          — основная таблица назначений, её грузим в DataLens
+    datalens_dataset_roles.csv    — по одной строке на роль, для чарта разброса
+    datalens_dataset_tree.csv     — пара «продукт — сотрудник», для дерева структуры
+    datalens_dataset_history.csv  — все накопленные срезы одним файлом, для динамики
+    datalens_dataset_changes.csv  — что изменилось с прошлого среза
+    datalens_dataset.xlsx         — то же самое плюс листы «Сотрудники», «Оценка ЗП»,
+                                    «Роли», «Проекты», «Иерархия», «Вакансии»,
+                                    «Выравнивание», «Изменения», «Проверки»
+    history/ГГГГ-ММ-ДД.csv        — архив срезов; из него собирается история
+
+История. Каждый запуск кладёт копию среза в history/ и пересобирает
+datalens_dataset_history.csv. Повторный запуск за ту же дату заменяет свой
+срез, а не добавляет второй. Сравнение двух последних срезов даёт лист
+«Изменения»: кто пришёл и ушёл, у кого изменились зарплата, роль, продукты,
+какие вакансии закрыты и какие висят третий срез подряд.
+
+⚠️ История сшивается по столбцу «Сотрудник». Идентификаторы обязаны быть
+неизменными между выгрузками: если обезличивание прогонять заново и раздавать
+номера в новом порядке, сравнение покажет, что уволились все и пришли все.
+Скрипт предупреждает об этом, когда состав меняется больше чем на 20%.
 
 Никаких данных внутри скрипта нет: он работает с тем файлом, который ему передали.
 Описание всех листов и столбцов — в 07-dataset-reference.md.
@@ -30,6 +47,7 @@ LOD-выражений, поведение которых зависит от р
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import re
 import sys
 from pathlib import Path
@@ -123,6 +141,7 @@ COLUMN_ORDER = [
     "Compa-ratio", "Отклонение руб", "Z-score",
     "Граница выброса вверх", "Граница выброса вниз", "Выброс по IQR",
     "Оценка ЗП", "Группа оценки", "Требует внимания", "Доплата до порога",
+    "Сценарий выравнивания",
     "Оценка стоимости вакансии",
     "Людей на продукте", "Bus factor",
 ]
@@ -473,6 +492,25 @@ def build_assignments(df: pd.DataFrame) -> pd.DataFrame:
         df["База сравнения"] * LOWER_THRESHOLD - df["ЗП"]
     ).round(0)
 
+    # Три сценария выравнивания, вложенные друг в друга: каждый следующий
+    # включает предыдущий. Так разговор с финансами идёт не про одну цифру
+    # «сколько стоит справедливость», а про выбор из трёх с понятной ценой.
+    #
+    #   1 — самые глубокие провалы (Compa-ratio < 0,80) и зарплата
+    #       подтверждена: спорить тут не о чем, это обязательный минимум;
+    #   2 — плюс те, кто ниже порога 0,90 с подтверждённой зарплатой:
+    #       полное выравнивание по тем данным, которым можно верить;
+    #   3 — плюс люди с неподтверждённой зарплатой: верхняя оценка,
+    #       но сначала эти зарплаты надо уточнить в источнике.
+    df["Сценарий выравнивания"] = "0. Не требуется"
+    confirmed = df["ЗП подтверждена"] == 1
+    df.loc[below & ~confirmed, "Сценарий выравнивания"] = "3. ЗП не подтверждена"
+    df.loc[below & confirmed, "Сценарий выравнивания"] = "2. Ниже роли, ЗП подтверждена"
+    df.loc[
+        below & confirmed & (df["Оценка ЗП"] == "1. Недоплата"),
+        "Сценарий выравнивания",
+    ] = "1. Недоплата, ЗП подтверждена"
+
     # --- оценка стоимости вакансий -------------------------------------------
     # Медиана роли — лучшая доступная оценка того, во сколько обойдётся
     # закрытие открытой позиции. Считаем по всем занятым, включая роли с
@@ -788,6 +826,72 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     return table.explode("Сотрудник")
 
 
+ALIGNMENT_SCENARIOS = [
+    ("A · Обязательный минимум",
+     ["1. Недоплата, ЗП подтверждена"],
+     "Compa-ratio ниже 0,80, зарплата подтверждена"),
+    ("B · Полное по проверенным данным",
+     ["1. Недоплата, ЗП подтверждена", "2. Ниже роли, ЗП подтверждена"],
+     "все ниже порога 0,90 с подтверждённой зарплатой"),
+    ("C · Верхняя оценка",
+     ["1. Недоплата, ЗП подтверждена", "2. Ниже роли, ЗП подтверждена",
+      "3. ЗП не подтверждена"],
+     "плюс неподтверждённые зарплаты — сначала уточнить в источнике"),
+]
+
+
+def sheet_alignment(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Сколько стоит выравнивание зарплат — тремя вложенными сценариями.
+
+    Возвращает две таблицы: сводку по сценариям и поимённый список тех, кому
+    доплата полагается. Доплата уже посчитана в столбце «Доплата до порога»
+    и лежит только на первичном назначении, поэтому суммируется без риска
+    задвоения.
+
+    Доплата считается до нижнего порога (0,90 от базы сравнения), а не до
+    самой базы: цель — убрать провалы, а не выровнять всех в одну точку.
+    Суммы указаны gross, без страховых взносов: ставка зависит от юрлица
+    и в исходных данных её нет.
+    """
+    people = df[(df["Вакансия"] == 0) & (df["Первичное назначение"] == 1)]
+    fot = people["ЗП"].sum()
+
+    summary = []
+    for name, groups, comment in ALIGNMENT_SCENARIOS:
+        rows = people[people["Сценарий выравнивания"].isin(groups)]
+        cost = rows["Доплата до порога"].sum()
+        summary.append({
+            "Сценарий": name,
+            "Кого включает": comment,
+            "Людей": len(rows),
+            "Доплата, мес": round(cost, 2),
+            "Доплата, год": round(cost * 12, 2),
+            "% от ФОТ": round(100 * cost / fot, 2) if fot else 0.0,
+            "Средняя доплата": round(cost / len(rows), 0) if len(rows) else 0.0,
+            "Максимальная доплата": round(rows["Доплата до порога"].max(), 0)
+            if len(rows) else 0.0,
+        })
+
+    listing = people[people["Доплата до порога"] > 0].copy()
+    listing["ЗП после выравнивания"] = (
+        listing["ЗП"] + listing["Доплата до порога"]
+    ).round(2)
+    listing["Compa-ratio после"] = (
+        listing["ЗП после выравнивания"] / listing["База сравнения"]
+    ).round(3)
+    columns = [
+        "Сценарий выравнивания", "Сотрудник", "Проектная роль", "Уровень роли",
+        "Блок", "Проект", "ЗП", "ЗП подтверждена", "База сравнения",
+        "Уровень сравнения", "Compa-ratio", "Оценка ЗП", "Доплата до порога",
+        "ЗП после выравнивания", "Compa-ratio после", "Комментарий",
+    ]
+    listing = listing[[c for c in columns if c in listing.columns]]
+    listing = listing.sort_values(
+        ["Сценарий выравнивания", "Доплата до порога"], ascending=[True, False]
+    )
+    return pd.DataFrame(summary), listing
+
+
 def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:
     """Открытые позиции и во что обойдётся их закрытие."""
     vacancies = df[df["Вакансия"] == 1]
@@ -799,6 +903,209 @@ def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:
     return vacancies[columns].sort_values(
         "Оценка стоимости вакансии", ascending=False
     )
+
+
+# --------------------------------------------------------------------------
+# История срезов
+# --------------------------------------------------------------------------
+
+# Порядок событий на листе «Изменения»: сначала то, из-за чего меняются
+# деньги и состав, потом перестановки, потом вакансии.
+EVENT_ORDER = [
+    "⚠ Проверьте нумерацию", "Ушёл", "Пришёл", "ЗП изменилась",
+    "Роль изменилась", "Руководитель изменился", "Продукты изменились",
+    "Вакансия закрыта", "Вакансия открыта", "Вакансия висит",
+]
+
+# Доля состава, смена которой за один срез означает скорее перетасовку
+# идентификаторов, чем реальное движение людей.
+SHUFFLE_ALERT = 0.20
+
+
+def read_snapshot(path: Path) -> pd.DataFrame:
+    """Читает архивный срез, сохраняя «Сотрудник» строкой.
+
+    Без явного типа pandas превратит «40» в 40.0, и тот же человек в двух
+    срезах перестанет совпадать сам с собой.
+    """
+    return pd.read_csv(path, dtype={"Сотрудник": str}, keep_default_na=True)
+
+
+def people_view(df: pd.DataFrame) -> pd.DataFrame:
+    """Один человек — одна строка. То, что имеет смысл сравнивать между срезами."""
+    people = df[df["Вакансия"] == 0]
+    primary = people[people["Первичное назначение"] == 1].drop_duplicates("Сотрудник")
+    primary = primary.set_index("Сотрудник")
+    products = people.groupby("Сотрудник")["Продукт ключ"].agg(
+        lambda values: ", ".join(sorted(set(values)))
+    )
+    return pd.DataFrame({
+        "ЗП": primary["ЗП"],
+        "Проектная роль": primary["Проектная роль"],
+        "Блок": primary["Блок"],
+        "Проект": primary["Проект"],
+        "Руководитель": primary["Руководитель"],
+        "Продукты": products.reindex(primary.index).fillna(""),
+    })
+
+
+def vacancy_view(df: pd.DataFrame) -> pd.Series:
+    """Открытые позиции, свёрнутые до «где и кем»: сколько таких на срезе."""
+    vacancies = df[df["Вакансия"] == 1]
+    return vacancies.groupby(
+        ["Блок", "Проект", "Продукт кратко", "Проектная роль"]
+    ).size()
+
+
+def vacancy_streaks(history: dict[str, pd.DataFrame]) -> dict[tuple, int]:
+    """Сколько срезов подряд, считая от последнего, позиция остаётся открытой.
+
+    Вакансия, висящая четвёртый месяц, — это либо ненужная позиция, либо не та
+    вилка. На одном срезе это неразличимо: там она выглядит одинаково и в
+    первый день, и в двухсотый.
+    """
+    dates = sorted(history)
+    views = {date: vacancy_view(history[date]) for date in dates}
+    streaks: dict[tuple, int] = {}
+    for key in views[dates[-1]].index:
+        streak = 0
+        for date in reversed(dates):
+            if key in views[date].index:
+                streak += 1
+            else:
+                break
+        streaks[key] = streak
+    return streaks
+
+
+def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Что изменилось между двумя последними срезами.
+
+    Отвечает на вопрос, на который не отвечает ни один чарт статичного среза:
+    не «как сейчас», а «что произошло с прошлого раза».
+    """
+    columns = ["Дата среза", "Событие", "Сотрудник", "Блок", "Проект",
+               "Продукт", "Было", "Стало", "Δ руб", "Δ %", "Комментарий"]
+    # Служебная колонка сортировки внутри типа события, в итог не попадает.
+    build = columns + ["_вес"]
+    dates = sorted(history)
+    if len(dates) < 2:
+        return pd.DataFrame([{
+            "Дата среза": dates[-1] if dates else "",
+            "Событие": "Первый срез",
+            "Комментарий": "Сравнивать не с чем. Изменения появятся "
+                           "со следующего запуска — храните папку history.",
+        }], columns=columns)
+
+    was, now = dates[-2], dates[-1]
+    before, after = people_view(history[was]), people_view(history[now])
+    rows: list[dict] = []
+
+    def add(event, **kwargs):
+        row = {"Дата среза": now, "Событие": event}
+        row.update(kwargs)
+        rows.append(row)
+
+    left = before.index.difference(after.index)
+    joined = after.index.difference(before.index)
+    stayed = before.index.intersection(after.index)
+
+    # Перетасовка номеров рвёт историю тише, чем ломает: сравнение просто
+    # покажет, что уволились все и пришли все. Проверяем это первым делом.
+    turnover = (len(left) + len(joined)) / max(len(before), 1)
+    if turnover > SHUFFLE_ALERT:
+        add("⚠ Проверьте нумерацию",
+            Было=len(before), Стало=len(after),
+            Комментарий=(
+                f"ушло {len(left)}, пришло {len(joined)} при составе "
+                f"{len(before)} — если движение было не таким, значит "
+                "идентификаторы сотрудников выданы заново. История сшивается "
+                "по столбцу «Сотрудник»: номера должны быть неизменными "
+                "между выгрузками."
+            ))
+
+    for person in sorted(left):
+        row = before.loc[person]
+        add("Ушёл", Сотрудник=person, Блок=row["Блок"], Проект=row["Проект"],
+            Продукт=row["Продукты"], Было=row["Проектная роль"],
+            **{"Δ руб": -row["ЗП"] if pd.notna(row["ЗП"]) else None})
+
+    for person in sorted(joined):
+        row = after.loc[person]
+        add("Пришёл", Сотрудник=person, Блок=row["Блок"], Проект=row["Проект"],
+            Продукт=row["Продукты"], Стало=row["Проектная роль"],
+            **{"Δ руб": row["ЗП"] if pd.notna(row["ЗП"]) else None})
+
+    for person in sorted(stayed):
+        old, new = before.loc[person], after.loc[person]
+
+        if pd.notna(old["ЗП"]) and pd.notna(new["ЗП"]) and old["ЗП"] != new["ЗП"]:
+            delta = new["ЗП"] - old["ЗП"]
+            add("ЗП изменилась", Сотрудник=person, Блок=new["Блок"],
+                Проект=new["Проект"], Было=old["ЗП"], Стало=new["ЗП"],
+                **{"Δ руб": round(delta, 2),
+                   "Δ %": round(100 * delta / old["ЗП"], 1) if old["ЗП"] else None})
+
+        for field, event in (("Проектная роль", "Роль изменилась"),
+                             ("Руководитель", "Руководитель изменился"),
+                             ("Продукты", "Продукты изменились")):
+            if old[field] != new[field]:
+                add(event, Сотрудник=person, Блок=new["Блок"],
+                    Проект=new["Проект"], Было=old[field], Стало=new[field])
+
+    # Вакансии сравниваем по количеству одинаковых позиций: две открытые
+    # ставки специалиста на одном продукте — это две строки, и закрытие одной
+    # из них должно быть видно.
+    before_v, after_v = vacancy_view(history[was]), vacancy_view(history[now])
+    streaks = vacancy_streaks(history)
+    for key in sorted(set(before_v.index) | set(after_v.index)):
+        block, project, product, role = key
+        old_n = int(before_v.get(key, 0))
+        new_n = int(after_v.get(key, 0))
+        common = {"Блок": block, "Проект": project, "Продукт": product}
+        if new_n > old_n:
+            add("Вакансия открыта", Было=old_n, Стало=new_n, Комментарий=role,
+                **common)
+        elif new_n < old_n:
+            add("Вакансия закрыта", Было=old_n, Стало=new_n, Комментарий=role,
+                **common)
+        elif new_n and streaks.get(key, 1) >= 3:
+            add("Вакансия висит", Стало=new_n, _вес=streaks[key],
+                Комментарий=f"{role} — открыта {streaks[key]} среза подряд",
+                **common)
+
+    changes = pd.DataFrame(rows, columns=build)
+    if changes.empty:
+        return pd.DataFrame([{
+            "Дата среза": now, "Событие": "Изменений нет",
+            "Комментарий": f"срез {now} совпадает со срезом {was}",
+        }], columns=columns)
+
+    # Внутри каждого типа события — сначала самое крупное: деньги по модулю
+    # изменения, зависшие вакансии по сроку.
+    order = {event: i for i, event in enumerate(EVENT_ORDER)}
+    changes["_группа"] = changes["Событие"].map(order).fillna(len(order))
+    changes["_вес"] = changes["_вес"].fillna(changes["Δ руб"].abs()).fillna(0)
+    changes = changes.sort_values(["_группа", "_вес"], ascending=[True, False])
+    return changes.drop(columns=["_группа", "_вес"])
+
+
+def save_snapshot(assignments: pd.DataFrame, folder: Path, date: str) -> dict:
+    """Кладёт срез в архив и возвращает всю историю: дата → таблица.
+
+    Повторный запуск за ту же дату заменяет свой срез, а не добавляет второй:
+    иначе двойной запуск за день задваивал бы месяц.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    assignments.to_csv(folder / f"{date}.csv", index=False, encoding="utf-8-sig")
+
+    history = {}
+    for path in sorted(folder.glob("*.csv")):
+        try:
+            history[path.stem] = read_snapshot(path)
+        except Exception as error:      # noqa: BLE001 — архив правим руками
+            print(f"Внимание: срез {path.name} не прочитан ({error}), пропускаю")
+    return history
 
 
 def sheet_checks(df: pd.DataFrame) -> pd.DataFrame:
@@ -857,6 +1164,9 @@ def sheet_checks(df: pd.DataFrame) -> pd.DataFrame:
         ("Продуктов с одним человеком",
          int(df[df["Bus factor"] == "Критично: 1 человек"]["Продукт ключ"].nunique()),
          "риск незаменимости"),
+        ("Выравнивание, руб/мес",
+         round(unique_people["Доплата до порога"].sum(), 2),
+         "верхняя оценка; три сценария — на листе «Выравнивание»"),
         ("Расхождение ФОТ, руб",
          round(people["ФОТ аллоцированный"].sum() - unique_people["ЗП"].sum(), 2),
          "должно быть 0: ФОТ на листе «Проекты» минус сумма ЗП на листе «Сотрудники»"),
@@ -877,7 +1187,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--snapshot", default="",
-        help="дата среза в формате ГГГГ-ММ-ДД; заполняет столбец «Дата среза»",
+        help="дата среза в формате ГГГГ-ММ-ДД; по умолчанию сегодняшняя. "
+             "Указывайте явно, если пересобираете срез задним числом",
+    )
+    parser.add_argument(
+        "--history", type=Path, default=None,
+        help="папка с архивом срезов (по умолчанию history рядом с --out)",
+    )
+    parser.add_argument(
+        "--no-history", action="store_true",
+        help="не сохранять срез в архив и не считать лист «Изменения»",
     )
     args = parser.parse_args()
 
@@ -893,8 +1212,14 @@ def main() -> None:
     raw = load_source(args.source, sheet)
 
     assignments = build_assignments(raw)
-    if args.snapshot:
-        assignments["Дата среза"] = args.snapshot
+    # Дата среза проставляется всегда: без неё архивный файл невозможно
+    # опознать, а история сшивается именно по ней.
+    snapshot = args.snapshot or dt.date.today().isoformat()
+    try:
+        dt.date.fromisoformat(snapshot)
+    except ValueError:
+        sys.exit(f"Дата среза «{snapshot}» не в формате ГГГГ-ММ-ДД")
+    assignments["Дата среза"] = snapshot
     assignments = order_columns(assignments)
 
     csv_path = args.out.with_suffix(".csv")
@@ -926,8 +1251,24 @@ def main() -> None:
     )
     staff_txt.write_text("\n".join(staff_list) + "\n", encoding="utf-8")
 
+    # Архив срезов и сравнение с предыдущим. Ценность появляется со второго
+    # запуска, поэтому копить начинаем с первого.
+    history: dict[str, pd.DataFrame] = {}
+    changes = None
+    if not args.no_history:
+        folder = args.history or args.out.parent / "history"
+        history = save_snapshot(assignments, folder, snapshot)
+        changes = sheet_changes(history)
+        history_csv = args.out.with_name(args.out.stem + "_history").with_suffix(".csv")
+        pd.concat(history.values(), ignore_index=True).to_csv(
+            history_csv, index=False, encoding="utf-8-sig"
+        )
+        changes_csv = args.out.with_name(args.out.stem + "_changes").with_suffix(".csv")
+        changes.to_csv(changes_csv, index=False, encoding="utf-8-sig")
+
     roles = sheet_roles(assignments)
     by_rating, by_role, by_project = sheet_rating(assignments)
+    align_summary, align_list = sheet_alignment(assignments)
 
     xlsx_path = args.out.with_suffix(".xlsx")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
@@ -956,13 +1297,39 @@ def main() -> None:
         )
         tree.reset_index().to_excel(writer, sheet_name="Иерархия", index=False)
         sheet_vacancies(assignments).to_excel(writer, sheet_name="Вакансии", index=False)
+
+        # Выравнивание: сводка по трём сценариям сверху, поимённый список ниже.
+        sheet = "Выравнивание"
+        pd.DataFrame({"Сколько стоит выравнивание зарплат": []}).to_excel(
+            writer, sheet_name=sheet, startrow=0
+        )
+        align_summary.to_excel(writer, sheet_name=sheet, startrow=1, index=False)
+        start = len(align_summary) + 5
+        pd.DataFrame({"Кому и сколько доплачивать": []}).to_excel(
+            writer, sheet_name=sheet, startrow=start
+        )
+        align_list.to_excel(writer, sheet_name=sheet, startrow=start + 1, index=False)
+
+        if changes is not None:
+            changes.to_excel(writer, sheet_name="Изменения", index=False)
         sheet_checks(assignments).to_excel(writer, sheet_name="Проверки", index=False)
 
     print(f"Записано: {csv_path}  ({len(assignments)} строк)")
     print(f"Записано: {roles_csv}  (по одной строке на роль, для чарта разброса)")
     print(f"Записано: {tree_csv}  ({len(tree)} строк: продукт × сотрудник, для иерархии)")
     print(f"Записано: {staff_txt}  ({len(staff_list)} сотрудников для селектора)")
+    if history:
+        print(f"Записано: {history_csv}  ({len(history)} срезов, "
+              f"{sum(len(x) for x in history.values())} строк)")
+        print(f"Записано: {changes_csv}  ({len(changes)} событий)")
     print(f"Записано: {xlsx_path}")
+    print()
+    print("Сколько стоит выравнивание зарплат:")
+    print(align_summary.to_string(index=False))
+    if changes is not None and len(history) > 1:
+        print()
+        print(f"Изменения с прошлого среза ({sorted(history)[-2]} → {snapshot}):")
+        print(changes["Событие"].value_counts().to_string())
     print()
     print(sheet_checks(assignments).to_string(index=False))
 

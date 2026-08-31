@@ -553,6 +553,38 @@ def order_columns(df: pd.DataFrame) -> pd.DataFrame:
 # Листы результата
 # --------------------------------------------------------------------------
 
+# Столбцы, у которых на реестровых листах может быть несколько значений
+# на человека: он работает в двух проектах или под двумя руководителями.
+WHERE_COLUMNS = ["Блок", "Проект", "Руководитель"]
+
+
+def multi_value(df: pd.DataFrame, column: str) -> pd.Series:
+    """Все значения столбца у сотрудника, через «; ».
+
+    На листах «один человек — одна строка» место работы берётся из первичного
+    назначения, и человек, занятый в двух проектах, показывался только в одном
+    из них — молча и без признака, что что-то потеряно. Здесь перечисляем всё.
+
+    Порядок алфавитный: он не зависит от того, какая строка исходника оказалась
+    первичной, поэтому строка не «прыгает» между выгрузками.
+    """
+    people = df[df["Вакансия"] == 0]
+    return people.groupby("Сотрудник")[column].agg(
+        lambda values: "; ".join(
+            sorted({str(v).strip() for v in values if str(v).strip()})
+        )
+    )
+
+
+def with_all_places(df: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
+    """Заменяет «где работает» на полный перечень мест по каждому человеку."""
+    table = table.copy()
+    for column in WHERE_COLUMNS:
+        if column in table.columns:
+            table[column] = table["Сотрудник"].map(multi_value(df, column))
+    return table
+
+
 def sheet_people(df: pd.DataFrame) -> pd.DataFrame:
     """Один человек — одна строка. Реестр для разбора зарплат."""
     people = df[(df["Вакансия"] == 0) & (df["Первичное назначение"] == 1)]
@@ -565,7 +597,7 @@ def sheet_people(df: pd.DataFrame) -> pd.DataFrame:
         "Назначений у сотрудника", "Продуктов у сотрудника",
         "Проектов у сотрудника",
     ]
-    return people[columns].sort_values("Отклонение руб")
+    return with_all_places(df, people[columns]).sort_values("Отклонение руб")
 
 
 def sheet_roles(df: pd.DataFrame) -> pd.DataFrame:
@@ -874,7 +906,9 @@ def sheet_alignment(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     people = df[(df["Вакансия"] == 0) & (df["Первичное назначение"] == 1)]
     fot = people["ЗП"].sum()
 
-    listing = people[people["Доплата до порога"] > 0].copy()
+    # Место работы — перечнем: человек, занятый в двух проектах, иначе
+    # показывался бы только в том, где стоит его первичное назначение.
+    listing = with_all_places(df, people[people["Доплата до порога"] > 0])
     listing["Уровень выравнивания"] = (
         listing["Сценарий выравнивания"].map(ALIGNMENT_LEVELS).astype(int)
     )

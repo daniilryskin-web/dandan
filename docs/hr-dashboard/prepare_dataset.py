@@ -28,7 +28,7 @@ LOD-выражений, поведение которых зависит от р
     datalens_dataset.xlsx         — то же самое плюс листы «Сотрудники», «Оценка ЗП»,
                                     «Роли», «Проекты», «Иерархия», «Вакансии»,
                                     «Выравнивание · сводка», «Выравнивание · люди»,
-                                    «Изменения», «Проверки»
+                                    «Изменения», «Изменения · прочее», «Проверки»
     history/ГГГГ-ММ-ДД.csv        — архив срезов; из него собирается история
 
 История. Каждый запуск кладёт копию среза в history/ и пересобирает
@@ -974,10 +974,13 @@ def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:
 # Порядок событий на листе «Изменения»: сначала то, из-за чего меняются
 # деньги и состав, потом перестановки, потом вакансии.
 EVENT_ORDER = [
-    "⚠ Проверьте нумерацию",
-    "ФОТ, мес", "Сотрудников", "Открытых вакансий",
+    # Лист «Изменения» — движение людей и денег, строго в этом порядке:
+    # по нему выстраивается лесенка ФОТ.
     "Ушёл", "Пришёл", "ЗП изменилась",
     "Роль изменилась", "Руководитель изменился", "Продукты изменились",
+    "Изменений нет",
+    # Лист «Изменения · прочее»
+    "⚠ Проверьте нумерацию", "Сотрудников", "Открытых вакансий",
     "Вакансия закрыта", "Вакансия открыта", "Вакансия висит",
 ]
 
@@ -1053,11 +1056,31 @@ def vacancy_streaks(history: dict[str, pd.DataFrame]) -> dict[tuple, int]:
     return streaks
 
 
-def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def money_text(value) -> str:
+    """Сумма с пробелами между разрядами — для подписей внутри ячейки."""
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{round(float(value)):,}".replace(",", " ") + " ₽"
+
+
+def sheet_changes(
+    history: dict[str, pd.DataFrame]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Что изменилось между двумя последними срезами.
 
-    Отвечает на вопрос, на который не отвечает ни один чарт статичного среза:
-    не «как сейчас», а «что произошло с прошлого раза».
+    Возвращает два листа.
+
+    Первый — движение людей и денег, выстроенное лесенкой: «Было» и «Стало» —
+    это ФОТ до и после каждого события, а не зарплата одного человека. Строки
+    идут подряд, поэтому «Стало» предыдущей равно «Было» следующей, а «Стало»
+    последней строки — это новый ФОТ. Видно не только кто ушёл, но и на сколько
+    от этого просел фонд — сразу в рублях и процентах.
+
+    Второй — всё, что к ФОТ отношения не имеет: численность, вакансии
+    и предупреждения о целостности истории.
+
+    Что именно изменилось у человека (роль, зарплата, продукты), написано
+    в «Комментарии»: столбцы «Было» и «Стало» заняты фондом.
     """
     columns = ["Дата среза", "Событие", "Сотрудник", "Блок", "Проект",
                "Продукт", "Было", "Стало", "Δ руб", "Δ %", "Комментарий"]
@@ -1065,21 +1088,24 @@ def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
     build = columns + ["_вес"]
     dates = sorted(history)
     if len(dates) < 2:
-        return pd.DataFrame([{
+        first = pd.DataFrame([{
             "Дата среза": dates[-1] if dates else "",
             "Событие": "Первый срез",
             "Комментарий": "Сравнивать не с чем. Изменения появятся "
                            "со следующего запуска — храните папку history.",
         }], columns=columns)
+        return first, first.copy()
 
     was, now = dates[-2], dates[-1]
     before, after = people_view(history[was]), people_view(history[now])
-    rows: list[dict] = []
 
-    def add(event, **kwargs):
-        row = {"Дата среза": now, "Событие": event}
+    people_rows: list[dict] = []
+    other_rows: list[dict] = []
+
+    def add(target, event, weight=0.0, **kwargs):
+        row = {"Дата среза": now, "Событие": event, "_вес": weight}
         row.update(kwargs)
-        rows.append(row)
+        target.append(row)
 
     left = before.index.difference(after.index)
     joined = after.index.difference(before.index)
@@ -1089,7 +1115,7 @@ def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
     # покажет, что уволились все и пришли все. Проверяем это первым делом.
     turnover = (len(left) + len(joined)) / max(len(before), 1)
     if turnover > SHUFFLE_ALERT:
-        add("⚠ Проверьте нумерацию",
+        add(other_rows, "⚠ Проверьте нумерацию",
             Было=len(before), Стало=len(after),
             Комментарий=(
                 f"ушло {len(left)}, пришло {len(joined)} при составе "
@@ -1099,58 +1125,60 @@ def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
                 "между выгрузками."
             ))
 
-    # Итоговые строки: движение видно в деньгах и людях сразу, без сложения
-    # событий глазами. Проценты считаются здесь и только здесь — по строке
-    # одного человека процент к его же зарплате смысла не имеет.
-    def total(event, was_value, now_value, digits=2):
-        delta = round(now_value - was_value, digits)
-        add(event, Было=round(was_value, digits), Стало=round(now_value, digits),
-            **{"Δ руб": delta if event == "ФОТ, мес" else None,
-               "Δ %": round(100 * delta / was_value, 1) if was_value else None},
-            _вес=abs(delta))
-
-    total("ФОТ, мес", before["ЗП"].sum(), after["ЗП"].sum())
-    total("Сотрудников", len(before), len(after), digits=0)
-    total("Открытых вакансий",
-          int((history[was]["Вакансия"] == 1).sum()),
-          int((history[now]["Вакансия"] == 1).sum()), digits=0)
-
-    summary_rows = len(rows)
-
-    # У людей в «Было/Стало» — их вклад в ФОТ, а не роль: так строка читается
-    # в тех же единицах, что итог сверху. Роль ушла в комментарий.
+    # --- события по людям: у каждого своя дельта, ФОТ проставим лесенкой ниже
     for person in sorted(left):
         row = before.loc[person]
-        salary = row["ЗП"] if pd.notna(row["ЗП"]) else None
-        add("Ушёл", Сотрудник=person, Блок=row["Блок"], Проект=row["Проект"],
-            Продукт=row["Продукты"], Было=salary, Стало=0,
-            Комментарий=row["Проектная роль"],
-            **{"Δ руб": -salary if salary is not None else None})
+        salary = 0.0 if pd.isna(row["ЗП"]) else float(row["ЗП"])
+        add(people_rows, "Ушёл", weight=salary, Сотрудник=person,
+            Блок=row["Блок"], Проект=row["Проект"], Продукт=row["Продукты"],
+            Комментарий=f"{row['Проектная роль']}, {money_text(salary)}",
+            **{"Δ руб": -salary})
 
     for person in sorted(joined):
         row = after.loc[person]
-        salary = row["ЗП"] if pd.notna(row["ЗП"]) else None
-        add("Пришёл", Сотрудник=person, Блок=row["Блок"], Проект=row["Проект"],
-            Продукт=row["Продукты"], Было=0, Стало=salary,
-            Комментарий=row["Проектная роль"],
-            **{"Δ руб": salary if salary is not None else None})
+        salary = 0.0 if pd.isna(row["ЗП"]) else float(row["ЗП"])
+        add(people_rows, "Пришёл", weight=salary, Сотрудник=person,
+            Блок=row["Блок"], Проект=row["Проект"], Продукт=row["Продукты"],
+            Комментарий=f"{row['Проектная роль']}, {money_text(salary)}",
+            **{"Δ руб": salary})
 
     for person in sorted(stayed):
         old, new = before.loc[person], after.loc[person]
 
         if pd.notna(old["ЗП"]) and pd.notna(new["ЗП"]) and old["ЗП"] != new["ЗП"]:
-            delta = new["ЗП"] - old["ЗП"]
-            add("ЗП изменилась", Сотрудник=person, Блок=new["Блок"],
-                Проект=new["Проект"], Было=old["ЗП"], Стало=new["ЗП"],
-                **{"Δ руб": round(delta, 2),
-                   "Δ %": round(100 * delta / old["ЗП"], 1) if old["ЗП"] else None})
+            delta = float(new["ЗП"]) - float(old["ЗП"])
+            own = round(100 * delta / old["ЗП"], 1) if old["ЗП"] else None
+            add(people_rows, "ЗП изменилась", weight=abs(delta),
+                Сотрудник=person, Блок=new["Блок"], Проект=new["Проект"],
+                Продукт=new["Продукты"],
+                Комментарий=(f"{money_text(old['ЗП'])} → {money_text(new['ЗП'])}"
+                             + (f" ({own:+.1f}% к своей ЗП)" if own is not None
+                                else "")),
+                **{"Δ руб": round(delta, 2)})
 
+        # Перестановки без денег: на ФОТ не влияют, но человека касаются,
+        # поэтому идут тем же листом с нулевой дельтой.
         for field, event in (("Проектная роль", "Роль изменилась"),
                              ("Руководитель", "Руководитель изменился"),
                              ("Продукты", "Продукты изменились")):
             if old[field] != new[field]:
-                add(event, Сотрудник=person, Блок=new["Блок"],
-                    Проект=new["Проект"], Было=old[field], Стало=new[field])
+                add(people_rows, event, Сотрудник=person, Блок=new["Блок"],
+                    Проект=new["Проект"], Продукт=new["Продукты"],
+                    Комментарий=f"{old[field]} → {new[field]}",
+                    **{"Δ руб": 0.0})
+
+    # --- прочее: численность, вакансии, целостность
+    def count_row(event, was_value, now_value):
+        delta = now_value - was_value
+        add(other_rows, event, weight=abs(delta),
+            Было=was_value, Стало=now_value,
+            **{"Δ руб": None,
+               "Δ %": round(100 * delta / was_value, 1) if was_value else None})
+
+    count_row("Сотрудников", len(before), len(after))
+    count_row("Открытых вакансий",
+              int((history[was]["Вакансия"] == 1).sum()),
+              int((history[now]["Вакансия"] == 1).sum()))
 
     # Вакансии сравниваем по количеству одинаковых позиций: две открытые
     # ставки специалиста на одном продукте — это две строки, и закрытие одной
@@ -1163,29 +1191,46 @@ def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
         new_n = int(after_v.get(key, 0))
         common = {"Блок": block, "Проект": project, "Продукт": product}
         if new_n > old_n:
-            add("Вакансия открыта", Было=old_n, Стало=new_n, Комментарий=role,
-                **common)
+            add(other_rows, "Вакансия открыта", weight=new_n - old_n,
+                Было=old_n, Стало=new_n, Комментарий=role, **common)
         elif new_n < old_n:
-            add("Вакансия закрыта", Было=old_n, Стало=new_n, Комментарий=role,
-                **common)
+            add(other_rows, "Вакансия закрыта", weight=old_n - new_n,
+                Было=old_n, Стало=new_n, Комментарий=role, **common)
         elif new_n and streaks.get(key, 1) >= 3:
-            add("Вакансия висит", Стало=new_n, _вес=streaks[key],
+            add(other_rows, "Вакансия висит", weight=streaks[key], Стало=new_n,
                 Комментарий=f"{role} — открыта {streaks[key]} среза подряд",
                 **common)
 
-    if len(rows) == summary_rows:
-        add("Изменений нет",
-            Комментарий=f"срез {now} совпадает со срезом {was}")
+    if not people_rows:
+        add(people_rows, "Изменений нет",
+            Комментарий=f"состав и зарплаты среза {now} совпадают со срезом {was}",
+            **{"Δ руб": 0.0})
 
-    changes = pd.DataFrame(rows, columns=build)
+    def order_by(rows_list):
+        frame = pd.DataFrame(rows_list, columns=build)
+        rank = {event: i for i, event in enumerate(EVENT_ORDER)}
+        frame["_группа"] = frame["Событие"].map(rank).fillna(len(rank))
+        frame = frame.sort_values(["_группа", "_вес"], ascending=[True, False])
+        return frame.drop(columns=["_группа", "_вес"]).reset_index(drop=True)
 
-    # Внутри каждого типа события — сначала самое крупное: деньги по модулю
-    # изменения, зависшие вакансии по сроку.
-    order = {event: i for i, event in enumerate(EVENT_ORDER)}
-    changes["_группа"] = changes["Событие"].map(order).fillna(len(order))
-    changes["_вес"] = changes["_вес"].fillna(changes["Δ руб"].abs()).fillna(0)
-    changes = changes.sort_values(["_группа", "_вес"], ascending=[True, False])
-    return changes.drop(columns=["_группа", "_вес"])
+    changes = order_by(people_rows)
+
+    # Лесенка ФОТ: «Было» строки — фонд перед этим событием, «Стало» — после.
+    # Порядок строк здесь уже окончательный, поэтому «Стало» последней строки
+    # совпадает с ФОТ нового среза. Это и есть встроенная сверка.
+    running = round(float(before["ЗП"].sum()), 2)
+    was_col, now_col, pct_col = [], [], []
+    for delta in changes["Δ руб"].fillna(0.0):
+        nxt = round(running + float(delta), 2)
+        was_col.append(running)
+        now_col.append(nxt)
+        pct_col.append(round(100 * float(delta) / running, 2) if running else None)
+        running = nxt
+    changes["Было"] = was_col
+    changes["Стало"] = now_col
+    changes["Δ %"] = pct_col
+
+    return changes, order_by(other_rows)
 
 
 def save_snapshot(assignments: pd.DataFrame, folder: Path, date: str) -> dict:
@@ -1360,10 +1405,11 @@ def main() -> None:
     # запуска, поэтому копить начинаем с первого.
     history: dict[str, pd.DataFrame] = {}
     changes = None
+    other_changes = None
     if not args.no_history:
         folder = args.history or args.out.parent / "history"
         history = save_snapshot(assignments, folder, snapshot)
-        changes = sheet_changes(history)
+        changes, other_changes = sheet_changes(history)
         history_csv = args.out.with_name(args.out.stem + "_history").with_suffix(".csv")
         pd.concat(history.values(), ignore_index=True).to_csv(
             history_csv, index=False, encoding="utf-8-sig"
@@ -1414,6 +1460,9 @@ def main() -> None:
 
         if changes is not None:
             changes.to_excel(writer, sheet_name="Изменения", index=False)
+            other_changes.to_excel(
+                writer, sheet_name="Изменения · прочее", index=False
+            )
         sheet_checks(assignments).to_excel(writer, sheet_name="Проверки", index=False)
 
     print(f"Записано: {csv_path}  ({len(assignments)} строк)")

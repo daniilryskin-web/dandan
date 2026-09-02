@@ -974,7 +974,9 @@ def sheet_vacancies(df: pd.DataFrame) -> pd.DataFrame:
 # Порядок событий на листе «Изменения»: сначала то, из-за чего меняются
 # деньги и состав, потом перестановки, потом вакансии.
 EVENT_ORDER = [
-    "⚠ Проверьте нумерацию", "Ушёл", "Пришёл", "ЗП изменилась",
+    "⚠ Проверьте нумерацию",
+    "ФОТ, мес", "Сотрудников", "Открытых вакансий",
+    "Ушёл", "Пришёл", "ЗП изменилась",
     "Роль изменилась", "Руководитель изменился", "Продукты изменились",
     "Вакансия закрыта", "Вакансия открыта", "Вакансия висит",
 ]
@@ -994,20 +996,31 @@ def read_snapshot(path: Path) -> pd.DataFrame:
 
 
 def people_view(df: pd.DataFrame) -> pd.DataFrame:
-    """Один человек — одна строка. То, что имеет смысл сравнивать между срезами."""
+    """Один человек — одна строка. То, что имеет смысл сравнивать между срезами.
+
+    «Где работает» перечисляется целиком через «; »: у человека может быть
+    несколько продуктов, проектов и руководителей, и в одну ячейку берётся
+    не первичное назначение, а все. Продукт — коротким названием: полное
+    «Проект / Продукт» дублировало бы соседний столбец «Проект».
+    """
     people = df[df["Вакансия"] == 0]
     primary = people[people["Первичное назначение"] == 1].drop_duplicates("Сотрудник")
     primary = primary.set_index("Сотрудник")
-    products = people.groupby("Сотрудник")["Продукт ключ"].agg(
-        lambda values: ", ".join(sorted(set(values)))
-    )
+
+    def joined(column: str) -> pd.Series:
+        return people.groupby("Сотрудник")[column].agg(
+            lambda values: "; ".join(
+                sorted({str(v).strip() for v in values if str(v).strip()})
+            )
+        ).reindex(primary.index).fillna("")
+
     return pd.DataFrame({
         "ЗП": primary["ЗП"],
         "Проектная роль": primary["Проектная роль"],
-        "Блок": primary["Блок"],
-        "Проект": primary["Проект"],
-        "Руководитель": primary["Руководитель"],
-        "Продукты": products.reindex(primary.index).fillna(""),
+        "Блок": joined("Блок"),
+        "Проект": joined("Проект"),
+        "Руководитель": joined("Руководитель"),
+        "Продукты": joined("Продукт кратко"),
     })
 
 
@@ -1086,17 +1099,41 @@ def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
                 "между выгрузками."
             ))
 
+    # Итоговые строки: движение видно в деньгах и людях сразу, без сложения
+    # событий глазами. Проценты считаются здесь и только здесь — по строке
+    # одного человека процент к его же зарплате смысла не имеет.
+    def total(event, was_value, now_value, digits=2):
+        delta = round(now_value - was_value, digits)
+        add(event, Было=round(was_value, digits), Стало=round(now_value, digits),
+            **{"Δ руб": delta if event == "ФОТ, мес" else None,
+               "Δ %": round(100 * delta / was_value, 1) if was_value else None},
+            _вес=abs(delta))
+
+    total("ФОТ, мес", before["ЗП"].sum(), after["ЗП"].sum())
+    total("Сотрудников", len(before), len(after), digits=0)
+    total("Открытых вакансий",
+          int((history[was]["Вакансия"] == 1).sum()),
+          int((history[now]["Вакансия"] == 1).sum()), digits=0)
+
+    summary_rows = len(rows)
+
+    # У людей в «Было/Стало» — их вклад в ФОТ, а не роль: так строка читается
+    # в тех же единицах, что итог сверху. Роль ушла в комментарий.
     for person in sorted(left):
         row = before.loc[person]
+        salary = row["ЗП"] if pd.notna(row["ЗП"]) else None
         add("Ушёл", Сотрудник=person, Блок=row["Блок"], Проект=row["Проект"],
-            Продукт=row["Продукты"], Было=row["Проектная роль"],
-            **{"Δ руб": -row["ЗП"] if pd.notna(row["ЗП"]) else None})
+            Продукт=row["Продукты"], Было=salary, Стало=0,
+            Комментарий=row["Проектная роль"],
+            **{"Δ руб": -salary if salary is not None else None})
 
     for person in sorted(joined):
         row = after.loc[person]
+        salary = row["ЗП"] if pd.notna(row["ЗП"]) else None
         add("Пришёл", Сотрудник=person, Блок=row["Блок"], Проект=row["Проект"],
-            Продукт=row["Продукты"], Стало=row["Проектная роль"],
-            **{"Δ руб": row["ЗП"] if pd.notna(row["ЗП"]) else None})
+            Продукт=row["Продукты"], Было=0, Стало=salary,
+            Комментарий=row["Проектная роль"],
+            **{"Δ руб": salary if salary is not None else None})
 
     for person in sorted(stayed):
         old, new = before.loc[person], after.loc[person]
@@ -1136,12 +1173,11 @@ def sheet_changes(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
                 Комментарий=f"{role} — открыта {streaks[key]} среза подряд",
                 **common)
 
+    if len(rows) == summary_rows:
+        add("Изменений нет",
+            Комментарий=f"срез {now} совпадает со срезом {was}")
+
     changes = pd.DataFrame(rows, columns=build)
-    if changes.empty:
-        return pd.DataFrame([{
-            "Дата среза": now, "Событие": "Изменений нет",
-            "Комментарий": f"срез {now} совпадает со срезом {was}",
-        }], columns=columns)
 
     # Внутри каждого типа события — сначала самое крупное: деньги по модулю
     # изменения, зависшие вакансии по сроку.

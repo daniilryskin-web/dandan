@@ -984,6 +984,11 @@ EVENT_ORDER = [
     "Вакансия закрыта", "Вакансия открыта", "Вакансия висит",
 ]
 
+CHANGE_COLUMNS = [
+    "Дата среза", "Предыдущий срез", "Событие", "Сотрудник", "Блок", "Проект",
+    "Продукт", "Было", "Стало", "Δ руб", "Δ %", "Комментарий",
+]
+
 # Доля состава, смена которой за один срез означает скорее перетасовку
 # идентификаторов, чем реальное движение людей.
 SHUFFLE_ALERT = 0.20
@@ -1035,14 +1040,15 @@ def vacancy_view(df: pd.DataFrame) -> pd.Series:
     ).size()
 
 
-def vacancy_streaks(history: dict[str, pd.DataFrame]) -> dict[tuple, int]:
+def vacancy_streaks(history: dict[str, pd.DataFrame],
+                    until: str | None = None) -> dict[tuple, int]:
     """Сколько срезов подряд, считая от последнего, позиция остаётся открытой.
 
     Вакансия, висящая четвёртый месяц, — это либо ненужная позиция, либо не та
     вилка. На одном срезе это неразличимо: там она выглядит одинаково и в
     первый день, и в двухсотый.
     """
-    dates = sorted(history)
+    dates = [d for d in sorted(history) if until is None or d <= until]
     views = {date: vacancy_view(history[date]) for date in dates}
     streaks: dict[tuple, int] = {}
     for key in views[dates[-1]].index:
@@ -1063,10 +1069,10 @@ def money_text(value) -> str:
     return f"{round(float(value)):,}".replace(",", " ") + " ₽"
 
 
-def sheet_changes(
-    history: dict[str, pd.DataFrame]
+def changes_between(
+    history: dict[str, pd.DataFrame], was: str, now: str
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Что изменилось между двумя последними срезами.
+    """Что изменилось между двумя соседними срезами.
 
     Возвращает два листа.
 
@@ -1082,28 +1088,15 @@ def sheet_changes(
     Что именно изменилось у человека (роль, зарплата, продукты), написано
     в «Комментарии»: столбцы «Было» и «Стало» заняты фондом.
     """
-    columns = ["Дата среза", "Событие", "Сотрудник", "Блок", "Проект",
-               "Продукт", "Было", "Стало", "Δ руб", "Δ %", "Комментарий"]
-    # Служебная колонка сортировки внутри типа события, в итог не попадает.
-    build = columns + ["_вес"]
-    dates = sorted(history)
-    if len(dates) < 2:
-        first = pd.DataFrame([{
-            "Дата среза": dates[-1] if dates else "",
-            "Событие": "Первый срез",
-            "Комментарий": "Сравнивать не с чем. Изменения появятся "
-                           "со следующего запуска — храните папку history.",
-        }], columns=columns)
-        return first, first.copy()
-
-    was, now = dates[-2], dates[-1]
+    build = CHANGE_COLUMNS + ["_вес"]
     before, after = people_view(history[was]), people_view(history[now])
 
     people_rows: list[dict] = []
     other_rows: list[dict] = []
 
     def add(target, event, weight=0.0, **kwargs):
-        row = {"Дата среза": now, "Событие": event, "_вес": weight}
+        row = {"Дата среза": now, "Предыдущий срез": was,
+               "Событие": event, "_вес": weight}
         row.update(kwargs)
         target.append(row)
 
@@ -1184,7 +1177,7 @@ def sheet_changes(
     # ставки специалиста на одном продукте — это две строки, и закрытие одной
     # из них должно быть видно.
     before_v, after_v = vacancy_view(history[was]), vacancy_view(history[now])
-    streaks = vacancy_streaks(history)
+    streaks = vacancy_streaks(history, until=now)
     for key in sorted(set(before_v.index) | set(after_v.index)):
         block, project, product, role = key
         old_n = int(before_v.get(key, 0))
@@ -1231,6 +1224,40 @@ def sheet_changes(
     changes["Δ %"] = pct_col
 
     return changes, order_by(other_rows)
+
+
+def sheet_changes(
+    history: dict[str, pd.DataFrame]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Журнал изменений по всей истории, а не только за последний срез.
+
+    Проходит по всем парам соседних срезов и склеивает результат: сверху
+    самый свежий период, ниже предыдущие. Лесенка ФОТ считается внутри
+    каждого периода отдельно, поэтому «Стало» последней строки периода
+    равно ФОТ на дату этого периода.
+
+    Периоды различаются парой столбцов «Дата среза» и «Предыдущий срез»:
+    по ним же на дашборде вешается селектор, если нужен один период.
+    """
+    dates = sorted(history)
+    if len(dates) < 2:
+        first = pd.DataFrame([{
+            "Дата среза": dates[-1] if dates else "",
+            "Событие": "Первый срез",
+            "Комментарий": "Сравнивать не с чем. Изменения появятся "
+                           "со следующего запуска — храните папку history.",
+        }], columns=CHANGE_COLUMNS)
+        return first, first.copy()
+
+    people_parts, other_parts = [], []
+    # От свежего к старому: последнее изменение читают чаще всего.
+    for was, now in reversed(list(zip(dates, dates[1:]))):
+        people, other = changes_between(history, was, now)
+        people_parts.append(people)
+        other_parts.append(other)
+
+    return (pd.concat(people_parts, ignore_index=True),
+            pd.concat(other_parts, ignore_index=True))
 
 
 def save_snapshot(assignments: pd.DataFrame, folder: Path, date: str) -> dict:
@@ -1479,9 +1506,15 @@ def main() -> None:
     print("Сколько стоит выравнивание зарплат:")
     print(align_summary.to_string(index=False))
     if changes is not None and len(history) > 1:
+        # В консоль — только последний период: лист содержит всю историю,
+        # и общий счётчик по нему ничего не сказал бы о сегодняшнем запуске.
+        latest = changes[changes["Дата среза"] == snapshot]
         print()
         print(f"Изменения с прошлого среза ({sorted(history)[-2]} → {snapshot}):")
-        print(changes["Событие"].value_counts().to_string())
+        print(latest["Событие"].value_counts().to_string())
+        if len(changes) > len(latest):
+            print(f"Всего в журнале: {len(changes)} событий "
+                  f"за {len(history) - 1} периодов")
     print()
     print(sheet_checks(assignments).to_string(index=False))
 

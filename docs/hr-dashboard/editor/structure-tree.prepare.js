@@ -54,13 +54,11 @@ var MIN_WIDTH = 900;
 // как будто его тут нет.
 var PINNED_BLOCKS = ['Цветков С.В.'];
 
-// Продукты, которые всегда идут первыми внутри своей ветки. Вместе с таким
-// продуктом наверх поднимаются его руководитель и проект — иначе продукт
-// оказался бы первым у своего руководителя, а сам руководитель стоял бы
-// в середине блока, и наверху продукт всё равно не появился бы.
-//
-// Имя сверяется с колонкой «Продукт кратко» точным совпадением.
-var PINNED_PRODUCTS = ['Руководство'];
+// Проекты, которые всегда идут первыми внутри своего направления.
+// Работает так же, как PINNED_BLOCKS, но сверяется с колонкой «Проект».
+// Если проект с таким названием есть в нескольких направлениях, он
+// поднимется наверх в каждом из них.
+var PINNED_PROJECTS = ['Руководство'];
 
 // Показать в шапке всё, что пришло в параметрах, с значениями. Включайте,
 // когда селектор не фильтрует: сразу видно, под каким именем приезжает
@@ -764,40 +762,22 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
     }
 
     // Крупные ветки выше: дерево читают сверху вниз. Исключения — списки
-    // PINNED_BLOCKS и PINNED_PRODUCTS: перечисленное в них идёт первым
+    // PINNED_BLOCKS и PINNED_PROJECTS: перечисленное в них идёт первым
     // независимо от размера.
-    function pinRank(name) {
-        var i = PINNED_BLOCKS.indexOf(name);
-        return i < 0 ? PINNED_BLOCKS.length : i;
+    function pinRank(list, name) {
+        var i = list.indexOf(name);
+        return i < 0 ? list.length : i;
     }
 
-    // Закреплённый продукт поднимает вместе с собой всю свою ветку —
-    // руководителя и проект. Иначе «Руководство» оказалось бы первым
-    // у своего руководителя, но сам руководитель стоял бы в середине
-    // блока, и наверху продукт всё равно не появился бы.
-    function markPinned(node, depth) {
-        if (depth === 3) {
-            node.pin = PINNED_PRODUCTS.indexOf(node.name);
-            if (node.pin < 0) { node.pin = PINNED_PRODUCTS.length; }
-            return node.pin;
-        }
-        var best = PINNED_PRODUCTS.length;
-        node.children.forEach(function (child) {
-            best = Math.min(best, markPinned(child, depth + 1));
-        });
-        node.pin = best;
-        return best;
-    }
-    root.children.forEach(function (block) { markPinned(block, 0); });
-
-    // Перестановка в два прохода вместо одного компаратора: сортировка по
-    // размеру остаётся ровно такой, какой была, а закрепление накладывается
-    // сверху. Полагаться на устойчивость sort в песочнице не хочется,
-    // поэтому раскладываем по корзинам руками.
-    function pinFirst(list, rank) {
+    // Перестановка отдельным проходом, а не условием внутри компаратора:
+    // сортировка по размеру остаётся ровно такой, какой была, закрепление
+    // накладывается поверх неё. Раскладка по корзинам сохраняет порядок
+    // внутри группы, поэтому не нужно полагаться на устойчивость sort
+    // в песочнице QuickJS.
+    function pinFirst(items, rank) {
         var buckets = {};
         var keys = [];
-        list.forEach(function (item) {
+        items.forEach(function (item) {
             var r = rank(item);
             if (!buckets[r]) { buckets[r] = []; keys.push(r); }
             buckets[r].push(item);
@@ -809,16 +789,16 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
     }
 
     function sortBranch(node, depth) {
-        // Листья по размеру не пересортировываем: их порядок задан выгрузкой.
-        if (depth < 3) {
-            node.children.sort(function (a, b) {
-                return depth === 2 ? (b.people - a.people) : (b.fot - a.fot);
+        node.children.sort(function (a, b) {
+            return depth === 2 ? (b.people - a.people) : (b.fot - a.fot);
+        });
+        if (depth === 0 || depth === 1) {
+            var pinned = depth === 0 ? PINNED_BLOCKS : PINNED_PROJECTS;
+            node.children = pinFirst(node.children, function (child) {
+                return pinRank(pinned, child.name);
             });
         }
-        node.children = pinFirst(node.children, depth === 0
-            ? function (child) { return pinRank(child.name); }
-            : function (child) { return child.pin; });
-        if (depth < 3) {
+        if (depth < 2) {
             node.children.forEach(function (child) { sortBranch(child, depth + 1); });
         }
     }

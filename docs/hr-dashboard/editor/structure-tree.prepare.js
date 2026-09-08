@@ -60,6 +60,15 @@ var PINNED_BLOCKS = ['Цветков С.В.'];
 // поднимется наверх в каждом из них.
 var PINNED_PROJECTS = ['Руководство'];
 
+// Продукты, которые всегда идут первыми внутри своего проекта. Сверяется
+// с колонкой «Продукт кратко».
+//
+// Продукт лежит не прямо под проектом, а через уровень руководителя,
+// поэтому вместе с закреплённым продуктом наверх поднимается и его
+// руководитель. Иначе продукт стал бы первым в своей команде, но сама
+// команда осталась бы в середине проекта.
+var PINNED_PRODUCTS = ['Директор департамента'];
+
 // Показать в шапке всё, что пришло в параметрах, с значениями. Включайте,
 // когда селектор не фильтрует: сразу видно, под каким именем приезжает
 // значение и приезжает ли вообще.
@@ -788,17 +797,41 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
         return out;
     }
 
-    function sortBranch(node, depth) {
-        node.children.sort(function (a, b) {
-            return depth === 2 ? (b.people - a.people) : (b.fot - a.fot);
+    // Руководителя поднимает закреплённый продукт в его команде: у самих
+    // руководителей списка закрепления нет, они попадают наверх только так.
+    function markPinned(node, level) {
+        if (level === 3) { return pinRank(PINNED_PRODUCTS, node.name); }
+        var best = PINNED_PRODUCTS.length;
+        node.children.forEach(function (child) {
+            best = Math.min(best, markPinned(child, level + 1));
         });
-        if (depth === 0 || depth === 1) {
-            var pinned = depth === 0 ? PINNED_BLOCKS : PINNED_PROJECTS;
+        node.pin = best;
+        return best;
+    }
+    root.children.forEach(function (block) { markPinned(block, 0); });
+
+    // depth — это уровень тех узлов, которые сортируются:
+    // 0 направления, 1 проекты, 2 руководители, 3 продукты.
+    function sortBranch(node, depth) {
+        // Продукты по размеру не пересортировываем: их порядок задан
+        // выгрузкой, там они уже идут по числу людей.
+        if (depth < 3) {
+            node.children.sort(function (a, b) {
+                return depth === 2 ? (b.people - a.people) : (b.fot - a.fot);
+            });
+        }
+        if (depth === 2) {
+            node.children = pinFirst(node.children, function (child) {
+                return child.pin;
+            });
+        } else {
+            var pinned = depth === 0 ? PINNED_BLOCKS
+                : depth === 1 ? PINNED_PROJECTS : PINNED_PRODUCTS;
             node.children = pinFirst(node.children, function (child) {
                 return pinRank(pinned, child.name);
             });
         }
-        if (depth < 2) {
+        if (depth < 3) {
             node.children.forEach(function (child) { sortBranch(child, depth + 1); });
         }
     }

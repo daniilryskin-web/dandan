@@ -160,9 +160,16 @@ const model = {
     showTotals: showTotals,
     brand: BRAND,
     font: FONT,
-    // Сегмент ниже этого значения не вмещает цифру внутри — она уходит
-    // на выноску сбоку. Видимы при этом все значения без исключения.
-    insideLabelMinHeight: 15,
+    // Ширина столбца: доля слота и жёсткий максимум в пикселях.
+    barWidthRatio: 0.62,
+    maxBarWidth: 96,
+    // Мелкий сегмент растягивается до этой высоты, чтобы цифра помещалась
+    // внутри блока. Недостающие пиксели снимаются с крупных сегментов, так
+    // что общая высота столбца остаётся верной. 0 — выключить растягивание.
+    minSegmentHeight: 20,
+    // Страховка: если столбец настолько низкий, что минимум не выдержать,
+    // цифра ниже этого порога не рисуется — она осталась бы нечитаемой.
+    insideLabelMinHeight: 13,
 };
 
 // ---------------------------------------------------------------------------
@@ -285,7 +292,7 @@ module.exports = {
 
             // Столбцы
             const slot = plotW / m.categories.length;
-            const barW = Math.max(8, Math.min(56, slot * 0.44));
+            const barW = Math.max(8, Math.min(m.maxBarWidth, slot * m.barWidthRatio));
 
             for (let ci = 0; ci < m.categories.length; ci++) {
                 const cx = pad.left + slot * ci + slot / 2;
@@ -296,34 +303,49 @@ module.exports = {
                 svg.push('<text x="' + cx + '" y="' + (y0 + 26) + '" fill="' + B.muted +
                     '" font-size="13" text-anchor="middle">' + esc(m.categories[ci]) + '</text>');
 
-                // Верхний непустой сегмент скругляем сверху — остальные встык.
-                let topIndex = -1;
-                for (let si = m.series.length - 1; si >= 0; si--) {
-                    if (value(si, ci) > 0) { topIndex = si; break; }
-                }
-
-                let cursor = y0;
-                let firstDrawn = true;
-                const GAP = 2;   // просвет между сегментами, чтобы стек читался
-
-                // Цифры, не влезшие внутрь сегмента, собираем на выноски.
-                const callouts = [];
-
+                // Видимые сегменты столбца снизу вверх.
+                const parts = [];
                 for (let si = 0; si < m.series.length; si++) {
                     const v = value(si, ci);
-                    if (v <= 0) continue;
+                    if (v > 0) parts.push({si: si, v: v, h: scale(v)});
+                }
 
-                    const h = scale(v);
-                    const y = cursor - h;
+                // Мелкие сегменты поднимаем до минимальной высоты, чтобы цифра
+                // помещалась внутри блока, а недостающие пиксели снимаем с
+                // крупных — общая высота столбца при этом не меняется.
+                const MIN_SEG = m.minSegmentHeight;
+                const small = parts.filter(function (p) { return p.h < MIN_SEG; });
+
+                if (MIN_SEG > 0 && small.length) {
+                    const deficit = small.reduce(function (a, p) { return a + (MIN_SEG - p.h); }, 0);
+                    const donors = parts.filter(function (p) { return p.h > MIN_SEG; });
+                    const surplus = donors.reduce(function (a, p) { return a + (p.h - MIN_SEG); }, 0);
+
+                    if (surplus >= deficit) {
+                        const shares = donors.map(function (p) { return (p.h - MIN_SEG) / surplus; });
+                        small.forEach(function (p) { p.h = MIN_SEG; });
+                        donors.forEach(function (p, k) { p.h -= shares[k] * deficit; });
+                    }
+                    // Иначе столбец слишком низкий, чтобы вместить все цифры:
+                    // оставляем честные пропорции и не растягиваем ничего.
+                }
+
+                const topPart = parts.length ? parts[parts.length - 1] : null;
+                const GAP = 2;   // просвет между сегментами, чтобы стек читался
+                let cursor = y0;
+                let firstDrawn = true;
+
+                parts.forEach(function (p) {
+                    const y = cursor - p.h;
                     cursor = y;
 
                     // Зазор срезается снизу сегмента, поэтому верх стека не «плывёт».
-                    const drawH = Math.max(1, firstDrawn ? h : h - GAP);
+                    const drawH = Math.max(1, firstDrawn ? p.h : p.h - GAP);
                     firstDrawn = false;
 
-                    const color = m.series[si].color;
+                    const color = m.series[p.si].color;
                     const r = Math.min(4, drawH / 2);
-                    const shape = (si === topIndex)
+                    const shape = (p === topPart)
                         ? '<path d="M' + x + ' ' + (y + drawH) + ' L' + x + ' ' + (y + r) +
                           ' Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y +
                           ' L' + (x + barW - r) + ' ' + y +
@@ -332,53 +354,20 @@ module.exports = {
                         : '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + drawH +
                           '" fill="' + color + '"/>';
 
-                    const raw = m.series[si].data[ci] || 0;
+                    const raw = m.series[p.si].data[ci] || 0;
                     const share = m.totals[ci] ? (raw / m.totals[ci]) * 100 : 0;
-                    const hint = m.categories[ci] + ' · ' + m.series[si].name + ': ' +
+                    const hint = m.categories[ci] + ' · ' + m.series[p.si].name + ': ' +
                         fmt(raw) + ' (' + fmt(share, 1) + ' %)';
-                    const text = m.mode === 'percent' ? fmt(v) + ' %' : fmt(raw);
 
                     svg.push('<g><title>' + esc(hint) + '</title>' + shape + '</g>');
 
                     if (drawH >= m.insideLabelMinHeight) {
                         svg.push('<text x="' + cx + '" y="' + (y + drawH / 2 + 4) +
                             '" fill="' + labelColor(color) + '" font-size="12" font-weight="600" ' +
-                            'text-anchor="middle" pointer-events="none">' + text + '</text>');
-                    } else {
-                        callouts.push({anchor: y + drawH / 2, y: y + drawH / 2, text: text, color: color});
+                            'text-anchor="middle" pointer-events="none">' +
+                            (m.mode === 'percent' ? fmt(p.v) + ' %' : fmt(raw)) + '</text>');
                     }
-                }
-
-                // Выноски: разводим по вертикали, чтобы цифры не слипались,
-                // и держим их внутри области построения.
-                if (callouts.length) {
-                    const STEP = 15;
-                    callouts.sort(function (a, b) { return a.y - b.y; });
-                    for (let k = 1; k < callouts.length; k++) {
-                        if (callouts[k].y - callouts[k - 1].y < STEP) {
-                            callouts[k].y = callouts[k - 1].y + STEP;
-                        }
-                    }
-                    const overflow = callouts[callouts.length - 1].y - (y0 - 4);
-                    if (overflow > 0) {
-                        callouts.forEach(function (c) { c.y -= overflow; });
-                    }
-
-                    // Справа места нет — уводим выноски влево.
-                    const toRight = (x + barW + 52) <= (pad.left + plotW);
-                    const elbow = toRight ? x + barW + 8 : x - 8;
-                    const tip = toRight ? x + barW + 18 : x - 18;
-                    const textX = toRight ? tip + 4 : tip - 4;
-
-                    callouts.forEach(function (c) {
-                        svg.push('<path d="M' + (toRight ? x + barW : x) + ' ' + c.anchor +
-                            ' L' + elbow + ' ' + c.anchor + ' L' + tip + ' ' + c.y +
-                            '" fill="none" stroke="' + c.color + '" stroke-width="1"/>');
-                        svg.push('<text x="' + textX + '" y="' + (c.y + 4) + '" fill="' + B.ink +
-                            '" font-size="12" font-weight="600" text-anchor="' +
-                            (toRight ? 'start' : 'end') + '">' + c.text + '</text>');
-                    });
-                }
+                });
 
                 // ⬇ Сумма в итогах — над столбцом.
                 // В режиме долей столбец упирается в верх шкалы, поэтому

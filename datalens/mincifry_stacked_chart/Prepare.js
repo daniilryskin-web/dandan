@@ -160,9 +160,9 @@ const model = {
     showTotals: showTotals,
     brand: BRAND,
     font: FONT,
-    // Сегмент меньше этой доли стека остаётся без подписи, чтобы цифры
-    // не наезжали друг на друга на узких столбцах.
-    minLabelShare: 0.06,
+    // Сегмент ниже этого значения не вмещает цифру внутри — она уходит
+    // на выноску сбоку. Видимы при этом все значения без исключения.
+    insideLabelMinHeight: 15,
 };
 
 // ---------------------------------------------------------------------------
@@ -306,6 +306,9 @@ module.exports = {
                 let firstDrawn = true;
                 const GAP = 2;   // просвет между сегментами, чтобы стек читался
 
+                // Цифры, не влезшие внутрь сегмента, собираем на выноски.
+                const callouts = [];
+
                 for (let si = 0; si < m.series.length; si++) {
                     const v = value(si, ci);
                     if (v <= 0) continue;
@@ -333,17 +336,48 @@ module.exports = {
                     const share = m.totals[ci] ? (raw / m.totals[ci]) * 100 : 0;
                     const hint = m.categories[ci] + ' · ' + m.series[si].name + ': ' +
                         fmt(raw) + ' (' + fmt(share, 1) + ' %)';
+                    const text = m.mode === 'percent' ? fmt(v) + ' %' : fmt(raw);
 
                     svg.push('<g><title>' + esc(hint) + '</title>' + shape + '</g>');
 
-                    // Подпись внутри сегмента: только если он достаточно крупный.
-                    const shareOfStack = total ? v / total : 0;
-                    if (drawH >= 16 && shareOfStack >= m.minLabelShare) {
+                    if (drawH >= m.insideLabelMinHeight) {
                         svg.push('<text x="' + cx + '" y="' + (y + drawH / 2 + 4) +
                             '" fill="' + labelColor(color) + '" font-size="12" font-weight="600" ' +
-                            'text-anchor="middle" pointer-events="none">' +
-                            (m.mode === 'percent' ? fmt(v) + ' %' : fmt(raw)) + '</text>');
+                            'text-anchor="middle" pointer-events="none">' + text + '</text>');
+                    } else {
+                        callouts.push({anchor: y + drawH / 2, y: y + drawH / 2, text: text, color: color});
                     }
+                }
+
+                // Выноски: разводим по вертикали, чтобы цифры не слипались,
+                // и держим их внутри области построения.
+                if (callouts.length) {
+                    const STEP = 15;
+                    callouts.sort(function (a, b) { return a.y - b.y; });
+                    for (let k = 1; k < callouts.length; k++) {
+                        if (callouts[k].y - callouts[k - 1].y < STEP) {
+                            callouts[k].y = callouts[k - 1].y + STEP;
+                        }
+                    }
+                    const overflow = callouts[callouts.length - 1].y - (y0 - 4);
+                    if (overflow > 0) {
+                        callouts.forEach(function (c) { c.y -= overflow; });
+                    }
+
+                    // Справа места нет — уводим выноски влево.
+                    const toRight = (x + barW + 52) <= (pad.left + plotW);
+                    const elbow = toRight ? x + barW + 8 : x - 8;
+                    const tip = toRight ? x + barW + 18 : x - 18;
+                    const textX = toRight ? tip + 4 : tip - 4;
+
+                    callouts.forEach(function (c) {
+                        svg.push('<path d="M' + (toRight ? x + barW : x) + ' ' + c.anchor +
+                            ' L' + elbow + ' ' + c.anchor + ' L' + tip + ' ' + c.y +
+                            '" fill="none" stroke="' + c.color + '" stroke-width="1"/>');
+                        svg.push('<text x="' + textX + '" y="' + (c.y + 4) + '" fill="' + B.ink +
+                            '" font-size="12" font-weight="600" text-anchor="' +
+                            (toRight ? 'start' : 'end') + '">' + c.text + '</text>');
+                    });
                 }
 
                 // ⬇ Сумма в итогах — над столбцом.
@@ -357,20 +391,37 @@ module.exports = {
                 }
             }
 
-            // Легенда по центру снизу
-            const legendY = H - 26;
+            // Легенда по центру снизу; при нехватке ширины переносится по рядам.
             const itemW = m.series.map(function (s) {
                 return 14 + 8 + s.name.length * 7.2 + 24;   // маркер + зазор + текст + отступ
             });
-            const legendW = itemW.reduce(function (a, b) { return a + b; }, 0) - 24;
-            let lx = Math.max(pad.left, (W - legendW) / 2);
-
+            const maxRowW = W - 2 * 16;
+            const rows = [[]];
+            let rowW = 0;
             m.series.forEach(function (s, i) {
-                svg.push('<rect x="' + lx + '" y="' + (legendY - 9) +
-                    '" width="10" height="10" rx="2" fill="' + s.color + '"/>');
-                svg.push('<text x="' + (lx + 18) + '" y="' + legendY + '" fill="' + B.ink +
-                    '" font-size="13">' + esc(s.name) + '</text>');
-                lx += itemW[i];
+                if (rows[rows.length - 1].length && rowW + itemW[i] - 24 > maxRowW) {
+                    rows.push([]);
+                    rowW = 0;
+                }
+                rows[rows.length - 1].push({series: s, w: itemW[i]});
+                rowW += itemW[i];
+            });
+
+            const ROW_H = 18;
+            const legendY0 = H - 26 - (rows.length - 1) * ROW_H;
+
+            rows.forEach(function (row, ri) {
+                const rw = row.reduce(function (a, it) { return a + it.w; }, 0) - 24;
+                let lx = Math.max(16, (W - rw) / 2);
+                const ly = legendY0 + ri * ROW_H;
+
+                row.forEach(function (it) {
+                    svg.push('<rect x="' + lx + '" y="' + (ly - 9) +
+                        '" width="10" height="10" rx="2" fill="' + it.series.color + '"/>');
+                    svg.push('<text x="' + (lx + 18) + '" y="' + ly + '" fill="' + B.ink +
+                        '" font-size="13">' + esc(it.series.name) + '</text>');
+                    lx += it.w;
+                });
             });
 
             svg.push('</svg>');

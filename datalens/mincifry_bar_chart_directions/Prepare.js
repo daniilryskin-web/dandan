@@ -54,6 +54,12 @@ const TITLE = 'Услуги по направлениям';
 // иначе одно и то же число стоит дважды. Убирается только хвост вида
 // «— <число>»: если в подписи нет такого окончания, она остаётся как есть.
 const STRIP_TOTAL_SUFFIX = true;
+
+// Сортировка по номеру в начале подписи: 1., 1.1, 1.2, 1.3, 2., 3.
+// Сортировка строк тут не годится: как строки «1.1» и «1.2» встают перед
+// «1.», а «10.» — перед «2.». Поэтому номер разбирается на числа и
+// сравнивается по частям. Категории без номера уходят в конец по алфавиту.
+const SORT_BY_NUMBER = true;
 // Пустая строка — подзаголовок не рисуется, шапка компактнее.
 const SUBTITLE = '';
 
@@ -97,13 +103,36 @@ const mode = (params.stacking && params.stacking[0]) === 'percent' ? 'percent' :
 
 const rows = normalizeRows(Editor.getLoadedData());
 
-// Порядок категорий — как пришёл из источника: нумерация «1., 1.1, 1.2, 2.»
-// уже задаёт нужный порядок, а сортировка строк его бы сломала.
+function numericPrefix(text) {
+    const found = String(text).match(/^\s*(\d+(?:\.\d+)*)/);
+    return found ? found[1].split('.').map(Number) : null;
+}
+
+function compareCategories(a, b) {
+    const pa = numericPrefix(a);
+    const pb = numericPrefix(b);
+
+    if (!pa && !pb) return String(a).localeCompare(String(b), 'ru');
+    if (!pa) return 1;
+    if (!pb) return -1;
+
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i++) {
+        // Более короткий номер идёт первым: «1.» раньше «1.1».
+        const da = pa[i] === undefined ? -1 : pa[i];
+        const db = pb[i] === undefined ? -1 : pb[i];
+        if (da !== db) return da - db;
+    }
+    return 0;
+}
+
 const categories = [];
 rows.forEach(function (row) {
     const key = String(row[X_FIELD]);
     if (categories.indexOf(key) === -1) categories.push(key);
 });
+
+if (SORT_BY_NUMBER) categories.sort(compareCategories);
 
 // Подпись для показа: без хвоста «— 76».
 const labels = categories.map(function (key) {

@@ -43,7 +43,8 @@ const FALLBACK_COLORS = [
 const X_FIELD = 'Год';
 const SOURCE_KEY = 'services';   // ключ источника из вкладки Sources
 const TITLE = 'Услуги по годам';
-const SUBTITLE = 'Онлайн · Проактив · Рефакторинг, ед.';
+// Пустая строка — подзаголовок не рисуется, шапка становится компактнее.
+const SUBTITLE = '';
 
 // --- Демо-режим -------------------------------------------------------------
 // true  — рисуем на зашитых цифрах (проверить оформление без датасета);
@@ -160,6 +161,10 @@ const model = {
     showTotals: showTotals,
     brand: BRAND,
     font: FONT,
+    // Отступ шапки от левого края холста. Заголовок ставится по краю
+    // виджета, а не по оси: подписи шкалы уходят левее оси, и заголовок,
+    // выровненный по ней, выглядит утопленным.
+    titleX: 16,
     // Ширина столбца: доля слота и жёсткий максимум в пикселях.
     barWidthRatio: 0.62,
     maxBarWidth: 96,
@@ -227,7 +232,8 @@ module.exports = {
                 );
             }
 
-            const pad = {top: m.title ? 78 : 28, right: 24, bottom: 78, left: 60};
+            const headerH = m.title ? (m.subtitle ? 78 : 58) : 28;
+            const pad = {top: headerH, right: 24, bottom: 78, left: 60};
             const plotW = Math.max(40, W - pad.left - pad.right);
             const plotH = Math.max(40, H - pad.top - pad.bottom);
 
@@ -269,11 +275,11 @@ module.exports = {
 
             // Заголовки
             if (m.title) {
-                svg.push('<text x="' + pad.left + '" y="34" fill="' + B.ink +
+                svg.push('<text x="' + m.titleX + '" y="34" fill="' + B.ink +
                     '" font-size="20" font-weight="700">' + esc(m.title) + '</text>');
             }
             if (m.subtitle) {
-                svg.push('<text x="' + pad.left + '" y="56" fill="' + B.muted +
+                svg.push('<text x="' + m.titleX + '" y="56" fill="' + B.muted +
                     '" font-size="13">' + esc(m.subtitle) + '</text>');
             }
 

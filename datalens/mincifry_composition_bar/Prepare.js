@@ -26,11 +26,19 @@ const BRAND = {
 const FONT = "Ubuntu, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
 
 // Порядок = порядок сегментов слева направо.
+// aliases — запасные имена поля: в датасете поле называется «Оставшиеся
+// (индикатор)», а в визарде оно же было «Оставшиеся». Берём то, что реально
+// пришло, чтобы переименование поля не роняло чарт молча.
+// label — как подписать серию в легенде, если имя поля неудобно читать.
 const SERIES_SPEC = [
     {field: 'ЛиР (ниже не приводятся)', color: BRAND.violet},
     {field: 'Не требуется ДК', color: BRAND.violetLight},
-    {field: 'Оставшиеся', color: BRAND.violetDeep},
+    {field: 'Оставшиеся (индикатор)', aliases: ['Оставшиеся'],
+     label: 'Оставшиеся', color: BRAND.violetDeep},
 ];
+
+// Поля-итоги в состав полосы попасть не должны: иначе целое сложится дважды.
+const EXCLUDE_FIELDS = ['ВСЕГО услуг', 'ВСЕГО'];
 
 const FALLBACK_COLORS = [
     BRAND.violet, BRAND.violetLight, BRAND.violetDeep,
@@ -82,36 +90,62 @@ function normalizeRows(loaded) {
 
 const rows = normalizeRows(Editor.getLoadedData());
 
-// Меры: сначала описанные в SERIES_SPEC, затем всё остальное, что пришло.
-const known = SERIES_SPEC.map(function (s) { return s.field; });
+// Какие поля вообще пришли.
 const present = [];
 rows.forEach(function (row) {
     Object.keys(row).forEach(function (field) {
         if (present.indexOf(field) === -1) present.push(field);
     });
 });
-const measures = known.filter(function (f) { return present.indexOf(f) !== -1; })
-    .concat(present.filter(function (f) { return known.indexOf(f) === -1; }));
 
 // Строк обычно одна, но если источник вернёт несколько — складываем: иначе
 // чарт молча показал бы только первую.
-const series = measures.map(function (field, i) {
-    const spec = SERIES_SPEC.filter(function (s) { return s.field === field; })[0];
-    return {
-        name: field,
-        color: spec ? spec.color : FALLBACK_COLORS[i % FALLBACK_COLORS.length],
-        value: rows.reduce(function (sum, row) { return sum + toNumber(row[field]); }, 0),
-    };
-}).filter(function (s) { return s.value > 0; });
+function sumOf(field) {
+    return rows.reduce(function (sum, row) { return sum + toNumber(row[field]); }, 0);
+}
 
-const total = series.reduce(function (sum, s) { return sum + s.value; }, 0);
+// Сначала описанные серии — каждая берёт первое из своих имён, которое
+// реально пришло.
+const used = [];
+const series = [];
+
+SERIES_SPEC.forEach(function (spec) {
+    const names = [spec.field].concat(spec.aliases || []);
+    let found = null;
+    for (let i = 0; i < names.length; i++) {
+        if (present.indexOf(names[i]) !== -1) { found = names[i]; break; }
+    }
+    if (!found) return;
+
+    used.push(found);
+    series.push({
+        name: spec.label || spec.field,
+        color: spec.color,
+        value: sumOf(found),
+    });
+});
+
+// Затем всё остальное, что пришло, кроме полей-итогов.
+present.forEach(function (field) {
+    if (used.indexOf(field) !== -1) return;
+    if (EXCLUDE_FIELDS.indexOf(field) !== -1) return;
+    series.push({
+        name: field,
+        color: FALLBACK_COLORS[series.length % FALLBACK_COLORS.length],
+        value: sumOf(field),
+    });
+});
+
+const visible = series.filter(function (s) { return s.value > 0; });
+
+const total = visible.reduce(function (sum, s) { return sum + s.value; }, 0);
 
 // Диагностика: пустая полоса без объяснения читается как поломка вёрстки.
 let problem = null;
 const keys = rows.length ? Object.keys(rows[0]) : [];
 if (!rows.length) {
     problem = 'Источник не вернул ни одной строки';
-} else if (!series.length) {
+} else if (!visible.length) {
     problem = 'Ни одна из мер не пришла со значением больше нуля. Пришли поля: ' +
         keys.join(', ');
 }
@@ -119,7 +153,7 @@ if (!rows.length) {
 const model = {
     title: TITLE,
     subtitle: SUBTITLE,
-    series: series,
+    series: visible,
     total: total,
     totalLabel: TOTAL_LABEL,
     showTotal: SHOW_TOTAL,

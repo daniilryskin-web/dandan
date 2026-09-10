@@ -46,6 +46,10 @@ const FALLBACK_COLORS = [
 // ЖС / ЛиР / ТМУ, а годами названы меры.
 const CATEGORY_FIELD = 'Год';
 const SOURCE_KEY = 'grouped';
+
+// Категории, которые не показываем. Сравнение точное, но с обрезкой пробелов
+// по краям: в датасетах они попадаются и ломают совпадение незаметно.
+const EXCLUDE_CATEGORIES = ['МСЗУ 1.0'];
 const TITLE = 'Услуги по типам и годам';
 // Пустая строка — подзаголовок не рисуется, шапка компактнее.
 const SUBTITLE = '';
@@ -85,7 +89,9 @@ function normalizeRows(loaded) {
     return [];
 }
 
-const rows = normalizeRows(Editor.getLoadedData());
+const rows = normalizeRows(Editor.getLoadedData()).filter(function (row) {
+    return EXCLUDE_CATEGORIES.indexOf(String(row[CATEGORY_FIELD]).trim()) === -1;
+});
 
 // Порядок категорий — как пришёл из источника: сортировкой распоряжается
 // датасет, а не чарт.

@@ -39,6 +39,12 @@ if (params.category && params.category[0]) {
     });
 }
 
+// Отсев ненужных категорий сделан во вкладке Prepare (EXCLUDE_CATEGORIES):
+// строк тут единицы, а имена операций BI API чувствительны к регистру и
+// расходятся между версиями — ошибка в фильтре роняет весь чарт. Если данных
+// станет много и захочется отсеивать на стороне источника, добавьте в filters:
+//    {ref: {type: 'title', title: 'Год'}, operation: 'NIN', values: ['МСЗУ 1.0']}
+// и уберите категорию из EXCLUDE_CATEGORIES.
 module.exports = {
     grouped: {
         datasetId: datasetId,

@@ -89,10 +89,54 @@ const wanted = (params.filter && params.filter[0])
 
 const rows = normalizeRows(Editor.getLoadedData());
 
-const matched = rows.filter(function (row) {
+// Сравниваем «мягко»: неразрывный пробел, двойные пробелы и регистр —
+// самая частая причина, по которой глазами значения одинаковые, а строкой
+// не совпадают.
+function norm(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+// Диагностика: пустой индикатор должен объяснять, что именно не сложилось.
+// Раньше здесь было одно сообщение на все случаи, и оно вводило в
+// заблуждение — писало «строка не найдена» даже когда строка была, а пустым
+// оказалось значение.
+let problem = null;
+const keys = rows.length ? Object.keys(rows[0]) : [];
+
+if (!rows.length) {
+    problem = 'Источник не вернул ни одной строки';
+} else if (keys.indexOf(FILTER_FIELD) === -1 || keys.indexOf(VALUE_FIELD) === -1) {
+    // Ответ разобран, но колонки названы иначе, чем ожидает код.
+    const missing = [];
+    if (keys.indexOf(FILTER_FIELD) === -1) missing.push('«' + FILTER_FIELD + '»');
+    if (keys.indexOf(VALUE_FIELD) === -1) missing.push('«' + VALUE_FIELD + '»');
+    problem = 'В ответе источника нет ' + missing.join(' и ') +
+        '. Пришли поля: ' + keys.join(', ');
+}
+
+const wantedNorm = wanted.map(norm);
+
+const matched = problem ? [] : rows.filter(function (row) {
     if (!wanted.length) return true;
-    return wanted.indexOf(String(row[FILTER_FIELD]).trim()) !== -1;
+    return wantedNorm.indexOf(norm(row[FILTER_FIELD])) !== -1;
 });
+
+if (!problem && !matched.length) {
+    // Показываем, какие значения в поле реально пришли: разница обычно в
+    // написании, и увидеть её можно только так.
+    const seen = [];
+    rows.forEach(function (row) {
+        const v = String(row[FILTER_FIELD]);
+        if (seen.indexOf(v) === -1 && seen.length < 6) seen.push(v);
+    });
+    problem = 'В поле «' + FILTER_FIELD + '» нет значения «' + wanted.join('», «') +
+        '». Пришли: «' + seen.join('», «') + '»';
+}
 
 // Берём первую строку с непустым значением: строки, у которых показатель
 // пуст, для индикатора бесполезны.
@@ -103,6 +147,11 @@ for (let i = 0; i < matched.length; i++) {
         raw = v;
         break;
     }
+}
+
+if (!problem && raw === null) {
+    problem = 'Строка со значением «' + wanted.join('», «') + '» найдена, но поле «' +
+        VALUE_FIELD + '» в ней пустое';
 }
 
 const numeric = toNumber(raw);
@@ -122,12 +171,9 @@ const model = {
             : formatNumber(numeric) + VALUE_SUFFIX),
     value: numeric,
     hasData: raw !== null,
-    // Подсказка, когда фильтр ничего не нашёл: пустой индикатор без объяснения
-    // выглядит как поломка.
-    emptyHint: wanted.length
-        ? 'Нет строки со значением «' + wanted.join('», «') + '» в поле «' +
-            FILTER_FIELD + '»'
-        : 'Нет данных',
+    // Подсказка, когда значения нет: пустой индикатор без объяснения выглядит
+    // как поломка, а односложное «нет данных» не даёт что-либо починить.
+    emptyHint: problem || 'Нет данных',
     showProgress: SHOW_PROGRESS,
     progressMax: PROGRESS_MAX,
     brand: BRAND,
@@ -187,8 +233,26 @@ module.exports = {
                 '" font-weight="700">' + esc(m.text) + '</text>');
 
             if (!m.hasData) {
-                svg.push('<text x="' + PAD + '" y="' + (valueY + 22) + '" fill="' + B.muted +
-                    '" font-size="13">' + esc(m.emptyHint) + '</text>');
+                // Диагностика бывает длинной — переносим по словам, иначе она
+                // уезжает за край холста и пользы от неё ноль.
+                const maxChars = Math.max(16, Math.floor((W - PAD * 2) / 6.6));
+                const lines = [];
+                let line = '';
+                String(m.emptyHint).split(' ').forEach(function (word) {
+                    if (!line.length) { line = word; return; }
+                    if ((line + ' ' + word).length <= maxChars) {
+                        line += ' ' + word;
+                    } else {
+                        lines.push(line);
+                        line = word;
+                    }
+                });
+                if (line.length) lines.push(line);
+
+                lines.slice(0, 6).forEach(function (text, i) {
+                    svg.push('<text x="' + PAD + '" y="' + (valueY + 22 + i * 17) +
+                        '" fill="' + B.muted + '" font-size="13">' + esc(text) + '</text>');
+                });
             } else if (m.showProgress && m.value !== null) {
                 const trackY = valueY + 18;
                 const done = Math.max(0, Math.min(1, m.value / m.progressMax));

@@ -20,14 +20,16 @@ const BRAND = {
 const FONT = "Ubuntu, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
 
 const SOURCE_KEY = 'kpi';
-const STATUS_FIELD = 'Статус';
+const FILTER_FIELD = 'Статус';
 const VALUE_FIELD = 'Уровень достижения ОЦС';
 
 const TITLE = 'Уровень достижения ОЦС';
 
 // Фильтр «Статус принадлежит множеству» — тот же, что у вас в визарде.
+// Строка должна совпадать со значением в датасете; сравнение мягкое —
+// неразрывные пробелы, двойные пробелы и регистр не мешают.
 // Пустой список = без фильтра, берётся первая строка с непустым значением.
-const STATUS_FILTER = ['Уровень достижения, %'];
+const FILTER_VALUES = ['Уровень достижения, %'];
 
 // Единица измерения дописывается, только если значение пришло числом:
 // вычисляемое поле может уже отдавать готовую строку «45 %».
@@ -77,21 +79,65 @@ function normalizeRows(loaded) {
 
 const params = Editor.getParams();
 
-// Статус из параметра перекрывает список в коде — это позволяет включить
+// Значение из параметра перекрывает список в коде — это позволяет включить
 // селектор во вкладке Controls, ничего не меняя здесь.
-const wanted = (params.status && params.status[0])
-    ? [params.status[0]]
-    : STATUS_FILTER;
+const wanted = (params.filter && params.filter[0])
+    ? [params.filter[0]]
+    : FILTER_VALUES;
 
 const rows = normalizeRows(Editor.getLoadedData());
 
-const matched = rows.filter(function (row) {
+// Сравниваем «мягко»: неразрывный пробел, двойные пробелы и регистр —
+// самая частая причина, по которой глазами значения одинаковые, а строкой
+// не совпадают.
+function norm(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+// Диагностика: пустой индикатор должен объяснять, что именно не сложилось.
+// Раньше здесь было одно сообщение на все случаи, и оно вводило в
+// заблуждение — писало «строка не найдена» даже когда строка была, а пустым
+// оказалось значение.
+let problem = null;
+const keys = rows.length ? Object.keys(rows[0]) : [];
+
+if (!rows.length) {
+    problem = 'Источник не вернул ни одной строки';
+} else if (keys.indexOf(FILTER_FIELD) === -1 || keys.indexOf(VALUE_FIELD) === -1) {
+    // Ответ разобран, но колонки названы иначе, чем ожидает код.
+    const missing = [];
+    if (keys.indexOf(FILTER_FIELD) === -1) missing.push('«' + FILTER_FIELD + '»');
+    if (keys.indexOf(VALUE_FIELD) === -1) missing.push('«' + VALUE_FIELD + '»');
+    problem = 'В ответе источника нет ' + missing.join(' и ') +
+        '. Пришли поля: ' + keys.join(', ');
+}
+
+const wantedNorm = wanted.map(norm);
+
+const matched = problem ? [] : rows.filter(function (row) {
     if (!wanted.length) return true;
-    return wanted.indexOf(String(row[STATUS_FIELD]).trim()) !== -1;
+    return wantedNorm.indexOf(norm(row[FILTER_FIELD])) !== -1;
 });
 
-// Берём первую строку с непустым значением: строки статусов, у которых
-// показатель пуст, для индикатора бесполезны.
+if (!problem && !matched.length) {
+    // Показываем, какие значения в поле реально пришли: разница обычно в
+    // написании, и увидеть её можно только так.
+    const seen = [];
+    rows.forEach(function (row) {
+        const v = String(row[FILTER_FIELD]);
+        if (seen.indexOf(v) === -1 && seen.length < 6) seen.push(v);
+    });
+    problem = 'В поле «' + FILTER_FIELD + '» нет значения «' + wanted.join('», «') +
+        '». Пришли: «' + seen.join('», «') + '»';
+}
+
+// Берём первую строку с непустым значением: строки, у которых показатель
+// пуст, для индикатора бесполезны.
 let raw = null;
 for (let i = 0; i < matched.length; i++) {
     const v = matched[i][VALUE_FIELD];
@@ -99,6 +145,11 @@ for (let i = 0; i < matched.length; i++) {
         raw = v;
         break;
     }
+}
+
+if (!problem && raw === null) {
+    problem = 'Строка со значением «' + wanted.join('», «') + '» найдена, но поле «' +
+        VALUE_FIELD + '» в ней пустое';
 }
 
 const numeric = toNumber(raw);
@@ -120,9 +171,7 @@ const model = {
     hasData: raw !== null,
     // Подсказка, когда фильтр ничего не нашёл: пустой индикатор без объяснения
     // выглядит как поломка.
-    emptyHint: wanted.length
-        ? 'Нет строки со статусом «' + wanted.join('», «') + '»'
-        : 'Нет данных',
+    emptyHint: problem || 'Нет данных',
     showProgress: SHOW_PROGRESS,
     progressMax: PROGRESS_MAX,
     brand: BRAND,
@@ -182,8 +231,26 @@ module.exports = {
                 '" font-weight="700">' + esc(m.text) + '</text>');
 
             if (!m.hasData) {
-                svg.push('<text x="' + PAD + '" y="' + (valueY + 22) + '" fill="' + B.muted +
-                    '" font-size="13">' + esc(m.emptyHint) + '</text>');
+                // Диагностика бывает длинной — переносим по словам, иначе она
+                // уезжает за край холста и пользы от неё ноль.
+                const maxChars = Math.max(16, Math.floor((W - PAD * 2) / 6.6));
+                const lines = [];
+                let line = '';
+                String(m.emptyHint).split(' ').forEach(function (word) {
+                    if (!line.length) { line = word; return; }
+                    if ((line + ' ' + word).length <= maxChars) {
+                        line += ' ' + word;
+                    } else {
+                        lines.push(line);
+                        line = word;
+                    }
+                });
+                if (line.length) lines.push(line);
+
+                lines.slice(0, 6).forEach(function (text, i) {
+                    svg.push('<text x="' + PAD + '" y="' + (valueY + 22 + i * 17) +
+                        '" fill="' + B.muted + '" font-size="13">' + esc(text) + '</text>');
+                });
             } else if (m.showProgress && m.value !== null) {
                 const trackY = valueY + 18;
                 const done = Math.max(0, Math.min(1, m.value / m.progressMax));

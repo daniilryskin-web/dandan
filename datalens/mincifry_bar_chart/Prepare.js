@@ -1,6 +1,6 @@
 // ============================================================================
-//  Вкладка Prepare — Advanced-чарт: столбчатый стек с суммой в итогах,
-//  оформление в палитре дизайн-системы Госуслуг / Минцифры.
+//  Вкладка Prepare — Advanced-чарт: горизонтальный стек по годам с суммой
+//  в конце полосы, оформление в палитре Минцифры / Госуслуг.
 //
 //  Код вне Editor.wrapFn исполняется на сервере: здесь готовим данные.
 //  Код внутри Editor.wrapFn исполняется в браузере: там рисуем SVG.
@@ -8,31 +8,31 @@
 //  передаётся через args.
 // ============================================================================
 
-// --- Палитра Минцифры / дизайн-системы Госуслуг -----------------------------
+// --- Палитра ----------------------------------------------------------------
+// Держите в синхроне с вертикальным чартом (mincifry_stacked_chart): это
+// отдельная сущность в DataLens, общего модуля у вкладок нет.
 const BRAND = {
-    // Фирменная фиолетовая гамма: одна гамма, три ступени по светлоте.
     violet: '#4B2DE8',        // основная ступень
     violetLight: '#8E7CF2',   // светлая
     violetDeep: '#4A38AD',    // глубокая
-    // Акценты — на случай, если серий окажется больше трёх.
-    magenta: '#C0397E',
+    magenta: '#C0397E',       // акцент для четвёртой серии
     ochre: '#8A6A00',
     teal: '#0A7D9E',
-    ink: '#17123B',           // основной текст
-    muted: '#6B6690',         // вторичный текст
+    ink: '#17123B',
+    muted: '#6B6690',
     grid: '#E7E3F5',
     axis: '#CFC9E8',
-    bg: '#FAF9FE',            // холст, едва тонированный в лиловый
+    bg: '#FAF9FE',
 };
 
-// Ubuntu — гарнитура дизайн-системы Госуслуг, дальше системный запас.
 const FONT = "Ubuntu, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
 
-// Порядок = порядок укладки стека снизу вверх.
+// Порядок = порядок укладки полосы слева направо.
 const SERIES_SPEC = [
-    {field: 'Рефакторинг', color: BRAND.violet},
-    {field: 'Проактив', color: BRAND.violetLight},
-    {field: 'Онлайн', color: BRAND.violetDeep},
+    {field: 'Федеральный', color: BRAND.violet},
+    {field: 'Региональный', color: BRAND.violetLight},
+    {field: 'Федеральный/Региональный', color: BRAND.violetDeep},
+    {field: 'Региональный/Муниципальный', color: BRAND.magenta},
 ];
 
 const FALLBACK_COLORS = [
@@ -41,20 +41,18 @@ const FALLBACK_COLORS = [
 ];
 
 const X_FIELD = 'Год';
-const SOURCE_KEY = 'services';   // ключ источника из вкладки Sources
-const TITLE = 'Услуги по годам';
-// Пустая строка — подзаголовок не рисуется, шапка становится компактнее.
+const SOURCE_KEY = 'levels';
+const TITLE = 'Услуги по году и уровню власти';
+// Пустая строка — подзаголовок не рисуется, шапка компактнее.
 const SUBTITLE = '';
 
 // --- Демо-режим -------------------------------------------------------------
-// true  — рисуем на зашитых цифрах (проверить оформление без датасета);
-// false — берём данные из вкладки Sources.
 const DEMO = true;
 
 const DEMO_ROWS = [
-    {'Год': '2025', 'Рефакторинг': 82, 'Проактив': 40, 'Онлайн': 9},
-    {'Год': '2026', 'Рефакторинг': 159, 'Проактив': 45, 'Онлайн': 31},
-    {'Год': '2027', 'Рефакторинг': 74, 'Проактив': 5, 'Онлайн': 19},
+    {'Год': '2025', 'Федеральный': 107, 'Региональный': 23, 'Федеральный/Региональный': 1, 'Региональный/Муниципальный': 2},
+    {'Год': '2026', 'Федеральный': 151, 'Региональный': 56, 'Федеральный/Региональный': 6, 'Региональный/Муниципальный': 22},
+    {'Год': '2027', 'Федеральный': 59, 'Региональный': 33, 'Федеральный/Региональный': 0, 'Региональный/Муниципальный': 6},
 ];
 
 // ---------------------------------------------------------------------------
@@ -66,8 +64,6 @@ function toNumber(value) {
     return isNaN(n) ? 0 : n;
 }
 
-// Ответ источника приводим к массиву плоских объектов {Год: '2025', ...}.
-// Поддержаны обе формы: ответ BI API (result_data + fields) и готовый массив.
 function normalizeRows(loaded) {
     if (!loaded) return [];
 
@@ -100,7 +96,7 @@ const showTotals = (params.totals && params.totals[0]) !== 'off';
 
 const rows = DEMO ? DEMO_ROWS : normalizeRows(Editor.getLoadedData());
 
-// Категории оси X по возрастанию.
+// Категории сверху вниз: свежий год сверху, как в вашем визарде.
 const categories = [];
 rows.forEach(function (row) {
     const key = String(row[X_FIELD]);
@@ -112,7 +108,6 @@ categories.sort(function (a, b) {
     return (isNaN(na) || isNaN(nb)) ? String(a).localeCompare(String(b)) : na - nb;
 });
 
-// Меры: сначала описанные в SERIES_SPEC, затем всё остальное, что пришло.
 const known = SERIES_SPEC.map(function (s) { return s.field; });
 const present = [];
 rows.forEach(function (row) {
@@ -161,20 +156,15 @@ const model = {
     showTotals: showTotals,
     brand: BRAND,
     font: FONT,
-    // Отступ шапки от левого края холста. Заголовок ставится по краю
-    // виджета, а не по оси: подписи шкалы уходят левее оси, и заголовок,
-    // выровненный по ней, выглядит утопленным.
+    // Отступ шапки от левого края холста.
     titleX: 16,
-    // Ширина столбца: доля слота и жёсткий максимум в пикселях.
-    barWidthRatio: 0.62,
-    maxBarWidth: 96,
-    // Мелкий сегмент растягивается до этой высоты, чтобы цифра помещалась
-    // внутри блока. Недостающие пиксели снимаются с крупных сегментов, так
-    // что общая высота столбца остаётся верной. 0 — выключить растягивание.
-    minSegmentHeight: 20,
-    // Страховка: если столбец настолько низкий, что минимум не выдержать,
-    // цифра ниже этого порога не рисуется — она осталась бы нечитаемой.
-    insideLabelMinHeight: 13,
+    // Толщина полосы: доля слота и жёсткий максимум в пикселях.
+    barThicknessRatio: 0.5,
+    maxBarThickness: 56,
+    // Узкий сегмент расширяется ровно настолько, чтобы цифра поместилась
+    // внутри блока; недостающие пиксели снимаются с крупных сегментов, так
+    // что общая длина полосы остаётся верной. false — выключить.
+    fitLabels: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -189,7 +179,7 @@ module.exports = {
             const F = m.font;
 
             const W = Math.max(320, parseInt(options && options.width, 10) || 960);
-            const H = Math.max(280, parseInt(options && options.height, 10) || 540);
+            const H = Math.max(240, parseInt(options && options.height, 10) || 480);
 
             const esc = function (value) {
                 return String(value)
@@ -199,17 +189,20 @@ module.exports = {
                     .replace(/"/g, '&quot;');
             };
 
-            // Формат «1 234,5» — узкий разделитель разрядов, запятая в дробной части.
             const fmt = function (value, digits) {
                 const d = digits === undefined ? 0 : digits;
                 const fixed = Math.abs(Number(value)).toFixed(d);
                 const parts = fixed.split('.');
-                parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+                parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
                 return (Number(value) < 0 ? '−' : '') + parts.join(',');
             };
 
-            // Цвет подписи внутри сегмента выбираем по контрасту с заливкой:
-            // белым по тёмной ступени, чернильным — по светлой.
+            // Ширина строки на глаз: цифры в 12 px ≈ 7,2 px на знак.
+            const textW = function (text, size) {
+                return String(text).length * (size || 12) * 0.6;
+            };
+
+            // Цвет подписи внутри сегмента — по контрасту с заливкой.
             const relLum = function (hex) {
                 const c = String(hex).replace('#', '');
                 const ch = [0, 2, 4].map(function (i) {
@@ -234,7 +227,7 @@ module.exports = {
 
             // Легенда считается заранее: от числа рядов зависит высота подвала.
             const itemW = m.series.map(function (s) {
-                return 14 + 8 + s.name.length * 7.2 + 24;   // маркер + зазор + текст + отступ
+                return 14 + 8 + s.name.length * 7.2 + 24;
             });
             const maxRowW = W - 2 * 16;
             const legendRows = [[]];
@@ -249,13 +242,14 @@ module.exports = {
             });
             const ROW_H = 18;
 
-            const headerH = m.title ? (m.subtitle ? 78 : 58) : 28;
-            // Снизу — подписи категорий и столько рядов легенды, сколько вышло.
-            const pad = {top: headerH, right: 24, bottom: 60 + legendRows.length * ROW_H, left: 60};
+            const headerH = m.title ? (m.subtitle ? 78 : 58) : 24;
+            // Справа оставляем место под подпись итога, слева — под год,
+            // снизу — под шкалу и столько рядов легенды, сколько получилось.
+            const pad = {top: headerH, right: 76, bottom: 38 + legendRows.length * ROW_H, left: 72};
             const plotW = Math.max(40, W - pad.left - pad.right);
             const plotH = Math.max(40, H - pad.top - pad.bottom);
+            const x0 = pad.left;
 
-            // Значения с учётом режима: в процентах нормируем каждый стек к 100.
             const value = function (si, ci) {
                 const raw = m.series[si].data[ci] || 0;
                 if (m.mode !== 'percent') return raw;
@@ -266,7 +260,6 @@ module.exports = {
                 return m.mode === 'percent' ? (m.totals[ci] ? 100 : 0) : (m.totals[ci] || 0);
             };
 
-            // «Круглый» максимум оси, с запасом под подпись итога.
             const niceMax = function (v) {
                 if (!(v > 0)) return 10;
                 const pow = Math.pow(10, Math.floor(Math.log(v) / Math.LN10));
@@ -281,9 +274,8 @@ module.exports = {
             for (let ci = 0; ci < m.categories.length; ci++) {
                 peak = Math.max(peak, stackTotal(ci));
             }
-            const yMax = m.mode === 'percent' ? 100 : niceMax(peak * 1.1);
-            const y0 = pad.top + plotH;
-            const scale = function (v) { return yMax ? (v / yMax) * plotH : 0; };
+            const xMax = m.mode === 'percent' ? 100 : niceMax(peak);
+            const scale = function (v) { return xMax ? (v / xMax) * plotW : 0; };
 
             const svg = [];
 
@@ -291,7 +283,6 @@ module.exports = {
                 '" xmlns="http://www.w3.org/2000/svg" font-family="' + esc(F) + '" role="img">');
             svg.push('<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="' + B.bg + '"/>');
 
-            // Заголовки
             if (m.title) {
                 svg.push('<text x="' + m.titleX + '" y="34" fill="' + B.ink +
                     '" font-size="20" font-weight="700">' + esc(m.title) + '</text>');
@@ -301,111 +292,117 @@ module.exports = {
                     '" font-size="13">' + esc(m.subtitle) + '</text>');
             }
 
-            // Сетка и подписи оси Y
+            // Сетка: вертикальные линии, подписи шкалы снизу.
             const tickCount = 5;
             for (let t = 0; t <= tickCount; t++) {
-                const v = (yMax / tickCount) * t;
-                const y = y0 - scale(v);
-                svg.push('<line x1="' + pad.left + '" y1="' + y + '" x2="' + (pad.left + plotW) +
-                    '" y2="' + y + '" stroke="' + (t === 0 ? B.axis : B.grid) +
+                const v = (xMax / tickCount) * t;
+                const x = x0 + scale(v);
+                svg.push('<line x1="' + x + '" y1="' + pad.top + '" x2="' + x +
+                    '" y2="' + (pad.top + plotH) + '" stroke="' + (t === 0 ? B.axis : B.grid) +
                     '" stroke-width="1"' + (t === 0 ? '' : ' stroke-dasharray="4 4"') + '/>');
-                svg.push('<text x="' + (pad.left - 12) + '" y="' + (y + 4) + '" fill="' + B.muted +
-                    '" font-size="12" text-anchor="end">' +
+                svg.push('<text x="' + x + '" y="' + (pad.top + plotH + 20) + '" fill="' + B.muted +
+                    '" font-size="12" text-anchor="middle">' +
                     (m.mode === 'percent' ? fmt(v) + ' %' : fmt(v)) + '</text>');
             }
 
-            // Столбцы
-            const slot = plotW / m.categories.length;
-            const barW = Math.max(8, Math.min(m.maxBarWidth, slot * m.barWidthRatio));
+            // Полосы
+            const slot = plotH / m.categories.length;
+            const barH = Math.max(10, Math.min(m.maxBarThickness, slot * m.barThicknessRatio));
 
             for (let ci = 0; ci < m.categories.length; ci++) {
-                const cx = pad.left + slot * ci + slot / 2;
-                const x = cx - barW / 2;
+                const cy = pad.top + slot * ci + slot / 2;
+                const y = cy - barH / 2;
                 const total = stackTotal(ci);
 
-                // Подпись категории
-                svg.push('<text x="' + cx + '" y="' + (y0 + 26) + '" fill="' + B.muted +
-                    '" font-size="13" text-anchor="middle">' + esc(m.categories[ci]) + '</text>');
+                // Подпись категории слева от оси.
+                svg.push('<text x="' + (x0 - 12) + '" y="' + (cy + 4) + '" fill="' + B.muted +
+                    '" font-size="13" text-anchor="end">' + esc(m.categories[ci]) + '</text>');
 
-                // Видимые сегменты столбца снизу вверх.
+                // Видимые сегменты слева направо.
                 const parts = [];
                 for (let si = 0; si < m.series.length; si++) {
                     const v = value(si, ci);
-                    if (v > 0) parts.push({si: si, v: v, h: scale(v)});
+                    if (v <= 0) continue;
+                    const raw = m.series[si].data[ci] || 0;
+                    const text = m.mode === 'percent' ? fmt(v) + ' %' : fmt(raw);
+                    parts.push({
+                        si: si,
+                        v: v,
+                        raw: raw,
+                        text: text,
+                        w: scale(v),
+                        need: textW(text, 12) + 12,   // цифра плюс поля внутри блока
+                    });
                 }
 
-                // Мелкие сегменты поднимаем до минимальной высоты, чтобы цифра
-                // помещалась внутри блока, а недостающие пиксели снимаем с
-                // крупных — общая высота столбца при этом не меняется.
-                const MIN_SEG = m.minSegmentHeight;
-                const small = parts.filter(function (p) { return p.h < MIN_SEG; });
+                // Узкие сегменты расширяем ровно до размера подписи, недостающие
+                // пиксели снимаем с крупных пропорционально их запасу.
+                if (m.fitLabels) {
+                    const tight = parts.filter(function (p) { return p.w < p.need; });
+                    if (tight.length) {
+                        const deficit = tight.reduce(function (a, p) { return a + (p.need - p.w); }, 0);
+                        const donors = parts.filter(function (p) { return p.w > p.need; });
+                        const surplus = donors.reduce(function (a, p) { return a + (p.w - p.need); }, 0);
 
-                if (MIN_SEG > 0 && small.length) {
-                    const deficit = small.reduce(function (a, p) { return a + (MIN_SEG - p.h); }, 0);
-                    const donors = parts.filter(function (p) { return p.h > MIN_SEG; });
-                    const surplus = donors.reduce(function (a, p) { return a + (p.h - MIN_SEG); }, 0);
-
-                    if (surplus >= deficit) {
-                        const shares = donors.map(function (p) { return (p.h - MIN_SEG) / surplus; });
-                        small.forEach(function (p) { p.h = MIN_SEG; });
-                        donors.forEach(function (p, k) { p.h -= shares[k] * deficit; });
+                        if (surplus >= deficit) {
+                            const shares = donors.map(function (p) { return (p.w - p.need) / surplus; });
+                            tight.forEach(function (p) { p.w = p.need; });
+                            donors.forEach(function (p, k) { p.w -= shares[k] * deficit; });
+                        }
+                        // Иначе полоса слишком коротка, чтобы вместить все цифры:
+                        // оставляем честные пропорции.
                     }
-                    // Иначе столбец слишком низкий, чтобы вместить все цифры:
-                    // оставляем честные пропорции и не растягиваем ничего.
                 }
 
-                const topPart = parts.length ? parts[parts.length - 1] : null;
-                const GAP = 2;   // просвет между сегментами, чтобы стек читался
-                let cursor = y0;
+                const lastPart = parts.length ? parts[parts.length - 1] : null;
+                const GAP = 2;
+                let cursor = x0;
                 let firstDrawn = true;
 
                 parts.forEach(function (p) {
-                    const y = cursor - p.h;
-                    cursor = y;
+                    const x = cursor;
+                    cursor = x + p.w;
 
-                    // Зазор срезается снизу сегмента, поэтому верх стека не «плывёт».
-                    const drawH = Math.max(1, firstDrawn ? p.h : p.h - GAP);
+                    // Зазор срезается слева сегмента, поэтому конец полосы не «плывёт».
+                    const off = firstDrawn ? 0 : GAP;
+                    const drawX = x + off;
+                    const drawW = Math.max(1, p.w - off);
                     firstDrawn = false;
 
                     const color = m.series[p.si].color;
-                    const r = Math.min(4, drawH / 2);
-                    const shape = (p === topPart)
-                        ? '<path d="M' + x + ' ' + (y + drawH) + ' L' + x + ' ' + (y + r) +
-                          ' Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y +
-                          ' L' + (x + barW - r) + ' ' + y +
-                          ' Q' + (x + barW) + ' ' + y + ' ' + (x + barW) + ' ' + (y + r) +
-                          ' L' + (x + barW) + ' ' + (y + drawH) + ' Z" fill="' + color + '"/>'
-                        : '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + drawH +
-                          '" fill="' + color + '"/>';
+                    const r = Math.min(4, drawW / 2);
+                    const shape = (p === lastPart)
+                        ? '<path d="M' + drawX + ' ' + y + ' L' + (drawX + drawW - r) + ' ' + y +
+                          ' Q' + (drawX + drawW) + ' ' + y + ' ' + (drawX + drawW) + ' ' + (y + r) +
+                          ' L' + (drawX + drawW) + ' ' + (y + barH - r) +
+                          ' Q' + (drawX + drawW) + ' ' + (y + barH) + ' ' + (drawX + drawW - r) + ' ' + (y + barH) +
+                          ' L' + drawX + ' ' + (y + barH) + ' Z" fill="' + color + '"/>'
+                        : '<rect x="' + drawX + '" y="' + y + '" width="' + drawW +
+                          '" height="' + barH + '" fill="' + color + '"/>';
 
-                    const raw = m.series[p.si].data[ci] || 0;
-                    const share = m.totals[ci] ? (raw / m.totals[ci]) * 100 : 0;
+                    const share = m.totals[ci] ? (p.raw / m.totals[ci]) * 100 : 0;
                     const hint = m.categories[ci] + ' · ' + m.series[p.si].name + ': ' +
-                        fmt(raw) + ' (' + fmt(share, 1) + ' %)';
+                        fmt(p.raw) + ' (' + fmt(share, 1) + ' %)';
 
                     svg.push('<g><title>' + esc(hint) + '</title>' + shape + '</g>');
 
-                    if (drawH >= m.insideLabelMinHeight) {
-                        svg.push('<text x="' + cx + '" y="' + (y + drawH / 2 + 4) +
+                    if (drawW >= textW(p.text, 12) + 6) {
+                        svg.push('<text x="' + (drawX + drawW / 2) + '" y="' + (cy + 4) +
                             '" fill="' + labelColor(color) + '" font-size="12" font-weight="600" ' +
-                            'text-anchor="middle" pointer-events="none">' +
-                            (m.mode === 'percent' ? fmt(p.v) + ' %' : fmt(raw)) + '</text>');
+                            'text-anchor="middle" pointer-events="none">' + p.text + '</text>');
                     }
                 });
 
-                // ⬇ Сумма в итогах — над столбцом.
-                // В режиме долей столбец упирается в верх шкалы, поэтому
-                // подпись прижимаем к границе области построения.
+                // ⬇ Сумма в итогах — в конце полосы.
                 if (m.showTotals && total > 0) {
-                    const totalY = Math.max(pad.top - 8, cursor - 10);
-                    svg.push('<text x="' + cx + '" y="' + totalY + '" fill="' + B.ink +
-                        '" font-size="13" font-weight="700" text-anchor="middle">' +
+                    svg.push('<text x="' + (cursor + 10) + '" y="' + (cy + 4) + '" fill="' + B.ink +
+                        '" font-size="13" font-weight="700" text-anchor="start">' +
                         (m.mode === 'percent' ? fmt(m.totals[ci]) : fmt(total)) + '</text>');
                 }
             }
 
             // Отрисовка легенды.
-            const legendY0 = H - 26 - (legendRows.length - 1) * ROW_H;
+            const legendY0 = H - 14 - (legendRows.length - 1) * ROW_H;
 
             legendRows.forEach(function (row, ri) {
                 const rw = row.reduce(function (a, it) { return a + it.w; }, 0) - 24;

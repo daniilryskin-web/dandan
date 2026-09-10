@@ -10,18 +10,19 @@
 
 // --- Палитра Минцифры / дизайн-системы Госуслуг -----------------------------
 const BRAND = {
-    blue: '#0D4CD3',      // основной синий
-    blueLight: '#5B8DEF',
-    red: '#EE3F58',       // акцент / внимание
-    green: '#0FA958',     // успех
-    orange: '#F2A200',
-    violet: '#7B61FF',
-    cyan: '#00A0C6',
-    ink: '#0B1F33',       // основной текст
-    muted: '#5A7196',     // вторичный текст
-    grid: '#E4E8EE',
-    axis: '#C9D2DE',
-    bg: '#FFFFFF',
+    // Фирменная фиолетовая гамма: одна гамма, три ступени по светлоте.
+    violet: '#4B2DE8',        // основная ступень
+    violetLight: '#8E7CF2',   // светлая
+    violetDeep: '#4A38AD',    // глубокая
+    // Акценты — на случай, если серий окажется больше трёх.
+    magenta: '#C0397E',
+    ochre: '#8A6A00',
+    teal: '#0A7D9E',
+    ink: '#17123B',           // основной текст
+    muted: '#6B6690',         // вторичный текст
+    grid: '#E7E3F5',
+    axis: '#CFC9E8',
+    bg: '#FAF9FE',            // холст, едва тонированный в лиловый
 };
 
 // Ubuntu — гарнитура дизайн-системы Госуслуг, дальше системный запас.
@@ -29,14 +30,14 @@ const FONT = "Ubuntu, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
 
 // Порядок = порядок укладки стека снизу вверх.
 const SERIES_SPEC = [
-    {field: 'Рефакторинг', color: BRAND.green},
-    {field: 'Проактив', color: BRAND.red},
-    {field: 'Онлайн', color: BRAND.blue},
+    {field: 'Рефакторинг', color: BRAND.violet},
+    {field: 'Проактив', color: BRAND.violetLight},
+    {field: 'Онлайн', color: BRAND.violetDeep},
 ];
 
 const FALLBACK_COLORS = [
-    BRAND.blue, BRAND.red, BRAND.green, BRAND.orange,
-    BRAND.violet, BRAND.cyan, BRAND.blueLight, BRAND.muted,
+    BRAND.violet, BRAND.violetLight, BRAND.violetDeep,
+    BRAND.magenta, BRAND.ochre, BRAND.teal,
 ];
 
 const X_FIELD = 'Год';
@@ -195,6 +196,23 @@ module.exports = {
                 return (Number(value) < 0 ? '−' : '') + parts.join(',');
             };
 
+            // Цвет подписи внутри сегмента выбираем по контрасту с заливкой:
+            // белым по тёмной ступени, чернильным — по светлой.
+            const relLum = function (hex) {
+                const c = String(hex).replace('#', '');
+                const ch = [0, 2, 4].map(function (i) {
+                    const v = parseInt(c.substr(i, 2), 16) / 255;
+                    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+                });
+                return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+            };
+            const labelColor = function (fill) {
+                const l = relLum(fill);
+                const onWhite = 1.05 / (l + 0.05);
+                const onInk = (l + 0.05) / (relLum(B.ink) + 0.05);
+                return onWhite >= onInk ? '#FFFFFF' : B.ink;
+            };
+
             if (!m.categories.length || !m.series.length) {
                 return Editor.generateHtml(
                     '<div style="font-family:' + F + ';color:' + B.muted +
@@ -285,6 +303,9 @@ module.exports = {
                 }
 
                 let cursor = y0;
+                let firstDrawn = true;
+                const GAP = 2;   // просвет между сегментами, чтобы стек читался
+
                 for (let si = 0; si < m.series.length; si++) {
                     const v = value(si, ci);
                     if (v <= 0) continue;
@@ -293,15 +314,19 @@ module.exports = {
                     const y = cursor - h;
                     cursor = y;
 
+                    // Зазор срезается снизу сегмента, поэтому верх стека не «плывёт».
+                    const drawH = Math.max(1, firstDrawn ? h : h - GAP);
+                    firstDrawn = false;
+
                     const color = m.series[si].color;
-                    const r = Math.min(3, h);
+                    const r = Math.min(4, drawH / 2);
                     const shape = (si === topIndex)
-                        ? '<path d="M' + x + ' ' + (y + h) + ' L' + x + ' ' + (y + r) +
+                        ? '<path d="M' + x + ' ' + (y + drawH) + ' L' + x + ' ' + (y + r) +
                           ' Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y +
                           ' L' + (x + barW - r) + ' ' + y +
                           ' Q' + (x + barW) + ' ' + y + ' ' + (x + barW) + ' ' + (y + r) +
-                          ' L' + (x + barW) + ' ' + (y + h) + ' Z" fill="' + color + '"/>'
-                        : '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + h +
+                          ' L' + (x + barW) + ' ' + (y + drawH) + ' Z" fill="' + color + '"/>'
+                        : '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + drawH +
                           '" fill="' + color + '"/>';
 
                     const raw = m.series[si].data[ci] || 0;
@@ -313,9 +338,9 @@ module.exports = {
 
                     // Подпись внутри сегмента: только если он достаточно крупный.
                     const shareOfStack = total ? v / total : 0;
-                    if (h >= 16 && shareOfStack >= m.minLabelShare) {
-                        svg.push('<text x="' + cx + '" y="' + (y + h / 2 + 4) +
-                            '" fill="#FFFFFF" font-size="12" font-weight="600" ' +
+                    if (drawH >= 16 && shareOfStack >= m.minLabelShare) {
+                        svg.push('<text x="' + cx + '" y="' + (y + drawH / 2 + 4) +
+                            '" fill="' + labelColor(color) + '" font-size="12" font-weight="600" ' +
                             'text-anchor="middle" pointer-events="none">' +
                             (m.mode === 'percent' ? fmt(v) + ' %' : fmt(raw)) + '</text>');
                     }

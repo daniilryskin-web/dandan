@@ -32,7 +32,7 @@ module.exports = {
             fields: fields,
             filters: filters,
             order_by: [
-                {ref: {type: 'title', title: 'Год'}, direction: 'ASC'},
+                {ref: {type: 'title', title: 'Год'}, direction: 'asc'},
             ],
             limit: 1000,
         },

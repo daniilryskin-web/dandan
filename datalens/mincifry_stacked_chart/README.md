@@ -41,21 +41,24 @@ module.exports = {
 Первым аргументом в `fn` всегда приходят параметры чарта (`width`, `height`),
 дальше — элементы `args`.
 
-## Быстрый старт
+## Подключение датасета
 
-В `Prepare.js` стоит `const DEMO = true` — чарт рисуется на зашитых цифрах
-(131 / 235 / 98), можно принять оформление, не подключая датасет. Дальше:
+Во вкладку **Meta** обязательно вписывается id датасета:
 
-1. `DEMO = false` в `Prepare.js`;
-2. в `Meta.json` подставьте ID датасета вместо `PUT_YOUR_DATASET_ID_HERE`
-   (берётся из URL: `.../datasets/<ID>`); в `Sources.js` он читается через
-   `Editor.getId('servicesDataset')`;
-3. названия полей правятся в двух местах: `SERIES_SPEC` / `X_FIELD` в
-   `Prepare.js` и `fields` в `Sources.js`.
+```json
+{"links": {"servicesDataset": "<id из адреса .../datasets/ID>"}}
+```
 
-Ключ источника (`services` в `Sources.js`) должен совпадать с константой
-`SOURCE_KEY` в `Prepare.js` — под этим именем данные приходят в
-`Editor.getLoadedData()`.
+Без этого чарт падает с `Source with id "" was not found in the meta links`:
+`Editor.getId()` не находит ключ и возвращает пустую строку. `Sources.js`
+проверяет id сам и пишет, что именно заполнить.
+
+Названия полей правятся в `SERIES_SPEC` / `X_FIELD` (`Prepare.js`) и в
+`fields` (`Sources.js`). Ключ источника `services` должен совпадать с
+`SOURCE_KEY` — под этим именем данные приходят в `Editor.getLoadedData()`.
+
+Демо-режима в коде нет: `Prepare.js` всегда читает данные источника. Данные
+для локального предпросмотра лежат в `dev/fixture.js`.
 
 ## Сумма в итогах
 

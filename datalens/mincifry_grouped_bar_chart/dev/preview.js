@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 
 const WIDTH = Number(process.argv[2]) || 960;
-const HEIGHT = Number(process.argv[3]) || 540;
+const HEIGHT = Number(process.argv[3]) || 460;
 
 // Заглушка Editor: повторяет контракт методов, которыми пользуется Prepare.
 global.Editor = {
@@ -18,7 +18,7 @@ global.Editor = {
         return require('../Params.js');
     },
     getLoadedData: function () {
-        return {services: require('./fixture.js')};
+        return {grouped: require('./fixture.js')};
     },
     getId: function (key) {
         return require('../Meta.json').links[key];
@@ -41,7 +41,7 @@ const html = wrapped.fn.apply(null, [{width: WIDTH, height: HEIGHT}].concat(wrap
 const page = [
     '<!doctype html>',
     '<html lang="ru"><head><meta charset="utf-8">',
-    '<title>Предпросмотр — Advanced-чарт, стиль Минцифры</title>',
+    '<title>Предпросмотр — Сгруппированные полосы, стиль Минцифры</title>',
     '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap">',
     '<style>body{margin:0;padding:24px;background:#F5F7FA;',
     'font-family:Ubuntu,"Segoe UI","Helvetica Neue",Arial,sans-serif}',

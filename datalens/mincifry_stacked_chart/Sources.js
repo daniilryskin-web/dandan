@@ -5,6 +5,21 @@
 //  ID датасета берётся из поля links вкладки Meta.
 // ============================================================================
 
+// Id датасета DataLens берёт из links вкладки Meta — вкладка Meta должна
+// содержать {"links": {"servicesDataset": "<id датасета>"}}.
+// Если ключа там нет, getId возвращает пустую строку, и чарт падает с
+// «Source with id "" was not found in the meta links»; ловим это сразу и
+// говорим, что именно не заполнено.
+const META_KEY = 'servicesDataset';
+const datasetId = Editor.getId(META_KEY);
+
+if (!datasetId) {
+    throw new Error(
+        'Не задан id датасета. Впишите во вкладку Meta: {"links": {"' +
+        META_KEY + '": "<id датасета из адреса .../datasets/ID>"}}'
+    );
+}
+
 const params = Editor.getParams();
 
 const fields = [
@@ -27,7 +42,7 @@ if (params.year && params.year[0]) {
 
 module.exports = {
     services: {
-        datasetId: Editor.getId('servicesDataset'),
+        datasetId: datasetId,
         data: {
             fields: fields,
             filters: filters,

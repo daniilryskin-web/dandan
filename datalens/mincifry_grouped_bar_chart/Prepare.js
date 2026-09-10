@@ -1,6 +1,6 @@
 // ============================================================================
-//  Вкладка Prepare — Advanced-чарт: горизонтальный стек по годам с суммой
-//  в конце полосы, оформление в палитре Минцифры / Госуслуг.
+//  Вкладка Prepare — Advanced-чарт: сгруппированные горизонтальные полосы.
+//  Категории (ЖС / ЛиР / ТМУ) по вертикали, внутри каждой — по полосе на год.
 //
 //  Код вне Editor.wrapFn исполняется на сервере: здесь готовим данные.
 //  Код внутри Editor.wrapFn исполняется в браузере: там рисуем SVG.
@@ -9,15 +9,18 @@
 // ============================================================================
 
 // --- Палитра ----------------------------------------------------------------
-// Держите в синхроне с вертикальным чартом (mincifry_stacked_chart): это
-// отдельная сущность в DataLens, общего модуля у вкладок нет.
+// Внимание: набор отличается от стековых чартов не по прихоти. В стеке
+// #4B2DE8 и #4A38AD никогда не соприкасаются — между ними светлая ступень.
+// Здесь полосы группы идут вплотную, и эта пара различается всего на ΔE 9.3,
+// то есть читается как один цвет. Третья ступень заменена на маджентовый
+// акцент: набор проходит проверку по всем парам, а не только по соседним.
 const BRAND = {
-    violet: '#4B2DE8',        // основная ступень
-    violetLight: '#8E7CF2',   // светлая
-    violetDeep: '#4A38AD',    // глубокая
-    magenta: '#C0397E',       // акцент для четвёртой серии
+    violetLight: '#8E7CF2',
+    violet: '#4B2DE8',
+    magenta: '#C0397E',
     ochre: '#8A6A00',
     teal: '#0A7D9E',
+    violetDeep: '#4A38AD',
     ink: '#17123B',
     muted: '#6B6690',
     grid: '#E7E3F5',
@@ -27,22 +30,23 @@ const BRAND = {
 
 const FONT = "Ubuntu, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
 
-// Порядок = порядок укладки полосы слева направо.
+// Порядок = порядок полос в группе сверху вниз.
 const SERIES_SPEC = [
-    {field: 'Федеральный', color: BRAND.violet},
-    {field: 'Региональный', color: BRAND.violetLight},
-    {field: 'Федеральный/Региональный', color: BRAND.violetDeep},
-    {field: 'Региональный/Муниципальный', color: BRAND.magenta},
+    {field: '2025', color: BRAND.violetLight},
+    {field: '2026', color: BRAND.violet},
+    {field: '2027', color: BRAND.magenta},
 ];
 
 const FALLBACK_COLORS = [
-    BRAND.violet, BRAND.violetLight, BRAND.violetDeep,
-    BRAND.magenta, BRAND.ochre, BRAND.teal,
+    BRAND.violetLight, BRAND.violet, BRAND.magenta,
+    BRAND.teal, BRAND.ochre, BRAND.violetDeep,
 ];
 
-const X_FIELD = 'Год';
-const SOURCE_KEY = 'levels';
-const TITLE = 'Услуги по году и уровню власти';
+// Поле категории. В вашем датасете оно называется «Год», хотя содержит
+// ЖС / ЛиР / ТМУ, а годами названы меры.
+const CATEGORY_FIELD = 'Год';
+const SOURCE_KEY = 'grouped';
+const TITLE = 'Услуги по типам и годам';
 // Пустая строка — подзаголовок не рисуется, шапка компактнее.
 const SUBTITLE = '';
 
@@ -81,28 +85,21 @@ function normalizeRows(loaded) {
     return [];
 }
 
-const params = Editor.getParams();
-const mode = (params.stacking && params.stacking[0]) === 'percent' ? 'percent' : 'abs';
-
 const rows = normalizeRows(Editor.getLoadedData());
 
-// Категории сверху вниз: свежий год сверху, как в вашем визарде.
+// Порядок категорий — как пришёл из источника: сортировкой распоряжается
+// датасет, а не чарт.
 const categories = [];
 rows.forEach(function (row) {
-    const key = String(row[X_FIELD]);
+    const key = String(row[CATEGORY_FIELD]);
     if (categories.indexOf(key) === -1) categories.push(key);
-});
-categories.sort(function (a, b) {
-    const na = Number(a);
-    const nb = Number(b);
-    return (isNaN(na) || isNaN(nb)) ? String(a).localeCompare(String(b)) : na - nb;
 });
 
 const known = SERIES_SPEC.map(function (s) { return s.field; });
 const present = [];
 rows.forEach(function (row) {
     Object.keys(row).forEach(function (field) {
-        if (field !== X_FIELD && present.indexOf(field) === -1) present.push(field);
+        if (field !== CATEGORY_FIELD && present.indexOf(field) === -1) present.push(field);
     });
 });
 const measures = known.filter(function (f) { return present.indexOf(f) !== -1; })
@@ -110,7 +107,7 @@ const measures = known.filter(function (f) { return present.indexOf(f) !== -1; }
 
 const index = {};
 rows.forEach(function (row) {
-    const key = String(row[X_FIELD]);
+    const key = String(row[CATEGORY_FIELD]);
     index[key] = index[key] || {};
     measures.forEach(function (field) {
         if (row[field] !== undefined) {
@@ -130,30 +127,19 @@ const series = measures.map(function (field, i) {
     };
 });
 
-const totals = categories.map(function (key) {
-    return measures.reduce(function (sum, field) {
-        return sum + ((index[key] && index[key][field]) || 0);
-    }, 0);
-});
-
 const model = {
     title: TITLE,
     subtitle: SUBTITLE,
     categories: categories,
     series: series,
-    totals: totals,
-    mode: mode,
     brand: BRAND,
     font: FONT,
     // Отступ шапки от левого края холста.
     titleX: 16,
-    // Толщина полосы: доля слота и жёсткий максимум в пикселях.
-    barThicknessRatio: 0.5,
-    maxBarThickness: 56,
-    // Узкий сегмент расширяется ровно настолько, чтобы цифра поместилась
-    // внутри блока; недостающие пиксели снимаются с крупных сегментов, так
-    // что общая длина полосы остаётся верной. false — выключить.
-    fitLabels: true,
+    // Геометрия группы.
+    groupRatio: 0.78,      // какую долю слота занимает группа полос
+    maxBarThickness: 34,   // предел толщины одной полосы
+    barGap: 4,             // просвет между полосами внутри группы
 };
 
 // ---------------------------------------------------------------------------
@@ -186,12 +172,10 @@ module.exports = {
                 return (Number(value) < 0 ? '−' : '') + parts.join(',');
             };
 
-            // Ширина строки на глаз: цифры в 12 px ≈ 7,2 px на знак.
             const textW = function (text, size) {
                 return String(text).length * (size || 12) * 0.6;
             };
 
-            // Цвет подписи внутри сегмента — по контрасту с заливкой.
             const relLum = function (hex) {
                 const c = String(hex).replace('#', '');
                 const ch = [0, 2, 4].map(function (i) {
@@ -232,22 +216,11 @@ module.exports = {
             const ROW_H = 18;
 
             const headerH = m.title ? (m.subtitle ? 78 : 58) : 24;
-            // Справа оставляем место под подпись итога, слева — под год,
-            // снизу — под шкалу и столько рядов легенды, сколько получилось.
-            const pad = {top: headerH, right: 76, bottom: 38 + legendRows.length * ROW_H, left: 72};
+            // Справа — место под подпись, вынесенную за короткую полосу.
+            const pad = {top: headerH, right: 56, bottom: 38 + legendRows.length * ROW_H, left: 76};
             const plotW = Math.max(40, W - pad.left - pad.right);
             const plotH = Math.max(40, H - pad.top - pad.bottom);
             const x0 = pad.left;
-
-            const value = function (si, ci) {
-                const raw = m.series[si].data[ci] || 0;
-                if (m.mode !== 'percent') return raw;
-                const total = m.totals[ci] || 0;
-                return total ? (raw / total) * 100 : 0;
-            };
-            const stackTotal = function (ci) {
-                return m.mode === 'percent' ? (m.totals[ci] ? 100 : 0) : (m.totals[ci] || 0);
-            };
 
             const niceMax = function (v) {
                 if (!(v > 0)) return 10;
@@ -260,10 +233,10 @@ module.exports = {
             };
 
             let peak = 0;
-            for (let ci = 0; ci < m.categories.length; ci++) {
-                peak = Math.max(peak, stackTotal(ci));
-            }
-            const xMax = m.mode === 'percent' ? 100 : niceMax(peak);
+            m.series.forEach(function (s) {
+                s.data.forEach(function (v) { peak = Math.max(peak, v || 0); });
+            });
+            const xMax = niceMax(peak);
             const scale = function (v) { return xMax ? (v / xMax) * plotW : 0; };
 
             const svg = [];
@@ -290,103 +263,59 @@ module.exports = {
                     '" y2="' + (pad.top + plotH) + '" stroke="' + (t === 0 ? B.axis : B.grid) +
                     '" stroke-width="1"' + (t === 0 ? '' : ' stroke-dasharray="4 4"') + '/>');
                 svg.push('<text x="' + x + '" y="' + (pad.top + plotH + 20) + '" fill="' + B.muted +
-                    '" font-size="12" text-anchor="middle">' +
-                    (m.mode === 'percent' ? fmt(v) + ' %' : fmt(v)) + '</text>');
+                    '" font-size="12" text-anchor="middle">' + fmt(v) + '</text>');
             }
 
-            // Полосы
+            // Группы полос
+            const n = m.series.length;
             const slot = plotH / m.categories.length;
-            const barH = Math.max(10, Math.min(m.maxBarThickness, slot * m.barThicknessRatio));
+            const groupH = Math.min(slot * m.groupRatio, n * m.maxBarThickness + (n - 1) * m.barGap);
+            const barH = Math.max(4, (groupH - (n - 1) * m.barGap) / n);
 
             for (let ci = 0; ci < m.categories.length; ci++) {
-                const cy = pad.top + slot * ci + slot / 2;
-                const y = cy - barH / 2;
-                const total = stackTotal(ci);
+                const groupTop = pad.top + slot * ci + (slot - groupH) / 2;
 
-                // Подпись категории слева от оси.
-                svg.push('<text x="' + (x0 - 12) + '" y="' + (cy + 4) + '" fill="' + B.muted +
-                    '" font-size="13" text-anchor="end">' + esc(m.categories[ci]) + '</text>');
+                // Подпись категории — по центру группы.
+                svg.push('<text x="' + (x0 - 12) + '" y="' + (groupTop + groupH / 2 + 4) +
+                    '" fill="' + B.ink + '" font-size="13" font-weight="600" text-anchor="end">' +
+                    esc(m.categories[ci]) + '</text>');
 
-                // Видимые сегменты слева направо.
-                const parts = [];
-                for (let si = 0; si < m.series.length; si++) {
-                    const v = value(si, ci);
-                    if (v <= 0) continue;
-                    const raw = m.series[si].data[ci] || 0;
-                    const text = m.mode === 'percent' ? fmt(v) + ' %' : fmt(raw);
-                    parts.push({
-                        si: si,
-                        v: v,
-                        raw: raw,
-                        text: text,
-                        w: scale(v),
-                        need: textW(text, 12) + 12,   // цифра плюс поля внутри блока
-                    });
-                }
+                for (let si = 0; si < n; si++) {
+                    const v = m.series[si].data[ci] || 0;
+                    const y = groupTop + si * (barH + m.barGap);
+                    const color = m.series[si].color;
+                    const text = fmt(v);
+                    const hint = m.categories[ci] + ' · ' + m.series[si].name + ': ' + text;
 
-                // Узкие сегменты расширяем ровно до размера подписи, недостающие
-                // пиксели снимаем с крупных пропорционально их запасу.
-                if (m.fitLabels) {
-                    const tight = parts.filter(function (p) { return p.w < p.need; });
-                    if (tight.length) {
-                        const deficit = tight.reduce(function (a, p) { return a + (p.need - p.w); }, 0);
-                        const donors = parts.filter(function (p) { return p.w > p.need; });
-                        const surplus = donors.reduce(function (a, p) { return a + (p.w - p.need); }, 0);
-
-                        if (surplus >= deficit) {
-                            const shares = donors.map(function (p) { return (p.w - p.need) / surplus; });
-                            tight.forEach(function (p) { p.w = p.need; });
-                            donors.forEach(function (p, k) { p.w -= shares[k] * deficit; });
-                        }
-                        // Иначе полоса слишком коротка, чтобы вместить все цифры:
-                        // оставляем честные пропорции.
+                    // Нулевое значение полосой не нарисовать — ставим цифру у оси,
+                    // иначе год молча исчезает из группы.
+                    if (v <= 0) {
+                        svg.push('<text x="' + (x0 + 6) + '" y="' + (y + barH / 2 + 4) +
+                            '" fill="' + B.muted + '" font-size="12">' + text + '</text>');
+                        continue;
                     }
-                }
 
-                const lastPart = parts.length ? parts[parts.length - 1] : null;
-                const GAP = 2;
-                let cursor = x0;
-                let firstDrawn = true;
+                    const w = scale(v);
+                    const r = Math.min(4, w / 2, barH / 2);
+                    svg.push('<g><title>' + esc(hint) + '</title>' +
+                        '<path d="M' + x0 + ' ' + y + ' L' + (x0 + w - r) + ' ' + y +
+                        ' Q' + (x0 + w) + ' ' + y + ' ' + (x0 + w) + ' ' + (y + r) +
+                        ' L' + (x0 + w) + ' ' + (y + barH - r) +
+                        ' Q' + (x0 + w) + ' ' + (y + barH) + ' ' + (x0 + w - r) + ' ' + (y + barH) +
+                        ' L' + x0 + ' ' + (y + barH) + ' Z" fill="' + color + '"/></g>');
 
-                parts.forEach(function (p) {
-                    const x = cursor;
-                    cursor = x + p.w;
-
-                    // Зазор срезается слева сегмента, поэтому конец полосы не «плывёт».
-                    const off = firstDrawn ? 0 : GAP;
-                    const drawX = x + off;
-                    const drawW = Math.max(1, p.w - off);
-                    firstDrawn = false;
-
-                    const color = m.series[p.si].color;
-                    const r = Math.min(4, drawW / 2);
-                    const shape = (p === lastPart)
-                        ? '<path d="M' + drawX + ' ' + y + ' L' + (drawX + drawW - r) + ' ' + y +
-                          ' Q' + (drawX + drawW) + ' ' + y + ' ' + (drawX + drawW) + ' ' + (y + r) +
-                          ' L' + (drawX + drawW) + ' ' + (y + barH - r) +
-                          ' Q' + (drawX + drawW) + ' ' + (y + barH) + ' ' + (drawX + drawW - r) + ' ' + (y + barH) +
-                          ' L' + drawX + ' ' + (y + barH) + ' Z" fill="' + color + '"/>'
-                        : '<rect x="' + drawX + '" y="' + y + '" width="' + drawW +
-                          '" height="' + barH + '" fill="' + color + '"/>';
-
-                    const share = m.totals[ci] ? (p.raw / m.totals[ci]) * 100 : 0;
-                    const hint = m.categories[ci] + ' · ' + m.series[p.si].name + ': ' +
-                        fmt(p.raw) + ' (' + fmt(share, 1) + ' %)';
-
-                    svg.push('<g><title>' + esc(hint) + '</title>' + shape + '</g>');
-
-                    if (drawW >= textW(p.text, 12) + 6) {
-                        svg.push('<text x="' + (drawX + drawW / 2) + '" y="' + (cy + 4) +
+                    // Цифра внутри полосы, если помещается; иначе сразу за её концом.
+                    // Стек здесь не при чём, поэтому вынос ничего не искажает.
+                    const fitsInside = w >= textW(text, 12) + 16 && barH >= 14;
+                    if (fitsInside) {
+                        svg.push('<text x="' + (x0 + w - 8) + '" y="' + (y + barH / 2 + 4) +
                             '" fill="' + labelColor(color) + '" font-size="12" font-weight="600" ' +
-                            'text-anchor="middle" pointer-events="none">' + p.text + '</text>');
+                            'text-anchor="end" pointer-events="none">' + text + '</text>');
+                    } else {
+                        svg.push('<text x="' + (x0 + w + 6) + '" y="' + (y + barH / 2 + 4) +
+                            '" fill="' + B.ink + '" font-size="12" font-weight="600" ' +
+                            'text-anchor="start" pointer-events="none">' + text + '</text>');
                     }
-                });
-
-                // ⬇ Сумма в итогах — в конце полосы.
-                if (total > 0) {
-                    svg.push('<text x="' + (cursor + 10) + '" y="' + (cy + 4) + '" fill="' + B.ink +
-                        '" font-size="13" font-weight="700" text-anchor="start">' +
-                        (m.mode === 'percent' ? fmt(m.totals[ci]) : fmt(total)) + '</text>');
                 }
             }
 

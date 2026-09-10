@@ -46,17 +46,6 @@ const TITLE = 'Услуги по годам';
 // Пустая строка — подзаголовок не рисуется, шапка становится компактнее.
 const SUBTITLE = '';
 
-// --- Демо-режим -------------------------------------------------------------
-// true  — рисуем на зашитых цифрах (проверить оформление без датасета);
-// false — берём данные из вкладки Sources.
-const DEMO = true;
-
-const DEMO_ROWS = [
-    {'Год': '2025', 'Рефакторинг': 82, 'Проактив': 40, 'Онлайн': 9},
-    {'Год': '2026', 'Рефакторинг': 159, 'Проактив': 45, 'Онлайн': 31},
-    {'Год': '2027', 'Рефакторинг': 74, 'Проактив': 5, 'Онлайн': 19},
-];
-
 // ---------------------------------------------------------------------------
 //  Серверная часть: данные → модель чарта
 // ---------------------------------------------------------------------------
@@ -96,9 +85,8 @@ function normalizeRows(loaded) {
 
 const params = Editor.getParams();
 const mode = (params.stacking && params.stacking[0]) === 'percent' ? 'percent' : 'abs';
-const showTotals = (params.totals && params.totals[0]) !== 'off';
 
-const rows = DEMO ? DEMO_ROWS : normalizeRows(Editor.getLoadedData());
+const rows = normalizeRows(Editor.getLoadedData());
 
 // Категории оси X по возрастанию.
 const categories = [];
@@ -158,7 +146,6 @@ const model = {
     series: series,
     totals: totals,
     mode: mode,
-    showTotals: showTotals,
     brand: BRAND,
     font: FONT,
     // Отступ шапки от левого края холста. Заголовок ставится по краю
@@ -396,7 +383,7 @@ module.exports = {
                 // ⬇ Сумма в итогах — над столбцом.
                 // В режиме долей столбец упирается в верх шкалы, поэтому
                 // подпись прижимаем к границе области построения.
-                if (m.showTotals && total > 0) {
+                if (total > 0) {
                     const totalY = Math.max(pad.top - 8, cursor - 10);
                     svg.push('<text x="' + cx + '" y="' + totalY + '" fill="' + B.ink +
                         '" font-size="13" font-weight="700" text-anchor="middle">' +

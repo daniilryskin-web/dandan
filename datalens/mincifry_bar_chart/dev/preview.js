@@ -18,7 +18,7 @@ global.Editor = {
         return require('../Params.js');
     },
     getLoadedData: function () {
-        return {};   // при DEMO = true не используется
+        return {levels: require('./fixture.js')};
     },
     getId: function (key) {
         return require('../Meta.json').links[key];

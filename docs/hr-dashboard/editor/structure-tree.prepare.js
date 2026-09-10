@@ -109,6 +109,7 @@ var THEME = {
     link: '#B7C4D2', rule: '#DFE4EA',
     deputy: '#12665A', deputyBg: '#D5EBE5',
     hit: '#8A4B12', hitBg: '#FBEBD6',
+    vacancy: '#8C6A1F', vacancyBg: '#FBF3E0', vacancyLine: '#D9BE7E',
     panelHead: '#F2F5F9', zebra: '#F7F9FB',
     warn: '#C79A4A', warnBg: '#F7EEDC',
     crit: '#A8382A', critBg: '#F6E3DF',
@@ -134,11 +135,11 @@ LEVELS.forEach(function (level, index) { LEVEL_RANK[level.key] = index; });
 var COLUMNS = [
     'Блок', 'Проект', 'Руководитель', 'Продукт кратко', 'риск',
     'R4', 'R3', 'R2', 'R1', 'R0', 'людей', 'вакансий', 'ФОТ_мес',
-    'заместитель', 'команда', 'Сотрудник'
+    'заместитель', 'команда', 'Сотрудник', 'вакансии'
 ];
 
 // Колонки, без которых чарт работает: их может не быть в старой выгрузке.
-var OPTIONAL = ['заместитель', 'команда', 'Сотрудник'];
+var OPTIONAL = ['заместитель', 'команда', 'Сотрудник', 'вакансии'];
 
 // Параметр селектора → колонка, по которой он фильтрует.
 //
@@ -720,8 +721,15 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
             .map(function (item) { return item.trim(); })
             .filter(function (item) { return item.length > 0; });
 
+        // Открытые позиции ролями: «Администратор проекта; Специалист × 2».
+        var openings = String(cell(row, at('вакансии')) || '')
+            .split(';')
+            .map(function (item) { return item.trim(); })
+            .filter(function (item) { return item.length > 0; });
+
         var product = {
             team: team,
+            openings: openings,
             name: String(row[at('Продукт кратко')] || ''),
             counts: counts,
             people: Number(row[at('людей')]) || 0,
@@ -958,11 +966,14 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
         deputyBg: THEME.deputyBg,
         panelBg: THEME.card,
         headBg: THEME.panelHead,
+        vacancyColor: THEME.vacancy,
+        vacancyBg: THEME.vacancyBg,
+        vacancyLine: THEME.vacancyLine,
         zebra: THEME.zebra,
         roleColor: ROLE_COLOR,
         panelLine: THEME.chiefLine,
         panelInk: THEME.ink,
-        note: 'клик по продукту — состав команды',
+        note: 'клик по продукту — состав команды и открытые позиции',
         filters: active,
         unknown: unknown || [],
         skipped: skipped || [],
@@ -992,6 +1003,7 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
             id: options.id || '',
             deputy: options.deputy || '',
             team: options.team || [],
+            openings: options.openings || [],
             meta: options.meta || '',
             metaColor: options.metaColor || THEME.inkFaint,
             badge: compose(options.counts),
@@ -1055,8 +1067,12 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
                           ' · ' + money(product.fot) + ' ₽';
 
                     var productBox = pushNode(3, product.row, {
-                        id: empty ? '' : 'p' + scene.nodes.length,
+                        // Раскрывать нечего, только если нет ни команды,
+                        // ни открытых позиций.
+                        id: (empty && !product.openings.length)
+                            ? '' : 'p' + scene.nodes.length,
                         team: product.team,
+                        openings: product.openings,
                         counts: product.counts, fill: fill, stroke: stroke,
                         color: empty ? THEME.inkFaint : color,
                         title: product.name, weight: 500,
@@ -1403,7 +1419,8 @@ module.exports = {
 
             // Панель команды рисуется последней — она ложится поверх узлов
             // ниже по дереву, не сдвигая раскладку.
-            if (openNode && openNode.node.team.length) {
+            if (openNode && (openNode.node.team.length ||
+                             openNode.node.openings.length)) {
                 var node = openNode.node;
                 var members = node.team.map(function (item) {
                     var cut = item.indexOf(' — ');
@@ -1414,7 +1431,11 @@ module.exports = {
 
                 var lineH = 19;
                 var headH = 52;
-                var panelH = headH + members.length * lineH + 10;
+                // Открытые позиции идут после состава, отбитые заголовком:
+                // это не команда, а то, чего в ней не хватает.
+                var openHead = node.openings.length ? 20 : 0;
+                var panelH = headH + members.length * lineH + openHead +
+                             node.openings.length * lineH + 10;
                 var panelW = openNode.w;
                 var panelX = openNode.x;
                 // Панель всегда под узлом, а полотно растёт под неё. Раньше
@@ -1507,6 +1528,49 @@ module.exports = {
                         esc(member.role) + '</text>'
                     );
                 });
+
+                // Открытые позиции: пунктирный кружок вместо цветной точки
+                // роли — место в команде есть, человека нет.
+                if (node.openings.length) {
+                    var openY = panelY + headH + members.length * lineH;
+                    parts.push(
+                        '<rect x="' + (panelX + 1) + '" y="' + openY + '" width="' +
+                        (panelW - 2) + '" height="' +
+                        (openHead + node.openings.length * lineH) + '" fill="' +
+                        scene.vacancyBg + '"/>'
+                    );
+                    parts.push(
+                        '<path d="M' + (panelX + 1) + ' ' + openY + 'H' +
+                        (panelX + panelW - 1) + '" stroke="' + scene.vacancyLine +
+                        '" stroke-width="1"/>'
+                    );
+                    parts.push(
+                        '<text x="' + (panelX + 12) + '" y="' + (openY + 14) +
+                        '" font-family="' + scene.font + '" font-size="10" ' +
+                        'font-weight="700" fill="' + scene.vacancyColor + '">' +
+                        esc('ОТКРЫТЫЕ ПОЗИЦИИ') + '</text>'
+                    );
+                    node.openings.forEach(function (opening, i) {
+                        var y = openY + openHead + i * lineH;
+                        parts.push(
+                            '<circle cx="' + (panelX + 18) + '" cy="' + (y + 10) +
+                            '" r="4" fill="none" stroke="' + scene.vacancyColor +
+                            '" stroke-width="1.2" stroke-dasharray="2 2"/>'
+                        );
+                        parts.push(
+                            '<text x="' + (panelX + 30) + '" y="' + (y + 14) +
+                            '" font-family="' + scene.font + '" font-size="11" ' +
+                            'font-weight="600" fill="' + scene.vacancyColor + '">' +
+                            esc('вакансия') + '</text>'
+                        );
+                        parts.push(
+                            '<text x="' + (panelX + panelW - 12) + '" y="' +
+                            (y + 14) + '" text-anchor="end" font-family="' +
+                            scene.font + '" font-size="11" fill="' +
+                            scene.vacancyColor + '">' + esc(opening) + '</text>'
+                        );
+                    });
+                }
             }
 
             var svg =

@@ -820,8 +820,34 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
         .fillna("")
     )
 
-    vacancies = df[df["Вакансия"] == 1].groupby(index).size()
-    table["вакансий"] = vacancies.reindex(table.index).fillna(0).astype(int)
+    open_positions = df[df["Вакансия"] == 1]
+    table["вакансий"] = (
+        open_positions.groupby(index).size()
+        .reindex(table.index).fillna(0).astype(int)
+    )
+
+    # Открытые позиции ролями, одной строкой — как «команда», только про то,
+    # кого ещё ищут. Без этого на карточке видно «+3 вак», но не видно,
+    # три администратора это или три руководителя, а решения тут разные.
+    def openings(rows: pd.DataFrame) -> str:
+        counts = (
+            rows.groupby(["Уровень роли №", "Проектная роль"]).size()
+            .reset_index(name="кол-во")
+            .sort_values(["Уровень роли №", "Проектная роль"],
+                         ascending=[False, True])
+        )
+        return "; ".join(
+            f"{row['Проектная роль']} × {row['кол-во']}"
+            if row["кол-во"] > 1 else row["Проектная роль"]
+            for _, row in counts.iterrows()
+        )
+
+    table["вакансии"] = (
+        open_positions.groupby(index)[["Проектная роль", "Уровень роли №"]]
+        .apply(openings)
+        .reindex(table.index)
+        .fillna("")
+    )
 
     # Тот же светофор незаменимости, что и в основной таблице, и с той же
     # градацией: нулевая ступень нужна продуктам, которые пока держатся
@@ -832,8 +858,8 @@ def sheet_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     ).astype(str)
 
     columns = [f"R{n}" for n in seen] + [
-        "Состав", "людей", "вакансий", "ФОТ_мес", "медиана_ЗП", "риск",
-        "заместитель", "команда",
+        "Состав", "людей", "вакансий", "вакансии", "ФОТ_мес", "медиана_ЗП",
+        "риск", "заместитель", "команда",
     ]
     table = table[columns].sort_values(["Блок", "Проект", "людей"],
                                        ascending=[True, True, False])

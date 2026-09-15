@@ -695,16 +695,11 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
     // и одна новая роль во всей выгрузке заставляла числа на узлах выше
     // продукта задваиваться.
     var rosterUsable = rosterKnown;
-    var unknownRoles = {};
     rosters.forEach(function (members, index) {
         if (members.length !== (Number(rows[index][at('людей')]) || 0)) {
             rosterUsable = false;
         }
-        members.forEach(function (member) {
-            if (!member.level) { unknownRoles[member.role || '(без роли)'] = true; }
-        });
     });
-    var unknownList = Object.keys(unknownRoles).sort();
 
     var uniquePeople = {};
     rosters.forEach(function (members) { mergeMembers(uniquePeople, members); });
@@ -999,7 +994,6 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
         panelInk: THEME.ink,
         note: 'клик по продукту — состав команды и открытые позиции',
         filters: active,
-        unknownRoles: unknownList,
         unknown: unknown || [],
         skipped: skipped || [],
         debugParams: DEBUG_PARAMS ? String(dump || '') : '',
@@ -1298,14 +1292,8 @@ module.exports = {
             // Служебная строка отдельно от легенды: приписанная в конец
             // первой строки, она уезжала за край и оставалась незамеченной.
             var service = '';
-            var alarm = scene.unknown.length > 0 || scene.skipped.length > 0 ||
-                        scene.unknownRoles.length > 0;
-            if (scene.unknownRoles.length) {
-                service = '⚠ роли вне классификатора: ' +
-                          scene.unknownRoles.join(', ') +
-                          '  — добавьте их в ROLE_TO_LEVEL, иначе эти люди ' +
-                          'считаются, но в полосе состава идут серым';
-            } else if (scene.unknown.length) {
+            var alarm = scene.unknown.length > 0 || scene.skipped.length > 0;
+            if (scene.unknown.length) {
                 service = '⚠ параметр пришёл, но фильтра под него нет: ' +
                           scene.unknown.join(', ') +
                           '  — добавьте это имя в FILTERS и Params';

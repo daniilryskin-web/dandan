@@ -131,6 +131,13 @@ Object.keys(ROLE_TO_LEVEL).forEach(function (role) {
 var LEVEL_RANK = {};
 LEVELS.forEach(function (level, index) { LEVEL_RANK[level.key] = index; });
 
+// Ступень для ролей, которых нет в ROLE_TO_LEVEL. Такие люди всё равно
+// должны считаться: раньше одна незнакомая роль отключала пересчёт по
+// фамилиям целиком, и числа на узлах выше продукта начинали задваиваться.
+// Теперь человек попадает сюда, а роль называется в предупреждении.
+var OTHER_KEY = 'R?';
+var OTHER_COLOR = '#9AA4B2';
+
 // Порядок колонок должен совпадать со списком полей на вкладке Sources.
 var COLUMNS = [
     'Блок', 'Проект', 'Руководитель', 'Продукт кратко', 'риск',
@@ -541,16 +548,21 @@ function money(value) {
 function emptyCounts() {
     var counts = {};
     LEVELS.forEach(function (level) { counts[level.key] = 0; });
+    counts[OTHER_KEY] = 0;
     return counts;
 }
 
 function addCounts(target, source) {
     LEVELS.forEach(function (level) { target[level.key] += source[level.key]; });
+    target[OTHER_KEY] += source[OTHER_KEY] || 0;
 }
 
 // Тот же вид, что в бейджах drawio: пять чисел от старших ролей к младшим.
+// Незнакомые роли приписываются шестым числом через «+», чтобы сумма бейджа
+// всегда сходилась с численностью слева от него.
 function compose(counts) {
-    return LEVELS.map(function (level) { return counts[level.key]; }).join('-');
+    var text = LEVELS.map(function (level) { return counts[level.key]; }).join('-');
+    return counts[OTHER_KEY] ? text + '+' + counts[OTHER_KEY] : text;
 }
 
 function segments(counts) {
@@ -559,6 +571,9 @@ function segments(counts) {
         var n = counts[level.key];
         if (n) { out.push({ n: n, color: level.color }); }
     });
+    if (counts[OTHER_KEY]) {
+        out.push({ n: counts[OTHER_KEY], color: OTHER_COLOR });
+    }
     return out;
 }
 
@@ -623,7 +638,8 @@ function countsOfMembers(members) {
     var counts = emptyCounts();
     Object.keys(members).forEach(function (name) {
         var level = members[name].level;
-        if (counts[level] !== undefined) { counts[level] += 1; }
+        if (level && counts[level] !== undefined) { counts[level] += 1; }
+        else { counts[OTHER_KEY] += 1; }
     });
     return counts;
 }
@@ -673,21 +689,22 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
         return rosterKnown ? parseRoster(cell(row, at('команда'))) : [];
     });
 
-    // Пересчёт по фамилиям делаем, только если состав читается целиком:
-    // у каждого участника распознана роль и число фамилий совпадает с
-    // колонкой «людей». Иначе честнее оставить суммы — они хотя бы не
-    // потеряют людей.
+    // Пересчёт по фамилиям делаем, если состав читается целиком: число
+    // фамилий совпадает с колонкой «людей». Незнакомая роль пересчёт НЕ
+    // отменяет — для счёта людей важны фамилии, а не роли. Раньше отменяла,
+    // и одна новая роль во всей выгрузке заставляла числа на узлах выше
+    // продукта задваиваться.
     var rosterUsable = rosterKnown;
+    var unknownRoles = {};
     rosters.forEach(function (members, index) {
-        if (!rosterUsable) { return; }
         if (members.length !== (Number(rows[index][at('людей')]) || 0)) {
             rosterUsable = false;
-            return;
         }
         members.forEach(function (member) {
-            if (!member.level) { rosterUsable = false; }
+            if (!member.level) { unknownRoles[member.role || '(без роли)'] = true; }
         });
     });
+    var unknownList = Object.keys(unknownRoles).sort();
 
     var uniquePeople = {};
     rosters.forEach(function (members) { mergeMembers(uniquePeople, members); });
@@ -712,9 +729,16 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
 
     rows.forEach(function (row, index) {
         var counts = emptyCounts();
+        var known = 0;
         LEVELS.forEach(function (level) {
             counts[level.key] = Number(row[at(level.key)]) || 0;
+            known += counts[level.key];
         });
+        // На листе R4…R0 приходят колонками, и человек с ролью вне
+        // классификатора не попадает ни в одну из них. Добираем разницу,
+        // иначе полоса состава не сойдётся с числом людей.
+        var headcount = Number(row[at('людей')]) || 0;
+        counts[OTHER_KEY] = headcount > known ? headcount - known : 0;
 
         var team = String(cell(row, at('команда')) || '')
             .split(';')
@@ -975,6 +999,7 @@ function buildScene(fields, rows, active, unknown, dump, search, skipped) {
         panelInk: THEME.ink,
         note: 'клик по продукту — состав команды и открытые позиции',
         filters: active,
+        unknownRoles: unknownList,
         unknown: unknown || [],
         skipped: skipped || [],
         debugParams: DEBUG_PARAMS ? String(dump || '') : '',
@@ -1273,8 +1298,14 @@ module.exports = {
             // Служебная строка отдельно от легенды: приписанная в конец
             // первой строки, она уезжала за край и оставалась незамеченной.
             var service = '';
-            var alarm = scene.unknown.length > 0 || scene.skipped.length > 0;
-            if (scene.unknown.length) {
+            var alarm = scene.unknown.length > 0 || scene.skipped.length > 0 ||
+                        scene.unknownRoles.length > 0;
+            if (scene.unknownRoles.length) {
+                service = '⚠ роли вне классификатора: ' +
+                          scene.unknownRoles.join(', ') +
+                          '  — добавьте их в ROLE_TO_LEVEL, иначе эти люди ' +
+                          'считаются, но в полосе состава идут серым';
+            } else if (scene.unknown.length) {
                 service = '⚠ параметр пришёл, но фильтра под него нет: ' +
                           scene.unknown.join(', ') +
                           '  — добавьте это имя в FILTERS и Params';

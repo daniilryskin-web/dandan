@@ -1,43 +1,67 @@
 // ============================================================================
-//  Вкладка Sources — запрос данных из датасета.
-//  Ключ 'status' совпадает с SOURCE_KEY во вкладке Prepare.
+//  Вкладка Sources — два запроса.
+//
+//  'status' — строки по статусам: измерение «Статус» и меры ОЦС / ДК.
+//  'extra'  — скалярные меры без измерения: «Не требуется», «Перенос на 2027»,
+//             «Исключены работы в 2026» и слагаемые формулы оставшихся.
+//
+//  Почему два, а не один: у этих наборов разная форма. Скалярные меры не
+//  разложены по статусам, и в запросе с измерением «Статус» они либо
+//  размножились бы по строкам, либо распались непредсказуемо. Отдельный
+//  запрос без измерения возвращает ровно одну строку с итогами.
 // ============================================================================
 
-// Id датасета DataLens берёт из links вкладки Meta — вкладка Meta должна
-// содержать {"links": {"statusDataset": "<id датасета>"}}.
-// Если ключа там нет, getId возвращает пустую строку, и чарт падает с
-// «Source with id "" was not found in the meta links»; ловим это сразу и
-// говорим, что именно не заполнено.
-const META_KEY = 'statusDataset';
-const datasetId = Editor.getId(META_KEY);
+const STATUS_META_KEY = 'statusDataset';
+// Если все поля лежат в одном датасете — впишите в Meta тот же id обоим
+// ключам. Ключи разные на случай, если меры формулы лежат в другом датасете.
+const EXTRA_META_KEY = 'extraDataset';
 
-if (!datasetId) {
-    throw new Error(
-        'Не задан id датасета. Впишите во вкладку Meta: {"links": {"' +
-        META_KEY + '": "<id датасета из адреса .../datasets/ID>"}}'
-    );
+function requireId(key) {
+    const id = Editor.getId(key);
+    if (!id) {
+        throw new Error(
+            'Не задан id датасета. Впишите во вкладку Meta: {"links": {"' +
+            key + '": "<id датасета из адреса .../datasets/ID>"}}'
+        );
+    }
+    return id;
 }
 
 // Имена полей должны совпадать с датасетом дословно.
-const fields = [
+const statusFields = [
     {ref: {type: 'title', title: 'Статус'}},
     {ref: {type: 'title', title: 'ОЦС2 (индикатор)'}},
     {ref: {type: 'title', title: 'ДК2 (индикатор)'}},
 ];
 
+const extraFields = [
+    {ref: {type: 'title', title: 'ВСЕГО услуг'}},
+    {ref: {type: 'title', title: 'ЛиР (ниже не приводятся)'}},
+    {ref: {type: 'title', title: 'Не требуется ОЦС'}},
+    {ref: {type: 'title', title: 'Не требуется ДК'}},
+    {ref: {type: 'title', title: 'Перенос на 2027 ОЦС'}},
+    {ref: {type: 'title', title: 'Перенос на 2027 ДК'}},
+    {ref: {type: 'title', title: 'Исключены работы в 2026 ОЦС'}},
+    {ref: {type: 'title', title: 'Исключены работы в 2026 ДК'}},
+];
+
 // Фильтр «Статус не принадлежит множеству» из вашего визарда сделан во
 // вкладке Prepare (EXCLUDE_CATEGORIES): строк тут единицы, а имена операций
 // BI API публично не документированы и расходятся между версиями — ошибка в
-// фильтре роняет весь чарт. Если данных станет много, отбор можно перенести
-// сюда, добавив в filters:
-//    {ref: {type: 'title', title: 'Статус'}, operation: 'NIN',
-//     values: ['Уровень достижения, %']}
-// и очистив EXCLUDE_CATEGORIES в Prepare.
+// фильтре роняет весь чарт.
 module.exports = {
     status: {
-        datasetId: datasetId,
+        datasetId: requireId(STATUS_META_KEY),
         data: {
-            fields: fields,
+            fields: statusFields,
+            filters: [],
+            limit: 1000,
+        },
+    },
+    extra: {
+        datasetId: requireId(EXTRA_META_KEY),
+        data: {
+            fields: extraFields,
             filters: [],
             limit: 1000,
         },

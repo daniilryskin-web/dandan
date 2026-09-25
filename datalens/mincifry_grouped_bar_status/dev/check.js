@@ -18,7 +18,7 @@ const path = require('path');
 
 global.Editor = {
     getParams: function () { return require('../Params.js'); },
-    getLoadedData: function () { return {status: require('./fixture.js')}; },
+    getLoadedData: function () { return require('./fixture.js'); },
     getId: function (key) { return require('../Meta.json').links[key]; },
     generateHtml: function (html) { return html; },
     wrapFn: function (conf) { return conf; },

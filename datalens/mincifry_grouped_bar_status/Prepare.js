@@ -1,6 +1,7 @@
 // ============================================================================
 //  Вкладка Prepare — Advanced-чарт: сгруппированные горизонтальные полосы.
-//  Статусы по вертикали, внутри каждого — полоса ОЦС и полоса ДК.
+//  По вертикали статусы, затем причины выбытия и вычисляемые «Оставшиеся»;
+//  внутри каждой группы — полоса ОЦС и полоса ДК.
 //
 //  Код вне Editor.wrapFn исполняется на сервере: здесь готовим данные.
 //  Код внутри Editor.wrapFn исполняется в браузере: там рисуем SVG.
@@ -46,7 +47,62 @@ const FALLBACK_COLORS = [
 ];
 
 const CATEGORY_FIELD = 'Статус';
-const SOURCE_KEY = 'status';
+const STATUS_SOURCE = 'status';
+const EXTRA_SOURCE = 'extra';
+
+// Дополнительные группы из скалярных мер. Ключи внутри values — это label
+// серии из SERIES_SPEC, список — имена поля и его запасные варианты.
+const EXTRA_GROUPS = [
+    {
+        label: 'Не требуется',
+        values: {
+            'ОЦС': ['Не требуется ОЦС', 'Не требуется ОЦС (индикатор)'],
+            'ДК': ['Не требуется ДК', 'Не требуется ДК (индикатор)'],
+        },
+    },
+    {
+        label: 'Перенос на 2027',
+        values: {
+            'ОЦС': ['Перенос на 2027 ОЦС', 'Перенос на 2027 ОЦС (индикатор)'],
+            'ДК': ['Перенос на 2027 ДК', 'Перенос на 2027 ДК (индикатор)'],
+        },
+    },
+    {
+        label: 'Исключены работы в 2026',
+        values: {
+            'ОЦС': ['Исключены работы в 2026 ОЦС', 'Исключены работы в 2026 ОЦС (индикатор)'],
+            'ДК': ['Исключены работы в 2026 ДК', 'Исключены работы в 2026 ДК (индикатор)'],
+        },
+    },
+];
+
+// Оставшиеся считаются по вашей формуле, отдельно для каждого трека:
+//   Оставшиеся ОЦС = ВСЕГО услуг − ЛиР − Не требуется ОЦС
+//                    − Перенос на 2027 ОЦС − Исключены работы в 2026 ОЦС
+//   Оставшиеся ДК  = то же самое с полями ДК
+// enabled: false — группа не рисуется.
+const REMAINING = {
+    enabled: true,
+    label: 'Оставшиеся',
+    base: ['ВСЕГО услуг'],
+    // Вычитается у обоих треков.
+    common: [
+        ['ЛиР (ниже не приводятся)'],
+    ],
+    // Вычитается только у своего трека.
+    perSeries: {
+        'ОЦС': [
+            ['Не требуется ОЦС'],
+            ['Перенос на 2027 ОЦС'],
+            ['Исключены работы в 2026 ОЦС'],
+        ],
+        'ДК': [
+            ['Не требуется ДК'],
+            ['Перенос на 2027 ДК'],
+            ['Исключены работы в 2026 ДК'],
+        ],
+    },
+};
 
 // Фильтр «Статус не принадлежит множеству» из вашего визарда. Сравнение
 // мягкое: неразрывный пробел, двойные пробелы и регистр совпадению не мешают.
@@ -69,10 +125,10 @@ function toNumber(value) {
     return isNaN(n) ? 0 : n;
 }
 
-function normalizeRows(loaded) {
+function normalizeRows(loaded, key) {
     if (!loaded) return [];
 
-    const src = loaded[SOURCE_KEY] || loaded[Object.keys(loaded)[0]];
+    const src = loaded[key];
     if (!src) return [];
 
     if (Array.isArray(src)) return src;
@@ -108,9 +164,46 @@ function norm(value) {
 
 const excluded = EXCLUDE_CATEGORIES.map(norm);
 
-const rows = normalizeRows(Editor.getLoadedData()).filter(function (row) {
+const loaded = Editor.getLoadedData();
+
+const rows = normalizeRows(loaded, STATUS_SOURCE).filter(function (row) {
     return excluded.indexOf(norm(row[CATEGORY_FIELD])) === -1;
 });
+
+// Скалярные меры: строк обычно одна, но если придёт несколько — складываем.
+const extraRows = normalizeRows(loaded, EXTRA_SOURCE);
+
+const extraKeys = [];
+extraRows.forEach(function (row) {
+    Object.keys(row).forEach(function (field) {
+        if (extraKeys.indexOf(field) === -1) extraKeys.push(field);
+    });
+});
+
+// Значение скалярной меры по первому имени из списка, которое реально пришло.
+// null означает «поля нет», и это не то же самое, что ноль: по нулю нельзя
+// отличить отсутствующее поле от честного нуля.
+function extraValue(names) {
+    for (let i = 0; i < names.length; i++) {
+        if (extraKeys.indexOf(names[i]) === -1) continue;
+        return extraRows.reduce(function (sum, row) {
+            return sum + toNumber(row[names[i]]);
+        }, 0);
+    }
+    return null;
+}
+
+// Список полей, которых не хватило: показываем их подписью, иначе группа
+// молча покажет ноль, и это будет выглядеть как настоящие данные.
+const missingFields = [];
+
+function extraValueOrZero(names) {
+    const value = extraValue(names);
+    if (value === null && missingFields.indexOf(names[0]) === -1) {
+        missingFields.push(names[0]);
+    }
+    return value === null ? 0 : value;
+}
 
 function numericPrefix(text) {
     const found = String(text).match(/^\s*(\d+(?:\.\d+)*)/);
@@ -184,20 +277,100 @@ rows.forEach(function (row) {
     });
 });
 
+// --- Группы из строк со статусами -------------------------------------------
+const statusData = {};
+resolved.forEach(function (r) {
+    statusData[r.name] = categories.map(function (key) {
+        return (index[key] && index[key][r.field]) || 0;
+    });
+});
+
+// Сумма по статусам — для сверки с вычисленными «Оставшимися».
+const statusSums = {};
+resolved.forEach(function (r) {
+    statusSums[r.name] = statusData[r.name].reduce(function (a, b) { return a + b; }, 0);
+});
+
+// --- Дополнительные группы из скалярных мер ---------------------------------
+const extraLabels = [];
+const extraData = {};
+resolved.forEach(function (r) { extraData[r.name] = []; });
+
+EXTRA_GROUPS.forEach(function (group) {
+    // Группа попадает в чарт, только если хотя бы одно её поле пришло: пустая
+    // группа из нулей выглядела бы как настоящие данные.
+    const anyPresent = resolved.some(function (r) {
+        const names = group.values[r.name];
+        return names && extraValue(names) !== null;
+    });
+    if (!anyPresent) return;
+
+    extraLabels.push(group.label);
+    resolved.forEach(function (r) {
+        const names = group.values[r.name];
+        extraData[r.name].push(names ? extraValueOrZero(names) : 0);
+    });
+});
+
+// --- Оставшиеся по формуле --------------------------------------------------
+const remainingValues = {};
+let remainingShown = false;
+
+if (REMAINING.enabled) {
+    const base = extraValue(REMAINING.base);
+
+    if (base !== null) {
+        remainingShown = true;
+        resolved.forEach(function (r) {
+            let value = base;
+            REMAINING.common.forEach(function (names) {
+                value -= extraValueOrZero(names);
+            });
+            (REMAINING.perSeries[r.name] || []).forEach(function (names) {
+                value -= extraValueOrZero(names);
+            });
+            remainingValues[r.name] = value;
+        });
+    } else if (missingFields.indexOf(REMAINING.base[0]) === -1) {
+        missingFields.push(REMAINING.base[0]);
+    }
+}
+
+// --- Сборка ----------------------------------------------------------------
+const allCategories = categories
+    .concat(extraLabels)
+    .concat(remainingShown ? [REMAINING.label] : []);
+
 const series = resolved.map(function (r) {
+    const data = statusData[r.name]
+        .concat(extraData[r.name])
+        .concat(remainingShown ? [remainingValues[r.name]] : []);
+
+    // У «Оставшихся» в подсказке — и формула, и сумма по статусам: если они
+    // разошлись, это видно сразу, а не после ручного пересчёта.
+    const hints = allCategories.map(function (label, i) {
+        if (remainingShown && i === allCategories.length - 1) {
+            return REMAINING.label + ' ' + r.name + ': ' + data[i] +
+                ' (сумма по статусам: ' + statusSums[r.name] + ')';
+        }
+        return label + ' · ' + r.name + ': ' + data[i];
+    });
+
     return {
         name: r.name,
         color: r.color,
-        data: categories.map(function (key) {
-            return (index[key] && index[key][r.field]) || 0;
-        }),
+        data: data,
+        hints: hints,
     };
 });
 
 const model = {
     title: TITLE,
     subtitle: SUBTITLE,
-    categories: categories,
+    categories: allCategories,
+    // Поля, которых не оказалось в ответе: без этой подписи недостающая мера
+    // молча превратилась бы в ноль.
+    missingFields: missingFields,
     series: series,
     brand: BRAND,
     font: FONT,
@@ -343,6 +516,14 @@ module.exports = {
                     '" font-size="13">' + esc(m.subtitle) + '</text>');
             }
 
+            // Недостающие поля называем прямо в чарте: иначе группа из нулей
+            // читается как настоящие данные.
+            if (m.missingFields && m.missingFields.length) {
+                svg.push('<text x="' + m.titleX + '" y="' + (headerH - 14) + '" fill="' +
+                    B.muted + '" font-size="12">' +
+                    esc('Нет полей: ' + m.missingFields.join(', ')) + '</text>');
+            }
+
             // Сетка: вертикальные линии, подписи шкалы снизу.
             const tickCount = 5;
             for (let t = 0; t <= tickCount; t++) {
@@ -375,7 +556,8 @@ module.exports = {
                     const y = groupTop + si * (barH + m.barGap);
                     const color = m.series[si].color;
                     const text = fmt(v);
-                    const hint = m.categories[ci] + ' · ' + m.series[si].name + ': ' + text;
+                    const hint = (m.series[si].hints && m.series[si].hints[ci]) ||
+                        (m.categories[ci] + ' · ' + m.series[si].name + ': ' + text);
 
                     // Нулевое значение полосой не нарисовать — ставим цифру у оси,
                     // иначе год молча исчезает из группы.

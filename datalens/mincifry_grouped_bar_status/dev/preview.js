@@ -18,7 +18,7 @@ global.Editor = {
         return require('../Params.js');
     },
     getLoadedData: function () {
-        return {status: require('./fixture.js')};
+        return require('./fixture.js');
     },
     getId: function (key) {
         return require('../Meta.json').links[key];

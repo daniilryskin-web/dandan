@@ -1,5 +1,6 @@
 {
     "links": {
-        "statusDataset": "PUT_YOUR_DATASET_ID_HERE"
+        "statusDataset": "PUT_YOUR_DATASET_ID_HERE",
+        "extraDataset": "PUT_YOUR_DATASET_ID_HERE"
     }
 }

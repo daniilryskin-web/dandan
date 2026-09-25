@@ -1,7 +1,7 @@
 // ============================================================================
-//  Вкладка Prepare — Advanced-чарт: одна полоса-состав.
-//  Измерения нет: три меры складываются в одну полосу во всю ширину,
-//  итог стоит в шапке справа.
+//  Вкладка Prepare — Advanced-чарт: состав услуг по двум трекам.
+//  Каждый трек (ОЦС и ДК) — полоса во всю ширину, разложенная на причины
+//  выбытия и оставшиеся. Итог стоит в шапке справа.
 //
 //  Код вне Editor.wrapFn исполняется на сервере: здесь готовим данные.
 //  Код внутри Editor.wrapFn исполняется в браузере: там рисуем SVG.
@@ -10,6 +10,9 @@
 // ============================================================================
 
 // --- Палитра ----------------------------------------------------------------
+// Порядок сегментов задан ниже; набор проверен по соседним парам, а самый
+// насыщенный цвет отдан «Оставшимся» — это главная часть состава, остальное
+// причины выбытия.
 const BRAND = {
     violet: '#4B2DE8',
     violetLight: '#8E7CF2',
@@ -25,33 +28,65 @@ const BRAND = {
 
 const FONT = "Ubuntu, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
 
-// Порядок = порядок сегментов слева направо.
-// aliases — запасные имена поля: в датасете поле называется «Оставшиеся
-// (индикатор)», а в визарде оно же было «Оставшиеся». Берём то, что реально
-// пришло, чтобы переименование поля не роняло чарт молча.
-// label — как подписать серию в легенде, если имя поля неудобно читать.
-const SERIES_SPEC = [
-    {field: 'ЛиР (ниже не приводятся)', color: BRAND.violet},
-    {field: 'Не требуется ДК', color: BRAND.violetLight},
-    {field: 'Оставшиеся (индикатор)', aliases: ['Оставшиеся'],
-     label: 'Оставшиеся', color: BRAND.violetDeep},
-];
-
-// Поля-итоги в состав полосы попасть не должны: иначе целое сложится дважды.
-const EXCLUDE_FIELDS = ['ВСЕГО услуг', 'ВСЕГО'];
-
-const FALLBACK_COLORS = [
-    BRAND.violet, BRAND.violetLight, BRAND.violetDeep,
-    BRAND.magenta, BRAND.ochre, BRAND.teal,
-];
-
 const SOURCE_KEY = 'composition';
-const TITLE = 'Состав услуг';
+const TITLE = 'Состав услуг по ОЦС и ДК';
 const SUBTITLE = '';
 
 // Подпись к итогу в шапке справа. Пустая строка — только число.
 const TOTAL_LABEL = 'ВСЕГО';
 const SHOW_TOTAL = true;
+
+// Уменьшаемое формулы: из него вычитаются все причины выбытия.
+const BASE_FIELD = ['ВСЕГО услуг', 'ВСЕГО'];
+
+// Треки: по одной полосе на каждый.
+const TRACKS = [
+    {label: 'ОЦС'},
+    {label: 'ДК'},
+];
+
+// Сегменты слева направо.
+//   common    — одно поле на оба трека;
+//   perTrack  — своё поле для каждого трека (ключ = label трека);
+//   remainder — вычисляется как BASE минус все предыдущие сегменты.
+// У каждого поля можно указать запасные имена: те же меры встречаются с
+// суффиксом «(индикатор)».
+const SEGMENTS = [
+    {
+        label: 'ЛиР (ниже не приводятся)',
+        common: ['ЛиР (ниже не приводятся)', 'ЛиР (ниже не приводятся) (индикатор)'],
+        color: BRAND.violetLight,
+    },
+    {
+        label: 'Не требуется',
+        perTrack: {
+            'ОЦС': ['Не требуется ОЦС', 'Не требуется ОЦС (индикатор)'],
+            'ДК': ['Не требуется ДК', 'Не требуется ДК (индикатор)'],
+        },
+        color: BRAND.violetDeep,
+    },
+    {
+        label: 'Перенос на 2027',
+        perTrack: {
+            'ОЦС': ['Перенос на 2027 ОЦС', 'Перенос на 2027 ОЦС (индикатор)'],
+            'ДК': ['Перенос на 2027 ДК', 'Перенос на 2027 ДК (индикатор)'],
+        },
+        color: BRAND.magenta,
+    },
+    {
+        label: 'Исключены работы в 2026',
+        perTrack: {
+            'ОЦС': ['Исключены работы в 2026 ОЦС', 'Исключены работы в 2026 ОЦС (индикатор)'],
+            'ДК': ['Исключены работы в 2026 ДК', 'Исключены работы в 2026 ДК (индикатор)'],
+        },
+        color: BRAND.ochre,
+    },
+    {
+        label: 'Оставшиеся',
+        remainder: true,
+        color: BRAND.violet,
+    },
+];
 
 // ---------------------------------------------------------------------------
 //  Серверная часть: данные → модель
@@ -90,79 +125,124 @@ function normalizeRows(loaded) {
 
 const rows = normalizeRows(Editor.getLoadedData());
 
-// Какие поля вообще пришли.
-const present = [];
+const keys = [];
 rows.forEach(function (row) {
+    // Пустая строка в ответе роняет Object.keys — проверка дешевле разбора
+    // потом по стектрейсу из браузера.
+    if (!row) return;
     Object.keys(row).forEach(function (field) {
-        if (present.indexOf(field) === -1) present.push(field);
+        if (keys.indexOf(field) === -1) keys.push(field);
     });
 });
 
-// Строк обычно одна, но если источник вернёт несколько — складываем: иначе
-// чарт молча показал бы только первую.
-function sumOf(field) {
-    return rows.reduce(function (sum, row) { return sum + toNumber(row[field]); }, 0);
+// Значение меры по первому имени из списка, которое реально пришло.
+// null означает «поля нет» — это не то же самое, что ноль: по нулю нельзя
+// отличить отсутствующее поле от честного нуля.
+// Строк обычно одна, но если источник вернёт несколько — складываем.
+function valueOf(names) {
+    for (let i = 0; i < names.length; i++) {
+        if (keys.indexOf(names[i]) === -1) continue;
+        return rows.reduce(function (sum, row) {
+            return sum + (row ? toNumber(row[names[i]]) : 0);
+        }, 0);
+    }
+    return null;
 }
 
-// Сначала описанные серии — каждая берёт первое из своих имён, которое
-// реально пришло.
-const used = [];
-const series = [];
+// Поля, которых не хватило: называем их в чарте, иначе недостающая мера молча
+// превращается в ноль и выглядит как настоящие данные.
+const missingFields = [];
 
-SERIES_SPEC.forEach(function (spec) {
-    const names = [spec.field].concat(spec.aliases || []);
-    let found = null;
-    for (let i = 0; i < names.length; i++) {
-        if (present.indexOf(names[i]) !== -1) { found = names[i]; break; }
+function valueOrZero(names) {
+    const value = valueOf(names);
+    if (value === null && missingFields.indexOf(names[0]) === -1) {
+        missingFields.push(names[0]);
     }
-    if (!found) return;
+    return value === null ? 0 : value;
+}
 
-    used.push(found);
-    series.push({
-        name: spec.label || spec.field,
-        color: spec.color,
-        value: sumOf(found),
-    });
-});
-
-// Затем всё остальное, что пришло, кроме полей-итогов.
-present.forEach(function (field) {
-    if (used.indexOf(field) !== -1) return;
-    if (EXCLUDE_FIELDS.indexOf(field) !== -1) return;
-    series.push({
-        name: field,
-        color: FALLBACK_COLORS[series.length % FALLBACK_COLORS.length],
-        value: sumOf(field),
-    });
-});
-
-const visible = series.filter(function (s) { return s.value > 0; });
-
-const total = visible.reduce(function (sum, s) { return sum + s.value; }, 0);
-
-// Диагностика: пустая полоса без объяснения читается как поломка вёрстки.
 let problem = null;
-const keys = rows.length ? Object.keys(rows[0]) : [];
+
 if (!rows.length) {
     problem = 'Источник не вернул ни одной строки';
-} else if (!visible.length) {
-    problem = 'Ни одна из мер не пришла со значением больше нуля. Пришли поля: ' +
+}
+
+const base = problem ? null : valueOf(BASE_FIELD);
+
+if (!problem && base === null) {
+    problem = 'В ответе источника нет поля «' + BASE_FIELD[0] + '». Пришли поля: ' +
         keys.join(', ');
+}
+
+// Сегмент виден в легенде, только если он где-то ненулевой: пустая строка
+// легенды ничего не сообщает.
+const tracks = [];
+const usedSegments = {};
+
+if (!problem) {
+    TRACKS.forEach(function (track) {
+        let spent = 0;
+        const segments = [];
+
+        SEGMENTS.forEach(function (spec) {
+            let value;
+
+            if (spec.remainder) {
+                value = base - spent;
+            } else if (spec.common) {
+                value = valueOrZero(spec.common);
+            } else {
+                const names = spec.perTrack && spec.perTrack[track.label];
+                value = names ? valueOrZero(names) : 0;
+            }
+
+            if (!spec.remainder) spent += value;
+            if (value > 0) usedSegments[spec.label] = spec.color;
+
+            segments.push({
+                name: spec.label,
+                color: spec.color,
+                value: value,
+                share: base ? (value / base) * 100 : 0,
+            });
+        });
+
+        tracks.push({
+            label: track.label,
+            segments: segments,
+            total: segments.reduce(function (sum, s) { return sum + Math.max(0, s.value); }, 0),
+            // Отрицательный остаток означает, что вычитаемые не сходятся с
+            // базой: молча рисовать такую полосу нельзя.
+            negative: segments.some(function (s) { return s.value < 0; }),
+        });
+    });
+}
+
+const legend = SEGMENTS
+    .filter(function (spec) { return usedSegments[spec.label]; })
+    .map(function (spec) { return {name: spec.label, color: spec.color}; });
+
+if (!problem && tracks.some(function (t) { return t.negative; })) {
+    problem = 'Сумма вычитаемых больше, чем «' + BASE_FIELD[0] +
+        '»: проверьте поля формулы';
 }
 
 const model = {
     title: TITLE,
     subtitle: SUBTITLE,
-    series: visible,
-    total: total,
+    tracks: tracks,
+    legend: legend,
+    total: base || 0,
     totalLabel: TOTAL_LABEL,
     showTotal: SHOW_TOTAL,
     problem: problem,
+    missingFields: missingFields,
     brand: BRAND,
     font: FONT,
     titleX: 16,
-    // Толщина полосы и её предел по доле высоты холста.
-    barThickness: 56,
+    // Толщина полосы и предел ширины колонки с подписями треков.
+    barThickness: 44,
+    maxLabelWidth: 160,
     // Узкий сегмент расширяется ровно настолько, чтобы цифра поместилась
     // внутри; недостающие пиксели снимаются с крупных, длина полосы не
     // меняется. false — выключить подгонку.
@@ -181,7 +261,7 @@ module.exports = {
             const F = m.font;
 
             const W = Math.max(320, parseInt(options && options.width, 10) || 960);
-            const H = Math.max(140, parseInt(options && options.height, 10) || 220);
+            const H = Math.max(160, parseInt(options && options.height, 10) || 280);
 
             const esc = function (value) {
                 return String(value)
@@ -218,7 +298,9 @@ module.exports = {
                 return onWhite >= onInk ? '#FFFFFF' : B.ink;
             };
 
+            const PAD = 16;
             const svg = [];
+
             svg.push('<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H +
                 '" xmlns="http://www.w3.org/2000/svg" font-family="' + esc(F) + '" role="img">');
             svg.push('<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="' + B.bg + '"/>');
@@ -232,11 +314,9 @@ module.exports = {
                     '" font-size="13">' + esc(m.subtitle) + '</text>');
             }
 
-            // Итог — в шапке справа: полоса занимает всю ширину, за её концом
-            // места для подписи не остаётся.
             if (m.showTotal && m.total > 0) {
                 const totalText = (m.totalLabel ? m.totalLabel + ' ' : '') + fmt(m.total);
-                svg.push('<text x="' + (W - 16) + '" y="34" fill="' + B.ink +
+                svg.push('<text x="' + (W - PAD) + '" y="34" fill="' + B.ink +
                     '" font-size="18" font-weight="700" text-anchor="end">' +
                     esc(totalText) + '</text>');
             }
@@ -251,93 +331,131 @@ module.exports = {
                 );
             }
 
-            const headerH = m.title ? (m.subtitle ? 74 : 54) : 20;
-            const legendH = 34;
-            const PAD = 16;
-            const plotW = Math.max(40, W - PAD * 2);
-            const barH = Math.min(m.barThickness, Math.max(20, H - headerH - legendH - 16));
-            const y = headerH + Math.max(0, (H - headerH - legendH - barH) / 2);
+            let headerH = m.title ? (m.subtitle ? 74 : 54) : 20;
 
-            // Ширины сегментов; узкие расширяем до размера подписи, недостающее
-            // снимаем с крупных пропорционально их запасу.
-            const parts = m.series.map(function (s) {
-                const text = fmt(s.value);
-                return {
-                    s: s,
-                    text: text,
-                    w: m.total ? (s.value / m.total) * plotW : 0,
-                    need: textW(text, 12) + 12,
-                };
-            });
-
-            if (m.fitLabels) {
-                const tight = parts.filter(function (p) { return p.w < p.need; });
-                if (tight.length) {
-                    const deficit = tight.reduce(function (a, p) { return a + (p.need - p.w); }, 0);
-                    const donors = parts.filter(function (p) { return p.w > p.need; });
-                    const surplus = donors.reduce(function (a, p) { return a + (p.w - p.need); }, 0);
-
-                    if (surplus >= deficit) {
-                        const shares = donors.map(function (p) { return (p.w - p.need) / surplus; });
-                        tight.forEach(function (p) { p.w = p.need; });
-                        donors.forEach(function (p, k) { p.w -= shares[k] * deficit; });
-                    }
-                }
+            if (m.missingFields && m.missingFields.length) {
+                svg.push('<text x="' + m.titleX + '" y="' + (headerH - 4) + '" fill="' + B.muted +
+                    '" font-size="12">' +
+                    esc('Нет полей: ' + m.missingFields.join(', ')) + '</text>');
+                headerH += 18;
             }
 
-            const GAP = 2;
-            const R = 4;
-            let cursor = PAD;
-
-            parts.forEach(function (p, i) {
-                const first = i === 0;
-                const last = i === parts.length - 1;
-
-                const x = cursor + (first ? 0 : GAP);
-                const w = Math.max(1, p.w - (first ? 0 : GAP));
-                cursor += p.w;
-
-                // Скругляем только внешние концы полосы.
-                const rl = first ? Math.min(R, w / 2) : 0;
-                const rr = last ? Math.min(R, w / 2) : 0;
-
-                svg.push('<g><title>' + esc(p.s.name + ': ' + p.text + ' (' +
-                    fmt(m.total ? (p.s.value / m.total) * 100 : 0, 1) + ' %)') + '</title>' +
-                    '<path d="M' + (x + rl) + ' ' + y +
-                    ' L' + (x + w - rr) + ' ' + y +
-                    (rr ? ' Q' + (x + w) + ' ' + y + ' ' + (x + w) + ' ' + (y + rr) : '') +
-                    ' L' + (x + w) + ' ' + (y + barH - rr) +
-                    (rr ? ' Q' + (x + w) + ' ' + (y + barH) + ' ' + (x + w - rr) + ' ' + (y + barH) : '') +
-                    ' L' + (x + rl) + ' ' + (y + barH) +
-                    (rl ? ' Q' + x + ' ' + (y + barH) + ' ' + x + ' ' + (y + barH - rl) : '') +
-                    ' L' + x + ' ' + (y + rl) +
-                    (rl ? ' Q' + x + ' ' + y + ' ' + (x + rl) + ' ' + y : '') +
-                    ' Z" fill="' + p.s.color + '"/></g>');
-
-                if (w >= textW(p.text, 12) + 6) {
-                    svg.push('<text x="' + (x + w / 2) + '" y="' + (y + barH / 2 + 4) +
-                        '" fill="' + labelColor(p.s.color) + '" font-size="12" font-weight="600" ' +
-                        'text-anchor="middle" pointer-events="none">' + p.text + '</text>');
-                }
-            });
-
-            // Легенда по центру снизу; при нехватке ширины переносится по рядам.
-            const itemW = m.series.map(function (s) {
-                return 14 + 8 + s.name.length * 7.2 + 24;
+            // Легенда считается заранее: от числа рядов зависит высота подвала.
+            const itemW = m.legend.map(function (it) {
+                return 14 + 8 + it.name.length * 7.2 + 24;
             });
             const maxRowW = W - 2 * PAD;
             const legendRows = [[]];
             let rowW = 0;
-            m.series.forEach(function (s, i) {
+            m.legend.forEach(function (it, i) {
                 if (legendRows[legendRows.length - 1].length && rowW + itemW[i] - 24 > maxRowW) {
                     legendRows.push([]);
                     rowW = 0;
                 }
-                legendRows[legendRows.length - 1].push({series: s, w: itemW[i]});
+                legendRows[legendRows.length - 1].push({item: it, w: itemW[i]});
                 rowW += itemW[i];
             });
 
             const ROW_H = 18;
+            const legendH = 16 + legendRows.length * ROW_H;
+
+            // Колонка подписей треков — по самой длинной, но не шире предела.
+            let labelW = 0;
+            m.tracks.forEach(function (t) { labelW = Math.max(labelW, textW(t.label, 13)); });
+            const labelColW = Math.min(m.maxLabelWidth, Math.max(30, W * 0.25),
+                Math.ceil(labelW) + 4);
+
+            const x0 = PAD + labelColW + 12;
+            const plotW = Math.max(40, W - x0 - PAD);
+            const plotH = Math.max(30, H - headerH - legendH);
+
+            // Обе полосы меряются одной шкалой: иначе треки нельзя сравнивать.
+            let maxTotal = 0;
+            m.tracks.forEach(function (t) { maxTotal = Math.max(maxTotal, t.total); });
+            const scale = function (v) { return maxTotal ? (v / maxTotal) * plotW : 0; };
+
+            const slot = plotH / Math.max(1, m.tracks.length);
+            const barH = Math.min(m.barThickness, Math.max(16, slot * 0.62));
+
+            m.tracks.forEach(function (track, ti) {
+                const cy = headerH + slot * ti + slot / 2;
+                const y = cy - barH / 2;
+
+                svg.push('<text x="' + (x0 - 12) + '" y="' + (cy + 4) + '" fill="' + B.ink +
+                    '" font-size="13" font-weight="600" text-anchor="end">' +
+                    esc(track.label) + '</text>');
+
+                const parts = track.segments
+                    .filter(function (s) { return s.value > 0; })
+                    .map(function (s) {
+                        const text = fmt(s.value);
+                        return {
+                            s: s,
+                            text: text,
+                            w: scale(s.value),
+                            need: textW(text, 12) + 12,
+                        };
+                    });
+
+                if (m.fitLabels) {
+                    const tight = parts.filter(function (p) { return p.w < p.need; });
+                    if (tight.length) {
+                        const deficit = tight.reduce(function (a, p) { return a + (p.need - p.w); }, 0);
+                        const donors = parts.filter(function (p) { return p.w > p.need; });
+                        const surplus = donors.reduce(function (a, p) { return a + (p.w - p.need); }, 0);
+
+                        if (surplus >= deficit) {
+                            const shares = donors.map(function (p) { return (p.w - p.need) / surplus; });
+                            tight.forEach(function (p) { p.w = p.need; });
+                            donors.forEach(function (p, k) { p.w -= shares[k] * deficit; });
+                        }
+                    }
+                }
+
+                const GAP = 2;
+                const R = 4;
+                let cursor = x0;
+
+                parts.forEach(function (p, i) {
+                    const first = i === 0;
+                    const last = i === parts.length - 1;
+
+                    const x = cursor + (first ? 0 : GAP);
+                    const w = Math.max(1, p.w - (first ? 0 : GAP));
+                    cursor += p.w;
+
+                    const rl = first ? Math.min(R, w / 2) : 0;
+                    const rr = last ? Math.min(R, w / 2) : 0;
+
+                    svg.push('<g><title>' + esc(track.label + ' · ' + p.s.name + ': ' +
+                        p.text + ' (' + fmt(p.s.share, 1) + ' %)') + '</title>' +
+                        '<path d="M' + (x + rl) + ' ' + y +
+                        ' L' + (x + w - rr) + ' ' + y +
+                        (rr ? ' Q' + (x + w) + ' ' + y + ' ' + (x + w) + ' ' + (y + rr) : '') +
+                        ' L' + (x + w) + ' ' + (y + barH - rr) +
+                        (rr ? ' Q' + (x + w) + ' ' + (y + barH) + ' ' + (x + w - rr) + ' ' + (y + barH) : '') +
+                        ' L' + (x + rl) + ' ' + (y + barH) +
+                        (rl ? ' Q' + x + ' ' + (y + barH) + ' ' + x + ' ' + (y + barH - rl) : '') +
+                        ' L' + x + ' ' + (y + rl) +
+                        (rl ? ' Q' + x + ' ' + y + ' ' + (x + rl) + ' ' + y : '') +
+                        ' Z" fill="' + p.s.color + '"/></g>');
+
+                    if (w >= textW(p.text, 12) + 6) {
+                        svg.push('<text x="' + (x + w / 2) + '" y="' + (y + barH / 2 + 4) +
+                            '" fill="' + labelColor(p.s.color) + '" font-size="12" ' +
+                            'font-weight="600" text-anchor="middle" pointer-events="none">' +
+                            p.text + '</text>');
+                    }
+                });
+
+                // Итог трека подписываем, только если он разошёлся с базой:
+                // при сходящейся формуле это было бы одно и то же число трижды.
+                if (m.total && track.total !== m.total) {
+                    svg.push('<text x="' + (cursor + 8) + '" y="' + (cy + 4) + '" fill="' +
+                        B.muted + '" font-size="12">' + fmt(track.total) + '</text>');
+                }
+            });
+
             const legendY0 = H - 14 - (legendRows.length - 1) * ROW_H;
 
             legendRows.forEach(function (row, ri) {
@@ -347,9 +465,9 @@ module.exports = {
 
                 row.forEach(function (it) {
                     svg.push('<rect x="' + lx + '" y="' + (ly - 9) +
-                        '" width="10" height="10" rx="2" fill="' + it.series.color + '"/>');
+                        '" width="10" height="10" rx="2" fill="' + it.item.color + '"/>');
                     svg.push('<text x="' + (lx + 18) + '" y="' + ly + '" fill="' + B.ink +
-                        '" font-size="13">' + esc(it.series.name) + '</text>');
+                        '" font-size="13">' + esc(it.item.name) + '</text>');
                     lx += it.w;
                 });
             });

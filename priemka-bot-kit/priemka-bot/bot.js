@@ -455,7 +455,9 @@ async function askFolder(chatId, s) {
 
   /* Папки и записи — одним списком по страницам: в обзоре на одном уровне бывают и те и другие. */
   const items = [
-    ...dirs.map((d) => btn('📁 ' + d.name, 'dir:' + keyFor(d.name))),
+    // В обзоре на кнопке папки — сколько видео в ней со всеми вложенными папками.
+    ...dirs.map((d) => btn(s.cmd === 'browse' ? cut(`📁 ${d.name} — ${videos(countUnder(d.path))}`, 60) : '📁 ' + d.name,
+      'dir:' + keyFor(d.name))),
     ...records.map((f) => btn(cut(`🎞 ${f.name.replace(/\.[^.]+$/, '')} · ${mb(f.size)} · ${fmtDate(f.created)}`, 60),
       'rec:' + keyFor(f))),
   ];
@@ -477,7 +479,9 @@ async function askFolder(chatId, s) {
   const f = FLOW[s.cmd] || FLOW.upload;
   const info = s.cmd === 'browse'
     ? (records.length || dirs.length
-      ? `Папок: ${dirs.length}, записей: ${records.length}` + (pages > 1 ? ` · страница ${page + 1} из ${pages}` : '')
+      ? (dirs.length
+        ? `Папок: ${dirs.length} · всего видео: ${countUnder(folder)}` + (records.length ? ` (здесь: ${records.length})` : '')
+        : `Видео в папке: ${records.length}`) + (pages > 1 ? ` · страница ${page + 1} из ${pages}` : '')
       : 'Здесь пока пусто.')
     : (pages > 1 ? `Страница ${page + 1} из ${pages}` : '');
   const text = [flowHead(s, 'folder'), RULE, f.ask, info].filter(Boolean).join('\n');
@@ -487,6 +491,17 @@ async function askFolder(chatId, s) {
   console.log(`   [шаг] MAX ${Date.now() - tSend} мс, всего ${Date.now() - t0} мс`);
   return r;
 }
+
+/** Сколько записей лежит в папке со всеми вложенными — по индексу, без запросов к Диску.
+ *  Индекс обновляется после каждой загрузки, переноса и удаления и раз в 6 часов целиком;
+ *  если видео клали на Диск руками — «Обновить структуру папок» в админке. */
+function countUnder(folder) {
+  const pre = ckey(folder).replace(/\/+$/, '') + '/';
+  let n = 0;
+  for (const list of scrIndex.values()) for (const f of list) if (ckey(f.path).startsWith(pre)) n++;
+  return n;
+}
+const videos = (n) => (n ? `${n} видео` : 'пусто');
 
 /** Папка существует и подпапок в ней нет — в неё можно загружать. */
 async function isBottomFolder(segments) {

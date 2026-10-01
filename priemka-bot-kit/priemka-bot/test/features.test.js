@@ -166,7 +166,7 @@ test('4.17 замена — только после подтверждения �
 test('4.3 обзор: папки и записи, карточка с действиями; гостю обзор не положен', async () => {
   await press(EDITOR_CHAT, EDITOR, 'cmd:browse');
   for (const f of ['ГК-1', 'ОП-1', 'Код-направления 01', 'Система А']) await click(EDITOR_CHAT, EDITOR, '📁 ' + f);
-  assert.match(lastText(EDITOR_CHAT), /Папок: 0, записей: 2/);
+  assert.match(lastText(EDITOR_CHAT), /Видео в папке: 2/);
   await click(EDITOR_CHAT, EDITOR, '🎞 SCR#2222222');
   assert.match(lastText(EDITOR_CHAT), /🎞 Видеозапись[\s\S]*SCR#2222222/);
   const b = buttons(EDITOR_CHAT);
@@ -175,12 +175,33 @@ test('4.3 обзор: папки и записи, карточка с дейст
   }
   assert.ok(!b.some((t) => t.includes('Удалить запись')), 'руководителю удаление не положено');
   await click(EDITOR_CHAT, EDITOR, 'К папке');
-  assert.match(lastText(EDITOR_CHAT), /записей: 2/);
+  assert.match(lastText(EDITOR_CHAT), /Видео в папке: 2/);
 
   await say(VIEWER_CHAT, VIEWER, '/start');
   assert.ok(!buttons(VIEWER_CHAT).some((t) => t.includes('Обзор')));
   await press(VIEWER_CHAT, VIEWER, 'cmd:browse');
   assert.match(lastText(VIEWER_CHAT), /недоступно/);
+});
+
+test('обзор: на каждом уровне — сколько видео внутри, со всеми вложенными папками', async () => {
+  await bot.warmTree();
+  await press(EDITOR_CHAT, EDITOR, 'cmd:browse');
+  // Всего видео на корневом уровне — столько, сколько записей в индексе (всё дерево).
+  const root = lastText(EDITOR_CHAT);
+  const total = [...bot.state().scrIndex.values()].flat().length;
+  assert.match(root, new RegExp(`Папок: 2 · всего видео: ${total}`));
+  const b = buttons(EDITOR_CHAT);
+  const gk1 = b.find((t) => t.startsWith('📁 ГК-1'));
+  assert.match(gk1, /^📁 ГК-1 — \d+ видео$/);
+  await click(EDITOR_CHAT, EDITOR, '📁 ГК-1');
+  await click(EDITOR_CHAT, EDITOR, '📁 ОП-1');
+  await click(EDITOR_CHAT, EDITOR, '📁 Код-направления 01');
+  assert.ok(buttons(EDITOR_CHAT).includes('📁 Система А — 2 видео'), buttons(EDITOR_CHAT).join(' | '));
+  assert.ok(buttons(EDITOR_CHAT).some((t) => t.startsWith('📁 Система Б — ')));
+  await press(EDITOR_CHAT, EDITOR, 'cmd:browse');
+  await click(EDITOR_CHAT, EDITOR, '📁 ГК-2');
+  assert.ok(buttons(EDITOR_CHAT).some((t) => t === '📁 ОП-02 — пусто'));
+  await press(EDITOR_CHAT, EDITOR, 'cmd:menu');
 });
 
 test('4.16 страницы: 15 периодов — по 10 кнопок с переключателем', async () => {

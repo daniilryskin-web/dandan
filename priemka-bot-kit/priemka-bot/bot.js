@@ -772,15 +772,14 @@ async function adminRoute(chatId, userId, payload, s) {
   }
 
   if (payload === 'adm:reports') {
+    /* Журнал — одним файлом за любой период. Отдельные кнопки месяцев убраны: «Указать
+     * период» → «09.2026» даёт тот же месяц, да ещё с итогами, а список кнопок не растёт
+     * каждый месяц. Старые кнопки месяцев в истории чата по-прежнему работают (admlog:). */
     const ms = await journal.months();
-    const buttons = ms.slice(0, 6).map((m) =>
-      btn(`🗒 Журнал за ${journal.monthTitle(m.ym)}`, 'admlog:' + m.ym));
-    if (!ms.length) buttons.push(btn('🗒 Журнал пока пуст', 'adm:reports'));
-    else {
-      // Один файл за любой период: весь журнал, текущий или прошлый месяц, свои даты.
-      buttons.unshift(btn('🗂 Весь журнал одним файлом', 'admrange:all'), btn('📅 Указать период', 'adm:period'));
-      buttons.splice(2, 0, btn('🗓 Этот месяц', 'admrange:this'), btn('🗓 Прошлый месяц', 'admrange:prev'));
-    }
+    const buttons = ms.length
+      ? [btn('🗂 Весь журнал одним файлом', 'admrange:all'), btn('🗓 Этот месяц', 'admrange:this'),
+        btn('🗓 Прошлый месяц', 'admrange:prev'), btn('📅 Указать период', 'adm:period')]
+      : [btn('🗒 Журнал пока пуст', 'adm:reports')];
     buttons.push(btn('🕒 Последние действия', 'adm:recent'));
     buttons.push(btn('📋 Сверка с реестром', 'adm:registry'));
     buttons.push(btn('📊 Что на Диске', 'adm:stats'));

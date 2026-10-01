@@ -447,6 +447,7 @@ test('журнал за период: весь журнал одним файл�
   for (const want of ['Весь журнал одним файлом', 'Указать период', 'Этот месяц', 'Прошлый месяц']) {
     assert.ok(b.some((t) => t.includes(want)), `нет «${want}»: ${b.join(' | ')}`);
   }
+  assert.ok(!b.some((t) => t.startsWith('🗒 Журнал за')), 'кнопок отдельных месяцев больше нет');
   await click(ADMIN_CHAT, ADMIN, 'Весь журнал одним файлом');
   const all = lastFilePost(ADMIN_CHAT);
   assert.match(all.text, /Журнал действий за 01\.\d{2}\.\d{4} – /);

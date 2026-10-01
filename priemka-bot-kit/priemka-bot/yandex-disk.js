@@ -497,8 +497,10 @@ export async function waitOperation(href, { timeoutMs = 20 * 60_000, initialDela
       throw new DiskError(`Неизвестный статус операции: ${JSON.stringify(status)}`);
     }
     if (Date.now() + delay >= deadline) {
+      // code='timeout' — бот отличает «ещё идёт» от настоящего отказа и ждёт дальше в фоне.
       throw new DiskError(
         `Операция не завершилась за ${Math.round(timeoutMs / 1000)} с. Файл может долиться позже`,
+        { code: 'timeout' },
       );
     }
     await sleep(delay);
@@ -633,16 +635,25 @@ export async function freeSpace() {
  * Содержимое папки: подпапки и файлы отдельно. На этом стоит весь опросник —
  * бот спускается по дереву, пока внизу есть папки, и не знает заранее, сколько уровней.
  */
-export async function listFolder(folder, { limit = 200 } = {}) {
+export async function listFolder(folder) {
   const path = normalizePath(folder);
-  const url = buildUrl('/disk/resources', {
-    path,
-    limit,
-    sort: 'name',
-    fields: '_embedded.items.name,_embedded.items.type,_embedded.items.path,_embedded.items.size,_embedded.items.created',
-  });
-  const { body } = await apiRequest('GET', url, { expect: [200], context: `Список ${folder}`, path });
-  const items = body?._embedded?.items ?? [];
+  /* Постранично: одна страница — не больше PAGE элементов, и раньше всё, что дальше
+   * двухсотого, в опросник просто не попадало. Читаем, пока страница полная. */
+  const PAGE = 200;
+  const items = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const url = buildUrl('/disk/resources', {
+      path,
+      limit: PAGE,
+      offset,
+      sort: 'name',
+      fields: '_embedded.items.name,_embedded.items.type,_embedded.items.path,_embedded.items.size,_embedded.items.created',
+    });
+    const { body } = await apiRequest('GET', url, { expect: [200], context: `Список ${folder}`, path });
+    const page = body?._embedded?.items ?? [];
+    items.push(...page);
+    if (page.length < PAGE) break;
+  }
   return {
     dirs: items.filter((i) => i.type === 'dir').map((i) => ({ name: i.name, path: i.path })),
     files: items
@@ -655,8 +666,10 @@ export async function listFolder(folder, { limit = 200 } = {}) {
  * Поиск файла по подстроке имени. Обхода дерева НЕ делаем: /resources/files отдаёт
  * плоский список всех файлов Диска сразу с путями — замерено 07.09.2026.
  * Дисковый список постраничный, поэтому идём по offset, пока не кончится.
+ * Верхнего предела по умолчанию нет: раньше он стоял на 1000 файлов всего Диска,
+ * и всё, что дальше, поиск не видел — «записи нет» на существующий номер.
  */
-export async function findFiles(substring, { limit = 1000 } = {}) {
+export async function findFiles(substring, { limit = Infinity } = {}) {
   const needle = String(substring).toLowerCase();
   const found = [];
   const PAGE = 200;

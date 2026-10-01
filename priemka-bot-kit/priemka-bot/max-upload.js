@@ -60,34 +60,96 @@ async function api(method, path, { query = {}, body = null } = {}) {
   return json;
 }
 
-/** Залить файл в MAX по ссылке на источник и получить токен вложения. */
-async function uploadMedia({ kind, filename, source }) {
+/* Выдача записи раньше скачивала файл с Диска ЦЕЛИКОМ в память и только потом отдавала
+ * в MAX: видео на 2 ГБ занимало 2 ГБ оперативной памяти. Теперь байты идут потоком —
+ * кусок пришёл с Диска, кусок ушёл в MAX, — и память от размера видео не зависит.
+ *
+ * Тело multipart собираем сами, а длину считаем заранее и шлём в Content-Length: для сервера
+ * загрузки MAX запрос выглядит так же, как раньше из FormData (проверено: без chunked).
+ *
+ * Если потоковая отправка всё же не удалась, файлы до FALLBACK_MAX уходят старым способом,
+ * через память. Крупнее — честная ошибка: старый способ на них всё равно уронил бы бота. */
+const FALLBACK_MAX = 300 * 1024 * 1024;
+
+// Имя в заголовке части экранируем так же, как это делает FormData.
+const quoteName = (name) => String(name).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+
+async function startUpload(kind) {
   // Замерено 07.09.2026: формы ответа для разных типов РАЗНЫЕ, в документации это не сказано.
   //   type=video → {url, token} — токен выдаётся сразу, ДО загрузки байтов;
   //   type=file  → {url}        — токен здесь не приходит, ищем его в ответе uploader'а
   //                              (там же может прийти «<retval>1</retval>», это просто «ок»).
   const started = await api('POST', '/uploads', { query: { type: kind } });
-  const url = started?.url;
-  const preToken = started?.token ?? null;
-  if (!url) throw new SendError('MAX не вернул url для загрузки');
+  if (!started?.url) throw new SendError('MAX не вернул url для загрузки');
+  return { url: started.url, preToken: started.token ?? null };
+}
 
-  // Тело целиком уходит в память: FormData требует готовый Blob.
+async function openSource(source) {
   const src = await fetch(String(source), { signal: AbortSignal.timeout(15 * 60_000) });
   if (!src.ok) throw new SendError(`Источник отдал HTTP ${src.status} — файл скачать не удалось`);
-  const payload = await src.blob();
+  return src;
+}
 
-  const form = new FormData();
-  form.append('data', payload, filename);
-
-  const up = await fetch(url, {
+async function postStream(url, src, filename, size) {
+  const boundary = '----priemka' + Math.random().toString(16).slice(2) + Date.now().toString(16);
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="data"; filename="${quoteName(filename)}"\r\n` +
+    `Content-Type: application/octet-stream\r\n\r\n`, 'utf8');
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+  const reader = src.body.getReader();
+  const body = new ReadableStream({
+    start(c) { c.enqueue(head); },
+    async pull(c) {
+      const { done, value } = await reader.read();
+      if (done) { c.enqueue(tail); c.close(); } else c.enqueue(value);
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+  return fetch(url, {
     method: 'POST',
-    body: form,
+    body,
+    duplex: 'half',
+    headers: {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': String(head.length + size + tail.length),
+    },
     signal: AbortSignal.timeout(30 * 60_000),
   });
+}
+
+async function postFromMemory(url, src, filename) {
+  const form = new FormData();
+  form.append('data', await src.blob(), filename);
+  return fetch(url, { method: 'POST', body: form, signal: AbortSignal.timeout(30 * 60_000) });
+}
+
+/** Один заход загрузки: новый url в MAX, свежее скачивание с Диска, отправка. */
+async function uploadOnce(kind, filename, source, size, mode) {
+  const { url, preToken } = await startUpload(kind);
+  const src = await openSource(source);
+  // Размер берём из ответа источника — он точнее метаданных, если файл успели заменить.
+  const len = Number(src.headers.get('content-length')) || Number(size) || 0;
+  const up = (mode === 'stream' && len > 0 && src.body)
+    ? await postStream(url, src, filename, len)
+    : await postFromMemory(url, src, filename);
   const text = await up.text();
   if (!up.ok) {
     throw new SendError(`Загрузка в MAX не удалась: HTTP ${up.status} ${redact(text).slice(0, 200)}`, { status: up.status });
   }
+  return { text, preToken };
+}
+
+/** Залить файл в MAX по ссылке на источник и получить токен вложения. */
+async function uploadMedia({ kind, filename, source, size }) {
+  let res;
+  try {
+    res = await uploadOnce(kind, filename, source, size, 'stream');
+  } catch (e) {
+    if (!(Number(size) > 0 && Number(size) <= FALLBACK_MAX)) throw e;
+    console.error(`   потоковая отправка ${filename} не удалась (${redact(e.message).slice(0, 160)}) — пробую через память`);
+    res = await uploadOnce(kind, filename, source, size, 'memory');
+  }
+  const { text, preToken } = res;
 
   let parsed = null;
   try { parsed = text ? JSON.parse(text) : null; } catch { /* для видео приходит не JSON — это норма */ }
@@ -149,6 +211,6 @@ export async function sendFileFromUrl(chatId, { url, filename, size, caption = '
   if (Number(size) > FILE_LIMIT) {
     throw new SendError(`Файл ${filename} весит ${(size / 1024 ** 3).toFixed(2)} ГБ — это больше потолка MAX в 4 ГБ`);
   }
-  const attachToken = await uploadMedia({ kind: 'file', filename, source: url });
+  const attachToken = await uploadMedia({ kind: 'file', filename, source: url, size });
   await sendMedia(chatId, { kind: 'file', attachToken, text: caption, buttons });
 }

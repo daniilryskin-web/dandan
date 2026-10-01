@@ -14,8 +14,9 @@
  */
 
 import * as disk from './yandex-disk.js';
+import { ROOT } from './config.js';
 
-const FOLDER = ['Видеопоказы', '_Журнал'];
+const FOLDER = [ROOT, '_Журнал'];
 const HEADER = ['Дата', 'Время', 'Кто (номер)', 'Кто (имя)', 'Действие', 'SCR', 'Где', 'Результат'];
 const BOM = '\uFEFF';
 
@@ -42,6 +43,9 @@ let chain = Promise.resolve();
  * @param {string} [e.where] путь или адресат
  * @param {string} [e.result] чем кончилось
  */
+/** Дождаться, пока все поставленные в очередь строки журнала записаны (для автотестов). */
+export const flushed = () => chain;
+
 export function log(e) {
   chain = chain.then(() => write(e)).catch((err) => {
     // Журнал не должен ронять работу бота: не смогли записать — жалуемся в консоль и живём дальше.
@@ -125,6 +129,9 @@ export async function exportPeople(access, roles) {
   await disk.uploadBuffer(Buffer.from(body, 'utf8'), path, { overwrite: true });
   return { path, name, size: Buffer.byteLength(body) };
 }
+
+/** Путь к журналу месяца «2026-09» — бот выдаёт его администратору файлом. */
+export const monthPath = (ym) => disk.joinPath(...FOLDER, `${ym}.csv`);
 
 /** Какие месяцы уже есть в журнале — для выбора при выгрузке. */
 export async function months() {

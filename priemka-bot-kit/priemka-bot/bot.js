@@ -14,24 +14,25 @@
  * бот спускается вглубь, пока в папке есть подпапки, — число уровней нигде не зашито.
  */
 
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import * as disk from './yandex-disk.js';
 import { sendFileFromUrl, SendError } from './max-upload.js';
 import * as journal from './journal.js';
+import {
+  ROOT, ADMINS, YANDEX_TOKEN_ISSUED, YANDEX_TOKEN_DAYS, LOW_SPACE_BYTES, BOT_DIR, dataFile,
+} from './config.js';
 
 const API = 'https://platform-api2.max.ru';
-const ROOT = 'Видеопоказы';
 const BACKUP = 'BackUp';
 const SCR_DIGITS = 7;                    // «SCR#6512028» — решение Эмиля, проверяем строго
 const STATE_TTL_MS = 30 * 60_000;        // получас на диалог, потом всё забываем
 const POLL_TIMEOUT_SEC = 30;
 
-/* Кто управляет доступом. Держим в коде намеренно: список админов меняется раз в год,
- * а если его положить в тот же файл, что и обычных пользователей, любой админ сможет
+/* Кто управляет доступом — ADMINS из config.js: берётся из .env (ADMINS=…), а если там
+ * пусто — основной администратор, записанный в config.js. Отдельно от access.json намеренно:
+ * если положить админов в тот же файл, что и обычных пользователей, любой админ сможет
  * случайно разжаловать всех остальных, включая себя. */
-const ADMINS = [
-  90235418,   // Даниил Рыскин, МЦ
-];
 
 /* Роли. Проверяем не «кто ты», а «что тебе можно» — так добавить четвёртую роль
  * будет правкой одной таблицы, а не поиском проверок по всему файлу. */
@@ -54,7 +55,7 @@ function can(userId, what) {
 /* А вот список допущенных живёт в ФАЙЛЕ: людей добавляют часто, и каждый раз править
  * код и перезапускать бота — плохой способ. Кого нет ни в файле, ни в ADMINS, бот не пускает:
  * пропавший или повреждённый файл не должен открывать доступ всем подряд. */
-const ACCESS_FILE = new URL('./access.json', import.meta.url);
+const ACCESS_FILE = dataFile('access.json');
 
 function loadAccess() {
   let text;
@@ -68,14 +69,14 @@ function loadAccess() {
     if (Array.isArray(j.allowed)) return j.allowed;
   } catch {}
   // Откладываем, а не затираем: первая же выдача доступа иначе перезаписала бы файл.
-  try { renameSync(ACCESS_FILE, new URL('./access.json.broken', import.meta.url)); } catch {}
+  try { renameSync(ACCESS_FILE, dataFile('access.json.broken')); } catch {}
   console.error('access.json повреждён и отложен в access.json.broken: пускаю только администраторов из кода');
   return [];
 }
 /* Через временный файл и переименование: оборванная запись не оставит полфайла. На Windows
  * антивирус иногда держит файл долю секунды, поэтому несколько попыток. */
 function saveAccess(list) {
-  const tmp = new URL('./access.json.tmp', import.meta.url);
+  const tmp = dataFile('access.json.tmp');
   for (let i = 0; ; i++) {
     try {
       writeFileSync(tmp, JSON.stringify({ allowed: list }, null, 2));
@@ -98,7 +99,7 @@ let access = loadAccess();
  * Замерено и поймано 07.09.2026.
  *
  * Пишем после обработки каждого события — их единицы в минуту, файл крошечный. */
-const STATE_FILE = new URL('./state.json', import.meta.url);
+const STATE_FILE = dataFile('state.json');
 
 function loadState() {
   try {
@@ -113,31 +114,48 @@ function loadState() {
       lastUser: new Map(Object.entries(j.lastUser || {}).map(([k, v]) => [Number(k), v])),
       choices: new Map(Object.entries(j.choices || {})),
       choiceSeq: j.choiceSeq || 0,
+      // Новые поля — только добавляются: старая версия бота их просто не заметит.
+      adminChats: new Map(Object.entries(j.adminChats || {}).map(([k, v]) => [Number(k), v])),
+      alerts: new Map(Object.entries(j.alerts || {})),
+      starts: Array.isArray(j.starts) ? j.starts : [],
+      plannedRestart: !!j.plannedRestart,
     };
   } catch {
-    return { sessions: new Map(), lastUser: new Map(), choices: new Map(), choiceSeq: 0 };
+    return {
+      sessions: new Map(), lastUser: new Map(), choices: new Map(), choiceSeq: 0,
+      adminChats: new Map(), alerts: new Map(), starts: [], plannedRestart: false,
+    };
   }
+}
+
+function writeState(extra = {}) {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify({
+      sessions: Object.fromEntries(sessions),
+      lastUser: Object.fromEntries(lastUser),
+      choices: Object.fromEntries(choices),
+      choiceSeq,
+      adminChats: Object.fromEntries(adminChats),
+      alerts: Object.fromEntries(alerts),
+      starts,
+      ...extra,
+    }));
+  } catch (e) { console.error('не смог сохранить состояние:', e.message); }
 }
 
 let saveTimer = null;
 function saveState() {
   // не чаще раза в секунду: событий бывает несколько подряд, писать на каждое незачем
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    try {
-      writeFileSync(STATE_FILE, JSON.stringify({
-        sessions: Object.fromEntries(sessions),
-        lastUser: Object.fromEntries(lastUser),
-        choices: Object.fromEntries(choices),
-        choiceSeq,
-      }));
-    } catch (e) { console.error('не смог сохранить состояние:', e.message); }
-  }, 1000);
+  saveTimer = setTimeout(() => { saveTimer = null; writeState(); }, 1000);
+  saveTimer.unref?.();
 }
 
 const restored = loadState();
 const sessions = restored.sessions;
+const adminChats = restored.adminChats;   // администратор → его чат с ботом, туда идут оповещения
+const alerts = restored.alerts;           // ключ оповещения → когда отправляли (не чаще раза в час)
+const starts = restored.starts;           // моменты запусков: частые — значит, бот падает
 
 function session(chatId) {
   const now = Date.now();
@@ -251,6 +269,68 @@ async function drop(chatId, mid) {
 // названия папок не режутся пополам на узком экране телефона.
 const rows = (items) => items.map((b) => [b]);
 const btn = (text, payload) => ({ type: 'callback', text, payload });
+
+/* Оповещения администратору.
+ * Раньше о сбоях знали только из bot.log — то есть узнавали от пользователей. Теперь бот
+ * сам пишет основным администраторам в их чат с ботом (чат запоминается, когда админ
+ * хоть раз написал боту). Одно и то же оповещение — не чаще раза в час, и время отправки
+ * хранится в state.json: при падении в цикле перезапусков бот не засыплет чат.
+ * Сбой отправки оповещения ни на что не влияет: он только попадает в журнал работы. */
+const ALERT_EVERY_MS = 60 * 60_000;
+
+async function notifyAdmins(key, text, { every = ALERT_EVERY_MS } = {}) {
+  const last = Number(alerts.get(key) || 0);
+  if (Date.now() - last < every) return;
+  alerts.set(key, Date.now());
+  saveState();
+  console.log(`   оповещение [${key}]: ${text.split('\n')[0]}`);
+  for (const id of ADMINS) {
+    const chatId = adminChats.get(id);
+    if (!chatId) continue;
+    try { await say(chatId, text); }
+    catch (e) { console.error(`   оповещение администратору ${id} не ушло:`, e.message); }
+  }
+}
+
+/* Очереди и замки.
+ *
+ * Раньше события разбирались строго по одному: пока Диск полчаса принимал чужое видео,
+ * бот не отвечал НИКОМУ. Теперь у каждого чата своя очередь: внутри чата — по порядку,
+ * как и прежде (иначе нажатия одного человека перепутались бы), а разные чаты друг друга
+ * не ждут. Выдач записи в чат одновременно — не больше HEAVY_MAX: только при выдаче байты
+ * видео идут через компьютер бота, и ноутбук с домашним интернетом не должен захлебнуться.
+ * (При загрузке Диск качает файл с серверов MAX сам — через бота байты не идут.) */
+const chatQueues = new Map();   // chatId → хвост очереди
+
+function enqueue(chatId, fn) {
+  const key = chatId ?? 'none';
+  const prev = chatQueues.get(key) ?? Promise.resolve();
+  const run = prev.then(fn).catch((e) => console.error('   ошибка обработки:', e?.message || e));
+  chatQueues.set(key, run);
+  run.finally(() => { if (chatQueues.get(key) === run) chatQueues.delete(key); });
+  return run;
+}
+
+const HEAVY_MAX = 3;
+let heavyNow = 0;
+const heavyWait = [];
+async function heavy(fn) {
+  // Освободившееся место передаётся ожидающему напрямую, иначе в щель между «освободил»
+  // и «ожидающий проснулся» мог бы проскочить четвёртый.
+  if (heavyNow >= HEAVY_MAX) await new Promise((r) => heavyWait.push(r));
+  else heavyNow++;
+  try { return await fn(); }
+  finally { const next = heavyWait.shift(); if (next) next(); else heavyNow--; }
+}
+
+/* Замок на номер записи. Пока события шли по одному, два человека физически не могли
+ * менять одну запись одновременно. Теперь могут — и замок возвращает эту гарантию:
+ * второй получает «запись сейчас занята», а не гонку на Диске. */
+const scrBusy = new Map();   // scr → что с ней делают
+const scrLock = (scr, what) => { if (scrBusy.has(scr)) return false; scrBusy.set(scr, what); return true; };
+const scrUnlock = (scr) => scrBusy.delete(scr);
+const busyText = (scr) =>
+  `С записью SCR#${scr} сейчас идёт другое действие (${scrBusy.get(scr)}). Попробуйте через пару минут.`;
 
 
 /** Меню собирается под права: человек не видит того, чего ему нельзя. */
@@ -384,36 +464,74 @@ const extOf = (name) => {
 
 /* кэш структуры папок.
  * Замерено 07.09.2026: чтение папки с Диска — 400–900 мс, и оно происходило на КАЖДОМ
- * шаге опросника. Структура меняется хорошо если раз в месяц, поэтому держим её в памяти:
- * шаг становится ~200 мс вместо 600–900. Кэш сбрасывается сам через пять минут и
- * принудительно — после любой записи на Диск, иначе свежая папка не появится в списке.
+ * шаге опросника. Структура меняется хорошо если раз в месяц, поэтому держим её в памяти.
+ *
+ * Полное обновление — раз в 6 часов: прогрев — это сотни запросов, и при частом обновлении
+ * они уходили бы впустую. Лимиты Диска не документированы, искать их холостым ходом — плохая идея.
+ * После загрузки и переноса сбрасываются ТОЛЬКО затронутые папки (раньше — всё дерево
+ * с повторным прогревом). Если папки правили руками на Диске — кнопка в админке.
+ *
+ * Ключ кэша — путь БЕЗ «disk:». Раньше прогрев клал папки под «disk:/Видеопоказы/…»
+ * (так их отдаёт Диск), а опросник искал «/Видеопоказы/…» — и кэш почти не срабатывал:
+ * каждый шаг всё равно шёл в Диск. Найдено при доработке 01.10.2026.
  */
-/* Раз в 6 часов, а не в полчаса. Структура папок меняется раз в месяц, а прогрев —
- * это 872 запроса за раз: при получасовом обновлении получалось 42 тысячи запросов
- * в сутки ВПУСТУЮ против 350 полезных. Лимиты Диска не документированы, и искать их
- * холостым ходом — плохая идея.
- * Свежесть при этом не страдает: кэш сбрасывается сам после каждой загрузки и
- * перемещения, а если папки правили руками на Диске — есть кнопка в админке. */
 const FOLDER_CACHE_TTL_MS = 6 * 60 * 60_000;
-const folderCache = new Map();   // путь → { at, listing }
+const folderCache = new Map();   // путь без «disk:» → { at, listing }
+const ckey = (p) => String(p).replace(/^disk:/i, '');
 
 async function listCached(folder) {
-  const hit = folderCache.get(folder);
+  const hit = folderCache.get(ckey(folder));
   if (hit && Date.now() - hit.at < FOLDER_CACHE_TTL_MS) return hit.listing;
   const listing = await disk.listFolder(folder);
-  folderCache.set(folder, { at: Date.now(), listing });
+  folderCache.set(ckey(folder), { at: Date.now(), listing });
   return listing;
 }
 
+/** Полный сброс — только по кнопке в админке и по расписанию. */
 function dropFolderCache() { folderCache.clear(); warmTree(); }
 
-/* Кэш сам по себе опроснику не помогал: каждый шаг — НОВАЯ папка, которую бот видит
- * впервые, и он всё равно шёл в Диск. Замерено 07.09.2026: 405–444 мс на шаг, при том
- * что отправка сообщения занимает ~190 мс. То есть две трети ожидания — это Диск.
+/** Точечный сброс: папки, где что-то легло или откуда что-то ушло. */
+function invalidateFolders(...folders) {
+  for (const f of folders) if (f) folderCache.delete(ckey(f));
+}
+
+/* Индекс «номер → где лежит».
+ * Поиск раньше листал плоский список ВСЕХ файлов Диска и видел только первую тысячу.
+ * Теперь индекс собирается заодно с прогревом дерева (прогрев и так читает каждую папку
+ * вместе с файлами) и обновляется после загрузки, замены и переноса.
  *
- * Поэтому дерево читаем ЦЕЛИКОМ заранее, в фоне: 4 контракта × периоды × направления —
- * это около полутора сотен запросов, но человек их не ждёт. Дальше опросник работает
- * из памяти, и шаг упирается только в скорость мессенджера. */
+ * Индекс только ускоряет поиск и никогда не решает за Диск:
+ *   - попадание проверяется одним stat — файл действительно на месте;
+ *   - промах или устаревшая запись — полный поиск по Диску, без предела в 1000.
+ * Поэтому ответ «записи нет» по-прежнему даёт только полный поиск. */
+const SCR_RE = /SCR#(\d{7})/i;
+const isTemp = (name) => /\.new$/i.test(String(name));   // недолитая замена — не запись
+const isLive = (f) => !f.path.includes(`/${BACKUP}/`) && !isTemp(f.name);
+let scrIndex = new Map();        // '6512028' → [{ name, path, size, created }]
+
+function indexAdd(f) {
+  const m = String(f.name).match(SCR_RE);
+  if (!m || !isLive(f)) return;
+  const list = (scrIndex.get(m[1]) || []).filter((x) => ckey(x.path) !== ckey(f.path));
+  list.push({ name: f.name, path: f.path, size: f.size ?? 0, created: f.created ?? null });
+  scrIndex.set(m[1], list);
+}
+function indexRemove(path) {
+  for (const [k, list] of scrIndex) {
+    const rest = list.filter((x) => ckey(x.path) !== ckey(path));
+    if (rest.length !== list.length) { if (rest.length) scrIndex.set(k, rest); else scrIndex.delete(k); }
+  }
+}
+
+/* Брошенные замены: «SCR#….mp4.new», которые остались, если бот перезапустили посреди
+ * замены. Сам бот с ними НИЧЕГО не делает — только показывает администратору. */
+const orphanSeen = new Set();    // о каких уже сообщили в этом запуске
+const inFlightPaths = new Set(); // .new, которые бот льёт прямо сейчас, — не брошенные
+
+/* Кэш сам по себе опроснику не помогал: каждый шаг — НОВАЯ папка, которую бот видит
+ * впервые. Поэтому дерево читаем ЦЕЛИКОМ заранее, в фоне, — человек этих запросов не ждёт.
+ * Индекс собирается в отдельную таблицу и подменяет прежний разом, в конце: пока идёт
+ * прогрев, поиск пользуется прежним индексом, а не наполовину собранным. */
 let warming = null;
 
 async function warmTree() {
@@ -421,14 +539,22 @@ async function warmTree() {
   const t0 = Date.now();
   warming = (async () => {
     let count = 0;
+    let complete = true;
+    const index = new Map();
+    const temps = [];
     const visit = async (folder, depth) => {
-      if (depth > 4) return;                        // глубже структура не уходит
+      if (depth > 8) return;                        // страховка от бесконечной вложенности
       let listing;
       try {
         listing = await disk.listFolder(folder);
-      } catch { return; }
-      folderCache.set(folder, { at: Date.now(), listing });
+      } catch { complete = false; return; }
+      folderCache.set(ckey(folder), { at: Date.now(), listing });
       count++;
+      for (const f of listing.files) {
+        if (isTemp(f.name) && SCR_RE.test(f.name)) { temps.push(f); continue; }
+        const m = String(f.name).match(SCR_RE);
+        if (m) index.set(m[1], [...(index.get(m[1]) || []), f]);
+      }
       const dirs = listing.dirs.filter((d) => d.name !== BACKUP && !d.name.startsWith('_'));
       // по 6 веток разом: Диск не любит шквал, но и по одной ждать незачем
       for (let i = 0; i < dirs.length; i += 6) {
@@ -436,16 +562,55 @@ async function warmTree() {
       }
     };
     await visit(disk.joinPath(ROOT), 0);
-    console.log(`   дерево прогрето: ${count} папок за ${((Date.now() - t0) / 1000).toFixed(1)} с`);
+    // Неполный прогрев (часть папок не прочиталась) индекс не подменяет: лучше старый
+    // целый, чем новый с дырами. Промахи всё равно добирает полный поиск.
+    if (complete) scrIndex = index;
+    console.log(`   дерево прогрето: ${count} папок, записей в индексе ${scrIndex.size}` +
+      `${complete ? '' : ' (часть папок не прочиталась — индекс оставлен прежним)'}` +
+      ` за ${((Date.now() - t0) / 1000).toFixed(1)} с`);
+    reportOrphans(temps).catch((e) => console.error('   проверка брошенных замен:', e.message));
   })().finally(() => { warming = null; });
   return warming;
 }
 
-/** Ищем запись по номеру. Имя всегда «SCR#<7 цифр>», поэтому подстроки достаточно. */
+async function reportOrphans(temps) {
+  for (const f of temps) {
+    const k = ckey(f.path);
+    if (inFlightPaths.has(k) || orphanSeen.has(k)) continue;
+    orphanSeen.add(k);
+    const key = keyFor(f.path);
+    console.log(`   найдена незавершённая замена: ${k}`);
+    const text = `⚠️ Найдена незавершённая замена\n\n${f.name}\n${report(f.path)}\n${RULE}\n` +
+      'Новая версия записи лежит на Диске под временным именем: бота, видимо, перезапустили ' +
+      'посреди замены. Сам бот с ней ничего делать не будет.';
+    const buttons = rows([
+      btn('✅ Завершить замену', 'orph:fin:' + key),
+      btn('📦 Убрать в архив', 'orph:arc:' + key),
+    ]);
+    for (const id of ADMINS) {
+      const chatId = adminChats.get(id);
+      if (!chatId) continue;
+      try { await say(chatId, text, buttons); } catch (e) { console.error('   не смог сообщить о замене:', e.message); }
+    }
+  }
+}
+
+/** Ищем запись по номеру: сначала индекс (с проверкой), при любом сомнении — весь Диск. */
 async function findByScr(scr) {
-  const all = await disk.findFiles(`SCR#${scr}`);
-  // BackUp исключаем: там лежат прошлые версии, их находить не надо
-  return all.filter((f) => !f.path.includes(`/${BACKUP}/`));
+  const hits = scrIndex.get(scr);
+  if (hits?.length) {
+    const ok = [];
+    for (const f of hits) {
+      const meta = await disk.stat(f.path, { fields: 'name,path,size,created' });
+      if (!meta) { ok.length = 0; break; }          // индекс устарел — не доверяем ему целиком
+      ok.push({ name: meta.name, path: meta.path, size: meta.size ?? 0, created: meta.created ?? null });
+    }
+    if (ok.length) return ok;
+  }
+  // BackUp и недолитые «.new» исключаем: это не записи
+  const all = (await disk.findFiles(`SCR#${scr}`)).filter(isLive);
+  if (all.length) scrIndex.set(scr, all); else scrIndex.delete(scr);
+  return all;
 }
 
 
@@ -509,7 +674,8 @@ async function adminRoute(chatId, userId, payload, s) {
     // В кнопке лежит сам месяц («2026-09»), а не ключ в памяти: ключи не переживают
     // перезапуск бота, и старая кнопка молча переставала работать. Замерено 07.09.2026.
     const ym = payload.slice(7);
-    const path = disk.joinPath('Видеопоказы', '_Журнал', `${ym}.csv`);
+    if (!/^\d{4}-\d{2}$/.test(ym)) return adminScreen(chatId);
+    const path = journal.monthPath(ym);
     try {
       const meta = await disk.stat(path, { fields: 'name,size,file' });
       await drop(chatId, s.mid);                       // экран «Отчёты» сейчас заменится файлом
@@ -594,8 +760,8 @@ async function adminRoute(chatId, userId, payload, s) {
   if (payload === 'adm:stats') {
     try {
       const files = await disk.findFiles('SCR#');
-      const live = files.filter((f) => !f.path.includes(`/${BACKUP}/`));
-      const backups = files.length - live.length;
+      const live = files.filter(isLive);
+      const backups = files.filter((f) => f.path.includes(`/${BACKUP}/`)).length;
       const bytes = live.reduce((n, f) => n + (f.size || 0), 0);
       const free = await disk.freeSpace();
       return adminScreen(chatId,
@@ -617,6 +783,16 @@ function allowed(userId) {
 }
 const isAdmin = (userId) => can(userId, 'admin');
 const nameOf = (userId) => (access.find((a) => a.id === userId)?.name) || String(userId);
+
+/** Сбои, о которых администратор должен узнать сразу, а не от пользователей. */
+function alertDisk(e) {
+  if (e?.status === 401 || e?.status === 403) {
+    notifyAdmins('disk-auth', `⛔ У бота нет доступа к Яндекс.Диску (HTTP ${e.status}).\n` +
+      'Скорее всего, истёк или отозван токен YANDEX_DISK_TOKEN — загрузки и поиск не работают.');
+  } else if (e?.status === 507) {
+    notifyAdmins('disk-full', '⚠️ На Яндекс.Диске закончилось место — загрузки не проходят.');
+  }
+}
 
 /** Короткая причина сбоя Диска для человека в чате; полный текст ошибки — в журнал работы. */
 function diskTrouble(e) {
@@ -642,6 +818,7 @@ async function onCallback(u) {
   if (!allowed(userId)) return denied(chatId, userId);
 
   lastUser.set(chatId, userId);
+  if (ADMINS.includes(userId)) adminChats.set(userId, chatId);   // сюда пойдут оповещения
   const s = session(chatId);
 
   if (payload === 'cmd:menu') {
@@ -651,6 +828,19 @@ async function onCallback(u) {
 
   if (payload === 'adm:back' || payload === 'adm:menu') { s.step = null; return onAdmin(chatId, userId, 'adm:menu', s); }
   if (payload.startsWith('adm')) return onAdmin(chatId, userId, payload, s);   // adm:, admdel:, admrole:, admlog:
+  if (payload.startsWith('orph:')) {
+    if (!isAdmin(userId)) return say(chatId, 'Эта команда доступна только администраторам.');
+    return onOrphan(chatId, userId, payload);
+  }
+
+  // Выбор одной записи из нескольких с одинаковым номером
+  if (payload.startsWith('pick:')) {
+    const f = choices.get(payload.slice(5));
+    if (!f || s.step !== 'pick' || !s.scr) return showMenu(chatId, 'Кнопка устарела — начните заново.', userId);
+    s.found = f;
+    s.step = null;
+    return afterFound(chatId, s);
+  }
 
   if (payload === 'up') { s.path.pop(); return askFolder(chatId, s); }
 
@@ -678,7 +868,7 @@ async function onCallback(u) {
       rows([btn('⬅️ В начало', 'cmd:menu')]));
   }
 
-  if (payload === 'go:move') return doMove(chatId, s);
+  if (payload === 'go:move') return doMove(chatId, userId, s);
 
   return showMenu(chatId);
 }
@@ -704,6 +894,7 @@ async function onMessage(u) {
   if (!allowed(userId)) return denied(chatId, userId);
 
   lastUser.set(chatId, userId);
+  if (ADMINS.includes(userId)) adminChats.set(userId, chatId);   // сюда пойдут оповещения
   const s = session(chatId);
 
   if (/^\/(start|menu|help)$/i.test(text)) {
@@ -786,14 +977,25 @@ async function onMessage(u) {
 }
 
 async function afterScr(chatId, s) {
-  const existing = await findByScr(s.scr);
+  let existing;
+  try {
+    existing = await findByScr(s.scr);
+  } catch (e) {
+    // Раньше сбой Диска здесь уходил только в журнал работы, а человек не получал ответа.
+    console.error('   поиск по номеру не удался:', e.message);
+    alertDisk(e);
+    reset(chatId);
+    return say(chatId, `Не удалось проверить номер SCR#${s.scr}.\n${diskTrouble(e)}`, rows(menuFor(lastUser.get(chatId))));
+  }
 
   if (s.cmd === 'upload') {
     if (existing.length) {
       reset(chatId);
+      const dup = existing.length > 1
+        ? `\n\nВнимание: записей с этим номером на Диске ${existing.length} — сообщите администратору.` : '';
       return say(chatId,
         `Запись SCR#${s.scr} уже загружена\n\n${report(existing[0].path)}\n${RULE}\n` +
-        `Чтобы загрузить новую версию, выберите «Заменить видеозапись» — прежняя сохранится в архиве.`,
+        `Чтобы загрузить новую версию, выберите «Заменить видеозапись» — прежняя сохранится в архиве.${dup}`,
         rows(menuFor(lastUser.get(chatId))));
     }
     s.step = 'await-file';
@@ -807,11 +1009,36 @@ async function afterScr(chatId, s) {
       `Записи SCR#${s.scr} нет. Проверьте номер или загрузите её через «Загрузить видеозапись».`,
       rows(menuFor(lastUser.get(chatId))));
   }
-  s.found = existing[0];
 
+  /* Несколько записей с одним номером. Раньше бот молча брал первую попавшуюся —
+   * и мог выдать, заменить или перенести не ту. Теперь показывает все и даёт выбрать. */
+  if (existing.length > 1) {
+    s.step = 'pick';
+    notifyAdmins(`dup:${s.scr}`, `⚠️ На Диске ${existing.length} записи с номером SCR#${s.scr}:\n` +
+      existing.map((f) => `• ${ckey(f.path)}`).join('\n') + '\nЛишнюю стоит убрать.', { every: 24 * 60 * 60_000 });
+    const list = existing.map((f, i) =>
+      `${i + 1}) ${reportInline(f.path) || ckey(parentOf(f.path))} · ${f.name} · ${mb(f.size)}`).join('\n');
+    const buttons = existing.map((f, i) =>
+      btn(cut(`${i + 1}) ${reportInline(f.path) || f.name}`, 60), 'pick:' + keyFor(f)));
+    buttons.push(btn('⬅️ В начало', 'cmd:menu'));
+    return screen(chatId,
+      `⚠️ Записей с номером SCR#${s.scr} несколько: ${existing.length}.\n${RULE}\n${list}\n${RULE}\nКакую взять?`,
+      rows(buttons));
+  }
+
+  s.found = existing[0];
+  return afterFound(chatId, s);
+}
+
+const mb = (bytes) => `${(Number(bytes || 0) / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`;
+const cut = (text, n) => (String(text).length > n ? String(text).slice(0, n - 1) + '…' : String(text));
+
+/** Запись выбрана — дальше по команде. */
+async function afterFound(chatId, s) {
   if (s.cmd === 'find') {
+    const found = s.found;
     reset(chatId);
-    return sendRecord(chatId, s.found);
+    return sendRecord(chatId, found);
   }
 
   if (s.cmd === 'replace') {
@@ -841,18 +1068,20 @@ async function sendRecord(chatId, found) {
   await drop(chatId, prev);                          // экран поиска заменяется самой записью
   const wait = await say(chatId, `Готовлю запись, это займёт до минуты`);
   try {
-    await sendFileFromUrl(chatId, {
+    // Байты записи идут через компьютер бота — поэтому таких выдач одновременно не больше HEAVY_MAX.
+    await heavy(async () => sendFileFromUrl(chatId, {
       url: await downloadHref(found.path),
       filename: found.name,
       size: found.size,
       caption: `${(found.name.match(/SCR#\d{7}/) || [found.name])[0]}\n${report(found.path)}`,
       // Кнопка едет на самом файле — отдельным сообщением меню только плодит экраны.
       buttons: rows([btn('⬅️ В начало', 'cmd:menu')]),
-    });
+    }));
     await drop(chatId, wait?.message?.body?.mid);    // «Готовлю запись» своё отработало
   } catch (e) {
     await drop(chatId, wait?.message?.body?.mid);
     console.error('   выдача записи не удалась:', e.message);
+    alertDisk(e);
     const msg = e instanceof SendError ? 'Не удалось отправить запись в MAX, попробуйте ещё раз.' : diskTrouble(e);
     await say(chatId, msg, rows(menuFor(lastUser.get(chatId))));
   }
@@ -861,16 +1090,44 @@ async function sendRecord(chatId, found) {
 async function downloadHref(path) {
   const r = await fetch(
     `https://cloud-api.yandex.net/v1/disk/resources/download?path=${encodeURIComponent(path)}`,
-    { headers: { Authorization: `OAuth ${process.env.YANDEX_DISK_TOKEN}` } },
+    { headers: { Authorization: `OAuth ${process.env.YANDEX_DISK_TOKEN}` }, signal: AbortSignal.timeout(60_000) },
   );
-  const j = await r.json();
-  if (!j?.href) throw new Error('Диск не дал ссылку на скачивание');
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j?.href) {
+    // HTTP-код нужен дальше: по 401/403 администратору уходит оповещение про токен.
+    throw Object.assign(new Error(`Диск не дал ссылку на скачивание (HTTP ${r.status})`), { status: r.status });
+  }
   return j.href;
 }
+
+/* Имя версии в архиве. Дата и время — оба по часам компьютера бота: раньше дата бралась
+ * в UTC, а время местное, и замены с полуночи до трёх ночи по Москве попадали в папку
+ * вчерашнего дня. */
+function backupPath(userId, name) {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  const clock = `${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  return disk.joinPath(ROOT, BACKUP, stamp, String(userId), `${clock} ${name}`);
+}
+
+// PRIEMKA_TEST_* — только для автотестов, чтобы не ждать по 10 минут; в .env их не ставят.
+const UPLOAD_WAIT_MS = Number(process.env.PRIEMKA_TEST_UPLOAD_WAIT_MS) || 10 * 60_000;  // столько человек ждёт в чате
+const UPLOAD_WAIT_BG_MS = 60 * 60_000;   // столько бот дожидается большой загрузки в фоне
+const BG_POLL_MS = Number(process.env.PRIEMKA_TEST_BG_POLL_MS) || 15_000;
+const background = new Set();            // фоновые доливки — чтобы тесты могли их дождаться
 
 async function onFile(chatId, userId, s, attachment) {
   if (s.step !== 'await-file' || !s.scr) {
     return showMenu(chatId, 'Сначала выберите действие, а потом пришлите запись.');
+  }
+  const cmd = s.cmd;
+  // Права проверяем ещё раз именно здесь, на шаге, который меняет Диск: роль могли
+  // отнять, пока человек выбирал папки.
+  if (!can(userId, cmd)) {
+    reset(chatId);
+    return say(chatId, 'Это действие вам больше недоступно — права изменились. Обратитесь к администратору.',
+      rows(menuFor(userId)));
   }
   const url = attachment.payload?.url;
   const size = Number(attachment.size || 0);
@@ -887,69 +1144,159 @@ async function onFile(chatId, userId, s, attachment) {
     return say(chatId, 'Не вижу вложения. Пришлите запись файлом.', rows(menuFor(lastUser.get(chatId))));
   }
 
+  const scr = s.scr;
+  const found = s.found;
   // При ЗАМЕНЕ новая версия встаёт ровно туда, где лежала старая: опросник в этой команде
   // не проходится, поэтому s.path пуст, и раньше файл улетал в корень /Видеопоказы.
   // Расширение берём у НОВОГО файла — прислать могут .mov вместо .mp4.
-  const target = (s.cmd === 'replace' && s.found)
-    ? parentOf(s.found.path) + '/' + `SCR#${s.scr}${extOf(srcName)}`
-    : disk.joinPath(ROOT, ...s.path, `SCR#${s.scr}${extOf(srcName)}`);
+  const replacing = cmd === 'replace' && !!found;
+  const target = replacing
+    ? parentOf(found.path) + '/' + `SCR#${scr}${extOf(srcName)}`
+    : disk.joinPath(ROOT, ...s.path, `SCR#${scr}${extOf(srcName)}`);
+  /* При замене порядок ВАЖЕН: сначала кладём новую версию во временное имя, и только
+   * когда она реально на Диске — убираем старую в архив и ставим новую на её место.
+   * Раньше старая уезжала в архив ПЕРВОЙ: любой сбой заливки — и человек оставался
+   * без записи вообще (в поиске её уже нет, новой ещё нет). Поймано ревизией 07.09.2026. */
+  const landing = replacing ? `${target}.new` : target;
+  const ctx = { chatId, userId, cmd, scr, found, target, landing, replacing };
 
+  if (!scrLock(scr, replacing ? 'замена' : 'загрузка')) return say(chatId, busyText(scr));
+  let detached = false;
   try {
+    // Хватит ли места — до загрузки, а не 507-м после получаса ожидания.
+    if (size > 0) {
+      let free = null;
+      try { free = await disk.freeSpace(); } catch { /* проверка не удалась — грузим как раньше */ }
+      if (free !== null && free < size) {
+        reset(chatId);
+        notifyAdmins('disk-full', `⚠️ На Яндекс.Диске не хватает места: свободно ${mb(free)}, ` +
+          `а прислали запись на ${mb(size)}. Загрузки не проходят.`);
+        return say(chatId,
+          `На Диске не хватает места: запись весит ${mb(size)}, а свободно ${mb(free)}.\n` +
+          'Загрузка не начиналась. Сообщите администратору.', rows(menuFor(userId)));
+      }
+    }
+
+    // Пока человек выбирал файл, состояние Диска могло измениться — перепроверяем под замком.
+    if (cmd === 'upload') {
+      const now = await findByScr(scr);
+      if (now.length) {
+        reset(chatId);
+        return say(chatId,
+          `Запись SCR#${scr} уже загружена — пока вы присылали файл, её загрузил другой пользователь.\n\n` +
+          `${report(now[0].path)}\n${RULE}\nЧтобы загрузить новую версию, выберите «Заменить видеозапись».`,
+          rows(menuFor(userId)));
+      }
+    }
+    if (replacing && !(await disk.stat(found.path, { fields: 'path' }))) {
+      reset(chatId);
+      return say(chatId, `Прежняя версия SCR#${scr} уже перемещена или заменена другим пользователем — начните заново.`,
+        rows(menuFor(userId)));
+    }
+
     await say(chatId, 'Загружаю…');
+    inFlightPaths.add(ckey(landing));
     // Папку заводим для РОДИТЕЛЯ файла: от самого пути файла Диск создаёт каталог
     // с именем «SCR#….mp4», и заливка туда же падает с 409.
     await disk.ensureFolder(parentOf(target));
-
-    /* При замене порядок ВАЖЕН: сначала кладём новую версию во временное имя, и только
-     * когда она реально на Диске — убираем старую в архив и ставим новую на её место.
-     * Раньше старая уезжала в архив ПЕРВОЙ: любой сбой заливки — и человек оставался
-     * без записи вообще (в поиске её уже нет, новой ещё нет). Поймано ревизией 07.09.2026. */
-    const replacing = s.cmd === 'replace' && s.found;
-    const landing = replacing ? `${target}.new` : target;
-
+    // Яндекс качает файл с серверов MAX сам — байты через компьютер бота не идут.
     const href = await disk.uploadFromUrl(url, landing);
-    await disk.waitOperation(href, { timeoutMs: 10 * 60_000 });
 
-    if (replacing) {
-      // время в имени: иначе вторая замена той же записи за сутки падала на занятом пути
-      const now = new Date();
-      const stamp = now.toISOString().slice(0, 10);
-      const clock = now.toTimeString().slice(0, 8).replace(/:/g, '-');
-      const backup = disk.joinPath(ROOT, BACKUP, stamp, String(userId), `${clock} ${s.found.name}`);
-      await disk.move(s.found.path, backup);
-      await disk.move(landing, target);
-      s.backupPath = backup;
+    try {
+      await disk.waitOperation(href, { timeoutMs: UPLOAD_WAIT_MS });
+    } catch (e) {
+      if (e?.code !== 'timeout') throw e;
+      /* Большое видео Диск принимает дольше 10 минут. Раньше человек получал «ошибку»,
+       * хотя файл потом спокойно долетал. Теперь бот честно говорит «ещё идёт», отпускает
+       * человека и дожидается результата в фоне. Замок на номер держится до конца. */
+      detached = true;
+      reset(chatId);
+      await say(chatId,
+        `⏳ Загрузка SCR#${scr} ещё идёт — большой файл Диск принимает дольше обычного.\n` +
+        'Когда закончится, пришлю результат. Пока можно пользоваться ботом.', rows(menuFor(userId)));
+      const job = (async () => {
+        try {
+          await disk.waitOperation(href, { timeoutMs: UPLOAD_WAIT_BG_MS, initialDelayMs: BG_POLL_MS, maxDelayMs: Math.max(BG_POLL_MS, 60_000) });
+          const done = await finishUpload(ctx);
+          await say(chatId, uploadDoneText(ctx, done), rows(menuFor(userId)));
+        } catch (err) {
+          await uploadFailed(ctx, err);
+        } finally {
+          scrUnlock(scr);
+          inFlightPaths.delete(ckey(landing));
+        }
+      })();
+      background.add(job);
+      job.finally(() => background.delete(job));
+      return;
     }
 
-    const meta = await disk.stat(target);
-    dropFolderCache();
-
-    journal.log({
-      userId, name: nameOf(userId),
-      action: s.cmd === 'replace' ? 'Замена видеозаписи' : 'Загрузка видеозаписи',
-      scr: s.scr, where: reportInline(target),
-      result: s.cmd === 'replace' ? 'прежняя версия в архиве' : 'успешно',
-    });
-
+    const done = await finishUpload(ctx);
     reset(chatId);
-    const head = s.cmd === 'replace' ? '♻️ Видеозапись заменена' : '✅ Видеозапись загружена';
-    const tail = s.cmd === 'replace'
-      ? `\n\nПрежняя версия сохранена:\n${(s.backupPath || '').replace('disk:', '')}`
-      : '';
-    return say(chatId, `${head}\n\n${report(target, { scr: s.scr, size: meta.size })}${tail}`, rows(menuFor(lastUser.get(chatId))));
+    return say(chatId, uploadDoneText(ctx, done), rows(menuFor(lastUser.get(chatId))));
   } catch (e) {
-    journal.log({
-      userId, name: nameOf(userId),
-      action: s.cmd === 'replace' ? 'Замена видеозаписи' : 'Загрузка видеозаписи',
-      scr: s.scr, where: reportInline(target), result: 'ОШИБКА: ' + e.message.slice(0, 120),
-    });
-    console.error('   загрузка не удалась:', e.message);
     reset(chatId);
-    return say(chatId, `Не удалось загрузить запись.\n${diskTrouble(e)}`, rows(menuFor(lastUser.get(chatId))));
+    return uploadFailed(ctx, e);
+  } finally {
+    if (!detached) { scrUnlock(scr); inFlightPaths.delete(ckey(landing)); }
   }
 }
 
-async function doMove(chatId, s) {
+/** Файл на Диске — довести дело до конца: архив прежней версии, индекс, журнал. */
+async function finishUpload({ userId, cmd, scr, found, target, landing, replacing }) {
+  let backup = null;
+  if (replacing) {
+    // время в имени: иначе вторая замена той же записи за сутки падала на занятом пути
+    backup = backupPath(userId, found.name);
+    await disk.move(found.path, backup);
+    try {
+      await disk.move(landing, target);
+    } catch (e) {
+      // Новая версия не встала на место — возвращаем прежнюю, чтобы запись не пропала из поиска.
+      try { await disk.move(backup, found.path); } catch { /* останется в архиве — сообщим ниже */ }
+      throw e;
+    }
+  }
+
+  const meta = await disk.stat(target);
+  if (!meta) throw new Error(`после загрузки файла нет на Диске: ${ckey(target)}`);
+  invalidateFolders(parentOf(target), replacing ? parentOf(found.path) : null);
+  if (replacing) indexRemove(found.path);
+  indexAdd({ name: meta.name, path: meta.path || target, size: meta.size });
+
+  journal.log({
+    userId, name: nameOf(userId),
+    action: cmd === 'replace' ? 'Замена видеозаписи' : 'Загрузка видеозаписи',
+    scr, where: reportInline(target),
+    result: cmd === 'replace' ? 'прежняя версия в архиве' : 'успешно',
+  });
+  return { meta, backup };
+}
+
+function uploadDoneText({ cmd, scr, target }, { meta, backup }) {
+  const head = cmd === 'replace' ? '♻️ Видеозапись заменена' : '✅ Видеозапись загружена';
+  const tail = cmd === 'replace' ? `\n\nПрежняя версия сохранена:\n${ckey(backup || '')}` : '';
+  return `${head}\n\n${report(target, { scr, size: meta.size })}${tail}`;
+}
+
+async function uploadFailed({ chatId, userId, cmd, scr, target }, e) {
+  journal.log({
+    userId, name: nameOf(userId),
+    action: cmd === 'replace' ? 'Замена видеозаписи' : 'Загрузка видеозаписи',
+    scr, where: reportInline(target), result: 'ОШИБКА: ' + String(e?.message || e).slice(0, 120),
+  });
+  console.error('   загрузка не удалась:', e?.message || e);
+  if ([401, 403, 507].includes(e?.status)) alertDisk(e);
+  else {
+    notifyAdmins(`upload:${scr}`, `⚠️ Не удалась ${cmd === 'replace' ? 'замена' : 'загрузка'} SCR#${scr} ` +
+      `(${nameOf(userId)}).\n${String(e?.message || e).slice(0, 300)}`);
+  }
+  try {
+    return await say(chatId, `Не удалось загрузить запись.\n${diskTrouble(e)}`, rows(menuFor(userId)));
+  } catch (err) { console.error('   не смог сообщить об ошибке загрузки:', err.message); }
+}
+
+async function doMove(chatId, userId, s) {
   const scr = s.scr;
   /* Кнопки живут в истории чата: по старой можно прийти с пустой сессией (тогда падало
    * «Cannot read properties of null») или уже начав другой перенос — и тогда запись
@@ -957,25 +1304,32 @@ async function doMove(chatId, s) {
   if (!s.found || !s.scr || !s.path.length) {
     return showMenu(chatId, 'Кнопка устарела — начните перенос заново.', lastUser.get(chatId));
   }
+  if (!can(userId, 'move')) {
+    reset(chatId);
+    return say(chatId, 'Это действие вам больше недоступно — права изменились. Обратитесь к администратору.',
+      rows(menuFor(userId)));
+  }
+  if (!scrLock(scr, 'перенос')) return say(chatId, busyText(scr));
+  const found = s.found;
+  const dest = disk.joinPath(ROOT, ...s.path, `SCR#${s.scr}${extOf(found.name)}`);
   try {
-    const dest = disk.joinPath(ROOT, ...s.path, `SCR#${s.scr}${extOf(s.found.name)}`);
-
     /* Перенос «сам в себя» Диск отбивает 409-м с текстом про несуществующий путь —
      * человеку это читалось как поломка. Ловим до обращения к API. */
-    const norm = (x) => String(x).replace(/^disk:/, '').replace(/\/+/g, '/');
-    if (norm(s.found.path) === norm(dest)) {
+    if (ckey(found.path).replace(/\/+/g, '/') === ckey(dest).replace(/\/+/g, '/')) {
       reset(chatId);
       return say(chatId,
         `Запись уже лежит в этой папке — переносить некуда.\n\nНомер: SCR#${scr}\n${RULE}\n${report(dest)}`,
         rows(menuFor(lastUser.get(chatId))));
     }
 
-    await disk.move(s.found.path, dest);
-    dropFolderCache();
+    await disk.move(found.path, dest);
+    invalidateFolders(parentOf(found.path), parentOf(dest));
+    indexRemove(found.path);
+    indexAdd({ name: found.name, path: dest, size: found.size, created: found.created });
     journal.log({
-      userId: lastUser.get(chatId), name: nameOf(lastUser.get(chatId)),
+      userId, name: nameOf(userId),
       action: 'Перемещение видеозаписи', scr,
-      where: reportInline(dest), result: 'из: ' + reportInline(s.found.path),
+      where: reportInline(dest), result: 'из: ' + reportInline(found.path),
     });
     const was = s.wasAt || '';
     reset(chatId);
@@ -987,6 +1341,7 @@ async function doMove(chatId, s) {
     // Сырой ответ Диска — простыня с путями и английским текстом: она уходит в лог,
     // а человеку остаётся короткая причина.
     console.error('   перемещение не удалось:', e.message);
+    alertDisk(e);
     reset(chatId);
     const why =
       e.code === 'DiskResourceAlreadyExistsError' ? 'В этой папке уже есть запись с таким номером.'
@@ -994,6 +1349,63 @@ async function doMove(chatId, s) {
       : e.status === 404 ? 'Запись не найдена — возможно, её уже переместили.'
       : 'Не получилось связаться с Диском, попробуйте ещё раз.';
     return say(chatId, `Не удалось переместить запись.\n${why}`, rows(menuFor(lastUser.get(chatId))));
+  } finally {
+    scrUnlock(scr);
+  }
+}
+
+/* Брошенная замена: администратор решает, что с ней делать. Ничего не удаляется —
+ * «убрать» значит переложить в архив. */
+async function onOrphan(chatId, userId, payload) {
+  const [, action, key] = payload.split(':');
+  const path = choices.get(key);
+  if (!path) return say(chatId, 'Кнопка устарела: бот перезапускался. Незавершённая замена, если она ещё есть, ' +
+    'будет показана снова после следующего прогрева.');
+  const name = String(path).split('/').pop();
+  const m = name.match(SCR_RE);
+  const scr = m?.[1];
+  if (!scr) return say(chatId, 'Не разобрал номер записи в имени файла.');
+  if (!scrLock(scr, 'разбор незавершённой замены')) return say(chatId, busyText(scr));
+  try {
+    if (!(await disk.stat(path, { fields: 'path' }))) {
+      return say(chatId, `Файла ${name} уже нет на Диске — разбирать нечего.`);
+    }
+    if (action === 'arc') {
+      const dest = backupPath(userId, `незавершённая ${name.replace(/\.new$/i, '')}`);
+      await disk.move(path, dest);
+      journal.log({ userId, name: nameOf(userId), action: 'Незавершённая замена — в архив', scr,
+        where: reportInline(path), result: ckey(dest) });
+      return say(chatId, `📦 Убрано в архив:\n${ckey(dest)}`);
+    }
+    // Завершить: прежняя версия — в архив, временная — на её место. Только если однозначно,
+    // что именно заменяем: ровно одна запись с этим номером и в той же папке.
+    const target = String(path).replace(/\.new$/i, '');
+    const live = await findByScr(scr);
+    const same = live.filter((f) => ckey(parentOf(f.path)) === ckey(parentOf(target)));
+    if (live.length > 1 || (live.length === 1 && !same.length)) {
+      return say(chatId, `Не могу завершить замену автоматически: записи SCR#${scr} лежат в других папках ` +
+        `(${live.length}). Разберите вручную на Диске или уберите временный файл в архив.`);
+    }
+    let backup = null;
+    if (live.length) {
+      backup = backupPath(userId, live[0].name);
+      await disk.move(live[0].path, backup);
+      indexRemove(live[0].path);
+    }
+    await disk.move(path, target);
+    const meta = await disk.stat(target);
+    if (meta) indexAdd({ name: meta.name, path: meta.path || target, size: meta.size });
+    invalidateFolders(parentOf(target));
+    journal.log({ userId, name: nameOf(userId), action: 'Завершение замены', scr,
+      where: reportInline(target), result: backup ? 'прежняя версия в архиве' : 'прежней версии не было' });
+    return say(chatId, `♻️ Замена SCR#${scr} завершена.\n\n${report(target, { scr, size: meta?.size })}` +
+      (backup ? `\n\nПрежняя версия сохранена:\n${ckey(backup)}` : ''));
+  } catch (e) {
+    console.error('   разбор незавершённой замены не удался:', e.message);
+    alertDisk(e);
+    return say(chatId, `Не получилось.\n${diskTrouble(e)}`);
+  } finally {
+    scrUnlock(scr);
   }
 }
 
@@ -1001,7 +1413,7 @@ async function doMove(chatId, s) {
 /* Маркер позиции в ленте событий — В ФАЙЛЕ, а не только в памяти.
  * Замерено 07.09.2026: без него перезапуск бота ТЕРЯЕТ накопленные события —
  * MAX на запрос без маркера отдаёт только самое последнее обновление, остальные пропадают. */
-const MARKER_FILE = new URL('./marker.json', import.meta.url);
+const MARKER_FILE = dataFile('marker.json');
 
 function loadMarker() {
   try { return JSON.parse(readFileSync(MARKER_FILE, 'utf8')).marker ?? null; }
@@ -1016,13 +1428,138 @@ function saveMarker(m) {
 let marker = loadMarker();
 let stopping = false;
 
+/** Чат, к которому относится событие, — по нему события раскладываются по очередям. */
+function chatOf(u) {
+  if (u.update_type === 'message_callback') return u.message?.recipient?.chat_id ?? u.callback?.user?.user_id;
+  if (u.update_type === 'message_created') return u.message?.recipient?.chat_id;
+  if (u.update_type === 'bot_started') return u.chat_id;
+  return null;
+}
+
+/** Разбор одного события — то, что раньше делал цикл опроса прямо у себя внутри. */
+async function handleUpdate(u) {
+  const at = new Date(u.timestamp || Date.now()).toLocaleTimeString('ru-RU');
+  const t0 = Date.now();
+  try {
+    if (u.update_type === 'message_callback') {
+      console.log(`${at} кнопка: ${u.callback?.payload}`);
+      await onCallback(u);
+      console.log(`         обработано за ${Date.now() - t0} мс`);
+    } else if (u.update_type === 'message_created') {
+      const t = u.message?.body?.text || (u.message?.body?.attachments?.[0]?.type ?? '');
+      console.log(`${at} сообщение: ${String(t).slice(0, 60)}`);
+      await onMessage(u);
+      console.log(`         обработано за ${Date.now() - t0} мс`);
+    } else if (u.update_type === 'bot_started') {
+      // userId берём из события: без него меню собралось бы для роли по умолчанию,
+      // и администратор при первом запуске не увидел бы свою кнопку.
+      const uid = u.user?.user_id ?? null;
+      console.log(`${at} запуск бота пользователем ${uid ?? '?'}`);
+      if (uid) lastUser.set(u.chat_id, uid);
+      if (uid && ADMINS.includes(uid)) adminChats.set(uid, u.chat_id);
+      if (uid && !allowed(uid)) { await denied(u.chat_id, uid); }
+      else await showMenu(u.chat_id, 'Бот хранит видеозаписи показов работ по контрактам.', uid);
+    }
+  } catch (e) {
+    console.error(`${at} ошибка обработки:`, e.message);
+  }
+  saveState();
+}
+
+/** Событие — в очередь его чата; цикл опроса дальше не ждёт. */
+const dispatch = (u) => enqueue(chatOf(u), () => handleUpdate(u));
+
+/* Проверки здоровья: место на Диске, срок токена, размер bot.log. Раз в час; каждое
+ * оповещение — не чаще раза в сутки. Любой сбой здесь только пишется в журнал работы. */
+const DAY_MS = 24 * 60 * 60_000;
+const LOG_ROTATE_BYTES = 10 * 1024 * 1024;
+
+async function healthTick() {
+  try {
+    const free = await disk.freeSpace();
+    if (free < LOW_SPACE_BYTES) {
+      notifyAdmins('space-low', `⚠️ На Яндекс.Диске осталось мало места: ${(free / 1024 ** 3).toFixed(1).replace('.', ',')} ГБ.`,
+        { every: DAY_MS });
+    }
+  } catch (e) {
+    console.error('   проверка места на Диске не удалась:', e.message);
+    alertDisk(e);
+  }
+
+  if (YANDEX_TOKEN_ISSUED) {
+    const issued = Date.parse(YANDEX_TOKEN_ISSUED);
+    if (Number.isFinite(issued)) {
+      const left = Math.ceil((issued + YANDEX_TOKEN_DAYS * DAY_MS - Date.now()) / DAY_MS);
+      if (left <= 30) {
+        notifyAdmins('token-age', left > 0
+          ? `🔑 Токен Яндекс.Диска истекает примерно через ${left} дн. (выдан ${YANDEX_TOKEN_ISSUED}). ` +
+            'Получите новый и обновите .env: остановить бота, удалить .env, запустить setup.cmd.'
+          : `🔑 Срок токена Яндекс.Диска, по расчёту, уже вышел (выдан ${YANDEX_TOKEN_ISSUED}). ` +
+            'Если бот ещё работает — обновите YANDEX_TOKEN_ISSUED в .env; если нет — получите новый токен.',
+        { every: DAY_MS });
+      }
+    } else {
+      console.error(`   YANDEX_TOKEN_ISSUED=${YANDEX_TOKEN_ISSUED} — не дата, ждём вид 2026-09-07`);
+    }
+  }
+
+  rotateLogIfNeeded();
+}
+
+/* bot.log пишет start-bot.cmd, пока бот работает, — переименовать файл на ходу нельзя.
+ * Поэтому, когда журнал перерос 10 МБ, бот глубокой ночью, если ничем не занят, сам
+ * завершается, а start-bot.cmd через 10 секунд переносит журнал в архив и запускает его
+ * снова. Только под start-bot.cmd (он ставит PRIEMKA_SUPERVISED=1): запущенный руками
+ * из консоли бот так не делает — его некому было бы поднять. */
+function rotateLogIfNeeded() {
+  if (process.env.PRIEMKA_SUPERVISED !== '1') return;
+  let size = 0;
+  try { size = statSync(join(BOT_DIR, 'bot.log')).size; } catch { return; }
+  const hour = new Date().getHours();
+  const idle = scrBusy.size === 0 && heavyNow === 0 && chatQueues.size === 0 && background.size === 0;
+  if (size < LOG_ROTATE_BYTES || hour < 3 || hour >= 5 || !idle) return;
+  console.log(`bot.log вырос до ${(size / 1024 / 1024).toFixed(0)} МБ — плановый перезапуск для переноса журнала в архив`);
+  writeState({ plannedRestart: true });
+  saveMarker(marker);
+  process.exit(0);
+}
+
+/** Запись о запуске: частые запуски подряд означают, что бот падает. */
+function noteStart() {
+  const now = Date.now();
+  const recent = starts.filter((t) => now - t < 60 * 60_000);
+  recent.push(now);
+  starts.splice(0, starts.length, ...recent.slice(-50));
+  saveState();
+  if (restored.plannedRestart) return;   // перезапуск для ротации журнала — не повод беспокоить
+  if (recent.length >= 4) {
+    notifyAdmins('crashloop', `⚠️ Бот перезапускался ${recent.length} раз за последний час — похоже, он падает. ` +
+      'Загляните в bot.log.');
+  } else {
+    notifyAdmins('start', '▶️ Бот запущен и на связи.');
+  }
+}
+
 async function loop() {
-  const me = await api('GET', '/me');
+  // Сеть при включении ноутбука поднимается не сразу: ждём, а не падаем — иначе каждая
+  // такая загрузка выглядела бы для оповещений как падение бота.
+  let me;
+  for (let attempt = 0; ; attempt++) {
+    try { me = await api('GET', '/me'); break; }
+    catch (e) {
+      console.error(`MAX не отвечает (${e.message}) — повтор через ${Math.min(60, 5 * (attempt + 1))} с`);
+      await new Promise((r) => setTimeout(r, Math.min(60, 5 * (attempt + 1)) * 1000));
+    }
+  }
   console.log(`Бот «${me.name}» (@${me.username}) на связи.`);
   console.log(`Корень на Диске: /${ROOT}, доступ: ${access.length ? access.length + ' чел.' : 'только основные администраторы'}`);
+  console.log(`Основные администраторы: ${ADMINS.join(', ')}`);
   if (sessions.size) console.log(`Восстановлено диалогов: ${sessions.size}`);
+  noteStart();
   warmTree();                                   // не ждём: опросник начнёт работать сразу, просто первые шаги медленнее
   setInterval(() => { folderCache.clear(); warmTree(); }, FOLDER_CACHE_TTL_MS);
+  setTimeout(healthTick, 60_000);
+  setInterval(healthTick, 60 * 60_000);
   console.log(marker ? `Продолжаю с маркера ${marker} — события за время простоя не потеряются.` : 'Маркера нет, начинаю с текущего момента.');
 
   while (!stopping) {
@@ -1034,30 +1571,8 @@ async function loop() {
       const waited = Date.now() - pollStart;
       if ((res?.updates || []).length) console.log(`         [опрос висел ${waited} мс, событий ${res.updates.length}]`);
       if (res?.marker != null && res.marker !== marker) { marker = res.marker; saveMarker(marker); }
-      for (const u of res?.updates || []) {
-        const at = new Date(u.timestamp).toLocaleTimeString('ru-RU');
-        const t0 = Date.now();
-        try {
-          if (u.update_type === 'message_callback') { console.log(`${at} кнопка: ${u.callback?.payload}`); await onCallback(u); console.log(`         обработано за ${Date.now()-t0} мс`); }
-          else if (u.update_type === 'message_created') {
-            const t = u.message?.body?.text || (u.message?.body?.attachments?.[0]?.type ?? '');
-            console.log(`${at} сообщение: ${String(t).slice(0, 60)}`);
-            await onMessage(u);
-            console.log(`         обработано за ${Date.now()-t0} мс`);
-          } else if (u.update_type === 'bot_started') {
-            // userId берём из события: без него меню собралось бы для роли по умолчанию,
-            // и администратор при первом запуске не увидел бы свою кнопку.
-            const uid = u.user?.user_id ?? null;
-            console.log(`${at} запуск бота пользователем ${uid ?? '?'}`);
-            if (uid) lastUser.set(u.chat_id, uid);
-            if (uid && !allowed(uid)) { await denied(u.chat_id, uid); }
-            else await showMenu(u.chat_id, 'Бот хранит видеозаписи показов работ по контрактам.', uid);
-          }
-        } catch (e) {
-          console.error(`${at} ошибка обработки:`, e.message);
-        }
-        saveState();
-      }
+      // Не ждём обработки: долгая загрузка в одном чате больше не держит остальные.
+      for (const u of res?.updates || []) dispatch(u);
     } catch (e) {
       console.error('опрос не удался:', e.message);
       await new Promise((r) => setTimeout(r, 5000));
@@ -1065,6 +1580,22 @@ async function loop() {
   }
 }
 
-process.on('SIGINT', () => { stopping = true; console.log('\nостанавливаюсь…'); process.exit(0); });
+/* Для автотестов: PRIEMKA_NO_START=1 загружает бота, не начиная опрос MAX.
+ * В обычной работе эта переменная не задаётся, и бот запускается как раньше. */
+export const _test = {
+  dispatch, handleUpdate, warmTree, findByScr,
+  idle: async ({ withBackground = true } = {}) => {
+    for (let i = 0; i < 50 && (chatQueues.size || (withBackground && background.size)); i++) {
+      await Promise.all([...chatQueues.values(), ...(withBackground ? background : [])]);
+    }
+  },
+  state: () => ({ sessions, scrIndex, folderCache, adminChats, scrBusy, alerts, choices }),
+  setAccess: (list) => { access = list; },
+  healthTick,
+  rotateLogIfNeeded,
+};
 
-loop().catch((e) => { console.error('фатально:', e); process.exit(1); });
+if (process.env.PRIEMKA_NO_START !== '1') {
+  process.on('SIGINT', () => { stopping = true; console.log('\nостанавливаюсь…'); writeState(); process.exit(0); });
+  loop().catch((e) => { console.error('фатально:', e); process.exit(1); });
+}

@@ -8,3 +8,4 @@ bot.log
 access.json.tmp
 access.json.broken
 node/
+tools/link-check.json

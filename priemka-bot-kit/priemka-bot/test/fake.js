@@ -28,6 +28,8 @@ export function createFake() {
     mids: new Map(),           // mid → chatId
     uploads: [],               // что пришло на сервер загрузки MAX
     rejectStream: false,       // true — сервер загрузки MAX отбивает потоковую отправку
+    blobs: new Map(),          // url вложения в MAX → содержимое (реестр для сверки)
+    commands: null,            // что бот прислал в PATCH /me
 
     mkdir(path) {
       const segs = norm(path).split('/').filter(Boolean);
@@ -135,6 +137,16 @@ export function createFake() {
       return json({ href: '' }, 201);
     }
 
+    if (ep === '/disk/resources/copy' && method === 'POST') {
+      const from = norm(q.get('from'));
+      const to = norm(q.get('path'));
+      if (!fake.nodes.has(from)) return json({ error: 'DiskNotFoundError' }, 404);
+      if (!fake.nodes.has(parent(to))) return json({ error: 'DiskPathDoesntExistsError' }, 409);
+      if (fake.nodes.has(to) && q.get('overwrite') !== 'true') return json({ error: 'DiskResourceAlreadyExistsError' }, 409);
+      fake.nodes.set(to, { ...fake.nodes.get(from) });
+      return json({ href: '' }, 201);
+    }
+
     if (ep === '/disk/resources/files' && method === 'GET') {
       const limit = Number(q.get('limit') || 20);
       const offset = Number(q.get('offset') || 0);
@@ -162,6 +174,7 @@ export function createFake() {
     const q = url.searchParams;
     const body = opt.body ? JSON.parse(opt.body) : null;
     const kb = (b) => b?.attachments?.find((a) => a.type === 'inline_keyboard')?.payload?.buttons || null;
+    if (url.pathname === '/me' && method === 'PATCH') { fake.commands = body?.commands || null; return json({ name: 'Тестовый бот' }); }
     if (url.pathname === '/me') return json({ name: 'Тестовый бот', username: 'test_bot' });
     if (url.pathname === '/messages' && method === 'POST') {
       const chatId = Number(q.get('chat_id'));
@@ -205,6 +218,10 @@ export function createFake() {
       if (!n) return new Response('', { status: 404 });
       const buf = n.content != null ? Buffer.from(n.content, 'utf8') : Buffer.alloc(n.size, 7);
       return new Response(buf, { status: 200, headers: { 'content-length': String(buf.length) } });
+    }
+    if (url.hostname === 'max.files.test') {               // файл, присланный человеком в чат
+      const b = fake.blobs.get(url.href);
+      return b ? new Response(b, { status: 200 }) : new Response('', { status: 404 });
     }
     if (url.hostname === 'fu.max.test') {                  // сервер загрузки файлов MAX
       const ct = headers.get('content-type') || '';

@@ -15,6 +15,7 @@
 
 import * as disk from './yandex-disk.js';
 import { ROOT } from './config.js';
+import { writeXlsx } from './xlsx.js';
 
 const FOLDER = [ROOT, '_Журнал'];
 const HEADER = ['Дата', 'Время', 'Кто (номер)', 'Кто (имя)', 'Действие', 'SCR', 'Где', 'Результат'];
@@ -97,37 +98,63 @@ async function write(e, attempt = 0) {
   }
 }
 
-/* Пустая строка — только когда Диск прямо ответил «файла нет». Любой другой сбой — исключение:
- * запись одной строки пропадёт, но месяц не будет перезаписан заголовком и этой строкой. */
-async function readFile(path) {
-  const meta = await disk.stat(path, { fields: 'name,size,file' });
-  if (!meta) return '';
-  if (!meta.file) throw new Error(`Диск не дал ссылку на чтение ${path}`);
-  const r = await fetch(meta.file, { signal: AbortSignal.timeout(60_000) });
-  if (!r.ok) throw new Error(`чтение ${path}: HTTP ${r.status}`);
-  const text = await r.text();
-  if (!text.replace(/^\uFEFF/, '').trim() && meta.size > 3) throw new Error(`чтение ${path}: пусто при размере ${meta.size} байт`);
-  return text;
-}
+// Чтение — disk.readText: пустая строка только при «файла нет», любой другой сбой — исключение.
+const readFile = (path) => disk.readText(path);
 
-/** Выгрузка людей списком — то, что открывается в Excel и годится для отчёта. */
-export async function exportPeople(access, roles) {
+/** Выгрузка людей списком — Excel-таблица с фильтрами; на Диске не хранится. */
+export function exportPeople(access, roles, nameOf = (id) => String(id)) {
   const now = new Date();
-  const head = ['Имя', 'Номер', 'Роль', 'Кем добавлен', 'Когда добавлен'];
   const rows = access.map((a) => [
     a.name || '',
     a.id,
     (roles[a.role] || {}).title || a.role || '',
-    a.addedBy || '',
+    a.addedBy ? nameOf(a.addedBy) : '',
     a.addedAt || '',
-  ].map(cell).join(';'));
-  const body = BOM + head.map(cell).join(';') + '\r\n' + rows.join('\r\n') + '\r\n';
+  ]);
+  const buffer = writeXlsx([{ name: 'Доступ', header: ['Имя', 'Номер', 'Роль', 'Кем добавлен', 'Когда добавлен'], rows }]);
+  return { buffer, name: `Доступ на ${now.toLocaleDateString('ru-RU').replace(/\./g, '-')}.xlsx` };
+}
 
-  const name = `Доступ на ${now.toLocaleDateString('ru-RU').replace(/\./g, '-')}.csv`;
-  const path = disk.joinPath(...FOLDER, name);
-  await disk.ensureFolder(disk.joinPath(...FOLDER));
-  await disk.uploadBuffer(Buffer.from(body, 'utf8'), path, { overwrite: true });
-  return { path, name, size: Buffer.byteLength(body) };
+/* Чтение журнала обратно в строки — для утренней сводки и «последних действий». */
+
+/** Разбор CSV ровно в том виде, в каком его пишет cell(): «;», кавычки удваиваются. */
+export function parseCsv(text) {
+  const out = [];
+  let row = [], field = '', quoted = false;
+  const src = String(text).replace(/^\uFEFF/, '');
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (quoted) {
+      if (ch === '"' && src[i + 1] === '"') { field += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else field += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ';') { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && src[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.some((f) => f !== '')) out.push(row);
+      row = [];
+    } else field += ch;
+  }
+  if (field !== '' || row.length) { row.push(field); if (row.some((f) => f !== '')) out.push(row); }
+  return out;
+}
+
+/** Строки журнала за месяц «2026-09» — объектами { Дата, Время, …, Результат }. Нет файла — []. */
+export async function readMonth(ym) {
+  const text = await readFile(monthPath(ym));
+  const [head, ...rows] = parseCsv(text);
+  if (!head) return [];
+  return rows.map((r) => Object.fromEntries(head.map((h, i) => [h, r[i] ?? ''])));
+}
+
+/** Журнал месяца — Excel-таблицей: жирная шапка, фильтры, закреплённая первая строка. */
+export async function monthXlsx(ym) {
+  const text = await readFile(monthPath(ym));
+  const [head, ...rows] = parseCsv(text);
+  if (!head) throw new Error(`журнал за ${ym} пуст`);
+  return writeXlsx([{ name: `Журнал ${ym}`, header: head, rows }]);
 }
 
 /** Путь к журналу месяца «2026-09» — бот выдаёт его администратору файлом. */

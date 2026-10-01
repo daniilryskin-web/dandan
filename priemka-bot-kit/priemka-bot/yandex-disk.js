@@ -715,3 +715,45 @@ export async function move(from, to, { overwrite = false } = {}) {
   }
   return dst;
 }
+
+/**
+ * Копия внутри Диска — для восстановления версии: архивная копия остаётся в BackUp,
+ * на место записи встаёт её дубликат. Устроено как move: родителя создаём сами,
+ * крупный файл копируется асинхронно (202) — дожидаемся.
+ */
+export async function copy(from, to, { overwrite = false } = {}) {
+  const src = normalizePath(from);
+  const dst = normalizePath(to);
+  const parent = dst.slice(0, dst.lastIndexOf('/')) || '/';
+  if (parent !== '/') await ensureFolder(parent);
+
+  const url = buildUrl('/disk/resources/copy', { from: src, path: dst, overwrite });
+  const { status, body } = await apiRequest('POST', url, {
+    expect: [201, 202],
+    context: `Копирование ${from} → ${to}`,
+    path: dst,
+    idempotent: false,
+  });
+  if (status === 202 && body?.href) {
+    await waitOperation(body.href, { timeoutMs: 15 * 60_000 });
+  }
+  return dst;
+}
+
+/**
+ * Прочитать небольшой текстовый файл с Диска (журнал, служебные данные).
+ * Пустая строка — только когда Диск прямо ответил «файла нет». Любой другой сбой —
+ * исключение: тот, кто потом перезапишет файл, не должен затереть его пустотой.
+ */
+export async function readText(path) {
+  const meta = await stat(path, { fields: 'name,size,file' });
+  if (!meta) return '';
+  if (!meta.file) throw new DiskError(`Диск не дал ссылку на чтение ${path}`, { path });
+  const r = await fetch(meta.file, { signal: AbortSignal.timeout(60_000) });
+  if (!r.ok) throw new DiskError(`чтение ${path}: HTTP ${r.status}`, { status: r.status, path });
+  const text = await r.text();
+  if (!text.replace(/^﻿/, '').trim() && meta.size > 3) {
+    throw new DiskError(`чтение ${path}: пусто при размере ${meta.size} байт`, { path });
+  }
+  return text;
+}

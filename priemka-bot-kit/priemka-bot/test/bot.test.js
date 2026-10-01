@@ -78,7 +78,7 @@ const lastFile = (chat) => fake.sent.filter((m) => m.chatId === chat && m.op ===
 /** Пройти опросник «Загрузить» до вопроса о номере. */
 async function walkUpload(chat, user, folders) {
   await press(chat, user, 'cmd:upload');
-  for (const f of folders) await click(chat, user, f);
+  for (const f of folders) await click(chat, user, '📁 ' + f);
   assert.match(lastText(chat), /Введите номер SCR/);
 }
 
@@ -204,12 +204,15 @@ test('3.1 и 3.6 замок на номер; долгая загрузка до�
   fake.holdOps = true;
   await press(EDITOR_CHAT, EDITOR, 'cmd:replace');
   await say(EDITOR_CHAT, EDITOR, '1000001');
-  bot.dispatch(msg(EDITOR_CHAT, EDITOR, '', [fileAtt('новая.mp4', 6000)]));
+  await say(EDITOR_CHAT, EDITOR, '', [fileAtt('новая.mp4', 6000)]);
+  assert.match(lastText(EDITOR_CHAT), /Проверьте перед заменой[\s\S]*БЫЛО[\s\S]*СТАНЕТ/);   // 4.17
+  bot.dispatch(cb(EDITOR_CHAT, EDITOR, fake.button(EDITOR_CHAT, 'Заменить')));
   await new Promise((r) => setTimeout(r, 300));
   // Второй руководитель пытается заменить ту же запись — получает «занята», а не гонку
   await press(EDITOR2_CHAT, EDITOR2, 'cmd:replace');
   await say(EDITOR2_CHAT, EDITOR2, '1000001');
   await say(EDITOR2_CHAT, EDITOR2, '', [fileAtt('другая.mp4', 6000)]);
+  await click(EDITOR2_CHAT, EDITOR2, 'Заменить');
   assert.match(lastText(EDITOR2_CHAT), /сейчас идёт другое действие/);
   // У первого истекает время ожидания в чате → «ещё идёт», бот отпускает человека
   await new Promise((r) => setTimeout(r, 1500));
@@ -273,7 +276,7 @@ test('3.12 два файла с одним номером — бот показ�
 test('3.12 перенос: запись переезжает, индекс обновлён', async () => {
   await press(EDITOR_CHAT, EDITOR, 'cmd:move');
   await say(EDITOR_CHAT, EDITOR, '4000004');
-  for (const f of ['ГК-2', 'ОП-2', 'Код-направления 02', 'Система В']) await click(EDITOR_CHAT, EDITOR, f);
+  for (const f of ['ГК-2', 'ОП-2', 'Код-направления 02', 'Система В']) await click(EDITOR_CHAT, EDITOR, '📁 ' + f);
   await click(EDITOR_CHAT, EDITOR, 'Переместить');
   assert.match(lastText(EDITOR_CHAT), /Видеозапись перемещена/);
   assert.ok(fake.exists(`${SYS_C}/SCR#4000004.mov`));

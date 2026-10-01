@@ -17,8 +17,14 @@
 import { readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import * as disk from './yandex-disk.js';
-import { sendFileFromUrl, SendError } from './max-upload.js';
+import { sendFileFromUrl, sendBuffer, SendError } from './max-upload.js';
 import * as journal from './journal.js';
+import * as meta from './meta.js';
+import { writeXlsx, readXlsxCells } from './xlsx.js';
+import {
+  btn, rows, HOME, RULE, mb, cut, fmtDate, parts, report, reportInline, crumbs, card, trouble,
+  stepTitle, paginate,
+} from './ui.js';
 import {
   ROOT, ADMINS, YANDEX_TOKEN_ISSUED, YANDEX_TOKEN_DAYS, LOW_SPACE_BYTES, BOT_DIR, dataFile,
 } from './config.js';
@@ -37,9 +43,13 @@ const POLL_TIMEOUT_SEC = 30;
 /* Роли. Проверяем не «кто ты», а «что тебе можно» — так добавить четвёртую роль
  * будет правкой одной таблицы, а не поиском проверок по всему файлу. */
 const ROLES = {
-  admin:  { title: 'Администратор',        can: ['find', 'upload', 'replace', 'move', 'admin'] },
-  editor: { title: 'Руководитель проекта', can: ['find', 'upload', 'replace', 'move'] },
-  viewer: { title: 'Гость',                can: ['find'] },
+  admin:  { title: 'Администратор',        desc: 'всё, включая доступ, удаление и отчёты',
+    can: ['find', 'upload', 'replace', 'move', 'browse', 'comment', 'versions', 'delete', 'admin'] },
+  editor: { title: 'Руководитель проекта', desc: 'загрузка, замена, перенос, обзор, версии',
+    can: ['find', 'upload', 'replace', 'move', 'browse', 'comment', 'versions'] },
+  // Гостю — только поиск по номеру: обзор показал бы всю структуру контрактов.
+  viewer: { title: 'Гость',                desc: 'только поиск записи по номеру',
+    can: ['find'] },
 };
 const DEFAULT_ROLE = 'editor';
 
@@ -119,11 +129,15 @@ function loadState() {
       alerts: new Map(Object.entries(j.alerts || {})),
       starts: Array.isArray(j.starts) ? j.starts : [],
       plannedRestart: !!j.plannedRestart,
+      lastPaths: new Map(Object.entries(j.lastPaths || {}).map(([k, v]) => [Number(k), v])),
+      requests: new Map(Object.entries(j.requests || {}).map(([k, v]) => [Number(k), v])),
+      lastSummary: j.lastSummary || null,
     };
   } catch {
     return {
       sessions: new Map(), lastUser: new Map(), choices: new Map(), choiceSeq: 0,
       adminChats: new Map(), alerts: new Map(), starts: [], plannedRestart: false,
+      lastPaths: new Map(), requests: new Map(), lastSummary: null,
     };
   }
 }
@@ -138,6 +152,9 @@ function writeState(extra = {}) {
       adminChats: Object.fromEntries(adminChats),
       alerts: Object.fromEntries(alerts),
       starts,
+      lastPaths: Object.fromEntries(lastPaths),
+      requests: Object.fromEntries(requests),
+      lastSummary,
       ...extra,
     }));
   } catch (e) { console.error('не смог сохранить состояние:', e.message); }
@@ -156,6 +173,9 @@ const sessions = restored.sessions;
 const adminChats = restored.adminChats;   // администратор → его чат с ботом, туда идут оповещения
 const alerts = restored.alerts;           // ключ оповещения → когда отправляли (не чаще раза в час)
 const starts = restored.starts;           // моменты запусков: частые — значит, бот падает
+const lastPaths = restored.lastPaths;     // человек → папка последней загрузки («В прошлую папку»)
+const requests = restored.requests;       // заявки на доступ: кто, когда, чем кончилось
+let lastSummary = restored.lastSummary;   // дата последней утренней сводки
 
 function session(chatId) {
   const now = Date.now();
@@ -265,10 +285,6 @@ async function drop(chatId, mid) {
   if (sess && sess.mid === mid) sess.mid = null;   // иначе следующая правка уйдёт в пустоту
 }
 
-// Кнопки MAX идут строками: массив массивов. Каждая своя строка — так длинные
-// названия папок не режутся пополам на узком экране телефона.
-const rows = (items) => items.map((b) => [b]);
-const btn = (text, payload) => ({ type: 'callback', text, payload });
 
 /* Оповещения администратору.
  * Раньше о сбоях знали только из bot.log — то есть узнавали от пользователей. Теперь бот
@@ -338,6 +354,7 @@ function menuFor(userId) {
   const m = [];
   if (can(userId, 'upload'))  m.push(btn('📤 Загрузить видеозапись', 'cmd:upload'));
   m.push(btn('🔍 Найти по номеру SCR', 'cmd:find'));
+  if (can(userId, 'browse'))  m.push(btn('📂 Обзор записей', 'cmd:browse'));
   if (can(userId, 'replace')) m.push(btn('♻️ Заменить видеозапись', 'cmd:replace'));
   if (can(userId, 'move'))    m.push(btn('📁 Переместить видеозапись', 'cmd:move'));
   if (can(userId, 'admin'))   m.push(btn('⚙️ Администрирование', 'adm:menu'));
@@ -351,6 +368,53 @@ const showMenu = (chatId, prefix = '', userId = null) =>
  * где userId под рукой нет (например, после ошибки). */
 const lastUser = restored.lastUser;
 
+/** Служебные папки в опроснике не показываем: BackUp — архив версий, а всё,
+ *  что начинается с подчёркивания (_Журнал, _Служебное), — наши потроха. */
+const visibleDirs = (listing) => listing.dirs.filter((d) => d.name !== BACKUP && !d.name.startsWith('_'));
+
+/** Сколько ещё уровней под папкой — по кэшу. null, если часть дерева не прочитана. */
+function depthBelow(folder, guard = 0) {
+  const hit = folderCache.get(ckey(folder));
+  if (!hit || guard > 10) return null;
+  const dirs = visibleDirs(hit.listing);
+  if (!dirs.length) return 0;
+  let max = 0;
+  for (const d of dirs) {
+    const n = depthBelow(d.path, guard + 1);
+    if (n === null) return null;
+    max = Math.max(max, n + 1);
+  }
+  return max;
+}
+
+const FLOW = {
+  upload:  { label: '📤 Загрузка',     ask: 'Куда сохранить запись?' },
+  move:    { label: '📁 Перенос',      ask: 'Куда перенести запись?' },
+  browse:  { label: '📂 Обзор записей', ask: 'Выберите папку' },
+  restore: { label: '🕘 Восстановление', ask: 'Исходная папка записи неизвестна — куда её вернуть?' },
+};
+
+/** Заголовок шага: «📤 Загрузка · шаг 2 из 6» и выбранные папки под ним. */
+function flowHead(s, phase) {
+  const f = FLOW[s.cmd] || { label: '' };
+  const below = depthBelow(disk.joinPath(ROOT, ...s.path));
+  const levels = below === null ? null : s.path.length + below;
+  let step = null, total = null;
+  if (s.cmd === 'upload') {
+    total = levels === null ? null : levels + 2;               // папки + номер + файл
+    step = phase === 'folder' ? s.path.length + 1 : phase === 'scr' ? s.path.length + 1 : s.path.length + 2;
+  } else if (s.cmd === 'move') {
+    total = levels === null ? null : levels + 2;               // номер + папки + подтверждение
+    step = phase === 'folder' ? s.path.length + 2 : s.path.length + 2;
+  } else if (s.cmd === 'replace') {
+    total = 3;
+    step = phase === 'scr' ? 1 : phase === 'file' ? 2 : 3;
+  }
+  const head = stepTitle(f.label, step, total);
+  const where = s.path.length ? crumbs(s.path) : '';
+  return where ? `${head}\n${where}` : head;
+}
+
 /** Показать содержимое текущего уровня. Если подпапок нет — уровень последний. */
 async function askFolder(chatId, s) {
   const t0 = Date.now();
@@ -362,85 +426,74 @@ async function askFolder(chatId, s) {
     if (tDisk > 60) console.log(`   [шаг] Диск ${tDisk} мс — мимо кэша`);
   } catch (e) {
     reset(chatId);
-    return screen(chatId, 'Не удалось прочитать структуру папок. Попробуйте ещё раз через минуту.', rows([btn('⬅️ В начало', 'cmd:menu')]));
+    return screen(chatId, trouble('Не удалось прочитать структуру папок', 'Попробуйте ещё раз через минуту.'), rows([HOME()]));
   }
 
-  /* Служебные папки в опроснике не показываем: BackUp — архив версий, а всё,
-   * что начинается с подчёркивания (_Журнал и что заведём дальше), — наши потроха.
-   * Человек выбирает, куда положить запись, а не гуляет по файловой системе. */
-  const dirs = listing.dirs.filter((d) => d.name !== BACKUP && !d.name.startsWith('_'));
+  const dirs = visibleDirs(listing);
+  const records = s.cmd === 'browse'
+    ? listing.files.filter((f) => SCR_RE.test(f.name) && isLive(f)).sort((a, b) => a.name.localeCompare(b.name))
+    : [];
 
-  if (dirs.length === 0) {
-    // Дно дерева: дальше спрашиваем номер
+  if (dirs.length === 0 && s.cmd !== 'browse') {
+    // Дно дерева: дальше — по команде
     if (s.cmd === 'move') {
       s.step = 'confirm-move';
       return screen(chatId,
+        `${stepTitle(FLOW.move.label, s.path.length + 2, s.path.length + 2)}\n\n` +
         `БЫЛО\n${report(s.found.path)}\n${RULE}\nСТАНЕТ\n${report(s.path)}\n${RULE}\nПереместить SCR#${s.scr}?`,
-        rows([btn('✅ Переместить', 'go:move'), btn('⬅️ В начало', 'cmd:menu')]));
+        rows([btn('✅ Переместить', 'go:move'), HOME()]));
+    }
+    if (s.cmd === 'restore') {
+      s.step = 'confirm-restore';
+      return confirmRestore(chatId, s);
     }
     s.step = 'await-scr';
     return screen(chatId,
-      `${report(s.path)}\n${RULE}\nВведите номер SCR — семь цифр, без «SCR» и «#»\nНапример: 6512028`,
-      rows([btn('⬅️ В начало', 'cmd:menu')]));
+      `${flowHead(s, 'scr')}\n${RULE}\nВведите номер SCR — семь цифр, без «SCR» и «#»\nНапример: 6512028`,
+      rows([HOME()]));
   }
 
-  const buttons = dirs.map((d) => btn('📁 ' + d.name, 'dir:' + keyFor(d.name)));
-  if (s.path.length) buttons.push(btn('⬆️ На уровень выше', 'up'));
-  buttons.push(btn('⬅️ В начало', 'cmd:menu'));
+  /* Папки и записи — одним списком по страницам: в обзоре на одном уровне бывают и те и другие. */
+  const items = [
+    ...dirs.map((d) => btn('📁 ' + d.name, 'dir:' + keyFor(d.name))),
+    ...records.map((f) => btn(cut(`🎞 ${f.name.replace(/\.[^.]+$/, '')} · ${mb(f.size)} · ${fmtDate(f.created)}`, 60),
+      'rec:' + keyFor(f))),
+  ];
+  const { slice, nav, page, pages } = paginate(items, s.page);
+  s.page = page;
 
-  const chosen = s.path.length ? report(s.path) : '';
+  const top = [];
+  // «В прошлую папку» — на первом экране загрузки, если человек уже грузил и папка на месте.
+  if (s.cmd === 'upload' && !s.path.length && page === 0) {
+    const last = lastPaths.get(lastUser.get(chatId));
+    if (last?.length && (await isBottomFolder(last))) {
+      top.push(btn(cut(`↩️ В прошлую папку: ${crumbs(last)}`, 60), 'again'));
+    }
+  }
+  const tail = [];
+  if (s.path.length) tail.push(btn('⬆️ На уровень выше', 'up'));
+  tail.push(HOME());
+
+  const f = FLOW[s.cmd] || FLOW.upload;
+  const info = s.cmd === 'browse'
+    ? (records.length || dirs.length
+      ? `Папок: ${dirs.length}, записей: ${records.length}` + (pages > 1 ? ` · страница ${page + 1} из ${pages}` : '')
+      : 'Здесь пока пусто.')
+    : (pages > 1 ? `Страница ${page + 1} из ${pages}` : '');
+  const text = [flowHead(s, 'folder'), RULE, f.ask, info].filter(Boolean).join('\n');
+
   const tSend = Date.now();
-  // При перемещении «сохранить» звучит как новая загрузка — спрашиваем по делу.
-  const ask = s.cmd === 'move' ? 'Куда перенести запись?' : 'Куда сохранить запись?';
-  const r = await screen(chatId, chosen ? `${chosen}\n${RULE}\n${ask}` : ask, rows(buttons));
+  const r = await screen(chatId, text, [...rows(top), ...rows(slice), ...nav, ...rows(tail)]);
   console.log(`   [шаг] MAX ${Date.now() - tSend} мс, всего ${Date.now() - t0} мс`);
   return r;
 }
 
-
-/* отчёт вместо пути.
- * Человеку не нужен путь на Диске: ему нужно понимать, к какому контракту и периоду
- * относится запись. Корневую папку не показываем вообще — она всегда одна и та же.
- * Префикс «Код-направления » режем: в отчёте это лишний шум.
- */
-function parts(pathOrSegments) {
-  const seg = Array.isArray(pathOrSegments)
-    ? pathOrSegments.slice()
-    : String(pathOrSegments).replace(/^disk:/i, '').split('/').filter(Boolean);
-  // убираем корень и имя файла, если они попали в список
-  if (seg[0] === ROOT) seg.shift();
-  if (seg.length && /\.[A-Za-z0-9]{1,8}$/.test(seg[seg.length - 1])) seg.pop();
-  const [gk, op, napr, sys] = seg;
-  return {
-    gk: gk || null,
-    op: op || null,
-    napr: napr ? napr.replace(/^Код[-\s]?направлени[яй]\s*/i, '') : null,
-    sys: sys || null,
-  };
-}
-
-/** Многострочный отчёт: только заполненные поля. */
-function report(src, { scr = null, size = null } = {}) {
-  const p = parts(src);
-  const lines = [];
-  if (scr) lines.push(`Номер: SCR#${scr}`);
-  if (p.gk) lines.push(`ГК: ${p.gk}`);
-  if (p.op) lines.push(`ОП: ${p.op}`);
-  if (p.napr) lines.push(`Направление: ${p.napr}`);
-  if (p.sys) lines.push(`Система: ${p.sys}`);
-  if (size != null) lines.push(`Размер: ${(size / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`);
-  return lines.join('\n');
-}
-
-/** Черта между «куда положим» и вопросом к человеку: без неё путь и вопрос
- *  сливаются в одну простыню и читать приходится по слогам. */
-const RULE = '––––––––––––––––––––';
-
-/** Однострочный вариант — для подписей и коротких сообщений. */
-function reportInline(src) {
-  const p = parts(src);
-  return [p.gk && `ГК: ${p.gk}`, p.op && `ОП: ${p.op}`, p.napr && `Направление: ${p.napr}`, p.sys && `Система: ${p.sys}`]
-    .filter(Boolean).join(' · ');
+/** Папка существует и подпапок в ней нет — в неё можно загружать. */
+async function isBottomFolder(segments) {
+  try {
+    const listing = await listCached(disk.joinPath(ROOT, ...segments));
+    return visibleDirs(listing).length === 0;
+  } catch { return false; }
 }
 
 /** Папка, в которой лежит файл: «disk:/a/b/c.mp4» → «/a/b» */
@@ -617,19 +670,18 @@ async function findByScr(scr) {
 /* админка.
  * Живёт внутри бота: отдельная панель ради десятка человек не окупается,
  * а здесь всё под рукой и не требует ни хостинга, ни отдельного входа.
+ * Три раздела вместо длинного столбика: действия живут рядом с тем, к чему относятся.
  */
-/* Три раздела вместо восьми пунктов: экран, где всё в столбик, читается хуже,
- * чем два коротких шага. Действия живут внутри своего раздела — рядом с тем,
- * к чему относятся. */
 const ADMIN_MENU = () => [
   btn('👥 Доступ', 'adm:people'),
   btn('📊 Отчёты', 'adm:reports'),
   btn('🔄 Обновить структуру папок', 'adm:refresh'),
-  btn('⬅️ В начало', 'cmd:menu'),
+  HOME(),
 ];
+const BACK = () => btn('⬅️ Назад', 'adm:back');
 
 async function adminScreen(chatId, prefix = '') {
-  return screen(chatId, (prefix ? prefix + '\n\n' : '') + 'Администрирование', rows(ADMIN_MENU()));
+  return screen(chatId, (prefix ? prefix + '\n\n' : '') + '⚙️ Администрирование', rows(ADMIN_MENU()));
 }
 
 async function onAdmin(chatId, userId, payload, s) {
@@ -637,13 +689,47 @@ async function onAdmin(chatId, userId, payload, s) {
   return adminRoute(chatId, userId, payload, s);
 }
 
+const roleTitle = (a) => (ROLES[a?.role] || ROLES[DEFAULT_ROLE]).title;
+const today = () => {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+const pendingRequests = () => [...requests.entries()].filter(([, r]) => r.status === 'pending');
+
+/** Выдать доступ — одна функция и для ввода номера, и для заявки. */
+function addAccess({ id, name, role, by }) {
+  if (access.some((a) => a.id === id)) return 'exists';
+  const next = [...access, { id, name: name || null, role, addedBy: by, addedAt: today() }];
+  if (!saveAccess(next)) return 'fail';
+  access = next;
+  console.log(`   доступ выдан: ${name || '—'} (${id}) роль ${role}, администратор ${by}`);
+  journal.log({ userId: by, name: nameOf(by), action: 'Выдача доступа',
+    where: `${name || 'без имени'} (${id})`, result: ROLES[role].title });
+  return 'ok';
+}
+
+/** Чат человека с ботом — чтобы сообщить ему о решении администратора. */
+const chatOfUser = (userId) => [...lastUser.entries()].find(([, u]) => u === userId)?.[0] ?? null;
+
+/** Список людей кнопками по страницам — для «Изменить роль» и «Убрать». */
+function peopleButtons(list, prefix, page) {
+  const items = list.map((a) => btn(cut(`${a.name || a.id} · ${roleTitle(a)}`, 60), prefix + keyFor(a.id)));
+  return paginate(items, page);
+}
+
 async function adminRoute(chatId, userId, payload, s) {
 
   if (payload === 'adm:people') {
-    if (!access.length) return screen(chatId, 'Список пуст: ботом пользуются только основные администраторы.', rows([
+    s.view = null;
+    const pend = pendingRequests().length;
+    const actions = [
+      ...(pend ? [btn(`🙋 Заявки на доступ (${pend})`, 'adm:reqs')] : []),
       btn('➕ Добавить', 'adm:add'),
-      btn('⬅️ Назад', 'adm:back'),
-    ]));
+      ...(access.length ? [btn('🔁 Изменить роль', 'adm:chg'), btn('➖ Убрать', 'adm:del'), btn('🔎 Найти', 'adm:find'),
+        btn('📥 Выгрузить в Excel', 'adm:export')] : []),
+      BACK(),
+    ];
+    if (!access.length) return screen(chatId, '👥 Доступ\n\nСписок пуст: ботом пользуются только основные администраторы.', rows(actions));
     const blocks = [];
     for (const [key, def] of Object.entries(ROLES)) {
       const people = access.filter((a) => (ROLES[a.role] ? a.role : DEFAULT_ROLE) === key);
@@ -651,13 +737,23 @@ async function adminRoute(chatId, userId, payload, s) {
       blocks.push(`${def.title.toUpperCase()} (${people.length})\n` +
         people.map((a) => `  ${a.name || 'без имени'} — ${a.id}`).join('\n'));
     }
-    return screen(chatId, `Доступ есть у ${access.length} чел.\n${RULE}\n` + blocks.join(`\n${RULE}\n`), rows([
-      btn('➕ Добавить', 'adm:add'),
-      btn('➖ Убрать', 'adm:del'),
-      btn('🔎 Найти', 'adm:find'),
-      btn('📥 Выгрузить в Excel', 'adm:export'),
-      btn('⬅️ Назад', 'adm:back'),
+    return screen(chatId, cut(`👥 Доступ есть у ${access.length} чел.\n${RULE}\n` + blocks.join(`\n${RULE}\n`), 3800), rows(actions));
+  }
+
+  if (payload === 'adm:reqs') {
+    const pend = pendingRequests();
+    if (!pend.length) return adminRoute(chatId, userId, 'adm:people', s);
+    return screen(chatId, `🙋 Заявки на доступ: ${pend.length}\n${RULE}\nВыберите, чтобы решить:`, rows([
+      ...pend.map(([id, r]) => btn(cut(`🙋 ${r.name || 'без имени'} · ${id}`, 60), `admreq:${id}`)),
+      BACK(),
     ]));
+  }
+
+  if (payload.startsWith('admreq:')) {
+    const id = Number(payload.slice(7));
+    const r = requests.get(id);
+    if (!r || r.status !== 'pending') return adminRoute(chatId, userId, 'adm:reqs', s);
+    return screen(chatId, requestCardText(id, r), requestButtons(id));
   }
 
   if (payload === 'adm:reports') {
@@ -665,9 +761,11 @@ async function adminRoute(chatId, userId, payload, s) {
     const buttons = ms.slice(0, 6).map((m) =>
       btn(`🗒 Журнал за ${journal.monthTitle(m.ym)}`, 'admlog:' + m.ym));
     if (!ms.length) buttons.push(btn('🗒 Журнал пока пуст', 'adm:reports'));
+    buttons.push(btn('🕒 Последние действия', 'adm:recent'));
+    buttons.push(btn('📋 Сверка с реестром', 'adm:registry'));
     buttons.push(btn('📊 Что на Диске', 'adm:stats'));
-    buttons.push(btn('⬅️ Назад', 'adm:back'));
-    return screen(chatId, 'Отчёты', rows(buttons));
+    buttons.push(BACK());
+    return screen(chatId, '📊 Отчёты', rows(buttons));
   }
 
   if (payload.startsWith('admlog:')) {
@@ -675,45 +773,103 @@ async function adminRoute(chatId, userId, payload, s) {
     // перезапуск бота, и старая кнопка молча переставала работать. Замерено 07.09.2026.
     const ym = payload.slice(7);
     if (!/^\d{4}-\d{2}$/.test(ym)) return adminScreen(chatId);
-    const path = journal.monthPath(ym);
+    await drop(chatId, s.mid);                       // экран «Отчёты» сейчас заменится файлом
+    const wait = await say(chatId, 'Готовлю журнал…');
+    const caption = `Журнал действий, ${journal.monthTitle(ym)}`;
     try {
-      const meta = await disk.stat(path, { fields: 'name,size,file' });
-      await drop(chatId, s.mid);                       // экран «Отчёты» сейчас заменится файлом
-      const wait = await say(chatId, 'Готовлю журнал…');
-      await sendFileFromUrl(chatId, {
-        url: await downloadHref(path), filename: meta.name, size: meta.size,
-        caption: `Журнал действий, ${journal.monthTitle(meta.name.slice(0, 7))}`,
-      });
+      // Excel с фильтрами; если собрать не вышло — прежний CSV, чтобы журнал не остался недоступен.
+      try {
+        await sendBuffer(chatId, { buffer: await journal.monthXlsx(ym), filename: `Журнал ${ym}.xlsx`, caption });
+      } catch (e) {
+        console.error('   журнал в Excel не собрался, отдаю CSV:', e.message);
+        const path = journal.monthPath(ym);
+        const st = await disk.stat(path, { fields: 'name,size' });
+        await sendFileFromUrl(chatId, { url: await downloadHref(path), filename: st.name, size: st.size, caption });
+      }
       await drop(chatId, wait?.message?.body?.mid);    // и служебное «готовлю» тоже
       return adminScreen(chatId);
     } catch (e) {
-      return adminScreen(chatId, `Не удалось выгрузить журнал.\n${e.message}`);
+      await drop(chatId, wait?.message?.body?.mid);
+      return adminScreen(chatId, trouble('Не удалось выгрузить журнал', e.message));
     }
   }
 
+  if (payload === 'adm:recent') return showRecent(chatId);
+
+  if (payload === 'adm:registry') {
+    s.step = 'await-registry';
+    return screen(chatId,
+      '📋 Сверка с реестром\n' + RULE + '\n' +
+      'Пришлите файлом таблицу Excel (.xlsx) или CSV со списком номеров SCR.\n' +
+      'Колонка не важна: бот найдёт все семизначные номера в любом месте таблицы.\n\n' +
+      'В ответ придёт таблица: какие записи есть на Диске, каких нет и какие лежат на Диске, но не в реестре.',
+      rows([BACK()]));
+  }
+
   if (payload === 'adm:add') {
-    const buttons = Object.entries(ROLES).map(([key, def]) =>
-      btn(`${def.title} — ${def.can.filter((c) => c !== 'admin').join(', ')}`, 'admrole:' + key));
-    buttons.push(btn('⬅️ Назад', 'adm:back'));
-    return screen(chatId, 'Какую роль дать человеку?', rows(buttons));
+    const buttons = Object.entries(ROLES).map(([key, def]) => btn(`${def.title} — ${def.desc}`, 'admrole:' + key));
+    buttons.push(BACK());
+    return screen(chatId, '➕ Какую роль дать человеку?', rows(buttons));
   }
 
   if (payload.startsWith('admrole:')) {
     s.newRole = payload.slice(8);
     s.step = 'adm-await-id';
     return screen(chatId,
-      `Роль: ${ROLES[s.newRole]?.title || s.newRole}\n${RULE}\n` +
+      `➕ Роль: ${ROLES[s.newRole]?.title || s.newRole}\n${RULE}\n` +
       'Пришлите номер человека — он видит его в отказе бота, когда пытается написать.\n\n' +
       'Можно сразу с именем, через пробел: 12345678 Иван Петров',
-      rows([btn('⬅️ Назад', 'adm:back')]));
+      rows([BACK()]));
   }
 
-  if (payload === 'adm:del') {
-    if (!access.length) return adminScreen(chatId, 'Убирать некого — список пуст.');
-    const buttons = access.map((a) => btn(
-      `➖ ${a.name || a.id} · ${(ROLES[a.role] || ROLES[DEFAULT_ROLE]).title}`, 'admdel:' + keyFor(a.id)));
-    buttons.push(btn('⬅️ Назад', 'adm:back'));
-    return screen(chatId, 'Кого убрать?', rows(buttons));
+  /* Смена роли. Раньше — только «убрать и добавить заново»: человек на это время терял
+   * доступ, номер вписывался руками ещё раз, а история «кто и когда добавил» пропадала. */
+  if (payload === 'adm:chg' || payload.startsWith('admchgp:')) {
+    const list = access.filter((a) => !ADMINS.includes(a.id));
+    if (!list.length) return adminRoute(chatId, userId, 'adm:people', s);
+    const { slice, nav } = peopleButtons(list, 'admchg:', payload.startsWith('admchgp:') ? Number(payload.slice(8)) : 0);
+    return screen(chatId, '🔁 Кому изменить роль?', [...rows(slice), ...navAs(nav, 'admchgp:', payload), ...rows([BACK()])]);
+  }
+
+  if (payload.startsWith('admchg:')) {
+    const id = choices.get(payload.slice(7));
+    const who = access.find((a) => a.id === id);
+    if (!who) return adminRoute(chatId, userId, 'adm:people', s);
+    s.chgId = id;
+    const buttons = Object.entries(ROLES).map(([key, def]) =>
+      btn(`${key === (ROLES[who.role] ? who.role : DEFAULT_ROLE) ? '✓ ' : ''}${def.title} — ${def.desc}`, 'admchgto:' + key));
+    buttons.push(BACK());
+    return screen(chatId, `🔁 ${who.name || 'без имени'} (${id})\nСейчас: ${roleTitle(who)}\n${RULE}\nНовая роль:`, rows(buttons));
+  }
+
+  if (payload.startsWith('admchgto:')) {
+    const role = payload.slice(9);
+    const id = s.chgId;
+    const who = access.find((a) => a.id === id);
+    if (!who || !ROLES[role]) return adminRoute(chatId, userId, 'adm:people', s);
+    if (ADMINS.includes(id)) return adminScreen(chatId, 'Основному администратору роль отсюда не меняется.');
+    const was = roleTitle(who);
+    if ((ROLES[who.role] ? who.role : DEFAULT_ROLE) === role) return adminRoute(chatId, userId, 'adm:people', s);
+    const next = access.map((a) => (a.id === id ? { ...a, role } : a));
+    if (!saveAccess(next)) return adminScreen(chatId, 'Не удалось сохранить список доступа, попробуйте ещё раз.');
+    access = next;
+    s.chgId = null;
+    journal.log({ userId, name: nameOf(userId), action: 'Смена роли',
+      where: `${who.name || 'без имени'} (${id})`, result: `${was} → ${ROLES[role].title}` });
+    const theirChat = chatOfUser(id);
+    if (theirChat) {
+      say(theirChat, `Ваша роль в боте изменена: ${ROLES[role].title}.`, rows(menuFor(id)))
+        .catch((e) => console.error('   не сообщил о смене роли:', e.message));
+    }
+    await say(chatId, `🔁 ${who.name || id}: ${was} → ${ROLES[role].title}`);
+    return adminRoute(chatId, userId, 'adm:people', s);
+  }
+
+  if (payload === 'adm:del' || payload.startsWith('admdelp:')) {
+    const list = access.filter((a) => !ADMINS.includes(a.id) && a.id !== userId);
+    if (!list.length) return adminScreen(chatId, 'Убирать некого.');
+    const { slice, nav } = peopleButtons(list, 'admdel:', payload.startsWith('admdelp:') ? Number(payload.slice(8)) : 0);
+    return screen(chatId, '➖ Кого убрать?', [...rows(slice), ...navAs(nav, 'admdelp:', payload), ...rows([BACK()])]);
   }
 
   if (payload.startsWith('admdel:')) {
@@ -735,26 +891,24 @@ async function adminRoute(chatId, userId, payload, s) {
 
   if (payload === 'adm:find') {
     s.step = 'adm-await-search';
-    return screen(chatId, 'Кого ищем? Введите часть имени или номер.', rows([btn('⬅️ Назад', 'adm:back')]));
+    return screen(chatId, '🔎 Кого ищем? Введите часть имени или номер.', rows([BACK()]));
   }
 
   if (payload === 'adm:export') {
     try {
-      const { path, name, size } = await journal.exportPeople(access, ROLES);
+      const { buffer, name } = journal.exportPeople(access, ROLES, nameOf);
       await drop(chatId, s.mid);
-      const wait = await say(chatId, `Готовлю выгрузку, ${access.length} чел.`);
-      const dl = await downloadHref(path);
-      await sendFileFromUrl(chatId, { url: dl, filename: name, size, caption: `Список доступа на ${new Date().toLocaleDateString('ru-RU')}` });
-      await drop(chatId, wait?.message?.body?.mid);
+      await sendBuffer(chatId, { buffer, filename: name, caption: `Список доступа на ${new Date().toLocaleDateString('ru-RU')}` });
       return onAdmin(chatId, userId, 'adm:people', s);
     } catch (e) {
-      return adminScreen(chatId, `Не удалось выгрузить список.\n${e.message}`);
+      return adminScreen(chatId, trouble('Не удалось выгрузить список', e.message));
     }
   }
 
   if (payload === 'adm:refresh') {
     dropFolderCache();
-    return adminScreen(chatId, 'Структура папок перечитана — свежие папки уже видны в опроснике.');
+    meta.reload();
+    return adminScreen(chatId, '🔄 Структура папок перечитывается — через минуту свежие папки будут видны в опроснике.');
   }
 
   if (payload === 'adm:stats') {
@@ -765,18 +919,53 @@ async function adminRoute(chatId, userId, payload, s) {
       const bytes = live.reduce((n, f) => n + (f.size || 0), 0);
       const free = await disk.freeSpace();
       return adminScreen(chatId,
-        `Записей на Диске: ${live.length}\n` +
+        '📊 Что на Диске\n\n' +
+        `Записей: ${live.length}\n` +
         `В архиве версий: ${backups}\n` +
-        `Занимают: ${(bytes / 1024 ** 3).toFixed(2)} ГБ\n` +
-        `Свободно на Диске: ${(free / 1024 ** 3).toFixed(2)} ГБ`);
+        `Занимают: ${(bytes / 1024 ** 3).toFixed(2).replace('.', ',')} ГБ\n` +
+        `Свободно: ${(free / 1024 ** 3).toFixed(2).replace('.', ',')} ГБ`);
     } catch (e) {
-      return adminScreen(chatId, `Не удалось собрать статистику.\n${e.message}`);
+      alertDisk(e);
+      return adminScreen(chatId, trouble('Не удалось собрать статистику', diskTrouble(e)));
     }
   }
 
   return adminScreen(chatId);
 }
 
+/** Строка страниц для списков админки: «pg:next» превращается в «admchgp:2» и т. п. */
+function navAs(nav, prefix, payload) {
+  if (!nav.length) return [];
+  const cur = payload.startsWith(prefix) ? Number(payload.slice(prefix.length)) || 0 : 0;
+  return [nav[0].map((b) => (b.payload === 'pg:prev' ? btn(b.text, prefix + (cur - 1))
+    : b.payload === 'pg:next' ? btn(b.text, prefix + (cur + 1)) : b))];
+}
+
+/** 🕒 Последние действия — прямо сообщением, без скачивания журнала. */
+async function showRecent(chatId, n = 15) {
+  try {
+    const now = new Date();
+    const ym = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    let list = await journal.readMonth(ym(now));
+    if (list.length < n) {
+      const prev = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      list = [...(await journal.readMonth(ym(prev))), ...list];
+    }
+    const last = list.slice(-n).reverse();
+    if (!last.length) return adminScreen(chatId, '🕒 Действий пока не было.');
+    const lines = last.map((r) => {
+      const err = /^ОШИБКА/.test(r['Результат']) ? ' ⚠️' : '';
+      return `${r['Дата'].slice(0, 5)} ${r['Время'].slice(0, 5)} · ${r['Кто (имя)'] || r['Кто (номер)']}${err}\n` +
+        `   ${r['Действие']}${r['SCR'] ? ' ' + r['SCR'] : ''}${r['Где'] ? ' · ' + cut(r['Где'], 70) : ''}` +
+        (err ? `\n   ${cut(r['Результат'], 90)}` : '');
+    });
+    return screen(chatId, cut(`🕒 Последние ${last.length} действий\n${RULE}\n${lines.join('\n')}`, 3800),
+      rows([btn('⬅️ К отчётам', 'adm:reports'), HOME()]));
+  } catch (e) {
+    alertDisk(e);
+    return adminScreen(chatId, trouble('Не удалось прочитать журнал', diskTrouble(e)));
+  }
+}
 
 function allowed(userId) {
   return ADMINS.includes(userId) || access.some((a) => a.id === userId);
@@ -803,34 +992,138 @@ function diskTrouble(e) {
   return 'Не получилось связаться с Диском, попробуйте ещё раз. Если повторится — сообщите администратору.';
 }
 
+/* Заявка на доступ.
+ * Раньше постороннему бот отвечал «перешлите номер администратору» — и дальше всё шло
+ * руками: переслать, вписать номер, не ошибиться в цифрах. Теперь у отказа есть кнопка
+ * «Запросить доступ», а администратору приходит карточка с выбором роли в одно касание.
+ * Посторонним открыта ровно эта кнопка; выдаёт доступ по-прежнему только администратор. */
+const REQUEST_EVERY_MS = 24 * 60 * 60_000;
+const userName = (u) => [u?.first_name, u?.last_name].filter(Boolean).join(' ') || u?.name || u?.username || null;
+
 /** Отказ с номером: человеку есть что переслать администратору, а админу — что вписать. */
 function denied(chatId, userId) {
   console.log(`   ОТКАЗ в доступе: user_id=${userId}`);
+  const pending = requests.get(userId)?.status === 'pending';
   return say(chatId,
-    `Доступ к боту не выдан.\n\nВаш номер: ${userId}\nПерешлите его администратору, чтобы получить доступ.`);
+    `Доступ к боту не выдан.\n\nВаш номер: ${userId}\n` +
+    (pending
+      ? 'Заявка уже у администратора — дождитесь решения, бот пришлёт сообщение.'
+      : 'Нажмите «Запросить доступ» — администратор получит заявку. Или перешлите номер администратору.'),
+    pending ? null : rows([btn('🙋 Запросить доступ', 'req:access')]));
 }
+
+function requestCardText(id, r) {
+  return `🙋 Заявка на доступ\n\nИмя: ${r.name || 'не указано'}\nНомер: ${id}\n` +
+    `Когда: ${new Date(r.at).toLocaleString('ru-RU')}\n${RULE}\nКакую роль дать?`;
+}
+const requestButtons = (id) => rows([
+  btn('👁 Гость — только поиск', `areq:viewer:${id}`),
+  btn('👷 Руководитель проекта', `areq:editor:${id}`),
+  btn('⛔ Отклонить', `areq:no:${id}`),
+]);
+
+async function onAccessRequest(chatId, user) {
+  const id = user?.user_id;
+  if (!id || !chatId) return;
+  if (allowed(id)) return showMenu(chatId, 'Доступ у вас уже есть.', id);
+  const r = requests.get(id);
+  if (r?.status === 'pending') return say(chatId, 'Заявка уже отправлена — администратор её рассмотрит.');
+  if (r && Date.now() - r.at < REQUEST_EVERY_MS) {
+    return say(chatId, `Заявку можно отправлять не чаще раза в сутки. Можно переслать номер администратору: ${id}`);
+  }
+  const adminChatIds = [...new Set(ADMINS.map((a) => adminChats.get(a)).filter(Boolean))];
+  if (!adminChatIds.length) return say(chatId, `Сейчас передать заявку некому. Перешлите ваш номер администратору: ${id}`);
+  // Решённые заявки старше месяца не храним: state.json не должен расти без предела.
+  for (const [k, v] of requests) if (v.status !== 'pending' && Date.now() - v.at > 30 * 24 * 60 * 60_000) requests.delete(k);
+  const req = { name: userName(user), chatId, at: Date.now(), status: 'pending' };
+  requests.set(id, req);
+  saveState();
+  console.log(`   заявка на доступ: ${req.name || '—'} (${id})`);
+  let sent = 0;
+  for (const ac of adminChatIds) {
+    try { await say(ac, requestCardText(id, req), requestButtons(id)); sent++; }
+    catch (e) { console.error('   заявка не дошла до администратора:', e.message); }
+  }
+  if (!sent) {
+    requests.delete(id);
+    return say(chatId, `Не удалось передать заявку. Перешлите ваш номер администратору: ${id}`);
+  }
+  return say(chatId, '🙋 Заявка отправлена администратору. Когда он её рассмотрит, бот пришлёт сообщение.');
+}
+
+async function onAccessDecision(chatId, adminId, payload) {
+  const [, role, idStr] = payload.split(':');
+  const id = Number(idStr);
+  const r = requests.get(id);
+  if (!r || r.status !== 'pending') {
+    return say(chatId, r
+      ? `Эту заявку уже рассмотрели: ${r.status === 'approved' ? 'доступ выдан' : 'отклонена'}${r.by ? ` (${nameOf(r.by)})` : ''}.`
+      : 'Заявка не найдена — возможно, её уже рассмотрели.');
+  }
+  if (role === 'no') {
+    Object.assign(r, { status: 'rejected', by: adminId, decidedAt: Date.now() });
+    saveState();
+    journal.log({ userId: adminId, name: nameOf(adminId), action: 'Отказ в доступе',
+      where: `${r.name || 'без имени'} (${id})`, result: 'заявка отклонена' });
+    if (r.chatId) say(r.chatId, 'Заявка на доступ отклонена администратором.').catch(() => {});
+    return say(chatId, `⛔ Заявка ${r.name || id} отклонена.`);
+  }
+  if (!ROLES[role] || role === 'admin') return say(chatId, 'Неизвестная роль.');
+  const res = addAccess({ id, name: r.name, role, by: adminId });
+  if (res === 'fail') return say(chatId, 'Не удалось сохранить список доступа, попробуйте ещё раз.');
+  Object.assign(r, { status: 'approved', role, by: adminId, decidedAt: Date.now() });
+  saveState();
+  if (r.chatId) {
+    say(r.chatId, `✅ Доступ выдан: ${ROLES[role].title}.`, rows(menuFor(id)))
+      .catch((e) => console.error('   не сообщил о выдаче доступа:', e.message));
+  }
+  return say(chatId, `✅ ${r.name || id}: доступ выдан — ${ROLES[role].title}.` +
+    (res === 'exists' ? ' (Человек уже был в списке.)' : ''));
+}
+
+const noRight = (chatId, userId) =>
+  say(chatId, 'Это действие недоступно для вашей роли.', rows(menuFor(userId)));
 
 async function onCallback(u) {
   const cb = u.callback;
   const chatId = u.message?.recipient?.chat_id ?? cb?.user?.user_id;
   const userId = cb?.user?.user_id;
   const payload = String(cb?.payload || '');
+  if (payload === 'req:access') return onAccessRequest(chatId, cb?.user);
   if (!allowed(userId)) return denied(chatId, userId);
 
   lastUser.set(chatId, userId);
   if (ADMINS.includes(userId)) adminChats.set(userId, chatId);   // сюда пойдут оповещения
   const s = session(chatId);
 
+  if (payload === 'pg:noop') return;                 // счётчик страниц — не кнопка
+
   if (payload === 'cmd:menu') {
     reset(chatId);
     return showMenu(chatId);
   }
 
+  if (payload.startsWith('areq:')) {
+    if (!isAdmin(userId)) return say(chatId, 'Эта команда доступна только администраторам.');
+    return onAccessDecision(chatId, userId, payload);
+  }
   if (payload === 'adm:back' || payload === 'adm:menu') { s.step = null; return onAdmin(chatId, userId, 'adm:menu', s); }
-  if (payload.startsWith('adm')) return onAdmin(chatId, userId, payload, s);   // adm:, admdel:, admrole:, admlog:
+  if (payload.startsWith('adm')) return onAdmin(chatId, userId, payload, s);   // adm:, admdel:, admrole:, admlog:…
   if (payload.startsWith('orph:')) {
     if (!isAdmin(userId)) return say(chatId, 'Эта команда доступна только администраторам.');
     return onOrphan(chatId, userId, payload);
+  }
+
+  // Кнопки опросника из старого сообщения, когда команда уже закончилась, — не гадаем.
+  if ((payload === 'up' || payload.startsWith('dir:') || payload === 'pg:prev' || payload === 'pg:next') &&
+      !s.cmd && s.view !== 'versions') {
+    return showMenu(chatId, 'Кнопка устарела — начните заново.', userId);
+  }
+
+  // Страницы: в обзоре версий — по версиям, иначе — по папкам опросника
+  if (payload === 'pg:prev' || payload === 'pg:next') {
+    s.page = (s.page || 0) + (payload === 'pg:next' ? 1 : -1);
+    return s.view === 'versions' ? showVersions(chatId, userId, s) : askFolder(chatId, s);
   }
 
   // Выбор одной записи из нескольких с одинаковым номером
@@ -842,33 +1135,81 @@ async function onCallback(u) {
     return afterFound(chatId, s);
   }
 
-  if (payload === 'up') { s.path.pop(); return askFolder(chatId, s); }
+  if (payload === 'up') { s.path.pop(); s.page = 0; return askFolder(chatId, s); }
 
   if (payload.startsWith('dir:')) {
     const name = choices.get(payload.slice(4));
     if (!name) return askFolder(chatId, s);   // ключ протух после перезапуска
     s.path.push(name);
+    s.page = 0;
+    return askFolder(chatId, s);
+  }
+
+  // «В прошлую папку» и «Ещё запись сюда»: сразу к номеру, если папка на месте
+  if (payload === 'again') {
+    if (!can(userId, 'upload')) return noRight(chatId, userId);
+    const last = lastPaths.get(userId);
+    const ok = last?.length && (await isBottomFolder(last));
+    Object.assign(s, { cmd: 'upload', step: 'folder', path: ok ? [...last] : [], scr: null, found: null,
+      page: 0, view: null, pending: null, renum: false });
     return askFolder(chatId, s);
   }
 
   if (payload === 'cmd:upload') {
     if (!can(userId, 'upload')) return say(chatId, 'Загрузка недоступна: у вас роль «Гость» — только поиск записей.');
-    Object.assign(s, { cmd: 'upload', step: 'folder', path: [], scr: null, found: null });
+    Object.assign(s, { cmd: 'upload', step: 'folder', path: [], scr: null, found: null, page: 0, view: null,
+      pending: null, renum: false });
+    return askFolder(chatId, s);
+  }
+
+  if (payload === 'cmd:browse') {
+    if (!can(userId, 'browse')) return noRight(chatId, userId);
+    Object.assign(s, { cmd: 'browse', step: 'folder', path: [], scr: null, found: null, page: 0, view: null });
     return askFolder(chatId, s);
   }
 
   if (payload === 'cmd:find' || payload === 'cmd:replace' || payload === 'cmd:move') {
     const cmd = payload.slice(4);
     if (!can(userId, cmd)) return say(chatId, 'Это действие недоступно: у вас роль «Гость» — только поиск записей.');
-    Object.assign(s, { cmd, step: 'await-scr', path: [], scr: null, found: null });
+    Object.assign(s, { cmd, step: 'await-scr', path: [], scr: null, found: null, page: 0, view: null, pending: null });
     const what = cmd === 'find' ? 'найти' : cmd === 'replace' ? 'заменить' : 'переместить';
+    const head = cmd === 'find' ? '🔍 Поиск записи' : cmd === 'replace' ? stepTitle('♻️ Замена', 1, 3) : stepTitle('📁 Перенос', 1, null);
     // Просим номер одинаково во всех командах: в ветке загрузки текст согласовали,
     // а здесь оставался старый — без подсказки про префикс и без примера.
-    return screen(chatId, `Какую запись ${what}?\n${RULE}\nВведите номер SCR — семь цифр, без «SCR» и «#»\nНапример: 6512028`,
-      rows([btn('⬅️ В начало', 'cmd:menu')]));
+    return screen(chatId, `${head}\n${RULE}\nКакую запись ${what}?\nВведите номер SCR — семь цифр, без «SCR» и «#»\nНапример: 6512028`,
+      rows([HOME()]));
+  }
+
+  if (payload.startsWith('rec:')) return openRecord(chatId, userId, s, choices.get(payload.slice(4)));
+  if (payload.startsWith('ra:')) return onRecordAction(chatId, userId, s, payload.slice(3));
+  if (payload.startsWith('cmt:')) {
+    if (!can(userId, 'comment')) return noRight(chatId, userId);
+    const f = choices.get(payload.slice(4));
+    if (!f) return showMenu(chatId, 'Кнопка устарела — найдите запись заново.', userId);
+    s.rec = f;
+    s.scr = (f.name.match(SCR_RE) || [])[1];
+    return askComment(chatId, s);
+  }
+  if (payload.startsWith('ver:')) {
+    const v = choices.get(payload.slice(4));
+    if (!v || !s.scr) return showMenu(chatId, 'Кнопка устарела — откройте версии заново.', userId);
+    s.ver = v;
+    s.cmd = s.cmd === 'restore' ? 'restore' : 'versions';
+    s.path = [];
+    return confirmRestore(chatId, s);
   }
 
   if (payload === 'go:move') return doMove(chatId, userId, s);
+  if (payload === 'go:file') return confirmedFile(chatId, userId, s);
+  if (payload === 'go:renum') {
+    if (s.step !== 'confirm-file' || !s.pending) return showMenu(chatId, 'Кнопка устарела — начните заново.', userId);
+    s.step = 'await-scr';
+    s.renum = true;
+    return screen(chatId, `${flowHead(s, 'scr')}\n${RULE}\nВведите правильный номер SCR — семь цифр.\nФайл присылать заново не нужно.`,
+      rows([HOME()]));
+  }
+  if (payload === 'go:restore') return doRestore(chatId, userId, s);
+  if (payload === 'go:delete') return doDelete(chatId, userId, s);
 
   return showMenu(chatId);
 }
@@ -910,8 +1251,8 @@ async function onMessage(u) {
     return onAdmin(chatId, userId, 'adm:menu', session(chatId));
   }
 
-  const cmdAlias = { upload: 'cmd:upload', find: 'cmd:find', replace: 'cmd:replace', move: 'cmd:move' };
-  const asCommand = text.match(/^\/(upload|find|replace|move)\b/i);
+  const cmdAlias = { upload: 'cmd:upload', find: 'cmd:find', replace: 'cmd:replace', move: 'cmd:move', browse: 'cmd:browse' };
+  const asCommand = text.match(/^\/(upload|find|replace|move|browse)\b/i);
   if (asCommand) {
     return onCallback({
       message: { recipient: { chat_id: chatId } },
@@ -919,45 +1260,44 @@ async function onMessage(u) {
     });
   }
 
-  // Файл прислали — значит ждём его на шаге загрузки или замены
+  // Файл прислали — запись на шаге загрузки или замены, либо реестр для сверки
   const file = attachments.find((a) => a.type === 'file' || a.type === 'video');
   if (file) return onFile(chatId, userId, s, file);
 
+  if (s.step === 'await-registry' && text) return say(chatId, 'Пришлите реестр файлом — таблицей .xlsx или .csv.');
+
+  // Комментарий к записи
+  if (s.step === 'await-comment' && text) return saveComment(chatId, userId, s, text);
+
   // Поиск человека в админке
   if (s.step === 'adm-await-search' && text) {
+    if (!isAdmin(userId)) return noRight(chatId, userId);
     const q = text.trim().toLowerCase();
     const hits = access.filter((a) =>
       String(a.id).includes(q) || (a.name || '').toLowerCase().includes(q));
     s.step = null;
     if (!hits.length) return say(chatId, `По запросу «${text.trim()}» никого не нашёл.`);
     const lines = hits.map((a) =>
-      `${a.name || 'без имени'} — ${a.id}\n  ${(ROLES[a.role] || ROLES[DEFAULT_ROLE]).title}` +
+      `${a.name || 'без имени'} — ${a.id}\n  ${roleTitle(a)}` +
       (a.addedAt ? `, добавлен ${a.addedAt}` : '')).join(`\n${RULE}\n`);
-    return say(chatId, `Нашёл ${hits.length}:\n${RULE}\n${lines}`);
+    return say(chatId, cut(`Нашёл ${hits.length}:\n${RULE}\n${lines}`, 3800));
   }
 
   // Номер человека для админки
   if (s.step === 'adm-await-id' && text) {
-    const m = text.match(/^\s*(\d{4,15})\s*(.*)$/);
-    if (!m) return say(chatId, 'Не разобрал номер. Пришлите только цифры, при желании имя через пробел.');
-    const id = Number(m[1]);
-    const name = (m[2] || '').trim() || null;
-    if (access.some((a) => a.id === id)) {
-      s.step = null;
-      await say(chatId, `${id} уже в списке.`);
-      return onAdmin(chatId, userId, 'adm:people', s);
-    }
+    if (!isAdmin(userId)) return noRight(chatId, userId);
+    const mm = text.match(/^\s*(\d{4,15})\s*(.*)$/);
+    if (!mm) return say(chatId, 'Не разобрал номер. Пришлите только цифры, при желании имя через пробел.');
+    const id = Number(mm[1]);
+    const name = (mm[2] || '').trim() || null;
     const role = ROLES[s.newRole] ? s.newRole : DEFAULT_ROLE;
-    const next = [...access, { id, name, role, addedBy: userId, addedAt: new Date().toISOString().slice(0, 10) }];
-    if (!saveAccess(next)) { s.step = null; return adminScreen(chatId, 'Не удалось сохранить список доступа, попробуйте ещё раз.'); }
-    access = next;
-    console.log(`   доступ выдан: ${name || '—'} (${id}) роль ${role}, администратор ${userId}`);
-    journal.log({
-      userId, name: nameOf(userId), action: 'Выдача доступа',
-      where: `${name || 'без имени'} (${id})`, result: ROLES[role].title,
-    });
-    s.newRole = null;
+    const res = addAccess({ id, name, role, by: userId });
     s.step = null;
+    if (res === 'exists') await say(chatId, `${id} уже в списке.`);
+    if (res === 'fail') return adminScreen(chatId, 'Не удалось сохранить список доступа, попробуйте ещё раз.');
+    const req = requests.get(id);
+    if (req?.status === 'pending') Object.assign(req, { status: 'approved', role, by: userId, decidedAt: Date.now() });
+    s.newRole = null;
     return onAdmin(chatId, userId, 'adm:people', s);
   }
 
@@ -977,6 +1317,7 @@ async function onMessage(u) {
 }
 
 async function afterScr(chatId, s) {
+  const userId = lastUser.get(chatId);
   let existing;
   try {
     existing = await findByScr(s.scr);
@@ -985,29 +1326,41 @@ async function afterScr(chatId, s) {
     console.error('   поиск по номеру не удался:', e.message);
     alertDisk(e);
     reset(chatId);
-    return say(chatId, `Не удалось проверить номер SCR#${s.scr}.\n${diskTrouble(e)}`, rows(menuFor(lastUser.get(chatId))));
+    return say(chatId, trouble(`Не удалось проверить номер SCR#${s.scr}`, diskTrouble(e)), rows(menuFor(userId)));
   }
 
   if (s.cmd === 'upload') {
     if (existing.length) {
       reset(chatId);
-      const dup = existing.length > 1
-        ? `\n\nВнимание: записей с этим номером на Диске ${existing.length} — сообщите администратору.` : '';
+      const dup = existing.length > 1 ? `Внимание: записей с этим номером на Диске ${existing.length} — сообщите администратору.` : '';
       return say(chatId,
-        `Запись SCR#${s.scr} уже загружена\n\n${report(existing[0].path)}\n${RULE}\n` +
-        `Чтобы загрузить новую версию, выберите «Заменить видеозапись» — прежняя сохранится в архиве.${dup}`,
-        rows(menuFor(lastUser.get(chatId))));
+        card({ title: `ℹ️ Запись SCR#${s.scr} уже загружена`, path: existing[0].path, size: existing[0].size,
+          created: existing[0].created,
+          notes: ['Чтобы загрузить новую версию, выберите «Заменить видеозапись» — прежняя сохранится в архиве.', dup] }),
+        rows(menuFor(userId)));
+    }
+    // Номер исправили после предупреждения о несовпадении — файл уже есть, повторно не просим.
+    if (s.renum && s.pending?.att) {
+      const att = s.pending.att;
+      Object.assign(s, { renum: false, pending: null, step: 'await-file' });
+      return onFile(chatId, userId, s, att);
     }
     s.step = 'await-file';
     return screen(chatId,
-      `SCR#${s.scr} — принято.\n\nПришлите видеозапись файлом. Если отправить её как видео, мессенджер сожмёт качество.`,
-      rows([btn('⬅️ В начало', 'cmd:menu')]));
+      `${flowHead(s, 'file')}\n${RULE}\nSCR#${s.scr} — принято.\n\nПришлите видеозапись файлом. Если отправить её как видео, мессенджер сожмёт качество.`,
+      rows([HOME()]));
   }
 
   if (!existing.length) {
+    // Записи нет, но, может быть, её удалили — тогда она в архиве и её можно вернуть.
+    let archived = [];
+    if (can(userId, 'versions')) { try { archived = await versionsOf(s.scr); } catch { /* без подсказки */ } }
+    const extra = archived.length ? [btn(`🕘 В архиве версий: ${archived.length} — посмотреть`, 'ra:versions')] : [];
+    s.rec = null;
     return say(chatId,
-      `Записи SCR#${s.scr} нет. Проверьте номер или загрузите её через «Загрузить видеозапись».`,
-      rows(menuFor(lastUser.get(chatId))));
+      `Записи SCR#${s.scr} нет. Проверьте номер или загрузите её через «Загрузить видеозапись».` +
+      (archived.length ? '\n\nВ архиве есть прежние версии этой записи — её, видимо, удалили.' : ''),
+      rows([...extra, ...menuFor(userId)]));
   }
 
   /* Несколько записей с одним номером. Раньше бот молча брал первую попавшуюся —
@@ -1020,7 +1373,7 @@ async function afterScr(chatId, s) {
       `${i + 1}) ${reportInline(f.path) || ckey(parentOf(f.path))} · ${f.name} · ${mb(f.size)}`).join('\n');
     const buttons = existing.map((f, i) =>
       btn(cut(`${i + 1}) ${reportInline(f.path) || f.name}`, 60), 'pick:' + keyFor(f)));
-    buttons.push(btn('⬅️ В начало', 'cmd:menu'));
+    buttons.push(HOME());
     return screen(chatId,
       `⚠️ Записей с номером SCR#${s.scr} несколько: ${existing.length}.\n${RULE}\n${list}\n${RULE}\nКакую взять?`,
       rows(buttons));
@@ -1030,52 +1383,59 @@ async function afterScr(chatId, s) {
   return afterFound(chatId, s);
 }
 
-const mb = (bytes) => `${(Number(bytes || 0) / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`;
-const cut = (text, n) => (String(text).length > n ? String(text).slice(0, n - 1) + '…' : String(text));
-
 /** Запись выбрана — дальше по команде. */
 async function afterFound(chatId, s) {
+  const userId = lastUser.get(chatId);
   if (s.cmd === 'find') {
     const found = s.found;
     reset(chatId);
-    return sendRecord(chatId, found);
+    return sendRecord(chatId, found, userId);
   }
 
   if (s.cmd === 'replace') {
     s.step = 'await-file';
+    const comment = await meta.getComment(s.scr);
     return screen(chatId,
-      `${report(s.found.path, { scr: s.scr, size: s.found.size })}\n${RULE}\n` +
-      `Пришлите новую версию файлом. Прежняя сохранится в архиве — ничего не потеряется.`,
-      rows([btn('⬅️ В начало', 'cmd:menu')]));
+      `${stepTitle('♻️ Замена', 2, 3)}\n\n` +
+      card({ scr: s.scr, path: s.found.path, size: s.found.size, created: s.found.created, comment,
+        notes: ['Пришлите новую версию файлом. Прежняя сохранится в архиве — ничего не потеряется.'] }),
+      rows([HOME()]));
   }
 
   if (s.cmd === 'move') {
     s.step = 'folder';
     s.path = [];
+    s.page = 0;
     s.wasAt = report(s.found.path);
-    await say(chatId, report(s.found.path, { scr: s.scr }));
+    await say(chatId, card({ title: '📁 Переносим запись', scr: s.scr, path: s.found.path, size: s.found.size }));
     return askFolder(chatId, s);
   }
 
   // Команда потерялась (например, пришли по старой кнопке после возврата в меню).
   // Без этой ветки функция просто заканчивалась и бот молчал.
-  return showMenu(chatId, 'Не понял, что делаем с этим номером — выберите действие.', lastUser.get(chatId));
+  return showMenu(chatId, 'Не понял, что делаем с этим номером — выберите действие.', userId);
 }
 
 /** Отдать запись в чат. Файлом, а не видео: важен оригинал, а не проигрывание. */
-async function sendRecord(chatId, found) {
+async function sendRecord(chatId, found, userId) {
   const prev = sessions.get(chatId)?.mid;
   await drop(chatId, prev);                          // экран поиска заменяется самой записью
   const wait = await say(chatId, `Готовлю запись, это займёт до минуты`);
   try {
+    const scr = (found.name.match(SCR_RE) || [])[1];
+    const comment = scr ? await meta.getComment(scr) : null;
+    // Кнопки едут на самом файле — отдельным сообщением меню только плодит экраны.
+    const buttons = [
+      ...(can(userId, 'browse') ? [btn('📋 Действия с записью', 'rec:' + keyFor(found))] : []),
+      HOME(),
+    ];
     // Байты записи идут через компьютер бота — поэтому таких выдач одновременно не больше HEAVY_MAX.
     await heavy(async () => sendFileFromUrl(chatId, {
       url: await downloadHref(found.path),
       filename: found.name,
       size: found.size,
-      caption: `${(found.name.match(/SCR#\d{7}/) || [found.name])[0]}\n${report(found.path)}`,
-      // Кнопка едет на самом файле — отдельным сообщением меню только плодит экраны.
-      buttons: rows([btn('⬅️ В начало', 'cmd:menu')]),
+      caption: card({ scr, path: found.path, comment }),
+      buttons: rows(buttons),
     }));
     await drop(chatId, wait?.message?.body?.mid);    // «Готовлю запись» своё отработало
   } catch (e) {
@@ -1083,7 +1443,7 @@ async function sendRecord(chatId, found) {
     console.error('   выдача записи не удалась:', e.message);
     alertDisk(e);
     const msg = e instanceof SendError ? 'Не удалось отправить запись в MAX, попробуйте ещё раз.' : diskTrouble(e);
-    await say(chatId, msg, rows(menuFor(lastUser.get(chatId))));
+    await say(chatId, trouble('Запись не отправлена', msg), rows(menuFor(lastUser.get(chatId))));
   }
 }
 
@@ -1100,6 +1460,343 @@ async function downloadHref(path) {
   return j.href;
 }
 
+/* ---------- карточка записи: обзор, версии, комментарий, удаление ---------- */
+
+/** Карточка записи с действиями по правам. Открывается из обзора и после поиска. */
+async function openRecord(chatId, userId, s, f, { notice = '' } = {}) {
+  if (!f?.path) return showMenu(chatId, 'Кнопка устарела — найдите запись заново.', userId);
+  let st;
+  try { st = await disk.stat(f.path, { fields: 'name,path,size,created' }); }
+  catch (e) { alertDisk(e); return screen(chatId, trouble('Не удалось открыть запись', diskTrouble(e)), rows([HOME()])); }
+  if (!st) {
+    indexRemove(f.path);
+    return screen(chatId, trouble('Записи здесь больше нет', 'Её переместили, заменили или удалили. Найдите её заново по номеру.'),
+      rows([HOME()]));
+  }
+  const rec = { name: st.name, path: st.path || f.path, size: st.size ?? 0, created: st.created ?? null };
+  const scr = (rec.name.match(SCR_RE) || [])[1];
+  const comment = scr ? await meta.getComment(scr) : null;
+  Object.assign(s, { rec, scr, step: 'record', view: null });
+  const b = [btn('📥 Получить файл', 'ra:get')];
+  if (can(userId, 'replace')) b.push(btn('♻️ Заменить', 'ra:replace'));
+  if (can(userId, 'move')) b.push(btn('📁 Переместить', 'ra:move'));
+  if (can(userId, 'versions')) b.push(btn('🕘 Версии', 'ra:versions'));
+  if (can(userId, 'comment')) b.push(btn(comment ? '💬 Изменить комментарий' : '💬 Добавить комментарий', 'ra:comment'));
+  if (can(userId, 'comment') && comment) b.push(btn('🧹 Убрать комментарий', 'ra:delcomment'));
+  if (can(userId, 'delete')) b.push(btn('🗑 Удалить запись', 'ra:delete'));
+  if (s.cmd === 'browse') b.push(btn('⬅️ К папке', 'ra:back'));
+  b.push(HOME());
+  return screen(chatId, card({ title: '🎞 Видеозапись', scr, path: rec.path, size: rec.size, created: rec.created,
+    comment, notes: [notice] }), rows(b));
+}
+
+async function onRecordAction(chatId, userId, s, action) {
+  if (action === 'versions') {
+    if (!can(userId, 'versions')) return noRight(chatId, userId);
+    if (!s.scr) return showMenu(chatId, 'Кнопка устарела — найдите запись заново.', userId);
+    s.view = 'versions';
+    s.page = 0;
+    return showVersions(chatId, userId, s);
+  }
+  if (!s.rec) return showMenu(chatId, 'Кнопка устарела — найдите запись заново.', userId);
+  const scr = s.scr;
+  switch (action) {
+    case 'open': return openRecord(chatId, userId, s, s.rec);
+    case 'back': s.cmd = 'browse'; s.view = null; return askFolder(chatId, s);
+    case 'get': return sendRecord(chatId, s.rec, userId);
+    case 'replace':
+      if (!can(userId, 'replace')) return noRight(chatId, userId);
+      Object.assign(s, { cmd: 'replace', found: s.rec, pending: null });
+      return afterFound(chatId, s);
+    case 'move':
+      if (!can(userId, 'move')) return noRight(chatId, userId);
+      Object.assign(s, { cmd: 'move', found: s.rec });
+      return afterFound(chatId, s);
+    case 'comment':
+      if (!can(userId, 'comment')) return noRight(chatId, userId);
+      return askComment(chatId, s);
+    case 'delcomment':
+      if (!can(userId, 'comment')) return noRight(chatId, userId);
+      try {
+        await meta.setComment(scr, null, userId);
+        journal.log({ userId, name: nameOf(userId), action: 'Комментарий убран', scr, where: reportInline(s.rec.path) });
+        return openRecord(chatId, userId, s, s.rec, { notice: '🧹 Комментарий убран.' });
+      } catch (e) {
+        alertDisk(e);
+        return say(chatId, trouble('Комментарий не убран', diskTrouble(e)));
+      }
+    case 'delete':
+      if (!can(userId, 'delete')) return noRight(chatId, userId);
+      s.step = 'confirm-delete';
+      return screen(chatId, card({ title: `🗑 Удалить запись SCR#${scr}?`, path: s.rec.path, size: s.rec.size,
+        created: s.rec.created,
+        notes: ['Запись уйдёт в архив, а не исчезнет: вернуть её можно через «Версии».'] }),
+      rows([btn('🗑 Да, удалить', 'go:delete'), btn('Отмена', 'ra:open'), HOME()]));
+    default: return openRecord(chatId, userId, s, s.rec);
+  }
+}
+
+/* Комментарий: дата показа, кто принимал, примечание. Хранится по номеру записи
+ * и переживает перенос и замену. */
+const COMMENT_MAX = 500;
+
+function askComment(chatId, s) {
+  s.step = 'await-comment';
+  return screen(chatId,
+    `💬 Комментарий к SCR#${s.scr}\n${RULE}\nНапишите его одним сообщением, до ${COMMENT_MAX} символов.\n` +
+    'Например: «Показ 12.09, принимал Иванов, замечаний нет».',
+    rows([btn('Отмена', 'ra:open'), HOME()]));
+}
+
+async function saveComment(chatId, userId, s, text) {
+  if (!can(userId, 'comment')) return noRight(chatId, userId);
+  if (!s.scr || !s.rec) return showMenu(chatId, 'Не понял, к какой записи комментарий — найдите её заново.', userId);
+  const t = cut(text.replace(/\s+/g, ' ').trim(), COMMENT_MAX);
+  try {
+    await meta.setComment(s.scr, t, userId);
+  } catch (e) {
+    console.error('   комментарий не сохранён:', e.message);
+    alertDisk(e);
+    return say(chatId, trouble('Комментарий не сохранён', diskTrouble(e)));
+  }
+  journal.log({ userId, name: nameOf(userId), action: 'Комментарий', scr: s.scr, where: reportInline(s.rec.path), result: t });
+  return openRecord(chatId, userId, s, s.rec, { notice: '💬 Комментарий сохранён.' });
+}
+
+/* История версий. Раньше архив существовал «на бумаге»: достать прежнюю версию можно было
+ * только из веб-интерфейса Диска, зная путь BackUp/дата/номер/время. Теперь — список и
+ * восстановление одной кнопкой, в безопасном порядке, как при замене. */
+function parseVersion(f) {
+  const segs = ckey(f.path).split('/').filter(Boolean);
+  const i = segs.indexOf(BACKUP);
+  const date = segs[i + 1] || '';
+  const uid = Number(segs[i + 2]);
+  const file = segs[segs.length - 1];
+  const m = file.match(/^(\d{2})-(\d{2})-(\d{2}) (.*)$/);
+  const rest = m ? m[4] : file;
+  const kind = /^удалено /.test(rest) ? 'удалил' : /^незавершённая /.test(rest) ? 'незавершённая замена' : 'заменил';
+  return { name: f.name, path: f.path, size: f.size, created: f.created,
+    date, uid, time: m ? `${m[1]}:${m[2]}` : '', kind, sortKey: `${date} ${m ? m[1] + m[2] + m[3] : ''}` };
+}
+
+async function versionsOf(scr) {
+  const all = await disk.findFiles(`SCR#${scr}`);
+  return all
+    .filter((f) => f.path.includes(`/${BACKUP}/`) && (f.name.match(SCR_RE) || [])[1] === scr)
+    .map(parseVersion)
+    .sort((a, b) => b.sortKey.localeCompare(a.sortKey));
+}
+
+const VERSIONS_PAGE = 8;
+
+async function showVersions(chatId, userId, s) {
+  const scr = s.scr;
+  let list, live;
+  try { [list, live] = await Promise.all([versionsOf(scr), findByScr(scr)]); }
+  catch (e) { alertDisk(e); return screen(chatId, trouble('Не удалось прочитать архив', diskTrouble(e)), rows([HOME()])); }
+  s.view = 'versions';
+  const back = s.rec ? [btn('⬅️ К записи', 'ra:open')] : [];
+  if (!list.length) {
+    return screen(chatId, `🕘 Версии SCR#${scr}\n${RULE}\nПрежних версий нет: запись не заменяли и не удаляли.`,
+      rows([...back, HOME()]));
+  }
+  const { slice, nav, page } = paginate(list, s.page, VERSIONS_PAGE);
+  s.page = page;
+  const dd = (v) => (v.date ? v.date.split('-').reverse().join('.') : '');
+  const now = live.length ? `Сейчас: ${reportInline(live[0].path)} · ${mb(live[0].size)}` : 'Сейчас записи нет — она удалена.';
+  const lines = slice.map((v, i) => `${page * VERSIONS_PAGE + i + 1}) ${dd(v)} ${v.time} · ${v.kind}: ${nameOf(v.uid)} · ${mb(v.size)}`);
+  const buttons = slice.map((v, i) => btn(`↩️ Восстановить ${page * VERSIONS_PAGE + i + 1})`, 'ver:' + keyFor(v)));
+  return screen(chatId,
+    `🕘 Версии SCR#${scr}\n${now}\n${RULE}\nДата — когда версию сменили или удалили, и кто это сделал:\n${lines.join('\n')}`,
+    [...rows(buttons), ...nav, ...rows([...back, HOME()])]);
+}
+
+/** Куда встанет восстановленная версия: на место текущей, в исходную папку или в выбранную. */
+async function confirmRestore(chatId, s) {
+  const v = s.ver;
+  if (!v || !s.scr) return showMenu(chatId, 'Кнопка устарела — откройте версии заново.');
+  let live;
+  try { live = await findByScr(s.scr); }
+  catch (e) { alertDisk(e); return screen(chatId, trouble('Не удалось проверить запись', diskTrouble(e)), rows([HOME()])); }
+  if (live.length > 1) {
+    return screen(chatId, trouble('Не могу восстановить', `Записей SCR#${s.scr} сейчас несколько (${live.length}) — сначала уберите лишнюю.`),
+      rows([HOME()]));
+  }
+  let note;
+  if (live.length === 1) {
+    s.restoreTo = parentOf(live[0].path);
+    note = 'Текущая версия уйдёт в архив, на её место встанет выбранная.';
+  } else if (s.cmd === 'restore' && s.path.length) {
+    s.restoreTo = disk.joinPath(ROOT, ...s.path);
+    note = 'Запись встанет в выбранную папку.';
+  } else {
+    const origin = await meta.getOrigin(v.path);
+    if (origin) {
+      s.restoreTo = parentOf(origin);
+      note = 'Запись вернётся в папку, где лежала до удаления.';
+    } else {
+      // Откуда удалили — неизвестно (удаление было до этой версии бота): пусть человек выберет.
+      Object.assign(s, { cmd: 'restore', path: [], page: 0, step: 'folder' });
+      return askFolder(chatId, s);
+    }
+  }
+  s.step = 'confirm-restore';
+  const dd = v.date ? v.date.split('-').reverse().join('.') : '';
+  return screen(chatId,
+    card({ title: `🕘 Восстановить версию SCR#${s.scr}?`, path: s.restoreTo, size: v.size,
+      notes: [`Версия: ${dd} ${v.time} (${v.kind}: ${nameOf(v.uid)})`, note, 'Архивная копия останется в архиве.'] }),
+    rows([btn('✅ Восстановить', 'go:restore'), btn('⬅️ К версиям', 'ra:versions'), HOME()]));
+}
+
+async function doRestore(chatId, userId, s) {
+  const v = s.ver, scr = s.scr, folder = s.restoreTo;
+  if (!v || !scr || !folder || s.step !== 'confirm-restore') return showMenu(chatId, 'Кнопка устарела — откройте версии заново.', userId);
+  if (!can(userId, 'versions')) return noRight(chatId, userId);
+  if (!scrLock(scr, 'восстановление')) return say(chatId, busyText(scr));
+  const target = `${ckey(folder)}/SCR#${scr}${extOf(v.name)}`;
+  const landing = `${target}.new`;
+  try {
+    if (!(await disk.stat(v.path, { fields: 'path' }))) {
+      reset(chatId);
+      return say(chatId, 'Этой версии в архиве уже нет.', rows(menuFor(userId)));
+    }
+    const live = await findByScr(scr);
+    if (live.length > 1) {
+      reset(chatId);
+      return say(chatId, trouble('Не могу восстановить', `Записей SCR#${scr} сейчас несколько — сначала уберите лишнюю.`), rows(menuFor(userId)));
+    }
+    inFlightPaths.add(ckey(landing));
+    // Копия, а не перенос: архивная версия остаётся в архиве.
+    await disk.copy(v.path, landing);
+    let backup = null;
+    if (live.length) {
+      backup = await archive(userId, live[0]);
+      indexRemove(live[0].path);
+    }
+    try {
+      await disk.move(landing, target);
+    } catch (e) {
+      if (backup) { try { await disk.move(backup, live[0].path); indexAdd(live[0]); } catch { /* останется в архиве */ } }
+      throw e;
+    }
+    const st = await disk.stat(target);
+    if (st) indexAdd({ name: st.name, path: st.path || target, size: st.size, created: st.created });
+    invalidateFolders(folder, live[0] ? parentOf(live[0].path) : null);
+    const dd = v.date ? v.date.split('-').reverse().join('.') : '';
+    journal.log({ userId, name: nameOf(userId), action: 'Восстановление версии', scr, where: reportInline(target),
+      result: `версия от ${dd} ${v.time}${backup ? '; прежняя в архиве' : ''}` });
+    reset(chatId);
+    return say(chatId,
+      card({ title: '↩️ Версия восстановлена', scr, path: target, size: st?.size,
+        notes: backup ? [`Прежняя версия сохранена в архиве:\n${ckey(backup)}`] : [] }),
+      rows(menuFor(userId)));
+  } catch (e) {
+    console.error('   восстановление не удалось:', e.message);
+    alertDisk(e);
+    reset(chatId);
+    return say(chatId, trouble('Не удалось восстановить версию', diskTrouble(e)), rows(menuFor(userId)));
+  } finally {
+    scrUnlock(scr);
+    inFlightPaths.delete(ckey(landing));
+  }
+}
+
+/* Удаление — только администратор, и только в архив: настоящего удаления в боте нет. */
+async function doDelete(chatId, userId, s) {
+  const f = s.rec, scr = s.scr;
+  if (!f || !scr || s.step !== 'confirm-delete') return showMenu(chatId, 'Кнопка устарела — найдите запись заново.', userId);
+  if (!can(userId, 'delete')) return noRight(chatId, userId);
+  if (!scrLock(scr, 'удаление')) return say(chatId, busyText(scr));
+  try {
+    if (!(await disk.stat(f.path, { fields: 'path' }))) {
+      reset(chatId);
+      return say(chatId, 'Записи здесь уже нет — её переместили или удалили.', rows(menuFor(userId)));
+    }
+    const dest = await archive(userId, f, 'удалено');
+    indexRemove(f.path);
+    invalidateFolders(parentOf(f.path));
+    journal.log({ userId, name: nameOf(userId), action: 'Удаление видеозаписи', scr, where: reportInline(f.path),
+      result: 'в архиве: ' + ckey(dest) });
+    reset(chatId);
+    return say(chatId,
+      card({ title: '🗑 Запись удалена', scr, path: f.path, size: f.size,
+        notes: ['Она в архиве. Вернуть: «Найти по номеру SCR» → «В архиве версий» → «Восстановить».'] }),
+      rows(menuFor(userId)));
+  } catch (e) {
+    console.error('   удаление не удалось:', e.message);
+    alertDisk(e);
+    reset(chatId);
+    return say(chatId, trouble('Не удалось удалить запись', diskTrouble(e)), rows(menuFor(userId)));
+  } finally {
+    scrUnlock(scr);
+  }
+}
+
+/* ---------- сверка с реестром ---------- */
+
+const decodeText = (buf) => {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+  catch { return new TextDecoder('windows-1251').decode(buf); }   // CSV из старого Excel
+};
+
+async function onRegistry(chatId, userId, s, att) {
+  if (!isAdmin(userId)) return noRight(chatId, userId);
+  const name = att.filename || '';
+  const ext = extOf(name);
+  if (!['.xlsx', '.csv', '.txt'].includes(ext)) {
+    return say(chatId, 'Пришлите таблицу .xlsx или .csv. Старый формат .xls не подходит — пересохраните файл в Excel как .xlsx.');
+  }
+  if (Number(att.size || 0) > 20 * 1024 * 1024) return say(chatId, 'Файл реестра больше 20 МБ — это не похоже на список номеров.');
+  if (!att.payload?.url) return say(chatId, 'Не вижу вложения. Пришлите реестр файлом.');
+  const wait = await say(chatId, '📋 Сверяю реестр с Диском…');
+  try {
+    const r = await fetch(att.payload.url, { signal: AbortSignal.timeout(120_000) });
+    if (!r.ok) throw new Error(`MAX не отдал файл: HTTP ${r.status}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const cells = ext === '.xlsx' ? readXlsxCells(buf) : [decodeText(buf)];
+    const wanted = new Set();
+    for (const c of cells) for (const m of String(c).matchAll(/(?<!\d)(\d{7})(?!\d)/g)) wanted.add(m[1]);
+    if (!wanted.size) {
+      await drop(chatId, wait?.message?.body?.mid);
+      return say(chatId, 'В файле не нашёл ни одного семизначного номера SCR.', rows([BACK()]));
+    }
+    // Индекс должен быть полным: дожидаемся прогрева, если он идёт или ещё не был.
+    if (warming) await warming;
+    if (!scrIndex.size) await warmTree();
+
+    const place = (f) => { const p = parts(f.path); return [p.gk || '', p.op || '', p.napr || '', p.sys || '', f.name]; };
+    const rowsOut = [];
+    let have = 0, missing = 0, extra = 0;
+    for (const n of [...wanted].sort()) {
+      const hit = scrIndex.get(n);
+      if (hit?.length) { have++; rowsOut.push([`SCR#${n}`, hit.length > 1 ? `есть (${hit.length} шт.)` : 'есть', ...place(hit[0])]); }
+      else { missing++; rowsOut.push([`SCR#${n}`, 'нет на Диске', '', '', '', '', '']); }
+    }
+    for (const [n, list] of [...scrIndex.entries()].sort()) {
+      if (wanted.has(n)) continue;
+      extra++;
+      rowsOut.push([`SCR#${n}`, 'нет в реестре', ...place(list[0])]);
+    }
+    const summary = `📋 Сверка с реестром «${name}»\n${RULE}\n` +
+      `Номеров в реестре: ${wanted.size}\nЕсть на Диске: ${have}\nНет на Диске: ${missing}\n` +
+      `На Диске, но не в реестре: ${extra}`;
+    const buffer = writeXlsx([{ name: 'Сверка', header: ['SCR', 'Статус', 'ГК', 'ОП', 'Направление', 'Система', 'Файл'], rows: rowsOut }]);
+    await drop(chatId, wait?.message?.body?.mid);
+    await sendBuffer(chatId, { buffer, filename: `Сверка ${new Date().toLocaleDateString('ru-RU').replace(/\./g, '-')}.xlsx`, caption: summary });
+    s.step = null;
+    return adminScreen(chatId);
+  } catch (e) {
+    await drop(chatId, wait?.message?.body?.mid);
+    console.error('   сверка с реестром не удалась:', e.message);
+    alertDisk(e);
+    return say(chatId, trouble('Сверка не получилась', /xlsx|zip/.test(e.message)
+      ? 'Файл не читается как таблица Excel. Пересохраните его в Excel как .xlsx и пришлите снова.'
+      : diskTrouble(e)), rows([BACK()]));
+  }
+}
+
+/* ---------- загрузка и замена ---------- */
+
 /* Имя версии в архиве. Дата и время — оба по часам компьютера бота: раньше дата бралась
  * в UTC, а время местное, и замены с полуночи до трёх ночи по Москве попадали в папку
  * вчерашнего дня. */
@@ -1111,20 +1808,36 @@ function backupPath(userId, name) {
   return disk.joinPath(ROOT, BACKUP, stamp, String(userId), `${clock} ${name}`);
 }
 
+/** Убрать запись в архив и запомнить, откуда, — чтобы восстановить на прежнее место. */
+async function archive(userId, f, label = '') {
+  const dest = backupPath(userId, label ? `${label} ${f.name}` : f.name);
+  await disk.move(f.path, dest);
+  meta.setOrigin(dest, f.path);
+  return dest;
+}
+
 // PRIEMKA_TEST_* — только для автотестов, чтобы не ждать по 10 минут; в .env их не ставят.
 const UPLOAD_WAIT_MS = Number(process.env.PRIEMKA_TEST_UPLOAD_WAIT_MS) || 10 * 60_000;  // столько человек ждёт в чате
 const UPLOAD_WAIT_BG_MS = 60 * 60_000;   // столько бот дожидается большой загрузки в фоне
 const BG_POLL_MS = Number(process.env.PRIEMKA_TEST_BG_POLL_MS) || 15_000;
+const PROGRESS_MS = Number(process.env.PRIEMKA_TEST_PROGRESS_MS) || 20_000;   // как часто обновлять «прошло …»
+const PENDING_TTL_MS = 30 * 60_000;      // файл, ждущий подтверждения, — не дольше получаса
 const background = new Set();            // фоновые доливки — чтобы тесты могли их дождаться
 
+/** Номер в имени файла: «SCR#6512028.mp4» или просто семь цифр подряд. */
+function numberInName(name) {
+  const s = String(name || '');
+  return (s.match(SCR_RE) || s.match(/(?<!\d)(\d{7})(?!\d)/) || [])[1] || null;
+}
+
 async function onFile(chatId, userId, s, attachment) {
+  if (s.step === 'await-registry') return onRegistry(chatId, userId, s, attachment);
   if (s.step !== 'await-file' || !s.scr) {
     return showMenu(chatId, 'Сначала выберите действие, а потом пришлите запись.');
   }
-  const cmd = s.cmd;
   // Права проверяем ещё раз именно здесь, на шаге, который меняет Диск: роль могли
   // отнять, пока человек выбирал папки.
-  if (!can(userId, cmd)) {
+  if (!can(userId, s.cmd)) {
     reset(chatId);
     return say(chatId, 'Это действие вам больше недоступно — права изменились. Обратитесь к администратору.',
       rows(menuFor(userId)));
@@ -1144,24 +1857,84 @@ async function onFile(chatId, userId, s, attachment) {
     return say(chatId, 'Не вижу вложения. Пришлите запись файлом.', rows(menuFor(lastUser.get(chatId))));
   }
 
+  const file = { url, size, name: srcName, at: Date.now(), att: attachment };
+  /* Сверка номера с именем файла: «ввели 6512028, а файл — SCR#6512029.mp4» — типичная
+   * ошибка, когда видео загружают не под тем номером. Нет цифр в имени — не спрашиваем. */
+  const inName = numberInName(srcName);
+  const mismatch = inName && inName !== s.scr;
+  const warn = mismatch ? `⚠️ В имени файла номер ${inName}, а вы указали SCR#${s.scr}.` : '';
+
+  // Замена — всегда с подтверждением: «было → станет».
+  if (s.cmd === 'replace' && s.found) {
+    Object.assign(s, { pending: file, step: 'confirm-file' });
+    return screen(chatId,
+      `${stepTitle('♻️ Замена', 3, 3)}\nПроверьте перед заменой\n${RULE}\n` +
+      `БЫЛО: ${s.found.name} · ${mb(s.found.size)}${s.found.created ? ` · загружена ${fmtDate(s.found.created)}` : ''}\n` +
+      `СТАНЕТ: ${srcName}${size ? ` · ${mb(size)}` : ''}\n` +
+      `${report(s.found.path)}\n${RULE}\n` +
+      (warn ? `${warn}\n` : '') +
+      'Прежняя версия уйдёт в архив — её можно будет вернуть.',
+      rows([btn(`✅ Заменить SCR#${s.scr}`, 'go:file'), HOME()]));
+  }
+
+  if (mismatch) {
+    Object.assign(s, { pending: file, step: 'confirm-file' });
+    return screen(chatId,
+      `⚠️ Проверьте номер\n\nВы указали номер SCR#${s.scr}, а файл называется «${srcName}» — в имени номер ${inName}.\n` +
+      `${RULE}\nВсё верно?`,
+      rows([btn(`✅ Да, загрузить как SCR#${s.scr}`, 'go:file'), btn('✏️ Ввести другой номер', 'go:renum'), HOME()]));
+  }
+
+  return doUpload(chatId, userId, s, file);
+}
+
+/** Человек подтвердил файл (замена или несовпадение номера) — грузим. */
+async function confirmedFile(chatId, userId, s) {
+  if (s.step !== 'confirm-file' || !s.pending || !s.scr) return showMenu(chatId, 'Кнопка устарела — начните заново.', userId);
+  if (Date.now() - s.pending.at > PENDING_TTL_MS) {
+    // Ссылка MAX на присланный файл живёт ограниченное время — не рискуем, просим заново.
+    Object.assign(s, { pending: null, step: 'await-file' });
+    return say(chatId, 'С тех пор как вы прислали файл, прошло больше получаса. Пришлите его, пожалуйста, ещё раз.');
+  }
+  if (!can(userId, s.cmd)) {
+    reset(chatId);
+    return say(chatId, 'Это действие вам больше недоступно — права изменились. Обратитесь к администратору.', rows(menuFor(userId)));
+  }
+  const file = s.pending;
+  s.pending = null;
+  return doUpload(chatId, userId, s, file);
+}
+
+const elapsed = (ms) => {
+  const sec = Math.round(ms / 1000);
+  return sec < 60 ? `${sec} с` : `${Math.floor(sec / 60)} мин ${sec % 60} с`;
+};
+const progressText = (scr, ms) =>
+  `⏳ Загружаю SCR#${scr} · прошло ${elapsed(ms)}\nДиск принимает файл с серверов MAX; большие записи — до нескольких минут.`;
+
+async function doUpload(chatId, userId, s, file) {
+  const { url, size, name: srcName } = file;
+  const cmd = s.cmd;
   const scr = s.scr;
   const found = s.found;
+  const path = [...s.path];
   // При ЗАМЕНЕ новая версия встаёт ровно туда, где лежала старая: опросник в этой команде
   // не проходится, поэтому s.path пуст, и раньше файл улетал в корень /Видеопоказы.
   // Расширение берём у НОВОГО файла — прислать могут .mov вместо .mp4.
   const replacing = cmd === 'replace' && !!found;
   const target = replacing
     ? parentOf(found.path) + '/' + `SCR#${scr}${extOf(srcName)}`
-    : disk.joinPath(ROOT, ...s.path, `SCR#${scr}${extOf(srcName)}`);
+    : disk.joinPath(ROOT, ...path, `SCR#${scr}${extOf(srcName)}`);
   /* При замене порядок ВАЖЕН: сначала кладём новую версию во временное имя, и только
    * когда она реально на Диске — убираем старую в архив и ставим новую на её место.
    * Раньше старая уезжала в архив ПЕРВОЙ: любой сбой заливки — и человек оставался
    * без записи вообще (в поиске её уже нет, новой ещё нет). Поймано ревизией 07.09.2026. */
   const landing = replacing ? `${target}.new` : target;
-  const ctx = { chatId, userId, cmd, scr, found, target, landing, replacing };
+  const ctx = { chatId, userId, cmd, scr, found, target, landing, replacing, path };
 
   if (!scrLock(scr, replacing ? 'замена' : 'загрузка')) return say(chatId, busyText(scr));
   let detached = false;
+  let stopProgress = async () => {};
   try {
     // Хватит ли места — до загрузки, а не 507-м после получаса ожидания.
     if (size > 0) {
@@ -1171,9 +1944,9 @@ async function onFile(chatId, userId, s, attachment) {
         reset(chatId);
         notifyAdmins('disk-full', `⚠️ На Яндекс.Диске не хватает места: свободно ${mb(free)}, ` +
           `а прислали запись на ${mb(size)}. Загрузки не проходят.`);
-        return say(chatId,
-          `На Диске не хватает места: запись весит ${mb(size)}, а свободно ${mb(free)}.\n` +
-          'Загрузка не начиналась. Сообщите администратору.', rows(menuFor(userId)));
+        return say(chatId, trouble('На Диске не хватает места',
+          `Запись весит ${mb(size)}, а свободно ${mb(free)}. Загрузка не начиналась. Сообщите администратору.`),
+        rows(menuFor(userId)));
       }
     }
 
@@ -1183,8 +1956,9 @@ async function onFile(chatId, userId, s, attachment) {
       if (now.length) {
         reset(chatId);
         return say(chatId,
-          `Запись SCR#${scr} уже загружена — пока вы присылали файл, её загрузил другой пользователь.\n\n` +
-          `${report(now[0].path)}\n${RULE}\nЧтобы загрузить новую версию, выберите «Заменить видеозапись».`,
+          card({ title: `ℹ️ Запись SCR#${scr} уже загружена`, path: now[0].path,
+            notes: ['Пока вы присылали файл, её загрузил другой пользователь.',
+              'Чтобы загрузить новую версию, выберите «Заменить видеозапись».'] }),
           rows(menuFor(userId)));
       }
     }
@@ -1194,7 +1968,19 @@ async function onFile(chatId, userId, s, attachment) {
         rows(menuFor(userId)));
     }
 
-    await say(chatId, 'Загружаю…');
+    /* Ход загрузки: вместо одного «Загружаю…» сообщение обновляется само — видно, что бот
+     * работает, а не завис. Процентов нет: Диск их не сообщает, только «идёт» или «готово». */
+    const startedAt = Date.now();
+    const prog = await say(chatId, progressText(scr, 0));
+    const progMid = prog?.message?.body?.mid;
+    const timer = setInterval(() => {
+      if (!progMid) return;
+      api('PUT', '/messages', { query: { message_id: progMid }, body: { text: progressText(scr, Date.now() - startedAt) } })
+        .catch(() => { /* не обновилось — не страшно */ });
+    }, PROGRESS_MS);
+    timer.unref?.();
+    stopProgress = async () => { clearInterval(timer); stopProgress = async () => {}; await drop(chatId, progMid); };
+
     inFlightPaths.add(ckey(landing));
     // Папку заводим для РОДИТЕЛЯ файла: от самого пути файла Диск создаёт каталог
     // с именем «SCR#….mp4», и заливка туда же падает с 409.
@@ -1210,6 +1996,7 @@ async function onFile(chatId, userId, s, attachment) {
        * хотя файл потом спокойно долетал. Теперь бот честно говорит «ещё идёт», отпускает
        * человека и дожидается результата в фоне. Замок на номер держится до конца. */
       detached = true;
+      await stopProgress();
       reset(chatId);
       await say(chatId,
         `⏳ Загрузка SCR#${scr} ещё идёт — большой файл Диск принимает дольше обычного.\n` +
@@ -1218,7 +2005,7 @@ async function onFile(chatId, userId, s, attachment) {
         try {
           await disk.waitOperation(href, { timeoutMs: UPLOAD_WAIT_BG_MS, initialDelayMs: BG_POLL_MS, maxDelayMs: Math.max(BG_POLL_MS, 60_000) });
           const done = await finishUpload(ctx);
-          await say(chatId, uploadDoneText(ctx, done), rows(menuFor(userId)));
+          await say(chatId, uploadDoneText(ctx, done), uploadDoneButtons(ctx, done));
         } catch (err) {
           await uploadFailed(ctx, err);
         } finally {
@@ -1231,10 +2018,12 @@ async function onFile(chatId, userId, s, attachment) {
       return;
     }
 
+    await stopProgress();
     const done = await finishUpload(ctx);
     reset(chatId);
-    return say(chatId, uploadDoneText(ctx, done), rows(menuFor(lastUser.get(chatId))));
+    return say(chatId, uploadDoneText(ctx, done), uploadDoneButtons(ctx, done));
   } catch (e) {
+    await stopProgress();
     reset(chatId);
     return uploadFailed(ctx, e);
   } finally {
@@ -1243,12 +2032,11 @@ async function onFile(chatId, userId, s, attachment) {
 }
 
 /** Файл на Диске — довести дело до конца: архив прежней версии, индекс, журнал. */
-async function finishUpload({ userId, cmd, scr, found, target, landing, replacing }) {
+async function finishUpload({ userId, cmd, scr, found, target, landing, replacing, path }) {
   let backup = null;
   if (replacing) {
     // время в имени: иначе вторая замена той же записи за сутки падала на занятом пути
-    backup = backupPath(userId, found.name);
-    await disk.move(found.path, backup);
+    backup = await archive(userId, found);
     try {
       await disk.move(landing, target);
     } catch (e) {
@@ -1262,7 +2050,9 @@ async function finishUpload({ userId, cmd, scr, found, target, landing, replacin
   if (!meta) throw new Error(`после загрузки файла нет на Диске: ${ckey(target)}`);
   invalidateFolders(parentOf(target), replacing ? parentOf(found.path) : null);
   if (replacing) indexRemove(found.path);
-  indexAdd({ name: meta.name, path: meta.path || target, size: meta.size });
+  indexAdd({ name: meta.name, path: meta.path || target, size: meta.size, created: meta.created });
+  // «В прошлую папку» и «Ещё запись сюда» — по папке последней ЗАГРУЗКИ человека.
+  if (cmd === 'upload' && path?.length) { lastPaths.set(userId, [...path]); saveState(); }
 
   journal.log({
     userId, name: nameOf(userId),
@@ -1274,9 +2064,20 @@ async function finishUpload({ userId, cmd, scr, found, target, landing, replacin
 }
 
 function uploadDoneText({ cmd, scr, target }, { meta, backup }) {
-  const head = cmd === 'replace' ? '♻️ Видеозапись заменена' : '✅ Видеозапись загружена';
-  const tail = cmd === 'replace' ? `\n\nПрежняя версия сохранена:\n${ckey(backup || '')}` : '';
-  return `${head}\n\n${report(target, { scr, size: meta.size })}${tail}`;
+  return card({
+    title: cmd === 'replace' ? '♻️ Видеозапись заменена' : '✅ Видеозапись загружена',
+    scr, path: target, size: meta.size,
+    notes: cmd === 'replace' ? [`Прежняя версия сохранена в архиве:\n${ckey(backup || '')}`] : [],
+  });
+}
+
+/** После загрузки: «Ещё запись сюда», комментарий — и обычное меню. */
+function uploadDoneButtons({ cmd, userId }, { meta }) {
+  const rec = { name: meta.name, path: meta.path, size: meta.size, created: meta.created };
+  const extra = [];
+  if (cmd === 'upload') extra.push(btn('📤 Ещё запись сюда', 'again'));
+  if (can(userId, 'comment')) extra.push(btn('💬 Добавить комментарий', 'cmt:' + keyFor(rec)));
+  return rows([...extra, ...menuFor(userId)]);
 }
 
 async function uploadFailed({ chatId, userId, cmd, scr, target }, e) {
@@ -1292,7 +2093,7 @@ async function uploadFailed({ chatId, userId, cmd, scr, target }, e) {
       `(${nameOf(userId)}).\n${String(e?.message || e).slice(0, 300)}`);
   }
   try {
-    return await say(chatId, `Не удалось загрузить запись.\n${diskTrouble(e)}`, rows(menuFor(userId)));
+    return await say(chatId, trouble('Не удалось загрузить запись', diskTrouble(e)), rows(menuFor(userId)));
   } catch (err) { console.error('   не смог сообщить об ошибке загрузки:', err.message); }
 }
 
@@ -1318,7 +2119,7 @@ async function doMove(chatId, userId, s) {
     if (ckey(found.path).replace(/\/+/g, '/') === ckey(dest).replace(/\/+/g, '/')) {
       reset(chatId);
       return say(chatId,
-        `Запись уже лежит в этой папке — переносить некуда.\n\nНомер: SCR#${scr}\n${RULE}\n${report(dest)}`,
+        card({ title: 'ℹ️ Запись уже лежит в этой папке — переносить некуда', scr, path: dest }),
         rows(menuFor(lastUser.get(chatId))));
     }
 
@@ -1334,8 +2135,8 @@ async function doMove(chatId, userId, s) {
     const was = s.wasAt || '';
     reset(chatId);
     return say(chatId,
-      `📁 Видеозапись перемещена\n\nНомер: SCR#${scr}\n${RULE}\n` +
-      (was ? `БЫЛО\n${was}\n${RULE}\n` : '') + `СТАЛО\n${report(dest)}`,
+      card({ title: '📁 Видеозапись перемещена', scr, path: dest, size: found.size,
+        notes: was ? [`Было:\n${was}`] : [] }),
       rows(menuFor(lastUser.get(chatId))));
   } catch (e) {
     // Сырой ответ Диска — простыня с путями и английским текстом: она уходит в лог,
@@ -1348,7 +2149,7 @@ async function doMove(chatId, userId, s) {
       : e.status === 409 ? 'Диск не принял перемещение по этому пути.'
       : e.status === 404 ? 'Запись не найдена — возможно, её уже переместили.'
       : 'Не получилось связаться с Диском, попробуйте ещё раз.';
-    return say(chatId, `Не удалось переместить запись.\n${why}`, rows(menuFor(lastUser.get(chatId))));
+    return say(chatId, trouble('Не удалось переместить запись', why), rows(menuFor(lastUser.get(chatId))));
   } finally {
     scrUnlock(scr);
   }
@@ -1371,8 +2172,7 @@ async function onOrphan(chatId, userId, payload) {
       return say(chatId, `Файла ${name} уже нет на Диске — разбирать нечего.`);
     }
     if (action === 'arc') {
-      const dest = backupPath(userId, `незавершённая ${name.replace(/\.new$/i, '')}`);
-      await disk.move(path, dest);
+      const dest = await archive(userId, { name: name.replace(/\.new$/i, ''), path }, 'незавершённая');
       journal.log({ userId, name: nameOf(userId), action: 'Незавершённая замена — в архив', scr,
         where: reportInline(path), result: ckey(dest) });
       return say(chatId, `📦 Убрано в архив:\n${ckey(dest)}`);
@@ -1388,8 +2188,7 @@ async function onOrphan(chatId, userId, payload) {
     }
     let backup = null;
     if (live.length) {
-      backup = backupPath(userId, live[0].name);
-      await disk.move(live[0].path, backup);
+      backup = await archive(userId, live[0]);
       indexRemove(live[0].path);
     }
     await disk.move(path, target);
@@ -1524,6 +2323,84 @@ function rotateLogIfNeeded() {
   process.exit(0);
 }
 
+/* Утренняя сводка администратору: что было вчера. Отправляется один раз в день, с SUMMARY_HOUR;
+ * если ноутбук утром был выключен — сразу после включения. Дата последней сводки — в state.json,
+ * поэтому перезапуск бота второй сводки за день не пришлёт. */
+const SUMMARY_HOUR = /^\d{1,2}$/.test(process.env.SUMMARY_HOUR || '') && Number(process.env.SUMMARY_HOUR) <= 23
+  ? Number(process.env.SUMMARY_HOUR) : 9;
+
+const ACTION_GROUPS = [
+  ['Загружено', /^Загрузка/], ['Заменено', /^Замена|^Завершение замены/], ['Перемещено', /^Перемещение/],
+  ['Восстановлено', /^Восстановление/], ['Удалено', /^Удаление/],
+  ['Доступ: выдан / изменён / закрыт', /доступ|роли/i],
+];
+
+async function buildSummary(day) {
+  const p = (n) => String(n).padStart(2, '0');
+  const ym = `${day.getFullYear()}-${p(day.getMonth() + 1)}`;
+  const dayRu = day.toLocaleDateString('ru-RU');
+  const rowsDay = (await journal.readMonth(ym)).filter((r) => r['Дата'] === dayRu);
+  const errors = rowsDay.filter((r) => /^ОШИБКА/.test(r['Результат']));
+  const ok = rowsDay.filter((r) => !/^ОШИБКА/.test(r['Результат']));
+  const lines = ACTION_GROUPS
+    .map(([label, re]) => [label, ok.filter((r) => re.test(r['Действие'])).length])
+    .filter(([, n]) => n > 0)
+    .map(([label, n]) => `${label}: ${n}`);
+  let free = null;
+  try { free = await disk.freeSpace(); } catch { /* без места — не беда */ }
+  const out = [`☀️ Сводка за ${dayRu}`, ''];
+  out.push(...(lines.length ? lines : ['Действий не было.']));
+  if (errors.length) {
+    out.push(RULE, `⚠️ Ошибок: ${errors.length}`,
+      ...errors.slice(0, 5).map((r) => `• ${r['Время'].slice(0, 5)} ${r['Кто (имя)'] || r['Кто (номер)']} — ${r['Действие']} ${r['SCR']}`));
+  }
+  out.push(RULE, `Записей на Диске: ${scrIndex.size}`);
+  if (free !== null) out.push(`Свободно: ${(free / 1024 ** 3).toFixed(1).replace('.', ',')} ГБ`);
+  const pend = pendingRequests().length;
+  if (pend) out.push(`🙋 Ждут решения заявок на доступ: ${pend}`);
+  return out.join('\n');
+}
+
+async function summaryTick(now = new Date()) {
+  if (now.getHours() < SUMMARY_HOUR) return;
+  const p = (n) => String(n).padStart(2, '0');
+  const todayKey = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`;
+  if (lastSummary === todayKey) return;
+  const chats = [...new Set(ADMINS.map((a) => adminChats.get(a)).filter(Boolean))];
+  if (!chats.length) return;                         // некому — пришлём, когда администратор напишет боту
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  let text;
+  try { text = await buildSummary(yesterday); }
+  catch (e) { console.error('   сводка не собралась:', e.message); alertDisk(e); return; }
+  let sent = 0;
+  for (const c of chats) {
+    try { await say(c, text, rows([btn('🕒 Последние действия', 'adm:recent'), HOME()])); sent++; }
+    catch (e) { console.error('   сводка не ушла:', e.message); }
+  }
+  // День отмечаем, только если сводка дошла: иначе следующая проверка через 5 минут повторит.
+  if (sent) { lastSummary = todayKey; saveState(); }
+}
+
+/* Список команд в MAX — рядом с полем ввода, чтобы меню не приходилось искать в ленте.
+ * Поддерживает ли это API MAX, документация прямо не говорит: не вышло — просто живём дальше. */
+const COMMANDS = [
+  { name: 'start', description: 'Главное меню' },
+  { name: 'upload', description: 'Загрузить видеозапись' },
+  { name: 'find', description: 'Найти запись по номеру SCR' },
+  { name: 'browse', description: 'Обзор записей по папкам' },
+  { name: 'replace', description: 'Заменить видеозапись' },
+  { name: 'move', description: 'Переместить видеозапись' },
+  { name: 'admin', description: 'Администрирование' },
+];
+async function registerCommands() {
+  try {
+    await api('PATCH', '/me', { body: { commands: COMMANDS } });
+    console.log('Список команд в MAX обновлён.');
+  } catch (e) {
+    console.log(`Список команд в MAX не обновлён (${String(e.message).slice(0, 120)}) — бот работает и без него.`);
+  }
+}
+
 /** Запись о запуске: частые запуски подряд означают, что бот падает. */
 function noteStart() {
   const now = Date.now();
@@ -1557,9 +2434,12 @@ async function loop() {
   if (sessions.size) console.log(`Восстановлено диалогов: ${sessions.size}`);
   noteStart();
   warmTree();                                   // не ждём: опросник начнёт работать сразу, просто первые шаги медленнее
-  setInterval(() => { folderCache.clear(); warmTree(); }, FOLDER_CACHE_TTL_MS);
+  setInterval(() => { folderCache.clear(); meta.reload(); warmTree(); }, FOLDER_CACHE_TTL_MS);
   setTimeout(healthTick, 60_000);
   setInterval(healthTick, 60 * 60_000);
+  setTimeout(() => summaryTick().catch(() => {}), 2 * 60_000);
+  setInterval(() => summaryTick().catch(() => {}), 5 * 60_000);
+  registerCommands();
   console.log(marker ? `Продолжаю с маркера ${marker} — события за время простоя не потеряются.` : 'Маркера нет, начинаю с текущего момента.');
 
   while (!stopping) {
@@ -1593,6 +2473,9 @@ export const _test = {
   setAccess: (list) => { access = list; },
   healthTick,
   rotateLogIfNeeded,
+  summaryTick,
+  resetSummary: () => { lastSummary = null; },
+  registerCommands,
 };
 
 if (process.env.PRIEMKA_NO_START !== '1') {

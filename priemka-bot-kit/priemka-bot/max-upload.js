@@ -214,3 +214,23 @@ export async function sendFileFromUrl(chatId, { url, filename, size, caption = '
   const attachToken = await uploadMedia({ kind: 'file', filename, source: url, size });
   await sendMedia(chatId, { kind: 'file', attachToken, text: caption, buttons });
 }
+
+/**
+ * Отправить файл, собранный в памяти (выгрузки Excel). Они маленькие — килобайты,
+ * поэтому обычный FormData, без потоковой передачи.
+ */
+export async function sendBuffer(chatId, { buffer, filename, caption = '', buttons = null }) {
+  const { url, preToken } = await startUpload('file');
+  const form = new FormData();
+  form.append('data', new Blob([buffer]), filename);
+  const up = await fetch(url, { method: 'POST', body: form, signal: AbortSignal.timeout(5 * 60_000) });
+  const text = await up.text();
+  if (!up.ok) {
+    throw new SendError(`Загрузка в MAX не удалась: HTTP ${up.status} ${redact(text).slice(0, 200)}`, { status: up.status });
+  }
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch { /* не JSON — токен возьмём из preToken */ }
+  const attachToken = preToken ?? parsed?.token ?? parsed?.file?.token;
+  if (!attachToken) throw new SendError('Загрузка прошла, но токен вложения не пришёл');
+  await sendMedia(chatId, { kind: 'file', attachToken, text: caption, buttons });
+}

@@ -1,0 +1,10 @@
+.env
+.env.txt
+ca.pem
+node-path.txt
+state.json
+marker.json
+bot.log
+access.json.tmp
+access.json.broken
+node/

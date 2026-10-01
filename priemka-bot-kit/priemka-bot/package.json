@@ -1,0 +1,7 @@
+{
+  "name": "priemka-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Бот приёмки: видео из MAX на Яндекс.Диск"
+}

@@ -1,0 +1,25 @@
+{
+  "allowed": [
+    {
+      "id": 7421093,
+      "name": "Эмиль Халилов",
+      "addedBy": null,
+      "addedAt": "2026-09-07",
+      "role": "admin"
+    },
+    {
+      "id": 90235418,
+      "name": "Даниил Рыскин",
+      "addedBy": null,
+      "addedAt": "2026-09-07",
+      "role": "admin"
+    },
+    {
+      "id": 5027929,
+      "name": null,
+      "role": "admin",
+      "addedBy": 7421093,
+      "addedAt": "2026-09-08"
+    }
+  ]
+}

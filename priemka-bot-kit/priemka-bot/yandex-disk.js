@@ -123,7 +123,7 @@ function buildUrl(endpoint, query = {}) {
  * за два UTF-16-символа при обрезке по 255.
  * Слэш заменяем, а не режем: имя ОБЯЗАНО остаться одним сегментом.
  */
-export function sanitizeName(raw, { fallback = 'file' } = {}) {
+function sanitizeName(raw, { fallback = 'file' } = {}) {
   let name = String(raw ?? '')
     .normalize('NFC')
     .replace(/\u00a0/g, ' ')
@@ -436,34 +436,6 @@ async function createFolder(folder) {
 }
 
 /**
- * Свободное имя рядом с занятым: «видео.mp4» → «видео (2).mp4».
- * Нужно ровно для случая «два видео подряд с одинаковым именем»: с overwrite=false второе
- * иначе упало бы 409, а с overwrite=true — затёрло бы первое.
- * Проверка и последующая запись не атомарны — сам Диск остаётся последним арбитром.
- * @returns {Promise<string>} нормализованный путь, которого сейчас нет на Диске
- */
-export async function findFreePath(path, { limit = 50 } = {}) {
-  const target = normalizePath(path);
-  if (!(await stat(target, { fields: 'type,path' }))) return target;
-
-  const slash = target.lastIndexOf('/');
-  const dir = target.slice(0, slash);
-  const name = target.slice(slash + 1);
-  const dot = name.lastIndexOf('.');
-  const stem = dot > 0 ? name.slice(0, dot) : name;
-  const ext = dot > 0 ? name.slice(dot) : '';
-
-  for (let n = 2; n <= limit; n++) {
-    const suffix = ` (${n})`;
-    const room = MAX_NAME_LENGTH - [...suffix].length - [...ext].length;
-    const shortStem = [...stem].slice(0, Math.max(1, room)).join('').replace(/[. ]+$/, '');
-    const candidate = normalizePath(`${dir}/${shortStem}${suffix}${ext}`);
-    if (!(await stat(candidate, { fields: 'type,path' }))) return candidate;
-  }
-  throw new DiskError(`Не нашёл свободное имя рядом с ${target} за ${limit} попыток`, { path: target });
-}
-
-/**
  * Асинхронная загрузка по внешней ссылке: Яндекс качает файл сам, байты через нас не идут.
  * Ответ 202 означает только «скачивание начато» — исход узнаёт waitOperation.
  * @returns {Promise<string>} href ручки статуса операции (использовать как непрозрачную строку)
@@ -572,24 +544,21 @@ async function requestUploadLink(target, overwrite) {
  * Здесь трафик идёт через наш процесс, поэтому это фолбэк, а не основной приём.
  * @param {Uint8Array|Buffer|ArrayBuffer|Blob} buffer содержимое файла (Blob из fs.openAsBlob
  *   не держит гигабайтное видео в памяти и переживает повтор запроса)
- * @param {object} [options]
- * @param {boolean} [options.unique] подобрать свободное имя вместо падения на 409
- * @returns {Promise<{path: string, status: number, operationId: string|null}>}
+ * @returns {Promise<{path: string, status: number}>}
  */
-export async function uploadBuffer(buffer, path, { overwrite = false, unique = false, timeoutMs = UPLOAD_TIMEOUT_MS } = {}) {
-  const initialTarget = normalizePath(path);
+export async function uploadBuffer(buffer, path, { overwrite = false, timeoutMs = UPLOAD_TIMEOUT_MS } = {}) {
+  const target = normalizePath(path);
   const bytes = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer;
   if (!(bytes instanceof Uint8Array) && !(bytes instanceof Blob)) {
-    throw new DiskError('uploadBuffer ждёт Buffer, Uint8Array, ArrayBuffer или Blob', { path: initialTarget });
+    throw new DiskError('uploadBuffer ждёт Buffer, Uint8Array, ArrayBuffer или Blob', { path: target });
   }
   // Пустой файл Диск примет молча, и в папке приёмки окажется «видео» на 0 байт.
   const size = bytes instanceof Blob ? bytes.size : bytes.byteLength;
   if (size === 0) {
-    throw new DiskError(`Пустой файл (0 байт) для ${initialTarget} — заливать нечего`, { path: initialTarget });
+    throw new DiskError(`Пустой файл (0 байт) для ${target} — заливать нечего`, { path: target });
   }
 
-  return withPathLock(initialTarget, async () => {
-    const target = unique && !overwrite ? await findFreePath(initialTarget) : initialTarget;
+  return withPathLock(target, async () => {
     let link = await requestUploadLink(target, overwrite);
 
     for (let attempt = 0; ; attempt++) {
@@ -615,14 +584,7 @@ export async function uploadBuffer(buffer, path, { overwrite = false, unique = f
 
       // 201 — файл на Диске; 202 — принят, но ещё переносится.
       if (response.status === 201 || response.status === 202) {
-        return {
-          path: target,
-          status: response.status,
-          // operation_id приходит вместе с upload-ссылкой. Дожать статус через waitOperation
-          // можно, но URL пришлось бы собирать руками, а его форма не подтверждена —
-          // надёжнее stat(target).
-          operationId: link.operation_id ?? null,
-        };
+        return { path: target, status: response.status };
       }
 
       const raw = await response.text().catch(() => '');
@@ -646,41 +608,6 @@ export async function uploadBuffer(buffer, path, { overwrite = false, unique = f
       throw formatApiError(response.status, parsed, `Заливка ${target}`, target);
     }
   });
-}
-
-/**
- * Опубликовать ресурс и вернуть публичную ссылку.
- * В ответе publish самой ссылки нет — href ведёт на метаданные, откуда и читается public_url.
- * Лимит на количество публикаций документация упоминает (403), но числа не называет.
- * Для бота дешевле публиковать ПАПКУ приёмки один раз, чем каждое видео.
- * @returns {Promise<string>} public_url вида https://yadi.sk/...
- */
-export async function publish(path) {
-  const target = normalizePath(path);
-  const { body: link } = await apiRequest('PUT', buildUrl('/disk/resources/publish', { path: target }), {
-    expect: [200],
-    context: `Публикация ${target}`,
-    path: target,
-  });
-
-  // href из ответа берём как есть, но только если он не шаблонный; иначе идём за метаданными сами.
-  const metaUrl =
-    link && typeof link === 'object' && typeof link.href === 'string' && link.templated !== true
-      ? link.href
-      : buildUrl('/disk/resources', { path: target, fields: 'public_url,name,type' });
-
-  // public_url появляется у ресурса только после публикации; даём второй заход на случай,
-  // если атрибут доедет не мгновенно.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { body: meta } = await apiRequest('GET', metaUrl, {
-      context: `Чтение public_url для ${target}`,
-      path: target,
-    });
-    if (meta && typeof meta === 'object' && meta.public_url) return meta.public_url;
-    if (attempt === 0) await sleep(1500);
-  }
-
-  throw new DiskError(`Ресурс ${target} опубликован, но public_url так и не пришёл в метаданных`, { path: target });
 }
 
 /**

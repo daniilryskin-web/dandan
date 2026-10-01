@@ -30,7 +30,6 @@ const POLL_TIMEOUT_SEC = 30;
  * а если его положить в тот же файл, что и обычных пользователей, любой админ сможет
  * случайно разжаловать всех остальных, включая себя. */
 const ADMINS = [
-  7421093,    // Эмиль Халилов
   90235418,   // Даниил Рыскин, МЦ
 ];
 
@@ -295,7 +294,6 @@ async function askFolder(chatId, s) {
     // Дно дерева: дальше спрашиваем номер
     if (s.cmd === 'move') {
       s.step = 'confirm-move';
-      const dest = disk.joinPath(ROOT, ...s.path, `SCR#${s.scr}${extOf(s.found.name)}`);
       return screen(chatId,
         `БЫЛО\n${report(s.found.path)}\n${RULE}\nСТАНЕТ\n${report(s.path)}\n${RULE}\nПереместить SCR#${s.scr}?`,
         rows([btn('✅ Переместить', 'go:move'), btn('⬅️ В начало', 'cmd:menu')]));
@@ -476,7 +474,7 @@ async function onAdmin(chatId, userId, payload, s) {
 
 async function adminRoute(chatId, userId, payload, s) {
 
-  if (payload === 'adm:people' || payload === 'adm:list') {
+  if (payload === 'adm:people') {
     if (!access.length) return screen(chatId, 'Список пуст: ботом пользуются только основные администраторы.', rows([
       btn('➕ Добавить', 'adm:add'),
       btn('⬅️ Назад', 'adm:back'),
@@ -792,7 +790,6 @@ async function afterScr(chatId, s) {
 
   if (s.cmd === 'upload') {
     if (existing.length) {
-      const where = existing[0].path.replace('disk:', '');
       reset(chatId);
       return say(chatId,
         `Запись SCR#${s.scr} уже загружена\n\n${report(existing[0].path)}\n${RULE}\n` +
@@ -844,10 +841,8 @@ async function sendRecord(chatId, found) {
   await drop(chatId, prev);                          // экран поиска заменяется самой записью
   const wait = await say(chatId, `Готовлю запись, это займёт до минуты`);
   try {
-    const link = await disk.stat(found.path);   // stat отдаёт и file-ссылку
-    const href = link.file || (await downloadHref(found.path));
     await sendFileFromUrl(chatId, {
-      url: href,
+      url: await downloadHref(found.path),
       filename: found.name,
       size: found.size,
       caption: `${(found.name.match(/SCR#\d{7}/) || [found.name])[0]}\n${report(found.path)}`,

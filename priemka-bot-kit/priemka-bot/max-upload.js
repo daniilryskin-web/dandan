@@ -3,17 +3,12 @@
 // Схема из документации: POST /uploads?type=… отдаёт временный url, на него льётся файл,
 // в ответ приходит токен, и уже он подставляется в attachments при POST /messages.
 //
-// Своя механика здесь — выбор типа вложения, скачивание с Диска и ожидание готовности вложения.
+// Своя механика здесь — скачивание с Диска и ожидание готовности вложения.
 
 const API = 'https://platform-api2.max.ru';
 
-// Лимиты POST /uploads, дословно из документации MAX.
-export const SEND_LIMITS = {
-  video: 250 * 1024 * 1024,       // MP4, MOV, MKV, WEBM
-  file: 4 * 1024 * 1024 * 1024,   // всё остальное
-};
-
-const VIDEO_EXT = new Set(['mp4', 'mov', 'mkv', 'webm']);
+// Потолок POST /uploads?type=file, дословно из документации MAX.
+const FILE_LIMIT = 4 * 1024 * 1024 * 1024;
 
 export class SendError extends Error {
   constructor(message, { status = 0, code = null } = {}) {
@@ -38,28 +33,7 @@ function redact(text) {
   return out.replace(/([?&][\w.-]*(?:rq|token|sig|signature)=)[^&\s'"]+/gi, '$1***');
 }
 
-const extOf = (name) => {
-  const m = String(name || '').match(/\.([A-Za-z0-9]{1,8})$/);
-  return m ? m[1].toLowerCase() : '';
-};
-
-/**
- * Каким типом отправлять: видео проигрывается прямо в чате, но потолок 250 МБ.
- * Всё, что крупнее или не видео по расширению, уходит файлом — его скачивают.
- */
-export function chooseKind(filename, size, { asVideo = false } = {}) {
-  // По умолчанию отдаём ФАЙЛОМ — решение Эмиля от 07.09.2026. Причина не в лимитах:
-  // видео-вложение MAX проигрывает в чате, но это уже не тот файл, что лежит на Диске,
-  // а для показов работ важен оригинал, который скачивается байт в байт.
-  // asVideo: true оставлен на случай, когда важнее удобство просмотра, а не точность.
-  if (Number(size) > SEND_LIMITS.file) return null;   // 4 ГБ — потолок MAX, дальше никак
-  if (!asVideo) return 'file';
-  const isVideoExt = VIDEO_EXT.has(extOf(filename));
-  if (isVideoExt && Number(size) > 0 && Number(size) <= SEND_LIMITS.video) return 'video';
-  return 'file';
-}
-
-async function api(method, path, { query = {}, body = null, signal = null } = {}) {
+async function api(method, path, { query = {}, body = null } = {}) {
   const qs = Object.entries(query)
     .filter(([, v]) => v !== undefined && v !== null)
     .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
@@ -72,7 +46,7 @@ async function api(method, path, { query = {}, body = null, signal = null } = {}
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
-    signal: signal || AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(60_000),
   });
   const text = await res.text();
   let json = null;
@@ -86,29 +60,21 @@ async function api(method, path, { query = {}, body = null, signal = null } = {}
   return json;
 }
 
-/**
- * Залить файл в MAX и получить токен вложения.
- * source — либо Buffer, либо URL, откуда взять файл.
- */
-export async function uploadMedia({ kind, filename, source, size = 0, signal = null }) {
+/** Залить файл в MAX по ссылке на источник и получить токен вложения. */
+async function uploadMedia({ kind, filename, source }) {
   // Замерено 07.09.2026: формы ответа для разных типов РАЗНЫЕ, в документации это не сказано.
   //   type=video → {url, token} — токен выдаётся сразу, ДО загрузки байтов;
   //   type=file  → {url}        — токен здесь не приходит, ищем его в ответе uploader'а
   //                              (там же может прийти «<retval>1</retval>», это просто «ок»).
-  const started = await api('POST', '/uploads', { query: { type: kind }, signal });
+  const started = await api('POST', '/uploads', { query: { type: kind } });
   const url = started?.url;
   const preToken = started?.token ?? null;
   if (!url) throw new SendError('MAX не вернул url для загрузки');
 
-  let payload;
-  if (Buffer.isBuffer(source)) {
-    payload = new Blob([source]);
-  } else {
-    // Тело целиком уходит в память: FormData требует готовый Blob.
-    const src = await fetch(String(source), { signal: signal || AbortSignal.timeout(15 * 60_000) });
-    if (!src.ok) throw new SendError(`Источник отдал HTTP ${src.status} — файл скачать не удалось`);
-    payload = await src.blob();
-  }
+  // Тело целиком уходит в память: FormData требует готовый Blob.
+  const src = await fetch(String(source), { signal: AbortSignal.timeout(15 * 60_000) });
+  if (!src.ok) throw new SendError(`Источник отдал HTTP ${src.status} — файл скачать не удалось`);
+  const payload = await src.blob();
 
   const form = new FormData();
   form.append('data', payload, filename);
@@ -116,7 +82,7 @@ export async function uploadMedia({ kind, filename, source, size = 0, signal = n
   const up = await fetch(url, {
     method: 'POST',
     body: form,
-    signal: signal || AbortSignal.timeout(30 * 60_000),
+    signal: AbortSignal.timeout(30 * 60_000),
   });
   const text = await up.text();
   if (!up.ok) {
@@ -148,7 +114,7 @@ export async function uploadMedia({ kind, filename, source, size = 0, signal = n
  * Отправить сообщение с вложением. Вложение после загрузки готово не мгновенно:
  * MAX отвечает attachment.not.ready, и это нормальное состояние, а не ошибка — ждём и повторяем.
  */
-export async function sendMedia(chatId, { kind, attachToken, text = '', signal = null, attempts = 12, buttons = null }) {
+async function sendMedia(chatId, { kind, attachToken, text = '', attempts = 12, buttons = null }) {
   // Кнопки едут ВМЕСТЕ с файлом: проверено на живом 08.09.2026 — MAX принимает
   // file и inline_keyboard в одном сообщении. Иначе после выдачи записи человек
   // оставался без меню и лез скроллить вверх за старой клавиатурой.
@@ -163,7 +129,7 @@ export async function sendMedia(chatId, { kind, attachToken, text = '', signal =
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await api('POST', '/messages', { query: { chat_id: chatId }, body, signal });
+      return await api('POST', '/messages', { query: { chat_id: chatId }, body });
     } catch (e) {
       lastErr = e;
       const notReady = e.status === 400 && /not\.?ready|not ready/i.test(e.message);
@@ -174,13 +140,15 @@ export async function sendMedia(chatId, { kind, attachToken, text = '', signal =
   throw new SendError(`Вложение так и не подготовилось за ${attempts} попыток: ${lastErr?.message || ''}`);
 }
 
-/** Весь путь: взять файл по ссылке и отправить его в чат подходящим типом. */
-export async function sendFileFromUrl(chatId, { url, filename, size, caption = '', signal = null, asVideo = false, buttons = null }) {
-  const kind = chooseKind(filename, size, { asVideo });
-  if (!kind) {
+/**
+ * Весь путь: взять файл по ссылке и отправить его в чат.
+ * Всегда ФАЙЛОМ, а не видео — решение Эмиля от 07.09.2026: видео-вложение MAX
+ * перекодирует, а для показов работ важен оригинал, который скачивается байт в байт.
+ */
+export async function sendFileFromUrl(chatId, { url, filename, size, caption = '', buttons = null }) {
+  if (Number(size) > FILE_LIMIT) {
     throw new SendError(`Файл ${filename} весит ${(size / 1024 ** 3).toFixed(2)} ГБ — это больше потолка MAX в 4 ГБ`);
   }
-  const attachToken = await uploadMedia({ kind, filename, source: url, size, signal });
-  await sendMedia(chatId, { kind, attachToken, text: caption, signal, buttons });
-  return kind;
+  const attachToken = await uploadMedia({ kind: 'file', filename, source: url });
+  await sendMedia(chatId, { kind: 'file', attachToken, text: caption, buttons });
 }

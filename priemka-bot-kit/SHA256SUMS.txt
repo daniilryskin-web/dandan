@@ -1,12 +1,12 @@
 ﻿Контрольные суммы SHA-256 файлов программы.
 Проверка в командной строке: certutil -hashfile priemka-bot\bot.js SHA256
 
-3868af710dac7fc441addf29c60dd8f81e45496e985d3b18cf8f629a9f22f310  priemka-bot\access.json
-9e587457237513107beee2da74bfd6efa56191160b98a6f9e630a8617109670e  priemka-bot\bot.js
+9610d79c0b1adc572ef313d04e3b8077e722a3c0fa780810f6d52c5d406633c7  priemka-bot\access.json
+4758cdab4ad2bfffd173a1158e36a8a4b2e425ae0eff3e33e5d3b4bd66a3bdee  priemka-bot\bot.js
 f36d59a12a23f3f33f44cb45fd0394b505e28b57d22670e1df50506ef8f5915a  priemka-bot\journal.js
-8cea9fb7438544b2d8aa776efe6818474f441d0f61f9dce77c319ce764a2b561  priemka-bot\max-upload.js
+2077fb87fb4940799663739ca10fffd331efb9406299b19d370de702d9a5edda  priemka-bot\max-upload.js
 a069f04dbe1e065711d721207eb310e3b56be6316f7ecbdca365fd48df0452da  priemka-bot\package.json
 4b41119189993425bee09a508482ac5b9cfef30598301d05f2fd30921a62ebe6  priemka-bot\setup.cmd
 90deaf1766c8e8c2c2fdc6800ab5bc1c17cc167f6dca33dc130dcf163974d382  priemka-bot\start-bot.cmd
 b95f94dfe6f6f56b0921cb45ba8869e3df836a58ef5a530a9ba34034e6ce8a08  priemka-bot\stop-bot.cmd
-ba1b87516097159b5443ac08581cb2a96ebaaef39b618d5051450faf73ecfe81  priemka-bot\yandex-disk.js
+ab3ed7553c933dd2d27f3c0ab4b12178bf8f8e88ae7f1850252cc8a533ce5b29  priemka-bot\yandex-disk.js

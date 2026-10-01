@@ -157,6 +157,80 @@ export async function monthXlsx(ym) {
   return writeXlsx([{ name: `Журнал ${ym}`, header: head, rows }]);
 }
 
+/* Журнал за произвольный период — одним файлом.
+ * Помесячные файлы остаются как есть (их удобно открывать прямо на Диске), а для отчёта
+ * бот склеивает нужные месяцы, отбирает строки по датам и добавляет итоги. */
+
+const dayOf = (ru) => {                       // «01.10.2026» → Date (полночь, местное время)
+  const m = String(ru).match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  return m ? new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])) : null;
+};
+const ymOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+export const ruDate = (d) => d.toLocaleDateString('ru-RU');
+
+/**
+ * Период из текста администратора. Понимает:
+ *   01.09.2026-15.10.2026 · 01.09.2026 15.10.2026 · 01.09.2026 по 15.10.2026
+ *   09.2026 · 09.2026-10.2026 · 01.10.2026 (один день)
+ * @returns {{ from: Date, to: Date } | null}  to — включительно
+ */
+export function parsePeriod(text) {
+  const t = String(text).trim().toLowerCase().replace(/\s*(?:—|–|-|по|до)\s*/g, ' ').replace(/^с\s+/, '');
+  const parts = t.split(/\s+/).filter(Boolean);
+  if (!parts.length || parts.length > 2) return null;
+  const parse = (x, end) => {
+    let m = x.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})$/);
+    if (m) {
+      const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+      const d = new Date(y, Number(m[2]) - 1, Number(m[1]));
+      return d.getMonth() === Number(m[2]) - 1 ? d : null;          // 31.02 — не дата
+    }
+    m = x.match(/^(\d{1,2})\.(\d{4})$/);
+    if (m && Number(m[1]) >= 1 && Number(m[1]) <= 12) {
+      return end ? new Date(Number(m[2]), Number(m[1]), 0) : new Date(Number(m[2]), Number(m[1]) - 1, 1);
+    }
+    return null;
+  };
+  const from = parse(parts[0], false);
+  const to = parse(parts[1] ?? parts[0], true);
+  if (!from || !to || to < from) return null;
+  return { from, to };
+}
+
+/** Строки журнала за период, по порядку: { Дата, Время, …, Результат }. */
+export async function readPeriod(from, to) {
+  const have = new Set((await months()).map((m) => m.ym));
+  const out = [];
+  for (let d = new Date(from.getFullYear(), from.getMonth(), 1); d <= to; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) {
+    const ym = ymOf(d);
+    if (!have.has(ym)) continue;
+    for (const r of await readMonth(ym)) {
+      const day = dayOf(r['Дата']);
+      if (day && day >= from && day <= to) out.push(r);
+    }
+  }
+  const key = (r) => { const [d, m, y] = r['Дата'].split('.'); return `${y}${m}${d} ${r['Время']}`; };
+  return out.sort((a, b) => key(a).localeCompare(key(b)));
+}
+
+/** Журнал за период — Excel: лист «Журнал» и итоги по действиям и по людям. */
+export async function periodXlsx(from, to) {
+  const list = await readPeriod(from, to);
+  const count = (field) => {
+    const m = new Map();
+    for (const r of list) m.set(r[field] || '—', (m.get(r[field] || '—') || 0) + 1);
+    return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  };
+  const errors = list.filter((r) => /^ОШИБКА/.test(r['Результат'])).length;
+  const buffer = writeXlsx([
+    { name: 'Журнал', header: HEADER, rows: list.map((r) => HEADER.map((h) => r[h] ?? '')) },
+    { name: 'Итоги по действиям', header: ['Действие', 'Количество'], rows: count('Действие') },
+    { name: 'Итоги по людям', header: ['Кто', 'Количество'],
+      rows: count('Кто (имя)').map(([who, n]) => [who, n]) },
+  ]);
+  return { buffer, rows: list.length, errors };
+}
+
 /** Путь к журналу месяца «2026-09» — бот выдаёт его администратору файлом. */
 export const monthPath = (ym) => disk.joinPath(...FOLDER, `${ym}.csv`);
 

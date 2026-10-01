@@ -428,3 +428,48 @@ test('ревизия: сводка не дошла — повторится пр
   await bot.summaryTick(day);
   assert.equal(fake.texts(ADMIN_CHAT).filter((t) => /☀️ Сводка/.test(t)).length, before + 1);
 });
+
+test('журнал за период: весь журнал одним файлом, свои даты, итоги по действиям и людям', async () => {
+  await journal.flushed();
+  // Прошлый месяц — положим файл журнала прямо на Диск, как будто бот писал его тогда
+  const now = new Date();
+  const prev = new Date(now.getFullYear(), now.getMonth() - 1, 15);
+  const ym = `${prev.getFullYear()}-${String(prev.getMonth() + 1).padStart(2, '0')}`;
+  const dd = prev.toLocaleDateString('ru-RU');
+  fake.put(`/${ROOT}/_Журнал/${ym}.csv`, 0,
+    '﻿Дата;Время;Кто (номер);Кто (имя);Действие;SCR;Где;Результат\r\n' +
+    `${dd};10:00:00;111;Руководитель Один;Загрузка видеозаписи;SCR#7000001;ГК: ГК-1;успешно\r\n` +
+    `${dd};11:00:00;111;Руководитель Один;Загрузка видеозаписи;SCR#7000002;ГК: ГК-1;ОШИБКА: тест\r\n`);
+  fake.nodes.get(`/${ROOT}/_Журнал/${ym}.csv`).size = 300;
+
+  await press(ADMIN_CHAT, ADMIN, 'adm:reports');
+  const b = buttons(ADMIN_CHAT);
+  for (const want of ['Весь журнал одним файлом', 'Указать период', 'Этот месяц', 'Прошлый месяц']) {
+    assert.ok(b.some((t) => t.includes(want)), `нет «${want}»: ${b.join(' | ')}`);
+  }
+  await click(ADMIN_CHAT, ADMIN, 'Весь журнал одним файлом');
+  const all = lastFilePost(ADMIN_CHAT);
+  assert.match(all.text, /Журнал действий за 01\.\d{2}\.\d{4} – /);
+  assert.match(all.text, /ошибок: 1/);
+  const cells = readXlsxCells(lastXlsx());
+  assert.ok(cells.includes('SCR#7000001'), 'прошлый месяц в файле');
+  assert.ok(cells.includes('Смена роли'), 'текущий месяц в файле');
+  assert.ok(cells.includes('Количество'), 'есть листы итогов');
+  assert.ok(cells.indexOf('SCR#7000001') < cells.indexOf('Смена роли'), 'строки по порядку дат');
+
+  // Свои даты: только прошлый месяц
+  await press(ADMIN_CHAT, ADMIN, 'adm:period');
+  await say(ADMIN_CHAT, ADMIN, `${String(prev.getMonth() + 1).padStart(2, '0')}.${prev.getFullYear()}`);
+  const only = readXlsxCells(lastXlsx());
+  assert.ok(only.includes('SCR#7000001'));
+  assert.ok(!only.includes('Смена роли'), 'текущий месяц не попал');
+  assert.match(lastFilePost(ADMIN_CHAT).text, /Записей: 2 · ошибок: 1/);
+
+  // Период без действий и непонятный текст
+  await press(ADMIN_CHAT, ADMIN, 'adm:period');
+  await say(ADMIN_CHAT, ADMIN, '01.01.2020-02.01.2020');
+  assert.match(lastText(ADMIN_CHAT), /действий в журнале нет/);
+  await press(ADMIN_CHAT, ADMIN, 'adm:period');
+  await say(ADMIN_CHAT, ADMIN, 'вчера');
+  assert.match(lastText(ADMIN_CHAT), /Не разобрал период/);
+});

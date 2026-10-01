@@ -776,6 +776,11 @@ async function adminRoute(chatId, userId, payload, s) {
     const buttons = ms.slice(0, 6).map((m) =>
       btn(`🗒 Журнал за ${journal.monthTitle(m.ym)}`, 'admlog:' + m.ym));
     if (!ms.length) buttons.push(btn('🗒 Журнал пока пуст', 'adm:reports'));
+    else {
+      // Один файл за любой период: весь журнал, текущий или прошлый месяц, свои даты.
+      buttons.unshift(btn('🗂 Весь журнал одним файлом', 'admrange:all'), btn('📅 Указать период', 'adm:period'));
+      buttons.splice(2, 0, btn('🗓 Этот месяц', 'admrange:this'), btn('🗓 Прошлый месяц', 'admrange:prev'));
+    }
     buttons.push(btn('🕒 Последние действия', 'adm:recent'));
     buttons.push(btn('📋 Сверка с реестром', 'adm:registry'));
     buttons.push(btn('📊 Что на Диске', 'adm:stats'));
@@ -810,6 +815,32 @@ async function adminRoute(chatId, userId, payload, s) {
   }
 
   if (payload === 'adm:recent') return showRecent(chatId);
+
+  if (payload === 'adm:period') {
+    s.step = 'adm-await-period';
+    return screen(chatId,
+      `📅 Журнал за период\n${RULE}\nНапишите период одним сообщением, например:\n` +
+      '• 01.09.2026-15.10.2026 — с даты по дату\n' +
+      '• 09.2026-10.2026 — с месяца по месяц\n' +
+      '• 09.2026 — один месяц\n' +
+      '• 01.10.2026 — один день',
+      rows([btn('⬅️ К отчётам', 'adm:reports'), HOME()]));
+  }
+
+  if (payload.startsWith('admrange:')) {
+    const now = new Date();
+    const which = payload.slice(9);
+    let from, to;
+    if (which === 'this') { from = new Date(now.getFullYear(), now.getMonth(), 1); to = now; }
+    else if (which === 'prev') { from = new Date(now.getFullYear(), now.getMonth() - 1, 1); to = new Date(now.getFullYear(), now.getMonth(), 0); }
+    else {
+      const ms = await journal.months();
+      if (!ms.length) return adminScreen(chatId, 'Журнал пока пуст.');
+      const first = ms[ms.length - 1].ym.split('-').map(Number);
+      from = new Date(first[0], first[1] - 1, 1); to = now;
+    }
+    return sendPeriod(chatId, s, from, to);
+  }
 
   if (payload === 'adm:registry') {
     s.step = 'await-registry';
@@ -954,6 +985,31 @@ function navAs(nav, prefix, payload) {
   const cur = payload.startsWith(prefix) ? Number(payload.slice(prefix.length)) || 0 : 0;
   return [nav[0].map((b) => (b.payload === 'pg:prev' ? btn(b.text, prefix + (cur - 1))
     : b.payload === 'pg:next' ? btn(b.text, prefix + (cur + 1)) : b))];
+}
+
+/** Журнал за период — одним Excel-файлом с итогами. */
+async function sendPeriod(chatId, s, from, to) {
+  const title = `${journal.ruDate(from)} – ${journal.ruDate(to)}`;
+  await drop(chatId, s.mid);
+  const wait = await say(chatId, `Готовлю журнал за ${title}…`);
+  try {
+    const { buffer, rows: n, errors } = await journal.periodXlsx(from, to);
+    await drop(chatId, wait?.message?.body?.mid);
+    if (!n) return adminScreen(chatId, `🗂 За ${title} действий в журнале нет.`);
+    const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    await sendBuffer(chatId, {
+      buffer, filename: `Журнал ${iso(from)}_${iso(to)}.xlsx`,
+      caption: `🗂 Журнал действий за ${title}\nЗаписей: ${n}${errors ? ` · ошибок: ${errors}` : ''}\n` +
+        'Листы: «Журнал», «Итоги по действиям», «Итоги по людям».',
+    });
+    s.step = null;
+    return adminScreen(chatId);
+  } catch (e) {
+    await drop(chatId, wait?.message?.body?.mid);
+    console.error('   журнал за период не собрался:', e.message);
+    alertDisk(e);
+    return adminScreen(chatId, trouble('Не удалось собрать журнал', diskTrouble(e)));
+  }
 }
 
 /** 🕒 Последние действия — прямо сообщением, без скачивания журнала. */
@@ -1283,6 +1339,17 @@ async function onMessage(u) {
 
   // Комментарий к записи
   if (s.step === 'await-comment' && text) return saveComment(chatId, userId, s, text);
+
+  // Период для журнала
+  if (s.step === 'adm-await-period' && text) {
+    if (!isAdmin(userId)) return noRight(chatId, userId);
+    const period = journal.parsePeriod(text);
+    if (!period) {
+      return say(chatId, 'Не разобрал период. Напишите, например: 01.09.2026-15.10.2026 или 09.2026',
+        rows([btn('⬅️ К отчётам', 'adm:reports')]));
+    }
+    return sendPeriod(chatId, s, period.from, period.to);
+  }
 
   // Поиск человека в админке
   if (s.step === 'adm-await-search' && text) {

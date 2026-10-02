@@ -2,9 +2,9 @@
 Проверка в командной строке: certutil -hashfile priemka-bot\bot.js SHA256
 
 9610d79c0b1adc572ef313d04e3b8077e722a3c0fa780810f6d52c5d406633c7  priemka-bot\access.json
-c093e2bee03728c0297898ae3866d2ad85f2b706615f0a4933a084c0890942cf  priemka-bot\bot.js
+f34f359eaaeb99306af69d328a7de22b80ab3bba9e59590478af1eeba895c807  priemka-bot\bot.js
 c97e3598d9931dbf9fb910e509054cb131bee642754985b0e1b8668415407fee  priemka-bot\config.js
-151d179b41f5ef733b2c26c41ccd32d65b538802dc5b88eae79406b3d3c3dee5  priemka-bot\journal.js
+df1f38f577779c454b33ba55160fb5a05ca9def88301dc7b8e6f901340a95fa7  priemka-bot\journal.js
 0581977d84db61b4b5be25f8b9c094746e405075d2bf9628b43987989923c2e4  priemka-bot\max-upload.js
 d1266bc2db42c0b7d2124bdaed9ccb63e33d63560c5c9b631e0b7841cbe845cf  priemka-bot\meta.js
 e303d79f6883901b132516a82fd4c32964971b0fbdef278c95aa8d97f01db42c  priemka-bot\package.json
@@ -13,4 +13,4 @@ e303d79f6883901b132516a82fd4c32964971b0fbdef278c95aa8d97f01db42c  priemka-bot\pa
 b95f94dfe6f6f56b0921cb45ba8869e3df836a58ef5a530a9ba34034e6ce8a08  priemka-bot\stop-bot.cmd
 4795686f28a65fc9fcb0c137b6172b60afc07b1d99a7a209ca8042c470a53a03  priemka-bot\ui.js
 1cca069641641c5b35c50549e027b01e4ac2437c8f8d597b154f19f07a53ce9d  priemka-bot\xlsx.js
-4db6c9e624fc6de866114f48f02b57a3488f165b96012eb42f6a9cacd01c2c49  priemka-bot\yandex-disk.js
+c0cc11d0e60d2a9ff67f4d2b5ce67a71bca34bb6dad9cda7507efeb632ecd58e  priemka-bot\yandex-disk.js

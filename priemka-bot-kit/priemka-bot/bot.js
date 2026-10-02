@@ -132,12 +132,14 @@ function loadState() {
       lastPaths: new Map(Object.entries(j.lastPaths || {}).map(([k, v]) => [Number(k), v])),
       requests: new Map(Object.entries(j.requests || {}).map(([k, v]) => [Number(k), v])),
       lastSummary: j.lastSummary || null,
+      catalogAuto: !!j.catalogAuto,
+      lastCatalog: j.lastCatalog || null,
     };
   } catch {
     return {
       sessions: new Map(), lastUser: new Map(), choices: new Map(), choiceSeq: 0,
       adminChats: new Map(), alerts: new Map(), starts: [], plannedRestart: false,
-      lastPaths: new Map(), requests: new Map(), lastSummary: null,
+      lastPaths: new Map(), requests: new Map(), lastSummary: null, catalogAuto: false, lastCatalog: null,
     };
   }
 }
@@ -155,6 +157,8 @@ function writeState(extra = {}) {
       lastPaths: Object.fromEntries(lastPaths),
       requests: Object.fromEntries(requests),
       lastSummary,
+      catalogAuto,
+      lastCatalog,
       ...extra,
     }));
   } catch (e) { console.error('не смог сохранить состояние:', e.message); }
@@ -176,6 +180,8 @@ const starts = restored.starts;           // моменты запусков: ч
 const lastPaths = restored.lastPaths;     // человек → папка последней загрузки («В прошлую папку»)
 const requests = restored.requests;       // заявки на доступ: кто, когда, чем кончилось
 let lastSummary = restored.lastSummary;   // дата последней утренней сводки
+let catalogAuto = restored.catalogAuto;   // реестр со ссылками включён — обновлять копию на Диске каждый день
+let lastCatalog = restored.lastCatalog;   // дата последнего ежедневного обновления реестра
 
 function session(chatId) {
   const now = Date.now();
@@ -581,7 +587,7 @@ function indexAdd(f) {
   const m = String(f.name).match(SCR_RE);
   if (!m || !isLive(f)) return;
   const list = (scrIndex.get(m[1]) || []).filter((x) => ckey(x.path) !== ckey(f.path));
-  list.push({ name: f.name, path: f.path, size: f.size ?? 0, created: f.created ?? null });
+  list.push({ name: f.name, path: f.path, size: f.size ?? 0, created: f.created ?? null, public_url: f.public_url ?? null });
   scrIndex.set(m[1], list);
 }
 function indexRemove(path) {
@@ -781,8 +787,10 @@ async function adminRoute(chatId, userId, payload, s) {
         btn('🗓 Прошлый месяц', 'admrange:prev'), btn('📅 Указать период', 'adm:period')]
       : [btn('🗒 Журнал пока пуст', 'adm:reports')];
     buttons.push(btn('🕒 Последние действия', 'adm:recent'));
+    buttons.push(btn('🔗 Реестр записей со ссылками', 'adm:catalog'));
     buttons.push(btn('📋 Сверка с реестром', 'adm:registry'));
     buttons.push(btn('📊 Что на Диске', 'adm:stats'));
+    if (catalogAuto) buttons.push(btn('⛔ Закрыть все публичные ссылки', 'adm:unpub'));
     buttons.push(BACK());
     return screen(chatId, '📊 Отчёты', rows(buttons));
   }
@@ -814,6 +822,36 @@ async function adminRoute(chatId, userId, payload, s) {
   }
 
   if (payload === 'adm:recent') return showRecent(chatId);
+
+  /* Реестр записей со ссылками — для дашборда DataLens. Публичная ссылка открывает видео
+   * у любого, у кого она есть, поэтому перед первой выгрузкой — подтверждение. */
+  if (payload === 'adm:catalog') {
+    if (catalogAuto) return runCatalog(chatId, userId, s);
+    return screen(chatId,
+      `🔗 Реестр записей со ссылками\n${RULE}\n` +
+      'Бот выгрузит таблицу всех записей и откроет для каждой публичную ссылку Яндекс.Диска — ' +
+      'по ней видео смотрится в браузере без входа в Яндекс. Это нужно для дашборда DataLens.\n\n' +
+      '⚠️ Видео сможет открыть любой, у кого окажется ссылка: из файла, из дашборда, из пересланного отчёта.\n\n' +
+      'Дальше бот будет каждое утро обновлять реестр на Диске и открывать ссылки новым записям. ' +
+      'Старые версии и удалённые записи ссылку теряют автоматически. Закрыть все ссылки разом — ' +
+      'кнопкой «Закрыть все публичные ссылки» в «Отчётах».',
+      rows([btn('✅ Открыть ссылки и выгрузить', 'adm:catalog-go'), btn('⬅️ К отчётам', 'adm:reports')]));
+  }
+  if (payload === 'adm:catalog-go') {
+    catalogAuto = true;
+    saveState();
+    return runCatalog(chatId, userId, s);
+  }
+
+  if (payload === 'adm:unpub') {
+    return screen(chatId,
+      `⛔ Закрыть все публичные ссылки\n${RULE}\n` +
+      'Бот закроет публичные ссылки у всех записей и их версий в архиве. Ссылки в выгруженных отчётах ' +
+      'и в дашборде перестанут открываться. Файлы на Диске не трогаются.\n\n' +
+      'Ежедневное обновление реестра выключится; включить снова — «Реестр записей со ссылками».',
+      rows([btn('⛔ Да, закрыть все ссылки', 'adm:unpub-go'), btn('⬅️ К отчётам', 'adm:reports')]));
+  }
+  if (payload === 'adm:unpub-go') return closeAllLinks(chatId, userId, s);
 
   if (payload === 'adm:period') {
     s.step = 'adm-await-period';
@@ -986,13 +1024,154 @@ function navAs(nav, prefix, payload) {
     : b.payload === 'pg:next' ? btn(b.text, prefix + (cur + 1)) : b))];
 }
 
+/* ---------- реестр записей со ссылками (для DataLens) ---------- */
+
+/* Плоская таблица — одна строка на запись, без объединённых ячеек: так её без правок берёт
+ * DataLens. Даты — в виде 2026-09-25, размер — числом. Копия всегда лежит по одному адресу
+ * на Диске (_Отчёты/Реестр записей.xlsx) — к ней можно подключить DataLens. */
+const CATALOG_FOLDER = () => disk.joinPath(ROOT, '_Отчёты');
+const CATALOG_PATH = () => disk.joinPath(ROOT, '_Отчёты', 'Реестр записей.xlsx');
+const PUBLISH_PARALLEL = 3;
+const CATALOG_HEADER = ['SCR', 'Номер', 'ГК', 'ОП', 'Дата ОП', 'Направление', 'Система', 'Файл',
+  'Размер, МБ', 'Дата загрузки', 'Комментарий', 'Ссылка', 'Путь на Диске'];
+const isoDay = (iso) => {
+  const d = new Date(iso);
+  if (!iso || !Number.isFinite(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+/** «ОП 1 (25.12.2025)» → «2025-12-25»: дата периода прямо в отдельной колонке. */
+const opDate = (op) => { const m = String(op || '').match(/(\d{2})\.(\d{2})\.(\d{4})/); return m ? `${m[3]}-${m[2]}-${m[1]}` : ''; };
+/** Текущая публичная ссылка записи по номеру — для колонок «Ссылка» в других отчётах. */
+const linkOf = (scrText) => {
+  const n = (String(scrText).match(/\d{7}/) || [])[0];
+  return n ? scrIndex.get(n)?.find((f) => f.public_url)?.public_url || '' : '';
+};
+
+async function buildCatalog({ onProgress = () => {} } = {}) {
+  // Свежий обход дерева: актуальные папки, записи и уже открытые ссылки — одним проходом.
+  folderCache.clear();
+  if (warming) await warming;
+  await warmTree();
+  const all = [...scrIndex.entries()].flatMap(([scr, list]) => list.map((f) => ({ scr, ...f })));
+  const missing = all.filter((f) => !f.public_url);
+  let published = 0, failed = 0, limit = false;
+  for (let i = 0; i < missing.length && !limit; i += PUBLISH_PARALLEL) {
+    await Promise.all(missing.slice(i, i + PUBLISH_PARALLEL).map(async (f) => {
+      try {
+        f.public_url = await disk.publish(f.path);
+        published++;
+        indexAdd(f);
+      } catch (e) {
+        failed++;
+        if (e.status === 403) limit = true;
+        console.error(`   не открыл ссылку ${ckey(f.path)}:`, e.message);
+      }
+    }));
+    onProgress(Math.min(i + PUBLISH_PARALLEL, missing.length), missing.length);
+  }
+  if (limit) {
+    notifyAdmins('publish-limit', '⚠️ Яндекс.Диск отказал в публикации (HTTP 403) — похоже, исчерпан лимит ' +
+      'публичных ссылок. Часть записей в реестре осталась без ссылки.', { every: 24 * 60 * 60_000 });
+  }
+  const rowsOut = [];
+  for (const f of all.sort((a, b) => ckey(a.path).localeCompare(ckey(b.path)))) {
+    const p = parts(f.path);
+    const c = await meta.getComment(f.scr);
+    rowsOut.push([`SCR#${f.scr}`, Number(f.scr), p.gk || '', p.op || '', opDate(p.op), p.napr || '', p.sys || '',
+      f.name, Math.round((f.size || 0) / 1024 / 1024 * 10) / 10, isoDay(f.created), c?.text || '',
+      f.public_url || '', ckey(f.path)]);
+  }
+  const buffer = writeXlsx([{ name: 'Записи', header: CATALOG_HEADER, rows: rowsOut }]);
+  let savedTo = null;
+  try {
+    await disk.ensureFolder(CATALOG_FOLDER());
+    await disk.uploadBuffer(buffer, CATALOG_PATH(), { overwrite: true });
+    savedTo = CATALOG_PATH();
+  } catch (e) { console.error('   реестр не сохранён на Диск:', e.message); }
+  return { buffer, total: all.length, published, failed: missing.length - published, savedTo };
+}
+
+async function runCatalog(chatId, userId, s) {
+  await drop(chatId, s.mid);
+  const wait = await say(chatId, '🔗 Собираю реестр записей и проверяю публичные ссылки…');
+  const mid = wait?.message?.body?.mid;
+  let lastEdit = 0;
+  try {
+    const r = await buildCatalog({ onProgress: (done, total) => {
+      if (!mid || Date.now() - lastEdit < 3000) return;
+      lastEdit = Date.now();
+      api('PUT', '/messages', { query: { message_id: mid }, body: { text: `🔗 Открываю публичные ссылки: ${done} из ${total}…` } })
+        .catch(() => {});
+    } });
+    await drop(chatId, mid);
+    journal.log({ userId, name: nameOf(userId), action: 'Выгрузка реестра записей',
+      result: `записей ${r.total}, новых ссылок ${r.published}${r.failed ? `, без ссылки ${r.failed}` : ''}` });
+    await sendBuffer(chatId, {
+      buffer: r.buffer,
+      filename: `Реестр записей ${new Date().toLocaleDateString('ru-RU').replace(/\./g, '-')}.xlsx`,
+      caption: `🔗 Реестр записей: ${r.total}\nНовых публичных ссылок: ${r.published}` +
+        (r.failed ? `\n⚠️ Без ссылки: ${r.failed}` : '') +
+        (r.savedTo ? `\n\nКопия на Диске, обновляется каждое утро:\n${ckey(r.savedTo)}` : ''),
+    });
+    return adminScreen(chatId);
+  } catch (e) {
+    await drop(chatId, mid);
+    console.error('   реестр не собрался:', e.message);
+    alertDisk(e);
+    return adminScreen(chatId, trouble('Не удалось собрать реестр', diskTrouble(e)));
+  }
+}
+
+/** Аварийно закрыть все публичные ссылки — у записей и у версий в архиве. */
+async function closeAllLinks(chatId, userId, s) {
+  await drop(chatId, s.mid);
+  const wait = await say(chatId, '⛔ Закрываю публичные ссылки…');
+  try {
+    const open = (await disk.findFiles('SCR#')).filter((f) => f.public_url);
+    let closed = 0, failed = 0;
+    for (let i = 0; i < open.length; i += PUBLISH_PARALLEL) {
+      await Promise.all(open.slice(i, i + PUBLISH_PARALLEL).map((f) =>
+        disk.unpublish(f.path).then(() => { closed++; }, (e) => { failed++; console.error('   не закрыл ссылку:', e.message); })));
+    }
+    for (const list of scrIndex.values()) for (const f of list) f.public_url = null;
+    catalogAuto = false;
+    saveState();
+    journal.log({ userId, name: nameOf(userId), action: 'Закрытие публичных ссылок',
+      result: `закрыто ${closed}${failed ? `, не удалось ${failed}` : ''}` });
+    await drop(chatId, wait?.message?.body?.mid);
+    return adminScreen(chatId, `⛔ Публичные ссылки закрыты: ${closed}` + (failed ? `\n⚠️ Не удалось закрыть: ${failed} — повторите позже.` : '') +
+      '\nЕжедневное обновление реестра выключено.');
+  } catch (e) {
+    await drop(chatId, wait?.message?.body?.mid);
+    alertDisk(e);
+    return adminScreen(chatId, trouble('Не удалось закрыть ссылки', diskTrouble(e)));
+  }
+}
+
+/** Каждое утро — обновить реестр на Диске: новые записи получают ссылки, дашборд — свежие данные. */
+async function catalogTick(now = new Date()) {
+  if (!catalogAuto || now.getHours() < SUMMARY_HOUR) return;
+  const key = isoDay(now.toISOString());
+  if (lastCatalog === key) return;
+  lastCatalog = key;
+  saveState();
+  try {
+    const r = await buildCatalog();
+    console.log(`   реестр обновлён: записей ${r.total}, новых ссылок ${r.published}`);
+  } catch (e) {
+    console.error('   ежедневное обновление реестра не удалось:', e.message);
+    alertDisk(e);
+  }
+}
+
 /** Журнал за период — одним Excel-файлом с итогами. */
 async function sendPeriod(chatId, s, from, to) {
   const title = `${journal.ruDate(from)} – ${journal.ruDate(to)}`;
   await drop(chatId, s.mid);
   const wait = await say(chatId, `Готовлю журнал за ${title}…`);
   try {
-    const { buffer, rows: n, errors } = await journal.periodXlsx(from, to);
+    const { buffer, rows: n, errors } = await journal.periodXlsx(from, to, { linkOf });
     await drop(chatId, wait?.message?.body?.mid);
     if (!n) return adminScreen(chatId, `🗂 За ${title} действий в журнале нет.`);
     const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -1547,14 +1726,14 @@ async function downloadHref(path) {
 async function openRecord(chatId, userId, s, f, { notice = '' } = {}) {
   if (!f?.path) return showMenu(chatId, 'Кнопка устарела — найдите запись заново.', userId);
   let st;
-  try { st = await disk.stat(f.path, { fields: 'name,path,size,created' }); }
+  try { st = await disk.stat(f.path, { fields: 'name,path,size,created,public_url' }); }
   catch (e) { alertDisk(e); return screen(chatId, trouble('Не удалось открыть запись', diskTrouble(e)), rows([HOME()])); }
   if (!st) {
     indexRemove(f.path);
     return screen(chatId, trouble('Записи здесь больше нет', 'Её переместили, заменили или удалили. Найдите её заново по номеру.'),
       rows([HOME()]));
   }
-  const rec = { name: st.name, path: st.path || f.path, size: st.size ?? 0, created: st.created ?? null };
+  const rec = { name: st.name, path: st.path || f.path, size: st.size ?? 0, created: st.created ?? null, public_url: st.public_url ?? null };
   const scr = (rec.name.match(SCR_RE) || [])[1];
   const comment = scr ? await meta.getComment(scr) : null;
   Object.assign(s, { rec, scr, step: 'record', view: null });
@@ -1568,7 +1747,7 @@ async function openRecord(chatId, userId, s, f, { notice = '' } = {}) {
   if (s.cmd === 'browse') b.push(btn('⬅️ К папке', 'ra:back'));
   b.push(HOME());
   return screen(chatId, card({ title: '🎞 Видеозапись', scr, path: rec.path, size: rec.size, created: rec.created,
-    comment, notes: [notice] }), rows(b));
+    comment, notes: [rec.public_url && can(userId, 'admin') ? `🔗 Публичная ссылка: ${rec.public_url}` : '', notice] }), rows(b));
 }
 
 async function onRecordAction(chatId, userId, s, action) {
@@ -1653,7 +1832,7 @@ function parseVersion(f) {
   const date = segs[i + 1] || '';
   const uid = Number(segs[i + 2]);
   const file = segs[segs.length - 1];
-  const m = file.match(/^(\d{2})-(\d{2})-(\d{2}) (.*)$/);
+  const m = file.match(/^(\d{2})-(\d{2})-(\d{2})(?:-\d+)? (.*)$/);
   const rest = m ? m[4] : file;
   const kind = /^удалено /.test(rest) ? 'удалил' : /^незавершённая /.test(rest) ? 'незавершённая замена' : 'заменил';
   return { name: f.name, path: f.path, size: f.size, created: f.created,
@@ -1850,18 +2029,18 @@ async function onRegistry(chatId, userId, s, att) {
     let have = 0, missing = 0, extra = 0;
     for (const n of [...wanted].sort()) {
       const hit = scrIndex.get(n);
-      if (hit?.length) { have++; rowsOut.push([`SCR#${n}`, hit.length > 1 ? `есть (${hit.length} шт.)` : 'есть', ...place(hit[0])]); }
-      else { missing++; rowsOut.push([`SCR#${n}`, 'нет на Диске', '', '', '', '', '']); }
+      if (hit?.length) { have++; rowsOut.push([`SCR#${n}`, hit.length > 1 ? `есть (${hit.length} шт.)` : 'есть', ...place(hit[0]), linkOf(n)]); }
+      else { missing++; rowsOut.push([`SCR#${n}`, 'нет на Диске', '', '', '', '', '', '']); }
     }
     for (const [n, list] of [...scrIndex.entries()].sort()) {
       if (wanted.has(n)) continue;
       extra++;
-      rowsOut.push([`SCR#${n}`, 'нет в реестре', ...place(list[0])]);
+      rowsOut.push([`SCR#${n}`, 'нет в реестре', ...place(list[0]), linkOf(n)]);
     }
     const summary = `📋 Сверка с реестром «${name}»\n${RULE}\n` +
       `Номеров в реестре: ${wanted.size}\nЕсть на Диске: ${have}\nНет на Диске: ${missing}\n` +
       `На Диске, но не в реестре: ${extra}`;
-    const buffer = writeXlsx([{ name: 'Сверка', header: ['SCR', 'Статус', 'ГК', 'ОП', 'Направление', 'Система', 'Файл'], rows: rowsOut }]);
+    const buffer = writeXlsx([{ name: 'Сверка', header: ['SCR', 'Статус', 'ГК', 'ОП', 'Направление', 'Система', 'Файл', 'Ссылка'], rows: rowsOut }]);
     await drop(chatId, wait?.message?.body?.mid);
     await sendBuffer(chatId, { buffer, filename: `Сверка ${new Date().toLocaleDateString('ru-RU').replace(/\./g, '-')}.xlsx`, caption: summary });
     s.step = null;
@@ -1881,19 +2060,29 @@ async function onRegistry(chatId, userId, s, att) {
 /* Имя версии в архиве. Дата и время — оба по часам компьютера бота: раньше дата бралась
  * в UTC, а время местное, и замены с полуночи до трёх ночи по Москве попадали в папку
  * вчерашнего дня. */
-function backupPath(userId, name) {
+function backupPath(userId, name, n = 1) {
   const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
+  const p = (x) => String(x).padStart(2, '0');
   const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-  const clock = `${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  const clock = `${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}${n > 1 ? `-${n}` : ''}`;
   return disk.joinPath(ROOT, BACKUP, stamp, String(userId), `${clock} ${name}`);
 }
 
 /** Убрать запись в архив и запомнить, откуда, — чтобы восстановить на прежнее место. */
 async function archive(userId, f, label = '') {
-  const dest = backupPath(userId, label ? `${label} ${f.name}` : f.name);
-  await disk.move(f.path, dest);
+  /* Одну и ту же запись в одну и ту же секунду могут убрать в архив дважды (восстановили версию
+   * и сразу заменили) — тогда имя совпало бы, и Диск отказал бы с 409. Берём следующее имя. */
+  let dest;
+  for (let n = 1; ; n++) {
+    dest = backupPath(userId, label ? `${label} ${f.name}` : f.name, n);
+    try { await disk.move(f.path, dest); break; }
+    catch (e) { if (e.code !== 'DiskResourceAlreadyExistsError' || n >= 5) throw e; }
+  }
   meta.setOrigin(dest, f.path);
+  /* Публичная ссылка переезжает вместе с файлом — иначе старая или удалённая версия
+   * оставалась бы открытой для всех, у кого есть ссылка из прежнего отчёта. Снимаем всегда:
+   * даже если бот не знает, была ли ссылка, — лишний запрос дешевле открытого видео. */
+  disk.unpublish(dest).catch((e) => console.error('   не снял публичную ссылку с архивной версии:', e.message));
   return dest;
 }
 
@@ -2520,6 +2709,7 @@ async function loop() {
   setInterval(healthTick, 60 * 60_000);
   setTimeout(() => summaryTick().catch(() => {}), 2 * 60_000);
   setInterval(() => summaryTick().catch(() => {}), 5 * 60_000);
+  setInterval(() => catalogTick().catch(() => {}), 15 * 60_000);
   registerCommands();
   console.log(marker ? `Продолжаю с маркера ${marker} — события за время простоя не потеряются.` : 'Маркера нет, начинаю с текущего момента.');
 
@@ -2557,6 +2747,8 @@ export const _test = {
   summaryTick,
   resetSummary: () => { lastSummary = null; },
   registerCommands,
+  catalogTick,
+  buildCatalog,
 };
 
 if (process.env.PRIEMKA_NO_START !== '1') {

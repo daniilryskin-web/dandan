@@ -474,3 +474,90 @@ test('журнал за период: весь журнал одним файл�
   await say(ADMIN_CHAT, ADMIN, 'вчера');
   assert.match(lastText(ADMIN_CHAT), /Не разобрал период/);
 });
+
+test('реестр со ссылками для DataLens: подтверждение, ссылки, плоская таблица, копия на Диске', async () => {
+  await press(ADMIN_CHAT, ADMIN, 'adm:reports');
+  await click(ADMIN_CHAT, ADMIN, 'Реестр записей со ссылками');
+  assert.match(lastText(ADMIN_CHAT), /Видео сможет открыть любой, у кого окажется ссылка/);   // сначала — предупреждение
+  assert.equal(fake.published, 0, 'до подтверждения ничего не открыто');
+  await click(ADMIN_CHAT, ADMIN, 'Открыть ссылки и выгрузить');
+  const post = lastFilePost(ADMIN_CHAT);
+  const total = [...bot.state().scrIndex.values()].flat().length;
+  assert.match(post.text, new RegExp(`Реестр записей: ${total}\\nНовых публичных ссылок: ${total}`));
+  assert.match(post.text, /_Отчёты\/Реестр записей\.xlsx/);
+  const cells = readXlsxCells(lastXlsx());
+  for (const h of ['SCR', 'Номер', 'ГК', 'ОП', 'Дата ОП', 'Направление', 'Система', 'Размер, МБ', 'Дата загрузки', 'Комментарий', 'Ссылка']) {
+    assert.ok(cells.includes(h), `нет колонки ${h}`);
+  }
+  assert.ok(cells.some((c) => /^https:\/\/disk\.yandex\.ru\/d\/pub\d+$/.test(c)), 'ссылки в таблице');
+  assert.ok(cells.includes('SCR#2222222'));
+  assert.ok(fake.exists(`/${ROOT}/_Отчёты/Реестр записей.xlsx`), 'копия на Диске');
+  // Повторная выгрузка — без предупреждения и без новых публикаций
+  const before = fake.published;
+  await press(ADMIN_CHAT, ADMIN, 'adm:catalog');
+  assert.match(lastFilePost(ADMIN_CHAT).text, /Новых публичных ссылок: 0/);
+  assert.equal(fake.published, before);
+  // Ссылка видна администратору в карточке; в журнале за период — колонка «Ссылка»
+  await press(ADMIN_CHAT, ADMIN, 'adm:period');
+  await say(ADMIN_CHAT, ADMIN, new Date().toLocaleDateString('ru-RU'));
+  const j = readXlsxCells(lastXlsx());
+  assert.ok(j.includes('Ссылка'));
+  assert.ok(j.some((c) => /disk\.yandex\.ru\/d\//.test(c)), 'в журнале есть ссылки');
+});
+
+test('реестр: замена снимает ссылку со старой версии; новая получает ссылку утром', async () => {
+  const old = fake.nodes.get(`${SYS_A}/SCR#2222222.mp4`);
+  assert.ok(old.public_url, 'у записи есть ссылка');
+  await press(EDITOR_CHAT, EDITOR, 'cmd:replace');
+  await say(EDITOR_CHAT, EDITOR, '2222222');
+  await say(EDITOR_CHAT, EDITOR, '', [fileAtt('v3.mp4', 2300)]);
+  await click(EDITOR_CHAT, EDITOR, 'Заменить');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(!old.public_url, 'архивная версия больше не открыта');
+  assert.ok(!fake.nodes.get(`${SYS_A}/SCR#2222222.mp4`).public_url, 'новая пока без ссылки');
+  const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(10, 0, 0, 0);
+  await bot.catalogTick(tomorrow);
+  assert.ok(fake.nodes.get(`${SYS_A}/SCR#2222222.mp4`).public_url, 'утреннее обновление открыло ссылку');
+  const before = fake.published;
+  await bot.catalogTick(tomorrow);
+  assert.equal(fake.published, before, 'второй раз за день — не обновляет');
+});
+
+test('реестр: лимит публикаций Диска — выгрузка не падает, администратор предупреждён', async () => {
+  fake.put(`${SYS_C}/SCR#8100001.mp4`, 100);
+  fake.put(`${SYS_C}/SCR#8100002.mp4`, 100);
+  fake.publishLimit = fake.published;          // больше не даёт
+  await press(ADMIN_CHAT, ADMIN, 'adm:catalog');
+  fake.publishLimit = null;
+  assert.match(lastFilePost(ADMIN_CHAT).text, /Без ссылки: 2/);
+  assert.ok(fake.texts(ADMIN_CHAT).some((t) => /лимит публичных ссылок/.test(t)));
+});
+
+test('ревизия: две архивации одной записи в одну секунду не мешают друг другу', async () => {
+  fake.put(`${SYS_B}/SCR#8200001.mp4`, 100);
+  await bot.warmTree();
+  for (const size of [110, 120]) {
+    await press(EDITOR_CHAT, EDITOR, 'cmd:replace');
+    await say(EDITOR_CHAT, EDITOR, '8200001');
+    await say(EDITOR_CHAT, EDITOR, '', [fileAtt('x.mp4', size)]);
+    await click(EDITOR_CHAT, EDITOR, 'Заменить');
+    assert.match(lastText(EDITOR_CHAT), /Видеозапись заменена/);
+  }
+  const versions = fake.files(`/${ROOT}/BackUp`).filter((p) => p.endsWith('SCR#8200001.mp4'));
+  assert.equal(versions.length, 2, versions.join('\n'));
+});
+
+test('аварийно закрыть все публичные ссылки — у записей и архивных версий', async () => {
+  await press(ADMIN_CHAT, ADMIN, 'adm:reports');
+  await click(ADMIN_CHAT, ADMIN, 'Закрыть все публичные ссылки');
+  assert.match(lastText(ADMIN_CHAT), /перестанут открываться/);
+  await click(ADMIN_CHAT, ADMIN, 'Да, закрыть все ссылки');
+  assert.match(lastText(ADMIN_CHAT), /Публичные ссылки закрыты: \d+/);
+  assert.ok(![...fake.nodes.values()].some((n) => n.public_url), 'открытых ссылок не осталось');
+  // Ежедневное обновление выключено — утром ничего не открывается
+  const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 3); tomorrow.setHours(10);
+  await bot.catalogTick(tomorrow);
+  assert.ok(![...fake.nodes.values()].some((n) => n.public_url));
+  await press(ADMIN_CHAT, ADMIN, 'adm:catalog');
+  assert.match(lastText(ADMIN_CHAT), /Видео сможет открыть любой/, 'включение снова — с предупреждением');
+});

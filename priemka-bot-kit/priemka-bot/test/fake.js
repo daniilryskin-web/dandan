@@ -30,6 +30,8 @@ export function createFake() {
     rejectStream: false,       // true — сервер загрузки MAX отбивает потоковую отправку
     blobs: new Map(),          // url вложения в MAX → содержимое (реестр для сверки)
     commands: null,            // что бот прислал в PATCH /me
+    published: 0,              // сколько публичных ссылок открыто
+    publishLimit: null,        // число — Диск отбивает публикации сверх него (403)
 
     mkdir(path) {
       const segs = norm(path).split('/').filter(Boolean);
@@ -64,6 +66,7 @@ export function createFake() {
   function resource(path, n) {
     const r = { name: nameOf(path) || 'disk', path: 'disk:' + path, type: n.type };
     if (n.type === 'file') { r.size = n.size; r.created = n.created; r.file = `https://downloader.disk.test/get?path=${encodeURIComponent(path)}`; }
+    if (n.public_url) r.public_url = n.public_url;
     return r;
   }
 
@@ -145,6 +148,17 @@ export function createFake() {
       if (fake.nodes.has(to) && q.get('overwrite') !== 'true') return json({ error: 'DiskResourceAlreadyExistsError' }, 409);
       fake.nodes.set(to, { ...fake.nodes.get(from) });
       return json({ href: '' }, 201);
+    }
+
+    if ((ep === '/disk/resources/publish' || ep === '/disk/resources/unpublish') && method === 'PUT') {
+      const path = norm(q.get('path'));
+      const n = fake.nodes.get(path);
+      if (!n) return json({ error: 'DiskNotFoundError' }, 404);
+      if (ep.endsWith('/publish')) {
+        if (fake.publishLimit !== null && fake.published >= fake.publishLimit) return json({ error: 'DiskPublishLimitError' }, 403);
+        if (!n.public_url) { fake.published++; n.public_url = `https://disk.yandex.ru/d/pub${fake.published}`; }
+      } else delete n.public_url;
+      return json({ href: `${DISK}/disk/resources?path=${encodeURIComponent(path)}`, method: 'GET', templated: false });
     }
 
     if (ep === '/disk/resources/files' && method === 'GET') {

@@ -214,7 +214,7 @@ export async function readPeriod(from, to) {
 }
 
 /** Журнал за период — Excel: лист «Журнал» и итоги по действиям и по людям. */
-export async function periodXlsx(from, to) {
+export async function periodXlsx(from, to, { linkOf = null } = {}) {
   const list = await readPeriod(from, to);
   const count = (field) => {
     const m = new Map();
@@ -223,7 +223,9 @@ export async function periodXlsx(from, to) {
   };
   const errors = list.filter((r) => /^ОШИБКА/.test(r['Результат'])).length;
   const buffer = writeXlsx([
-    { name: 'Журнал', header: HEADER, rows: list.map((r) => HEADER.map((h) => r[h] ?? '')) },
+    // «Ссылка» — текущая публичная ссылка записи, если она открыта (реестр со ссылками).
+    { name: 'Журнал', header: linkOf ? [...HEADER, 'Ссылка'] : HEADER,
+      rows: list.map((r) => [...HEADER.map((h) => r[h] ?? ''), ...(linkOf ? [r['SCR'] ? linkOf(r['SCR']) : ''] : [])]) },
     { name: 'Итоги по действиям', header: ['Действие', 'Количество'], rows: count('Действие') },
     { name: 'Итоги по людям', header: ['Кто', 'Количество'],
       rows: count('Кто (имя)').map(([who, n]) => [who, n]) },

@@ -647,7 +647,7 @@ export async function listFolder(folder) {
       limit: PAGE,
       offset,
       sort: 'name',
-      fields: '_embedded.items.name,_embedded.items.type,_embedded.items.path,_embedded.items.size,_embedded.items.created',
+      fields: '_embedded.items.name,_embedded.items.type,_embedded.items.path,_embedded.items.size,_embedded.items.created,_embedded.items.public_url',
     });
     const { body } = await apiRequest('GET', url, { expect: [200], context: `Список ${folder}`, path });
     const page = body?._embedded?.items ?? [];
@@ -658,7 +658,7 @@ export async function listFolder(folder) {
     dirs: items.filter((i) => i.type === 'dir').map((i) => ({ name: i.name, path: i.path })),
     files: items
       .filter((i) => i.type === 'file')
-      .map((i) => ({ name: i.name, path: i.path, size: i.size ?? 0, created: i.created ?? null })),
+      .map((i) => ({ name: i.name, path: i.path, size: i.size ?? 0, created: i.created ?? null, public_url: i.public_url ?? null })),
   };
 }
 
@@ -677,13 +677,13 @@ export async function findFiles(substring, { limit = Infinity } = {}) {
     const url = buildUrl('/disk/resources/files', {
       limit: PAGE,
       offset,
-      fields: 'items.name,items.path,items.size,items.created,items.type',
+      fields: 'items.name,items.path,items.size,items.created,items.type,items.public_url',
     });
     const { body } = await apiRequest('GET', url, { expect: [200], context: 'Поиск файла по имени' });
     const items = body?.items ?? [];
     for (const it of items) {
       if (String(it.name).toLowerCase().includes(needle)) {
-        found.push({ name: it.name, path: it.path, size: it.size ?? 0, created: it.created ?? null });
+        found.push({ name: it.name, path: it.path, size: it.size ?? 0, created: it.created ?? null, public_url: it.public_url ?? null });
       }
     }
     if (items.length < PAGE) break;   // страница неполная — дальше ничего нет
@@ -756,4 +756,31 @@ export async function readText(path) {
     throw new DiskError(`чтение ${path}: пусто при размере ${meta.size} байт`, { path });
   }
   return text;
+}
+
+/**
+ * Опубликовать файл и вернуть публичную ссылку (https://disk.yandex.ru/d/…): по ней видео
+ * открывается у любого, без входа в Яндекс. Повторная публикация уже открытого файла
+ * возвращает ту же ссылку. Лимит числа публикаций у Диска есть (403), но он не назван.
+ */
+export async function publish(path) {
+  const target = normalizePath(path);
+  await apiRequest('PUT', buildUrl('/disk/resources/publish', { path: target }), {
+    expect: [200], context: `Публикация ${target}`, path: target,
+  });
+  // public_url появляется в метаданных не всегда мгновенно — даём пару заходов.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const meta = await stat(target, { fields: 'public_url' });
+    if (meta?.public_url) return meta.public_url;
+    await sleep(1000);
+  }
+  throw new DiskError(`Файл ${target} опубликован, но публичная ссылка так и не появилась`, { path: target });
+}
+
+/** Закрыть публичную ссылку. Ничего не удаляет: файл остаётся на Диске. */
+export async function unpublish(path) {
+  const target = normalizePath(path);
+  await apiRequest('PUT', buildUrl('/disk/resources/unpublish', { path: target }), {
+    expect: [200], context: `Снятие публикации ${target}`, path: target,
+  });
 }

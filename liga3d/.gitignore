@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.local
+# Изображения покемонов импортируются локально (npm run import-sprites) и не публикуются
+public/sprites/

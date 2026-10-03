@@ -10,7 +10,7 @@
     "typecheck": "tsc -b --pretty",
     "test": "vitest run",
     "import-sprites": "node scripts/import-sprites.mjs",
-    "gen-dexinfo": "node scripts/gen-dexinfo.mjs"
+    "build-data": "node scripts/build-data.mjs"
   },
   "dependencies": {
     "@react-three/drei": "^9.122.0",

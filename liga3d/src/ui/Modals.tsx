@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getItem, KIND_LABELS, type ItemKind } from '../data/items';
-import { DEX_INFO } from '../data/dexinfo';
 import { getMove } from '../data/moves';
 import { dexNo, getSpecies, SPECIES_LIST, STAT_KEYS, STAT_LABELS } from '../data/species';
 import { TYPE_INFO } from '../data/types';
@@ -226,11 +225,9 @@ export function DexModal() {
                 ))}
                 {game.dex[sel.id] === 'caught' && <span className="done-chip">Пойман</span>}
               </div>
-              {DEX_INFO[sel.id] && (
-                <p className="muted">
-                  Рост {DEX_INFO[sel.id].height} м · вес {DEX_INFO[sel.id].weight} кг · шанс поимки {sel.catchRate}
-                </p>
-              )}
+              <p className="muted">
+                Рост {sel.height} м · вес {sel.weight} кг · шанс поимки {sel.catchRate}
+              </p>
               <table className="stat-table compact">
                 <tbody>
                   {STAT_KEYS.map((k) => (

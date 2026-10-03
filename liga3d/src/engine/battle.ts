@@ -3,7 +3,7 @@ import { getMove, STAT_NAMES, STATUS_INFO, type BattleStat, type MoveData, type 
 import { getSpecies } from '../data/species';
 import { effectiveness } from '../data/types';
 import { getLocation, type TrainerDef } from '../data/world';
-import type { BattleEvent, BattleResult, BattleState, GameState, Pokemon, Side, Stages } from './model';
+import type { BattleEvent, BattleResult, BattleState, GameState, Pokemon, Side, Stages, Volatile } from './model';
 import { MAX_TEAM } from './model';
 import {
   addEvs, calcStats, createPokemon, displayName, evYield, gainExp, healFully, isFainted, levelEvolution, maxHp,
@@ -18,6 +18,10 @@ export type BattleAction =
   | { kind: 'switch'; index: number }
   | { kind: 'item'; itemId: string; targetUid?: string }
   | { kind: 'run' };
+
+export function freshVolatile(): Volatile {
+  return { confused: 0, recharge: false, protectStreak: 0, protected: false };
+}
 
 export function freshStages(): Stages {
   return { atk: 0, def: 0, spa: 0, spd: 0, spe: 0, acc: 0, eva: 0 };
@@ -101,10 +105,11 @@ function inflictStatus(ctx: Ctx, side: Side, status: StatusId, fromStatusMove: b
   return true;
 }
 
-function changeStages(ctx: Ctx, side: Side, changes: Partial<Record<BattleStat, number>>) {
+function changeStages(ctx: Ctx, side: Side, changes: Partial<Record<BattleStat | 'hp', number>>) {
   const st = stages(ctx, side);
   const name = label(ctx.battle, side, mon(ctx, side));
   for (const [k, delta] of Object.entries(changes) as [BattleStat, number][]) {
+    if (!(k in st)) continue;
     const before = st[k];
     st[k] = Math.max(-6, Math.min(6, before + delta));
     const real = st[k] - before;
@@ -142,8 +147,11 @@ export function computeDamage(
   const defTypes = getSpecies(defender.species).types;
   const eff = effectiveness(move.type, defTypes);
   if (eff === 0) return { damage: 0, eff };
-  if (move.effect.fixedDamage !== undefined) {
-    return { damage: move.effect.fixedDamage === 'level' ? attacker.level : move.effect.fixedDamage, eff: 1 };
+  const fixed = move.effect.fixedDamage;
+  if (fixed !== undefined) {
+    if (fixed === 'level') return { damage: attacker.level, eff: 1 };
+    if (fixed === 'half') return { damage: Math.max(1, Math.floor(defender.hp / 2)), eff: 1 };
+    return { damage: fixed, eff: 1 };
   }
   const a = calcStats(attacker);
   const d = calcStats(defender);
@@ -184,7 +192,13 @@ function useMove(ctx: Ctx, side: Side, slotIndex: number | 'struggle', movedFirs
   const defSide = other(side);
   const defender = mon(ctx, defSide);
   const name = label(ctx.battle, side, attacker);
+  const vol = ctx.battle.volatile[side];
 
+  if (vol.recharge) {
+    vol.recharge = false;
+    say(ctx, `${name} восстанавливает силы после мощной атаки.`);
+    return;
+  }
   if (attacker.status === 'frz') {
     if (ctx.rng() < 0.2) {
       attacker.status = null;
@@ -210,6 +224,24 @@ function useMove(ctx: Ctx, side: Side, slotIndex: number | 'struggle', movedFirs
     say(ctx, `${name} дрогнул и не смог атаковать!`);
     return;
   }
+  if (vol.confused > 0) {
+    vol.confused -= 1;
+    if (vol.confused === 0) {
+      say(ctx, `${name} больше не в замешательстве!`);
+    } else {
+      say(ctx, `${name} в замешательстве...`);
+      if (ctx.rng() < 1 / 3) {
+        const st = stages(ctx, side);
+        const s = calcStats(attacker);
+        const A = s.atk * stageMult(st.atk);
+        const D = s.def * stageMult(st.def);
+        const dmg = Math.max(1, Math.floor(Math.floor((Math.floor((2 * attacker.level) / 5 + 2) * 40 * A) / D) / 50) + 2);
+        applyDamage(ctx, side, dmg, 1, false);
+        say(ctx, `${name} бьёт сам себя в замешательстве!`);
+        return;
+      }
+    }
+  }
   if (attacker.status === 'par' && ctx.rng() < 0.25) {
     say(ctx, `${name} парализован и не может двигаться!`);
     return;
@@ -227,6 +259,7 @@ function useMove(ctx: Ctx, side: Side, slotIndex: number | 'struggle', movedFirs
   ctx.ev.push({ t: 'move', side, moveId: move.id });
   say(ctx, `${name} использует «${move.name}»!`);
   const fx = move.effect;
+  if (!fx.protect) vol.protectStreak = 0;
 
   if (fx.flee) {
     if (ctx.battle.kind === 'wild') {
@@ -238,7 +271,26 @@ function useMove(ctx: Ctx, side: Side, slotIndex: number | 'struggle', movedFirs
     return;
   }
 
-  const targetsFoe = move.category !== 'status' || fx.status !== undefined || fx.stats?.target === 'foe';
+  const targetsFoe = move.category !== 'status' || fx.status !== undefined || fx.confuse !== undefined || fx.stats?.target === 'foe';
+  if (targetsFoe && ctx.battle.volatile[defSide].protected) {
+    say(ctx, `${label(ctx.battle, defSide, defender)} защищается!`);
+    if (fx.selfKO) selfKnockOut(ctx, side);
+    return;
+  }
+  if (fx.ohko) {
+    if (attacker.level < defender.level || effectiveness(move.type, getSpecies(defender.species).types) === 0) {
+      say(ctx, 'Но ничего не произошло!');
+      return;
+    }
+    if (ctx.rng() * 100 >= 30 + attacker.level - defender.level) {
+      ctx.ev.push({ t: 'miss', side });
+      say(ctx, `${name} промахивается!`);
+      return;
+    }
+    applyDamage(ctx, defSide, defender.hp, 1, false);
+    say(ctx, 'Сокрушительный удар — одним махом!');
+    return;
+  }
   if (targetsFoe && move.accuracy !== null) {
     const atkSt = stages(ctx, side);
     const defSt = stages(ctx, defSide);
@@ -246,6 +298,7 @@ function useMove(ctx: Ctx, side: Side, slotIndex: number | 'struggle', movedFirs
     if (ctx.rng() * 100 >= acc) {
       ctx.ev.push({ t: 'miss', side });
       say(ctx, `${name} промахивается!`);
+      if (fx.selfKO) selfKnockOut(ctx, side);
       return;
     }
   }
@@ -261,6 +314,7 @@ function useMove(ctx: Ctx, side: Side, slotIndex: number | 'struggle', movedFirs
   const eff = effectiveness(move.type, defTypes);
   if (eff === 0) {
     say(ctx, `${defName} неуязвим к этой атаке!`);
+    if (fx.selfKO) selfKnockOut(ctx, side);
     return;
   }
   const hits = fx.multiHit ? multiHitCount(ctx.rng, fx.multiHit) : 1;
@@ -302,12 +356,32 @@ function useMove(ctx: Ctx, side: Side, slotIndex: number | 'struggle', movedFirs
 
   if (defender.hp > 0) {
     if (fx.status && chance(ctx.rng, fx.status.chance)) inflictStatus(ctx, defSide, fx.status.id, false);
+    if (fx.confuse && chance(ctx.rng, fx.confuse)) confuse(ctx, defSide, false);
     if (fx.stats?.target === 'foe' && chance(ctx.rng, fx.stats.chance)) changeStages(ctx, defSide, fx.stats.changes);
     if (fx.flinch && movedFirst && chance(ctx.rng, fx.flinch)) ctx.flinch[defSide] = true;
   }
   if (fx.stats?.target === 'self' && attacker.hp > 0 && chance(ctx.rng, fx.stats.chance)) {
     changeStages(ctx, side, fx.stats.changes);
   }
+  if (fx.recharge && attacker.hp > 0) vol.recharge = true;
+  if (fx.selfKO) selfKnockOut(ctx, side);
+}
+
+function selfKnockOut(ctx: Ctx, side: Side) {
+  const p = mon(ctx, side);
+  if (p.hp > 0) applyDamage(ctx, side, p.hp, 1, false);
+}
+
+function confuse(ctx: Ctx, side: Side, fromStatusMove: boolean) {
+  const vol = ctx.battle.volatile[side];
+  const name = label(ctx.battle, side, mon(ctx, side));
+  if (vol.confused > 0) {
+    if (fromStatusMove) say(ctx, `${name} уже в замешательстве.`);
+    return;
+  }
+  vol.confused = randInt(ctx.rng, 2, 5);
+  ctx.ev.push({ t: 'confuse', side });
+  say(ctx, `${name} приходит в замешательство!`);
 }
 
 function runStatusMove(ctx: Ctx, side: Side, move: MoveData) {
@@ -334,6 +408,23 @@ function runStatusMove(ctx: Ctx, side: Side, move: MoveData) {
     say(ctx, healed > 0 ? `${name} восстанавливает здоровье!` : 'Но ничего не произошло!');
     return;
   }
+  if (fx.protect) {
+    const vol = ctx.battle.volatile[side];
+    if (ctx.rng() < 1 / Math.pow(3, vol.protectStreak)) {
+      vol.protected = true;
+      vol.protectStreak += 1;
+      ctx.ev.push({ t: 'protect', side });
+      say(ctx, `${name} готовится защищаться!`);
+    } else {
+      vol.protectStreak = 0;
+      say(ctx, 'Но ничего не вышло!');
+    }
+    return;
+  }
+  if (fx.confuse && !fx.status && !fx.stats) {
+    confuse(ctx, defSide, true);
+    return;
+  }
   if (fx.status) {
     const targetTypes = getSpecies(target.species).types;
     const powder = move.id.includes('powder') || move.id === 'spore';
@@ -346,6 +437,7 @@ function runStatusMove(ctx: Ctx, side: Side, move: MoveData) {
   }
   if (fx.stats) {
     changeStages(ctx, fx.stats.target === 'self' ? side : defSide, fx.stats.changes);
+    if (fx.confuse) confuse(ctx, defSide, false);
     return;
   }
   say(ctx, 'Но ничего не произошло!');
@@ -366,12 +458,16 @@ export function chooseEnemyMove(state: GameState, rng: Rng): number | 'struggle'
   const scored = usable.map(({ m, i }) => {
     const mv = getMove(m.id);
     let score: number;
-    if (mv.category === 'status') {
-      if (mv.effect.status) score = target.status ? 0 : 45;
+    if (mv.effect.ohko) {
+      score = enemy.level >= target.level ? 40 : 0;
+    } else if (mv.category === 'status') {
+      if (mv.effect.protect) score = 8;
+      else if (mv.effect.status) score = target.status ? 0 : 45;
       else if (mv.effect.heal || mv.effect.rest) score = enemy.hp < maxHp(enemy) * 0.4 ? 80 : 0;
       else score = battle.turn <= 2 ? 25 : 5;
     } else if (mv.effect.fixedDamage !== undefined) {
-      score = mv.effect.fixedDamage === 'level' ? enemy.level * 1.2 : mv.effect.fixedDamage;
+      const fixed = mv.effect.fixedDamage;
+      score = fixed === 'level' ? enemy.level * 1.2 : fixed === 'half' ? target.hp / 2 : fixed;
     } else {
       const eff = effectiveness(mv.type, targetTypes);
       score = mv.power * eff * (enemyTypes.includes(mv.type) ? 1.5 : 1) * ((mv.accuracy ?? 100) / 100);
@@ -396,6 +492,7 @@ function baseBattle(state: GameState, kind: BattleState['kind'], enemyTeam: Poke
     playerActive,
     playerStages: freshStages(),
     enemyStages: freshStages(),
+    volatile: { player: freshVolatile(), enemy: freshVolatile() },
     participants: [state.team[playerActive].uid],
     leveled: [],
     turn: 0,
@@ -549,6 +646,7 @@ function switchPlayer(ctx: Ctx, index: number) {
   const prev = ctx.state.team[battle.playerActive];
   battle.playerActive = index;
   battle.playerStages = freshStages();
+  battle.volatile.player = freshVolatile();
   const next = ctx.state.team[index];
   if (!battle.participants.includes(next.uid)) battle.participants.push(next.uid);
   if (prev && prev.hp > 0) say(ctx, `${displayName(prev)}, вернись!`);
@@ -678,6 +776,8 @@ function throwBall(ctx: Ctx, ballId: string): boolean {
 }
 
 function endOfTurn(ctx: Ctx) {
+  ctx.battle.volatile.player.protected = false;
+  ctx.battle.volatile.enemy.protected = false;
   for (const side of ['player', 'enemy'] as Side[]) {
     const p = mon(ctx, side);
     if (p.hp <= 0) continue;
@@ -707,6 +807,7 @@ function resolveFaints(ctx: Ctx) {
     }
     battle.enemyActive = next;
     battle.enemyStages = freshStages();
+    battle.volatile.enemy = freshVolatile();
     battle.participants = player.hp > 0 ? [player.uid] : [];
     const nm = battle.enemyTeam[next];
     markSeen(state, nm.species);
@@ -807,6 +908,7 @@ export function forceSwitch(state: GameState, index: number): BattleEvent[] {
   const ctx: Ctx = { state, battle, ev: [], rng: Math.random, flinch: { player: false, enemy: false } };
   battle.playerActive = index;
   battle.playerStages = freshStages();
+  battle.volatile.player = freshVolatile();
   if (!battle.participants.includes(target.uid)) battle.participants.push(target.uid);
   ctx.ev.push({ t: 'switch', side: 'player', uid: target.uid });
   say(ctx, `Вперёд, ${displayName(target)}!`);

@@ -1,0 +1,848 @@
+# Русские названия атак: идентификатор PokeAPI | название. Переведено для игры «Лига 3D».
+pound|Шлепок
+karate-chop|Удар каратэ
+double-slap|Двойная пощёчина
+comet-punch|Кометный удар
+mega-punch|Мегаудар
+pay-day|Монетки
+fire-punch|Огненный удар
+ice-punch|Ледяной удар
+thunder-punch|Громовой удар
+scratch|Царапина
+vice-grip|Тиски
+guillotine|Гильотина
+razor-wind|Режущий ветер
+swords-dance|Танец мечей
+cut|Разрез
+gust|Порыв ветра
+wing-attack|Удар крылом
+whirlwind|Вихрь
+fly|Полёт
+bind|Сдавливание
+slam|Хлёсткий удар
+vine-whip|Лозовый хлыст
+stomp|Топот
+double-kick|Двойной пинок
+mega-kick|Мегапинок
+jump-kick|Пинок в прыжке
+rolling-kick|Пинок с разворота
+sand-attack|Песок в глаза
+headbutt|Удар головой
+horn-attack|Удар рогом
+fury-attack|Яростная атака
+horn-drill|Рог-бур
+tackle|Таран
+body-slam|Бросок телом
+wrap|Обвивание
+take-down|Таран с разбега
+thrash|Буйство
+double-edge|Отчаянный рывок
+tail-whip|Взмах хвостом
+poison-sting|Ядовитое жало
+twineedle|Двойная игла
+pin-missile|Игольчатый залп
+leer|Злобный взгляд
+bite|Укус
+growl|Рык
+roar|Рёв
+sing|Колыбельная
+supersonic|Ультразвук
+sonic-boom|Звуковой удар
+disable|Блокировка
+acid|Кислота
+ember|Угольки
+flamethrower|Огнемёт
+mist|Туман
+water-gun|Водомёт
+hydro-pump|Гидронасос
+surf|Сёрфинг
+ice-beam|Ледяной луч
+blizzard|Метель
+psybeam|Психолуч
+bubble-beam|Луч пузырей
+aurora-beam|Луч авроры
+hyper-beam|Гиперлуч
+peck|Клевок
+drill-peck|Буравящий клюв
+submission|Покорение
+low-kick|Подсечка
+counter|Контрудар
+seismic-toss|Сейсмический бросок
+strength|Сила
+absorb|Поглощение
+mega-drain|Мега-поглощение
+leech-seed|Семя-пиявка
+growth|Рост
+razor-leaf|Бритвенный лист
+solar-beam|Солнечный луч
+poison-powder|Ядовитая пыльца
+stun-spore|Парализующие споры
+sleep-powder|Усыпляющая пыльца
+petal-dance|Танец лепестков
+string-shot|Липкая нить
+dragon-rage|Ярость дракона
+fire-spin|Огненный вихрь
+thunder-shock|Электрошок
+thunderbolt|Удар молнии
+thunder-wave|Волна грома
+thunder|Гром
+rock-throw|Бросок камня
+earthquake|Землетрясение
+fissure|Разлом
+dig|Подкоп
+toxic|Токсин
+confusion|Замешательство
+psychic|Психика
+hypnosis|Гипноз
+meditate|Медитация
+agility|Ускорение
+quick-attack|Быстрая атака
+rage|Ярость
+teleport|Телепорт
+night-shade|Ночная тень
+mimic|Подражание
+screech|Скрежет
+double-team|Двойник
+recover|Восстановление
+harden|Затвердение
+minimize|Уменьшение
+smokescreen|Дымовая завеса
+confuse-ray|Смущающий луч
+withdraw|Укрытие в панцирь
+defense-curl|Сворачивание
+barrier|Барьер
+light-screen|Световой экран
+haze|Мгла
+reflect|Отражение
+focus-energy|Концентрация
+bide|Выжидание
+metronome|Метроном
+mirror-move|Зеркальный приём
+self-destruct|Самоуничтожение
+egg-bomb|Яйцо-бомба
+lick|Лизание
+smog|Смог
+sludge|Нечистоты
+bone-club|Удар костью
+fire-blast|Огненный взрыв
+waterfall|Водопад
+clamp|Захлопывание
+swift|Звёздочки
+skull-bash|Удар черепом
+spike-cannon|Шипованная пушка
+constrict|Стягивание
+amnesia|Амнезия
+kinesis|Кинезис
+soft-boiled|Яйцо всмятку
+high-jump-kick|Пинок в высоком прыжке
+glare|Свирепый взгляд
+dream-eater|Пожиратель снов
+poison-gas|Ядовитый газ
+barrage|Обстрел
+leech-life|Пиявка
+lovely-kiss|Нежный поцелуй
+sky-attack|Небесная атака
+transform|Превращение
+bubble|Пузыри
+dizzy-punch|Оглушающий удар
+spore|Споры
+flash|Вспышка
+psywave|Психоволна
+splash|Плеск
+acid-armor|Кислотная броня
+crabhammer|Крабомолот
+explosion|Взрыв
+fury-swipes|Яростные царапины
+bonemerang|Костеранг
+rest|Отдых
+rock-slide|Камнепад
+hyper-fang|Гиперклык
+sharpen|Заточка
+conversion|Конверсия
+tri-attack|Тройная атака
+super-fang|Суперклык
+slash|Рассечение
+substitute|Заменитель
+struggle|Борьба
+sketch|Эскиз
+triple-kick|Тройной пинок
+thief|Воришка
+spider-web|Паутина
+mind-reader|Чтение мыслей
+nightmare|Кошмар
+flame-wheel|Огненное колесо
+snore|Храп
+curse|Проклятие
+flail|Метания
+conversion-2|Конверсия-2
+aeroblast|Аэробласт
+cotton-spore|Хлопковые споры
+reversal|Реверс
+spite|Злоба
+powder-snow|Снежная пыль
+protect|Защита
+mach-punch|Мах-удар
+scary-face|Страшная гримаса
+feint-attack|Подлый удар
+sweet-kiss|Сладкий поцелуй
+belly-drum|Барабан-живот
+sludge-bomb|Грязевая бомба
+mud-slap|Грязевой шлепок
+octazooka|Осьмизука
+spikes|Шипы
+zap-cannon|Электропушка
+foresight|Прозорливость
+destiny-bond|Узы судьбы
+perish-song|Песня гибели
+icy-wind|Ледяной ветер
+detect|Обнаружение
+bone-rush|Костяной натиск
+lock-on|Наводка
+outrage|Неистовство
+sandstorm|Песчаная буря
+giga-drain|Гига-поглощение
+endure|Стойкость
+charm|Очарование
+rollout|Перекат
+false-swipe|Ложный удар
+swagger|Бахвальство
+milk-drink|Глоток молока
+spark|Искра
+fury-cutter|Яростный резак
+steel-wing|Стальное крыло
+mean-look|Пристальный взгляд
+attract|Притяжение
+sleep-talk|Разговор во сне
+heal-bell|Лечебный звон
+return|Отдача
+present|Подарок
+frustration|Разочарование
+safeguard|Охрана
+pain-split|Раздел боли
+sacred-fire|Священный огонь
+magnitude|Магнитуда
+dynamic-punch|Динамический удар
+megahorn|Мегарог
+dragon-breath|Дыхание дракона
+baton-pass|Передача эстафеты
+encore|На бис
+pursuit|Преследование
+rapid-spin|Быстрое вращение
+sweet-scent|Сладкий аромат
+iron-tail|Железный хвост
+metal-claw|Стальной коготь
+vital-throw|Жизненный бросок
+morning-sun|Утреннее солнце
+synthesis|Синтез
+moonlight|Лунный свет
+hidden-power|Скрытая сила
+cross-chop|Перекрёстный удар
+twister|Смерч
+rain-dance|Танец дождя
+sunny-day|Солнечный день
+crunch|Хруст
+mirror-coat|Зеркальный покров
+psych-up|Психонастрой
+extreme-speed|Сверхскорость
+ancient-power|Древняя сила
+shadow-ball|Шар тени
+future-sight|Предвидение
+rock-smash|Крушение камня
+whirlpool|Водоворот
+beat-up|Избиение
+fake-out|Обманный выпад
+uproar|Гвалт
+stockpile|Запасание
+spit-up|Выплёвывание
+swallow|Проглатывание
+heat-wave|Волна жара
+hail|Град
+torment|Мучение
+flatter|Лесть
+will-o-wisp|Блуждающий огонь
+memento|Напоминание
+facade|Показуха
+focus-punch|Сфокусированный удар
+smelling-salts|Нюхательная соль
+follow-me|За мной
+nature-power|Сила природы
+charge|Зарядка
+taunt|Насмешка
+helping-hand|Рука помощи
+trick|Фокус
+role-play|Ролевая игра
+wish|Желание
+assist|Помощь
+ingrain|Укоренение
+superpower|Суперсила
+magic-coat|Волшебный покров
+recycle|Переработка
+revenge|Месть
+brick-break|Разбивание
+yawn|Зевота
+knock-off|Выбивание
+endeavor|Старание
+eruption|Извержение
+skill-swap|Обмен способностями
+imprison|Заточение
+refresh|Освежение
+grudge|Обида
+snatch|Перехват
+secret-power|Тайная сила
+dive|Нырок
+arm-thrust|Толчок ладонью
+camouflage|Камуфляж
+tail-glow|Свечение хвоста
+luster-purge|Сияющее очищение
+mist-ball|Туманный шар
+feather-dance|Танец перьев
+teeter-dance|Шаткий танец
+blaze-kick|Пылающий пинок
+mud-sport|Грязевая забава
+ice-ball|Ледяной шар
+needle-arm|Игольчатая рука
+slack-off|Безделье
+hyper-voice|Гиперголос
+poison-fang|Ядовитый клык
+crush-claw|Сокрушающий коготь
+blast-burn|Пламенный взрыв
+hydro-cannon|Гидропушка
+meteor-mash|Метеорный удар
+astonish|Испуг
+weather-ball|Погодный шар
+aromatherapy|Ароматерапия
+fake-tears|Притворные слёзы
+air-cutter|Воздушный резак
+overheat|Перегрев
+odor-sleuth|Нюх
+rock-tomb|Каменная гробница
+silver-wind|Серебряный ветер
+metal-sound|Металлический звук
+grass-whistle|Травяной свисток
+tickle|Щекотка
+cosmic-power|Космическая сила
+water-spout|Водный фонтан
+signal-beam|Сигнальный луч
+shadow-punch|Теневой удар
+extrasensory|Экстрасенсорика
+sky-uppercut|Небесный апперкот
+sand-tomb|Песчаная гробница
+sheer-cold|Абсолютный холод
+muddy-water|Мутная вода
+bullet-seed|Пулемёт семенами
+aerial-ace|Воздушный удар
+icicle-spear|Ледяное копьё
+iron-defense|Железная защита
+block|Блок
+howl|Вой
+dragon-claw|Драконий коготь
+frenzy-plant|Буйство растений
+bulk-up|Накачка
+bounce|Прыжок
+mud-shot|Грязевой выстрел
+poison-tail|Ядовитый хвост
+covet|Зависть
+volt-tackle|Вольт-таран
+magical-leaf|Волшебный лист
+water-sport|Водная забава
+calm-mind|Спокойствие
+leaf-blade|Лист-клинок
+dragon-dance|Танец дракона
+rock-blast|Каменная очередь
+shock-wave|Ударная волна
+water-pulse|Водный импульс
+doom-desire|Желание гибели
+psycho-boost|Психоускорение
+roost|Насест
+gravity|Гравитация
+miracle-eye|Чудесный глаз
+wake-up-slap|Будящая пощёчина
+hammer-arm|Рука-молот
+gyro-ball|Гиромяч
+healing-wish|Исцеляющее желание
+brine|Рассол
+natural-gift|Дар природы
+feint|Финт
+pluck|Выклёвывание
+tailwind|Попутный ветер
+acupressure|Акупрессура
+metal-burst|Металлический всплеск
+u-turn|Разворот
+close-combat|Ближний бой
+payback|Расплата
+assurance|Уверенность
+embargo|Эмбарго
+fling|Метание
+psycho-shift|Психосдвиг
+trump-card|Козырь
+heal-block|Блок лечения
+wring-out|Выжимание
+power-trick|Силовой трюк
+gastro-acid|Желудочный сок
+lucky-chant|Счастливое заклятие
+me-first|Я первый
+copycat|Подражатель
+power-swap|Обмен силой
+guard-swap|Обмен защитой
+punishment|Наказание
+last-resort|Последнее средство
+worry-seed|Семя тревоги
+sucker-punch|Удар исподтишка
+toxic-spikes|Ядовитые шипы
+heart-swap|Обмен сердцами
+aqua-ring|Водное кольцо
+magnet-rise|Магнитный подъём
+flare-blitz|Пламенный рывок
+force-palm|Силовая ладонь
+aura-sphere|Сфера ауры
+rock-polish|Полировка камня
+poison-jab|Ядовитый укол
+dark-pulse|Тёмный импульс
+night-slash|Ночной разрез
+aqua-tail|Водный хвост
+seed-bomb|Бомба-семя
+air-slash|Воздушный клинок
+x-scissor|Икс-ножницы
+bug-buzz|Жужжание
+dragon-pulse|Импульс дракона
+dragon-rush|Драконий натиск
+power-gem|Силовой камень
+drain-punch|Иссушающий удар
+vacuum-wave|Вакуумная волна
+focus-blast|Фокус-взрыв
+energy-ball|Энергошар
+brave-bird|Храбрая птица
+earth-power|Сила земли
+switcheroo|Подмена
+giga-impact|Гигаудар
+nasty-plot|Коварный план
+bullet-punch|Пулевой удар
+avalanche|Лавина
+ice-shard|Ледяной осколок
+shadow-claw|Теневой коготь
+thunder-fang|Громовой клык
+ice-fang|Ледяной клык
+fire-fang|Огненный клык
+shadow-sneak|Теневой выпад
+mud-bomb|Грязевая бомба-шар
+psycho-cut|Психорез
+zen-headbutt|Дзен-удар
+mirror-shot|Зеркальный выстрел
+flash-cannon|Луч вспышки
+rock-climb|Скалолаз
+defog|Разгон тумана
+trick-room|Комната фокусов
+draco-meteor|Драко-метеор
+discharge|Разряд
+lava-plume|Лавовый шлейф
+leaf-storm|Листовой шторм
+power-whip|Силовой хлыст
+rock-wrecker|Скалолом
+cross-poison|Ядовитый крест
+gunk-shot|Выстрел грязью
+iron-head|Железная голова
+magnet-bomb|Магнитная бомба
+stone-edge|Каменное лезвие
+captivate|Пленение
+stealth-rock|Скрытые камни
+grass-knot|Травяной узел
+chatter|Болтовня
+judgment|Правосудие
+bug-bite|Укус жука
+charge-beam|Заряженный луч
+wood-hammer|Деревянный молот
+aqua-jet|Водная струя
+attack-order|Приказ: атака
+defend-order|Приказ: защита
+heal-order|Приказ: лечение
+head-smash|Сокрушительный удар головой
+double-hit|Двойной удар
+roar-of-time|Рёв времени
+spacial-rend|Разрыв пространства
+lunar-dance|Лунный танец
+crush-grip|Сокрушающая хватка
+magma-storm|Магмовый шторм
+dark-void|Тёмная пустота
+seed-flare|Вспышка семян
+ominous-wind|Зловещий ветер
+shadow-force|Теневая сила
+hone-claws|Заточка когтей
+wide-guard|Широкая защита
+guard-split|Раздел защиты
+power-split|Раздел силы
+wonder-room|Чудесная комната
+psyshock|Психошок
+venoshock|Ядовитый шок
+autotomize|Автотомия
+rage-powder|Пыльца ярости
+telekinesis|Телекинез
+magic-room|Волшебная комната
+smack-down|Сбивание
+storm-throw|Штормовой бросок
+flame-burst|Огненный всплеск
+sludge-wave|Грязевая волна
+quiver-dance|Трепещущий танец
+heavy-slam|Тяжёлый удар
+synchronoise|Синхрошум
+electro-ball|Электрошар
+soak|Промачивание
+flame-charge|Огненный заряд
+coil|Свернуться кольцами
+low-sweep|Низкая подсечка
+acid-spray|Кислотный спрей
+foul-play|Грязная игра
+simple-beam|Простой луч
+entrainment|Увлечение
+after-you|После вас
+round|Хоровод
+echoed-voice|Эхо голоса
+chip-away|Скалывание
+clear-smog|Чистый смог
+stored-power|Накопленная сила
+quick-guard|Быстрая защита
+ally-switch|Смена союзника
+scald|Ошпаривание
+shell-smash|Разбитие панциря
+heal-pulse|Лечебный импульс
+hex|Порча
+sky-drop|Падение с неба
+shift-gear|Переключение передачи
+circle-throw|Круговой бросок
+incinerate|Испепеление
+quash|Подавление
+acrobatics|Акробатика
+reflect-type|Отражение типа
+retaliate|Возмездие
+final-gambit|Последняя ставка
+bestow|Дар
+inferno|Инферно
+water-pledge|Водная клятва
+fire-pledge|Огненная клятва
+grass-pledge|Травяная клятва
+volt-switch|Вольт-смена
+struggle-bug|Сопротивление жука
+bulldoze|Сотрясение
+frost-breath|Морозное дыхание
+dragon-tail|Драконий хвост
+work-up|Разогрев
+electroweb|Электросеть
+wild-charge|Дикий заряд
+drill-run|Бурение
+dual-chop|Двойной рубящий
+heart-stamp|Печать сердца
+horn-leech|Рог-пиявка
+sacred-sword|Священный меч
+razor-shell|Ракушка-бритва
+heat-crash|Жаркий удар
+leaf-tornado|Листовой торнадо
+steamroller|Каток
+cotton-guard|Хлопковая защита
+night-daze|Ночное помрачение
+psystrike|Псиудар
+tail-slap|Хлопки хвостом
+hurricane|Ураган
+head-charge|Удар с разгона
+gear-grind|Зубчатые шестерни
+searing-shot|Палящий выстрел
+techno-blast|Технобласт
+relic-song|Древняя песня
+secret-sword|Тайный меч
+glaciate|Оледенение
+bolt-strike|Удар молнией
+blue-flare|Синее пламя
+fiery-dance|Огненный танец
+freeze-shock|Ледяной шок
+ice-burn|Ледяной ожог
+snarl|Рычание
+icicle-crash|Падение сосулек
+v-create|В-создание
+fusion-flare|Пламя слияния
+fusion-bolt|Молния слияния
+flying-press|Летящий пресс
+mat-block|Блок ковриком
+belch|Отрыжка
+rototiller|Культиватор
+sticky-web|Липкая паутина
+fell-stinger|Смертельное жало
+phantom-force|Призрачная сила
+trick-or-treat|Сладость или гадость
+noble-roar|Благородный рык
+ion-deluge|Ионный ливень
+parabolic-charge|Параболический заряд
+forests-curse|Проклятие леса
+petal-blizzard|Лепестковая буря
+freeze-dry|Сублимация
+disarming-voice|Обезоруживающий голос
+parting-shot|Прощальный выпад
+topsy-turvy|Вверх дном
+draining-kiss|Осушающий поцелуй
+crafty-shield|Хитрый щит
+flower-shield|Цветочный щит
+grassy-terrain|Травяное поле
+misty-terrain|Туманное поле
+electrify|Электризация
+play-rough|Грубая игра
+fairy-wind|Волшебный ветер
+moonblast|Лунный удар
+boomburst|Звуковой взрыв
+fairy-lock|Волшебный замок
+kings-shield|Королевский щит
+play-nice|Дружелюбие
+confide|Признание
+diamond-storm|Алмазная буря
+steam-eruption|Паровое извержение
+hyperspace-hole|Гиперпространственная дыра
+water-shuriken|Водяной сюрикен
+mystical-fire|Мистический огонь
+spiky-shield|Шипастый щит
+aromatic-mist|Ароматный туман
+eerie-impulse|Жуткий импульс
+venom-drench|Ядовитый душ
+powder|Порошок
+geomancy|Геомантия
+magnetic-flux|Магнитный поток
+happy-hour|Счастливый час
+electric-terrain|Электрическое поле
+dazzling-gleam|Ослепительный блеск
+celebrate|Праздник
+hold-hands|Держаться за руки
+baby-doll-eyes|Кукольные глазки
+nuzzle|Тычок мордочкой
+hold-back|Сдержанность
+infestation|Нашествие
+power-up-punch|Усиливающий удар
+oblivion-wing|Крыло забвения
+thousand-arrows|Тысяча стрел
+thousand-waves|Тысяча волн
+lands-wrath|Гнев земли
+light-of-ruin|Свет разрушения
+origin-pulse|Импульс истока
+precipice-blades|Лезвия пропасти
+dragon-ascent|Драконье вознесение
+hyperspace-fury|Гиперпространственная ярость
+shore-up|Укрепление берега
+first-impression|Первое впечатление
+baneful-bunker|Губительный бункер
+spirit-shackle|Оковы духа
+darkest-lariat|Тёмнейший лариат
+sparkling-aria|Искрящаяся ария
+ice-hammer|Ледяной молот
+floral-healing|Цветочное лечение
+high-horsepower|Лошадиная сила
+strength-sap|Высасывание силы
+solar-blade|Солнечный клинок
+leafage|Листопад
+spotlight|Прожектор
+toxic-thread|Ядовитая нить
+laser-focus|Лазерная фокусировка
+gear-up|Настройка шестерён
+throat-chop|Удар по горлу
+pollen-puff|Пыльцевой шар
+anchor-shot|Якорный выстрел
+psychic-terrain|Психическое поле
+lunge|Выпад
+fire-lash|Огненная плеть
+power-trip|Силовой трип
+burn-up|Выгорание
+speed-swap|Обмен скоростью
+smart-strike|Умный удар
+purify|Очищение
+revelation-dance|Танец откровения
+core-enforcer|Сила ядра
+trop-kick|Тропический пинок
+instruct|Указание
+beak-blast|Взрыв клюва
+clanging-scales|Звенящая чешуя
+dragon-hammer|Драконий молот
+brutal-swing|Жестокий размах
+aurora-veil|Завеса авроры
+shell-trap|Ловушка-панцирь
+fleur-cannon|Цветочная пушка
+psychic-fangs|Психические клыки
+stomping-tantrum|Топот в ярости
+shadow-bone|Теневая кость
+accelerock|Камень-ускоритель
+liquidation|Ликвидация
+prismatic-laser|Призматический лазер
+spectral-thief|Призрачный вор
+sunsteel-strike|Удар солнечной стали
+moongeist-beam|Луч лунного призрака
+tearful-look|Слёзный взгляд
+zing-zap|Звонкий разряд
+natures-madness|Безумие природы
+multi-attack|Мульти-атака
+mind-blown|Взрыв разума
+plasma-fists|Плазменные кулаки
+photon-geyser|Фотонный гейзер
+zippy-zap|Шустрый разряд
+splishy-splash|Плюх-всплеск
+floaty-fall|Парящее падение
+pika-papow|Пика-бах
+bouncy-bubble|Прыгучий пузырь
+buzzy-buzz|Жужжащий разряд
+sizzly-slide|Шипящий скольз
+glitzy-glow|Блестящее сияние
+baddy-bad|Злюка-бяка
+sappy-seed|Сочное семя
+freezy-frost|Морозный холод
+sparkly-swirl|Искрящийся вихрь
+veevee-volley|Иви-залп
+double-iron-bash|Двойной железный удар
+dynamax-cannon|Динамакс-пушка
+snipe-shot|Снайперский выстрел
+jaw-lock|Хватка челюстей
+stuff-cheeks|Набить щёки
+no-retreat|Без отступления
+tar-shot|Смоляной выстрел
+magic-powder|Волшебный порошок
+dragon-darts|Драконьи дротики
+teatime|Чаепитие
+octolock|Осьмизахват
+bolt-beak|Клюв-молния
+fishious-rend|Рыбий разрыв
+court-change|Смена поля
+clangorous-soul|Звенящая душа
+body-press|Пресс телом
+decorate|Украшение
+drum-beating|Барабанная дробь
+snap-trap|Капкан
+pyro-ball|Огненный мяч
+behemoth-blade|Клинок исполина
+behemoth-bash|Удар исполина
+aura-wheel|Колесо ауры
+breaking-swipe|Ломающий размах
+branch-poke|Тычок веткой
+overdrive|Перегрузка
+apple-acid|Яблочная кислота
+grav-apple|Грав-яблоко
+spirit-break|Сокрушение духа
+strange-steam|Странный пар
+life-dew|Роса жизни
+obstruct|Преграда
+false-surrender|Ложная капитуляция
+meteor-assault|Метеорный штурм
+eternabeam|Вечный луч
+steel-beam|Стальной луч
+expanding-force|Расширяющаяся сила
+steel-roller|Стальной каток
+scale-shot|Чешуйчатый залп
+meteor-beam|Метеорный луч
+shell-side-arm|Удар раковиной
+misty-explosion|Туманный взрыв
+grassy-glide|Травяное скольжение
+rising-voltage|Растущее напряжение
+terrain-pulse|Импульс поля
+skitter-smack|Шустрый шлепок
+burning-jealousy|Жгучая ревность
+lash-out|Вспышка гнева
+poltergeist|Полтергейст
+corrosive-gas|Едкий газ
+coaching|Тренировка
+flip-turn|Кувырок-разворот
+triple-axel|Тройной аксель
+dual-wingbeat|Двойной взмах крыльев
+scorching-sands|Раскалённые пески
+jungle-healing|Лечение джунглей
+wicked-blow|Злобный удар
+surging-strikes|Бурлящие удары
+thunder-cage|Громовая клетка
+dragon-energy|Энергия дракона
+freezing-glare|Ледяной взгляд
+fiery-wrath|Огненный гнев
+thunderous-kick|Громовой пинок
+glacial-lance|Ледниковое копьё
+astral-barrage|Астральный обстрел
+eerie-spell|Жуткое заклинание
+dire-claw|Ужасный коготь
+psyshield-bash|Удар псищитом
+power-shift|Сдвиг силы
+stone-axe|Каменный топор
+springtide-storm|Весенний шторм
+mystical-power|Мистическая сила
+raging-fury|Бушующая ярость
+wave-crash|Удар волной
+chloroblast|Хлоробласт
+mountain-gale|Горный ветер
+victory-dance|Победный танец
+headlong-rush|Безудержный натиск
+barb-barrage|Шквал шипов
+esper-wing|Эспер-крыло
+bitter-malice|Горькая злоба
+shelter|Убежище
+triple-arrows|Тройные стрелы
+infernal-parade|Адский парад
+ceaseless-edge|Неумолимое лезвие
+bleakwind-storm|Буря стужи
+wildbolt-storm|Буря молний
+sandsear-storm|Буря песков
+lunar-blessing|Лунное благословение
+take-heart|Мужество
+tera-blast|Тера-взрыв
+silk-trap|Шёлковая ловушка
+axe-kick|Пинок-топор
+last-respects|Последние почести
+lumina-crash|Удар сияния
+order-up|Заказ подан
+jet-punch|Реактивный удар
+spicy-extract|Острый экстракт
+spin-out|Занос
+population-bomb|Популяционный взрыв
+ice-spinner|Ледяной волчок
+glaive-rush|Натиск глефой
+revival-blessing|Благословение возрождения
+salt-cure|Засолка
+triple-dive|Тройной нырок
+mortal-spin|Смертельное вращение
+doodle|Каракули
+fillet-away|Филе
+kowtow-cleave|Поклон с рассечением
+flower-trick|Цветочный фокус
+torch-song|Песня факела
+aqua-step|Водный шаг
+raging-bull|Яростный бык
+make-it-rain|Денежный дождь
+psyblade|Псиклинок
+hydro-steam|Гидропар
+ruination|Разорение
+collision-course|Курс столкновения
+electro-drift|Электродрифт
+shed-tail|Сброс хвоста
+chilly-reception|Холодный приём
+tidy-up|Уборка
+snowscape|Снегопад
+pounce|Наскок
+trailblaze|Первопроходец
+chilling-water|Ледяная вода
+hyper-drill|Гипербур
+twin-beam|Двойной луч
+rage-fist|Кулак ярости
+armor-cannon|Броне-пушка
+bitter-blade|Горький клинок
+double-shock|Двойной шок
+gigaton-hammer|Гигатонный молот
+comeuppance|Расплата сполна
+aqua-cutter|Водный резак
+blazing-torque|Пылающий крутящий момент
+wicked-torque|Злобный крутящий момент
+noxious-torque|Ядовитый крутящий момент
+combat-torque|Боевой крутящий момент
+magical-torque|Волшебный крутящий момент
+blood-moon|Кровавая луна
+matcha-gotcha|Матча-попался
+syrup-bomb|Сиропная бомба
+ivy-cudgel|Плющевая дубина
+electro-shot|Электровыстрел
+tera-starstorm|Тера-звездопад
+fickle-beam|Капризный луч
+burning-bulwark|Пылающий бастион
+thunderclap|Раскат грома
+mighty-cleave|Мощный рассекатель
+tachyon-cutter|Тахионный резак
+hard-press|Жёсткий пресс
+dragon-cheer|Драконий клич
+alluring-voice|Манящий голос
+temper-flare|Вспышка нрава
+supercell-slam|Удар суперячейки
+psychic-noise|Психический шум
+upper-hand|Перехват инициативы
+malignant-chain|Злокачественная цепь

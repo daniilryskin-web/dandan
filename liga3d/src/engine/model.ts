@@ -39,6 +39,8 @@ export type BattleEvent =
   | { t: 'damage'; side: Side; amount: number; hp: number; eff: number; crit: boolean }
   | { t: 'heal'; side: Side; amount: number; hp: number }
   | { t: 'status'; side: Side; status: StatusId | null }
+  | { t: 'confuse'; side: Side }
+  | { t: 'protect'; side: Side }
   | { t: 'stat'; side: Side; stat: BattleStat; delta: number }
   | { t: 'miss'; side: Side }
   | { t: 'faint'; side: Side }
@@ -52,6 +54,17 @@ export type BattleEvent =
 export type Side = 'player' | 'enemy';
 export type BattleResult = 'win' | 'lose' | 'caught' | 'fled';
 
+export interface Volatile {
+  /** Turns of confusion left (0 = not confused). */
+  confused: number;
+  /** Must skip the next turn (after Hyper Beam & co.). */
+  recharge: boolean;
+  /** Consecutive successful Protect uses. */
+  protectStreak: number;
+  /** Protected for the rest of this turn. */
+  protected: boolean;
+}
+
 export interface BattleState {
   kind: 'wild' | 'trainer';
   trainerId?: string;
@@ -63,6 +76,7 @@ export interface BattleState {
   playerActive: number;
   playerStages: Stages;
   enemyStages: Stages;
+  volatile: Record<Side, Volatile>;
   /** uids of player pokemon that fought the current enemy. */
   participants: string[];
   /** uids of player pokemon that leveled up during this battle. */

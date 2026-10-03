@@ -1,6 +1,6 @@
 import { getMove } from '../data/moves';
 import { NATURES, natureMultiplier } from '../data/natures';
-import { getSpecies, STAT_KEYS, type GrowthRate, type Species, type StatKey, type Stats } from '../data/species';
+import { getSpecies, STAT_KEYS, type Evolution, type GrowthRate, type Species, type StatKey, type Stats } from '../data/species';
 import type { MoveSlot, Pokemon } from './model';
 import { randInt, type Rng } from './rng';
 
@@ -25,6 +25,15 @@ export function expForLevel(growth: GrowthRate, level: number): number {
       return Math.max(0, Math.floor((6 / 5) * n ** 3 - 15 * n ** 2 + 100 * n - 140));
     case 'slow':
       return Math.floor((5 * n ** 3) / 4);
+    case 'erratic':
+      if (n <= 50) return Math.floor((n ** 3 * (100 - n)) / 50);
+      if (n <= 68) return Math.floor((n ** 3 * (150 - n)) / 100);
+      if (n <= 98) return Math.floor((n ** 3 * Math.floor((1911 - 10 * n) / 3)) / 500);
+      return Math.floor((n ** 3 * (160 - n)) / 100);
+    case 'fluctuating':
+      if (n <= 15) return Math.floor((n ** 3 * (Math.floor((n + 1) / 3) + 24)) / 50);
+      if (n <= 36) return Math.floor((n ** 3 * (n + 14)) / 50);
+      return Math.floor((n ** 3 * (Math.floor(n / 2) + 32)) / 50);
   }
 }
 
@@ -192,14 +201,40 @@ export function addEvs(p: Pokemon, gain: Partial<Stats>): void {
   }
 }
 
-export function levelEvolution(p: Pokemon): number | null {
-  const evo = getSpecies(p.species).evolutions.find((e) => e.level !== undefined && p.level >= e.level);
-  return evo ? evo.to : null;
+export function timeOfDay(date = new Date()): 'day' | 'night' {
+  const h = date.getHours();
+  return h >= 6 && h < 18 ? 'day' : 'night';
 }
 
-export function itemEvolution(p: Pokemon, itemId: string): number | null {
-  const evo = getSpecies(p.species).evolutions.find((e) => e.item === itemId);
-  return evo ? evo.to : null;
+function conditionsMet(p: Pokemon, e: Evolution, now: Date): boolean {
+  if (e.time && e.time !== timeOfDay(now)) return false;
+  if (e.gender && e.gender !== p.gender) return false;
+  if (e.physical !== undefined) {
+    const s = calcStats(p);
+    const rel = Math.sign(s.atk - s.def);
+    if (rel !== e.physical) return false;
+  }
+  return true;
+}
+
+/** Picks one of several equally valid evolutions (Wurmple, Toxel…) deterministically per pokemon. */
+function pickStable(p: Pokemon, list: Evolution[]): Evolution | null {
+  if (!list.length) return null;
+  const conditioned = list.filter((e) => e.time || e.gender || e.physical !== undefined);
+  const pool = conditioned.length ? conditioned : list;
+  let h = 0;
+  for (const ch of p.uid) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return pool[h % pool.length];
+}
+
+export function levelEvolution(p: Pokemon, now = new Date()): number | null {
+  const list = getSpecies(p.species).evolutions.filter((e) => e.level !== undefined && !e.item && p.level >= e.level && conditionsMet(p, e, now));
+  return pickStable(p, list)?.to ?? null;
+}
+
+export function itemEvolution(p: Pokemon, itemId: string, now = new Date()): number | null {
+  const list = getSpecies(p.species).evolutions.filter((e) => e.item === itemId && conditionsMet(p, e, now));
+  return pickStable(p, list)?.to ?? null;
 }
 
 /** Changes species in place, keeping the same HP ratio of damage taken. */

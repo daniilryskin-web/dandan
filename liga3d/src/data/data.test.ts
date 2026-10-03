@@ -40,6 +40,17 @@ describe('game data', () => {
     }
   });
 
+  it('has all 1025 species with Russian names and sane stats', () => {
+    expect(SPECIES_LIST).toHaveLength(1025);
+    for (const s of SPECIES_LIST) {
+      expect(s.name, `#${s.id}`).toMatch(/[А-Яа-яЁё]/);
+      expect(s.types.length).toBeGreaterThan(0);
+      expect(s.base.hp).toBeGreaterThan(0);
+    }
+    expect(SPECIES[25].name).toBe('Пикачу');
+    expect(SPECIES[1025].name).toBe('Печарант');
+  });
+
   it('type chart basics', () => {
     expect(TYPES).toHaveLength(18);
     expect(effectiveness('water', ['fire'])).toBe(2);

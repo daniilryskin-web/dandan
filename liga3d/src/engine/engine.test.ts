@@ -6,7 +6,7 @@ import {
 } from './actions';
 import { battleTurn, catchShakes, closeBattle, computeDamage, forceSwitch, freshStages, startWildBattle } from './battle';
 import type { GameState } from './model';
-import { calcStats, createPokemon, expForLevel, gainExp, maxHp } from './pokemon';
+import { calcStats, createPokemon, expForLevel, gainExp, itemEvolution, levelEvolution, maxHp } from './pokemon';
 import { seededRng } from './rng';
 import { deserialize, serialize } from './save';
 
@@ -67,7 +67,24 @@ describe('pokemon stats', () => {
 
   it('starts with the latest four moves', () => {
     const p = createPokemon(1, 20, seededRng(3), { uid: 'x' });
-    expect(p.moves.map((m) => m.id)).toEqual(['poison-powder', 'sleep-powder', 'take-down', 'razor-leaf']);
+    const expected = [...new Set(getSpecies(1).learnset.filter(([l]) => l <= 20).map(([, m]) => m))].slice(-4);
+    expect(p.moves.map((m) => m.id)).toEqual(expected);
+  });
+
+  it('erratic and fluctuating curves end where the games do', () => {
+    expect(expForLevel('erratic', 100)).toBe(600000);
+    expect(expForLevel('fluctuating', 100)).toBe(1640000);
+  });
+
+  it('conditional evolutions', () => {
+    const eevee = createPokemon(133, 20, seededRng(1), { uid: 'e1' });
+    expect(itemEvolution(eevee, 'soothe-bell', new Date(2026, 0, 1, 12))).toBe(196);
+    expect(itemEvolution(eevee, 'soothe-bell', new Date(2026, 0, 1, 23))).toBe(197);
+    expect(itemEvolution(eevee, 'shiny-stone')).toBe(700);
+    const tyrogue = createPokemon(236, 20, seededRng(1), { uid: 't', ivs: { atk: 31, def: 0 }, nature: 'hardy' });
+    expect(levelEvolution(tyrogue)).toBe(106);
+    const wurmple = createPokemon(265, 7, seededRng(1), { uid: 'w1' });
+    expect([266, 268]).toContain(levelEvolution(wurmple));
   });
 });
 
@@ -194,6 +211,53 @@ describe('battle flow', () => {
     expect(res.ok).toBe(true);
     expect(state.team[0].species).toBe(5);
     expect(getSpecies(state.team[0].species).name).toBe('Чармелеон');
+  });
+
+  it('protect blocks the attack for one turn', () => {
+    const state = game(26);
+    const me = state.team[0];
+    me.moves = [{ id: 'protect', pp: 10, maxPp: 10 }];
+    startWildBattle(state, 19, 5, seededRng(2));
+    state.battle!.enemyTeam[0].moves = [{ id: 'tackle', pp: 35, maxPp: 35 }];
+    const hp = me.hp;
+    const ev = battleTurn(state, { kind: 'move', index: 0 }, seededRng(3));
+    expect(ev.some((e) => e.t === 'protect')).toBe(true);
+    expect(me.hp).toBe(hp);
+    expect(state.battle!.volatile.player.protected).toBe(false);
+  });
+
+  it('hyper beam forces a recharge turn', () => {
+    const state = game(27);
+    const me = state.team[0];
+    me.level = 50;
+    me.exp = expForLevel('mediumSlow', 50);
+    me.hp = maxHp(me);
+    me.moves = [{ id: 'hyper-beam', pp: 5, maxPp: 5 }];
+    startWildBattle(state, 143, 60, seededRng(1));
+    const foe = state.battle!.enemyTeam[0];
+    foe.moves = [{ id: 'splash', pp: 40, maxPp: 40 }];
+    const rng = seededRng(5);
+    let ev = battleTurn(state, { kind: 'move', index: 0 }, rng);
+    for (let i = 0; i < 10 && !ev.some((e) => e.t === 'damage' && e.side === 'enemy'); i++) ev = battleTurn(state, { kind: 'move', index: 0 }, rng);
+    expect(state.battle!.volatile.player.recharge).toBe(true);
+    ev = battleTurn(state, { kind: 'move', index: 0 }, rng);
+    expect(ev.some((e) => e.t === 'msg' && e.text.includes('восстанавливает силы'))).toBe(true);
+  });
+
+  it('confusion can make a pokemon hit itself', () => {
+    const state = game(28);
+    const me = state.team[0];
+    me.moves = [{ id: 'confuse-ray', pp: 10, maxPp: 10 }];
+    startWildBattle(state, 19, 5, seededRng(2));
+    const foe = state.battle!.enemyTeam[0];
+    foe.moves = [{ id: 'tackle', pp: 35, maxPp: 35 }];
+    const rng = seededRng(11);
+    let confusedSeen = false;
+    for (let i = 0; i < 6 && state.battle!.phase === 'choose'; i++) {
+      const ev = battleTurn(state, { kind: 'move', index: 0 }, rng);
+      if (ev.some((e) => e.t === 'confuse' && e.side === 'enemy')) confusedSeen = true;
+    }
+    expect(confusedSeen).toBe(true);
   });
 
   it('switching costs a turn and resets stages', () => {

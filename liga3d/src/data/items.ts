@@ -47,12 +47,57 @@ const LIST: ItemData[] = [
   { id: 'leaf-stone', name: 'Листовой камень', kind: 'stone', price: 2100, icon: '#66bb6a', desc: 'Вызывает эволюцию некоторых травяных покемонов.' },
   { id: 'moon-stone', name: 'Лунный камень', kind: 'stone', price: 3000, icon: '#b0bec5', desc: 'Таинственный камень, вызывающий эволюцию.' },
 
+  { id: 'sun-stone', name: 'Солнечный камень', kind: 'stone', price: 3000, icon: '#ffb74d', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'shiny-stone', name: 'Сияющий камень', kind: 'stone', price: 3000, icon: '#e1f5fe', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'dusk-stone', name: 'Сумеречный камень', kind: 'stone', price: 3000, icon: '#5e35b1', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'dawn-stone', name: 'Рассветный камень', kind: 'stone', price: 3000, icon: '#4dd0e1', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'ice-stone', name: 'Ледяной камень', kind: 'stone', price: 3000, icon: '#b3e5fc', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'oval-stone', name: 'Овальный камень', kind: 'stone', price: 3000, icon: '#f5f5f5', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'metal-coat', name: 'Металлическое покрытие', kind: 'stone', price: 4500, icon: '#90a4ae', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'kings-rock', name: 'Королевский камень', kind: 'stone', price: 4500, icon: '#ffd54f', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'dragon-scale', name: 'Драконья чешуя', kind: 'stone', price: 4500, icon: '#7e57c2', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'up-grade', name: 'Апгрейд', kind: 'stone', price: 4500, icon: '#e57373', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'dubious-disc', name: 'Сомнительный диск', kind: 'stone', price: 4500, icon: '#ba68c8', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'protector', name: 'Протектор', kind: 'stone', price: 4500, icon: '#8d6e63', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'electirizer', name: 'Электризатор', kind: 'stone', price: 4500, icon: '#fdd835', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'magmarizer', name: 'Магмаризатор', kind: 'stone', price: 4500, icon: '#ff7043', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'reaper-cloth', name: 'Ткань жнеца', kind: 'stone', price: 4500, icon: '#5c6bc0', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'razor-claw', name: 'Острый коготь', kind: 'stone', price: 4500, icon: '#b0bec5', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'razor-fang', name: 'Острый клык', kind: 'stone', price: 4500, icon: '#eceff1', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'prism-scale', name: 'Призматическая чешуя', kind: 'stone', price: 4500, icon: '#f48fb1', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'whipped-dream', name: 'Взбитая мечта', kind: 'stone', price: 4500, icon: '#f8bbd0', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'sachet', name: 'Саше', kind: 'stone', price: 4500, icon: '#ce93d8', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'deep-sea-tooth', name: 'Глубоководный зуб', kind: 'stone', price: 4500, icon: '#80deea', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'deep-sea-scale', name: 'Глубоководная чешуя', kind: 'stone', price: 4500, icon: '#f48fb1', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'tart-apple', name: 'Кислое яблоко', kind: 'stone', price: 4500, icon: '#9ccc65', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'sweet-apple', name: 'Сладкое яблоко', kind: 'stone', price: 4500, icon: '#ef5350', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'syrupy-apple', name: 'Сиропное яблоко', kind: 'stone', price: 4500, icon: '#ffb300', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'cracked-pot', name: 'Треснутый чайник', kind: 'stone', price: 4500, icon: '#a1887f', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'galarica-cuff', name: 'Галарский браслет', kind: 'stone', price: 4500, icon: '#8bc34a', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'galarica-wreath', name: 'Галарский венок', kind: 'stone', price: 4500, icon: '#7cb342', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'auspicious-armor', name: 'Благоприятные доспехи', kind: 'stone', price: 4500, icon: '#ffca28', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'malicious-armor', name: 'Зловещие доспехи', kind: 'stone', price: 4500, icon: '#6a1b9a', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'black-augurite', name: 'Чёрный авгурит', kind: 'stone', price: 4500, icon: '#424242', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'peat-block', name: 'Торфяной брикет', kind: 'stone', price: 4500, icon: '#6d4c41', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'metal-alloy', name: 'Металлический сплав', kind: 'stone', price: 4500, icon: '#78909c', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'unremarkable-teacup', name: 'Невзрачная чашка', kind: 'stone', price: 4500, icon: '#a5d6a7', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'scroll-of-darkness', name: 'Свиток тьмы', kind: 'stone', price: 4500, icon: '#37474f', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'scroll-of-waters', name: 'Свиток вод', kind: 'stone', price: 4500, icon: '#4fc3f7', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'strawberry-sweet', name: 'Клубничная сладость', kind: 'stone', price: 4500, icon: '#ff8a80', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'soothe-bell', name: 'Колокольчик дружбы', kind: 'stone', price: 4500, icon: '#fff59d', desc: 'Вызывает эволюцию некоторых покемонов.' },
+  { id: 'linking-cord', name: 'Шнур связи', kind: 'stone', price: 4500, icon: '#81d4fa', desc: 'Вызывает эволюцию некоторых покемонов.' },
+
   { id: 'old-rod', name: 'Старая удочка', kind: 'rod', price: 1500, rod: 1, icon: '#8d6e63', desc: 'Позволяет рыбачить на водоёмах.' },
   { id: 'good-rod', name: 'Хорошая удочка', kind: 'rod', price: 8000, rod: 2, icon: '#5d4037', desc: 'Ловит более редких водных покемонов.' },
 ];
 
 export const ITEMS: Record<string, ItemData> = Object.fromEntries(LIST.map((i) => [i.id, i]));
 export const ITEM_LIST = LIST;
+
+/** Item picture from the PokeAPI sprite repository (loaded by the player's browser). */
+export function itemIconUrl(id: string): string {
+  return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/${id}.png`;
+}
 
 export function getItem(id: string): ItemData {
   const it = ITEMS[id];
@@ -66,7 +111,7 @@ export const KIND_LABELS: Record<ItemKind, string> = {
   status: 'От статусов',
   revive: 'Оживление',
   pp: 'PP',
-  stone: 'Камни эволюции',
+  stone: 'Предметы эволюции',
   rod: 'Удочки',
   key: 'Особые',
 };

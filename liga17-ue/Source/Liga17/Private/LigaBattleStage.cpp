@@ -185,7 +185,7 @@ bool ALigaBattleStage::SetupModel(int32 Side, const FLigaPokemon& Pk)
 		M.IdleAnim = LoadAnim(Def->Idle);
 		M.AttackAnim = LoadAnim(Def->Attack);
 		M.FaintAnim = LoadAnim(Def->Faint);
-		if (M.IdleAnim) M.Skel->PlayAnimation(M.IdleAnim, true);
+		if (M.IdleAnim) M.Skel->PlayAnimation(M.IdleAnim.Get(), true);
 		B = SK->GetBounds();
 		M.bSkeletal = true;
 	}
@@ -227,7 +227,7 @@ void ALigaBattleStage::Animate(int32 Side, FName Anim)
 	{
 		UAnimSequence* Clip = Anim == TEXT("attack") ? M.AttackAnim.Get() : Anim == TEXT("faint") ? M.FaintAnim.Get() : nullptr;
 		if (Clip) M.Skel->PlayAnimation(Clip, false);
-		else if (M.IdleAnim && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim, true);
+		else if (M.IdleAnim && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim.Get(), true);
 	}
 }
 
@@ -446,7 +446,7 @@ void ALigaBattleStage::UpdateMon(int32 Side, float Dt)
 		C->SetWorldLocation(M.Home + Offset + FVector(0, 0, M.ModelLift * S) - Rot.RotateVector(M.ModelCenter * S));
 		C->SetWorldScale3D(FVector(S, S, S * Breath));
 		C->SetWorldRotation(Rot);
-		if (M.bSkeletal && M.IdleAnim && M.Anim != TEXT("faint") && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim, true);
+		if (M.bSkeletal && M.IdleAnim && M.Anim != TEXT("faint") && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim.Get(), true);
 		return;
 	}
 	const bool bVisible = M.bHasTexture && !bGone;

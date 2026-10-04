@@ -78,7 +78,7 @@ void LigaVisuals::SetupBody(ACharacter* Character, USkeletalMeshComponent* VrmMe
 		if (Rtg.IsEmpty())
 		{
 			// VRM4U puts RTG_<file name> next to the asset list.
-			const FString Folder = FPackageName::GetLongPackagePath(AssetList->GetOutermost()->GetName());
+			const FString Folder = FPackageName::GetLongPackagePath(AssetList->GetPackage()->GetName());
 			FString Base = AssetList->GetName();
 			if (FStrProperty* P = FindFProperty<FStrProperty>(AssetList->GetClass(), TEXT("BaseFileName")))
 			{

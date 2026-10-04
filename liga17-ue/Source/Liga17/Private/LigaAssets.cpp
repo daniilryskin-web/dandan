@@ -105,7 +105,7 @@ void FLigaAssets::Load()
 
 const FLigaModel3D* FLigaAssets::FindModel3D(int32 Species, bool bShiny) const
 {
-	return Pokemon3D.Find(FString::Printf(bShiny ? TEXT("%ds") : TEXT("%d"), Species));
+	return Pokemon3D.Find(bShiny ? FString::Printf(TEXT("%ds"), Species) : FString::Printf(TEXT("%d"), Species));
 }
 
 UStaticMesh* FLigaAssets::KitMesh(const FString& Name) const

@@ -1,7 +1,10 @@
 ﻿#include "LigaBattleStage.h"
 
+#include "Animation/AnimSequence.h"
 #include "Camera/CameraComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
@@ -42,6 +45,19 @@ ALigaBattleStage::ALigaBattleStage()
 		M->SetCastShadow(true);
 		M->bCastHiddenShadow = false;
 		Mons[i].Mesh = M;
+
+		USkeletalMeshComponent* S = CreateDefaultSubobject<USkeletalMeshComponent>(i == 0 ? TEXT("PlayerModel") : TEXT("EnemyModel"));
+		S->SetupAttachment(Root);
+		S->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		S->SetVisibility(false);
+		S->bCastHiddenShadow = false;
+		Mons[i].Skel = S;
+		UStaticMeshComponent* SM = CreateDefaultSubobject<UStaticMeshComponent>(i == 0 ? TEXT("PlayerModelStatic") : TEXT("EnemyModelStatic"));
+		SM->SetupAttachment(Root);
+		SM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		SM->SetVisibility(false);
+		SM->bCastHiddenShadow = false;
+		Mons[i].Static = SM;
 	}
 	Ball = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Ball"));
 	Ball->SetupAttachment(Root);
@@ -147,6 +163,50 @@ void ALigaBattleStage::SetupMon(int32 Side, const FLigaPokemon& Pk, const FVecto
 	}
 	ShownHp[Side] = TargetHp[Side] = Pk.HP;
 	ShownStatus[Side] = Pk.GetStatus();
+	SetupModel(Side, Pk);
+}
+
+bool ALigaBattleStage::SetupModel(int32 Side, const FLigaPokemon& Pk)
+{
+	FLigaBillboard& M = Mons[Side];
+	M.bModel = M.bSkeletal = false;
+	M.IdleAnim = M.AttackAnim = M.FaintAnim = nullptr;
+	M.Skel->SetVisibility(false);
+	M.Static->SetVisibility(false);
+	const FLigaModel3D* Def = FLigaAssets::Get().FindModel3D(Pk.Species, Pk.bShiny);
+	if (!Def) return false;
+	UObject* Obj = LoadObject<UObject>(nullptr, *Def->Mesh, nullptr, LOAD_NoWarn | LOAD_Quiet);
+	FBoxSphereBounds B(ForceInit);
+	if (USkeletalMesh* SK = Cast<USkeletalMesh>(Obj))
+	{
+		M.Skel->SetSkeletalMesh(SK);
+		M.Skel->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+		auto LoadAnim = [](const FString& Path) { return Path.IsEmpty() ? nullptr : LoadObject<UAnimSequence>(nullptr, *Path, nullptr, LOAD_NoWarn | LOAD_Quiet); };
+		M.IdleAnim = LoadAnim(Def->Idle);
+		M.AttackAnim = LoadAnim(Def->Attack);
+		M.FaintAnim = LoadAnim(Def->Faint);
+		if (M.IdleAnim) M.Skel->PlayAnimation(M.IdleAnim, true);
+		B = SK->GetBounds();
+		M.bSkeletal = true;
+	}
+	else if (UStaticMesh* SM = Cast<UStaticMesh>(Obj))
+	{
+		M.Static->SetStaticMesh(SM);
+		B = SM->GetBounds();
+	}
+	else
+	{
+		return false;
+	}
+	// Fit the model to the same size the picture would have: by height, and not wider than the stage allows.
+	const float H = FMath::Max(1.f, B.BoxExtent.Z * 2.f);
+	const float W = FMath::Max(1.f, FMath::Max(B.BoxExtent.X, B.BoxExtent.Y) * 2.f);
+	M.ModelScale = FMath::Min(M.Height * 0.8f / H, M.Height * 1.5f / W);
+	M.ModelLift = -(B.Origin.Z - B.BoxExtent.Z);
+	M.ModelCenter = FVector(B.Origin.X, B.Origin.Y, 0.f);
+	M.bModel = true;
+	M.Mesh->SetVisibility(false);
+	return true;
 }
 
 void ALigaBattleStage::SetMonTexture(int32 Side, UTexture2D* Tex)
@@ -160,8 +220,15 @@ void ALigaBattleStage::SetMonTexture(int32 Side, UTexture2D* Tex)
 
 void ALigaBattleStage::Animate(int32 Side, FName Anim)
 {
-	Mons[Side].Anim = Anim;
-	Mons[Side].AnimTime = 0.f;
+	FLigaBillboard& M = Mons[Side];
+	M.Anim = Anim;
+	M.AnimTime = 0.f;
+	if (M.bModel && M.bSkeletal)
+	{
+		UAnimSequence* Clip = Anim == TEXT("attack") ? M.AttackAnim.Get() : Anim == TEXT("faint") ? M.FaintAnim.Get() : nullptr;
+		if (Clip) M.Skel->PlayAnimation(Clip, false);
+		else if (M.IdleAnim && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim, true);
+	}
 }
 
 void ALigaBattleStage::Play(const TArray<FLigaBattleEvent>& Events)
@@ -175,7 +242,7 @@ void ALigaBattleStage::AddPopup(int32 Side, const FString& Text, const FLinearCo
 	FLigaPopup& P = Popups.AddDefaulted_GetRef();
 	P.Text = Text;
 	P.Color = Color;
-	P.World = Mons[Side].Mesh->GetComponentLocation() + FVector(0, 0, Mons[Side].Height + 30.f);
+	P.World = Mons[Side].Home + FVector(0, 0, Mons[Side].Height + 30.f);
 }
 
 void ALigaBattleStage::NextEvent()
@@ -364,6 +431,24 @@ void ALigaBattleStage::UpdateMon(int32 Side, float Dt)
 		Flash = 1.f;
 	}
 	const bool bGone = M.Anim == TEXT("hidden") || (M.Anim == TEXT("faint") && T >= 0.75f) || (M.Anim == TEXT("capture") && T >= 0.4f);
+	if (M.bModel)
+	{
+		// 3D model: same motion as the picture; blinks when hit, breathes a little, faces its opponent.
+		USceneComponent* C = M.bSkeletal ? static_cast<USceneComponent*>(M.Skel.Get()) : static_cast<USceneComponent*>(M.Static.Get());
+		const bool bBlink = M.Anim == TEXT("hit") && Flash > 0.f;
+		const bool bShow = !bGone && !bBlink;
+		if (C->IsVisible() != bShow) C->SetVisibility(bShow);
+		if (M.Mesh->IsVisible()) M.Mesh->SetVisibility(false);
+		const float S = M.ModelScale * Scale;
+		const float Breath = 1.f + 0.015f * FMath::Sin(Time * 2.4f + Side * 1.7f);
+		// Imported glTF models face +Y in their own space.
+		const FRotator Rot(0.f, Toward.Rotation().Yaw - 90.f, 0.f);
+		C->SetWorldLocation(M.Home + Offset + FVector(0, 0, M.ModelLift * S) - Rot.RotateVector(M.ModelCenter * S));
+		C->SetWorldScale3D(FVector(S, S, S * Breath));
+		C->SetWorldRotation(Rot);
+		if (M.bSkeletal && M.IdleAnim && M.Anim != TEXT("faint") && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim, true);
+		return;
+	}
 	const bool bVisible = M.bHasTexture && !bGone;
 	if (M.Mesh->IsVisible() != bVisible) M.Mesh->SetVisibility(bVisible);
 	M.Mesh->SetWorldLocation(M.Home + Offset);

@@ -10,6 +10,15 @@ class USkeletalMesh;
 class UObject;
 class FJsonObject;
 
+/** A 3D Pokémon model imported by Content/Python/liga_pokemon3d.py (skeletal or static mesh + optional animations). */
+struct FLigaModel3D
+{
+	FString Mesh;
+	FString Idle;
+	FString Attack;
+	FString Faint;
+};
+
 struct LIGA17_API FLigaAssets
 {
 	static const FLigaAssets& Get();
@@ -22,6 +31,10 @@ struct LIGA17_API FLigaAssets
 	TMap<FString, FString> NpcVrm;     // NPC id (or look) -> VrmAssetListObject
 	TMap<FString, FString> NpcRtg;     // NPC id (or look) -> IK retargeter
 	TMap<FString, FString> Kit;        // kit asset name -> static mesh path
+	TMap<FString, FLigaModel3D> Pokemon3D;  // "25" (regular) or "25s" (shiny) -> model
+
+	/** The model for a species, or null (the battle then shows the HOME picture). Shiny ones need their own model. */
+	const FLigaModel3D* FindModel3D(int32 Species, bool bShiny) const;
 
 	UStaticMesh* KitMesh(const FString& Name) const;
 	UMaterialInterface* LoadBillboardMaterial() const;

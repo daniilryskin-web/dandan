@@ -7,8 +7,10 @@
 #include "LigaBattle.h"
 #include "LigaBattleStage.generated.h"
 
+class UAnimSequence;
 class UCameraComponent;
 class UMaterialInstanceDynamic;
+class USkeletalMeshComponent;
 class UProceduralMeshComponent;
 class UStaticMeshComponent;
 class UTexture2D;
@@ -20,6 +22,18 @@ struct FLigaBillboard
 
 	UPROPERTY() TObjectPtr<UProceduralMeshComponent> Mesh;
 	UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> Mat;
+	// 3D model (when imported for this species); the picture quad is hidden then.
+	UPROPERTY() TObjectPtr<USkeletalMeshComponent> Skel;
+	UPROPERTY() TObjectPtr<UStaticMeshComponent> Static;
+	UPROPERTY() TObjectPtr<UAnimSequence> IdleAnim;
+	UPROPERTY() TObjectPtr<UAnimSequence> AttackAnim;
+	UPROPERTY() TObjectPtr<UAnimSequence> FaintAnim;
+	bool bModel = false;
+	bool bSkeletal = false;
+	float ModelScale = 1.f;
+	float ModelLift = 0.f;
+	/** Horizontal centre of the model's bounds in its own space (models are often not centred on their origin). */
+	FVector ModelCenter = FVector::ZeroVector;
 	FVector Home = FVector::ZeroVector;
 	float Height = 100.f;
 	int32 Species = 0;
@@ -100,6 +114,7 @@ private:
 	FVector GroundAt(const FVector& P) const;
 	void SetupMon(int32 Side, const FLigaPokemon& P, const FVector& Where);
 	void SetMonTexture(int32 Side, UTexture2D* Tex);
+	bool SetupModel(int32 Side, const FLigaPokemon& P);
 	void Animate(int32 Side, FName Anim);
 	void UpdateMon(int32 Side, float Dt);
 	void UpdateCamera(float Dt);

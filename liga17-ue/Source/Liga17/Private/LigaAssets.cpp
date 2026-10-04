@@ -87,6 +87,25 @@ void FLigaAssets::Load()
 	{
 		for (const auto& KV : (*Obj)->Values) Kit.Add(LigaJsonKey(KV.Key), KV.Value->AsString());
 	}
+	if (Root->TryGetObjectField(TEXT("pokemon3d"), Obj))
+	{
+		for (const auto& KV : (*Obj)->Values)
+		{
+			const TSharedPtr<FJsonObject> M = KV.Value->AsObject();
+			if (!M) continue;
+			FLigaModel3D D;
+			M->TryGetStringField(TEXT("mesh"), D.Mesh);
+			M->TryGetStringField(TEXT("idle"), D.Idle);
+			M->TryGetStringField(TEXT("attack"), D.Attack);
+			M->TryGetStringField(TEXT("faint"), D.Faint);
+			if (!D.Mesh.IsEmpty()) Pokemon3D.Add(LigaJsonKey(KV.Key), D);
+		}
+	}
+}
+
+const FLigaModel3D* FLigaAssets::FindModel3D(int32 Species, bool bShiny) const
+{
+	return Pokemon3D.Find(FString::Printf(bShiny ? TEXT("%ds") : TEXT("%d"), Species));
 }
 
 UStaticMesh* FLigaAssets::KitMesh(const FString& Name) const

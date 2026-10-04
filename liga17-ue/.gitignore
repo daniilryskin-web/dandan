@@ -19,6 +19,9 @@ Content/Liga/Materials/
 Content/Liga/Town/
 Content/Liga/Maps/
 Content/Liga/Data/assets.json
+Content/Liga/Pokemon/
+# Python packages the setup installs for 3D-model conversion (numpy, DracoPy, Pillow)
+Content/Python/Lib/
 Content/Characters/
 Content/ThirdPerson/
 Content/LevelPrototyping/

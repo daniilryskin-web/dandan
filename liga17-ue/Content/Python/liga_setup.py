@@ -7,6 +7,7 @@ What it does:
   2. builds materials: wind-animated foliage, vertex-colour terrain blend, sea, Pokémon billboard;
   3. finds the Third Person mannequin; downloads the anime (VRoid, CC0) cast listed in ArtSource/Characters/cast.json
      and imports it with the VRM4U plugin (your own <Role>.vrm in that folder replaces a model);
+     downloads 3D models of the Pokémon the game can show (liga_pokemon3d.py) — on this computer only;
   4. creates /Game/Liga/Maps/PalletTown, imports the town scene into it, adds sky, sun, clouds, fog;
   5. writes Content/Liga/Data/assets.json for the game code and saves everything.
 Safe to run again: it rebuilds the level and replaces imported assets.
@@ -542,6 +543,24 @@ def import_characters():
     return result
 
 
+@step('3D-покемоны')
+def import_pokemon3d():
+    """3D models for the Pokémon in the game (starters, Route 1, Pikachu and Eevee lines), see liga_pokemon3d.py."""
+    import importlib
+    import sys
+    here = os.path.join(PROJECT, 'Content', 'Python')
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import liga_pokemon3d
+    importlib.reload(liga_pokemon3d)
+    ids = liga_pokemon3d.GAME_SPECIES
+    with unreal.ScopedSlowTask(len(ids), '3D-покемоны') as task:
+        task.make_dialog(True)
+        models = liga_pokemon3d.import_species(ids, True, log, warn, task)
+    log(f'3D-покемоны: моделей {len(models)} (остальные покемоны — картинками)')
+    return models
+
+
 # ——— level ———
 
 def spawn(cls, loc, rot=None):
@@ -698,8 +717,14 @@ def finish_level(terrain_mat, sea_mat):
     log('уровень сохранён')
 
 
-def write_assets_json(meshes, chars, billboard):
+def write_assets_json(meshes, chars, billboard, models3d=None):
+    old = {}
+    path = os.path.join(DATA, 'assets.json')
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            old = json.load(f)
     data = dict(chars or {})
+    data['pokemon3d'] = dict(old.get('pokemon3d', {}), **(models3d or {}))  # keeps models added by liga_pokemon3d_all.py
     data['kit'] = {k: sm.get_path_name() for k, sm in (meshes or {}).items()}
     data['billboard_material'] = billboard.get_path_name() if billboard else ''
     os.makedirs(DATA, exist_ok=True)
@@ -742,7 +767,7 @@ def main():
     src_layout = os.path.join(EXPORTS, 'layout.json')
     if os.path.exists(src_layout):
         shutil.copyfile(src_layout, os.path.join(DATA, 'layout.json'))
-    with unreal.ScopedSlowTask(7, 'Лига 17: настройка проекта') as task:
+    with unreal.ScopedSlowTask(8, 'Лига 17: настройка проекта') as task:
         task.make_dialog(True)
         task.enter_progress_frame(1, 'Текстуры')
         textures = import_textures() or {}
@@ -758,7 +783,9 @@ def main():
         chars = find_characters() or {}
         task.enter_progress_frame(1, 'Аниме-персонажи (первый раз — несколько минут)')
         chars.update(import_characters() or {})
-        write_assets_json(meshes, chars, billboard)
+        task.enter_progress_frame(1, '3D-покемоны')
+        models3d = import_pokemon3d() or {}
+        write_assets_json(meshes, chars, billboard, models3d)
         task.enter_progress_frame(1, 'Уровень')
         open_fresh_level()
 

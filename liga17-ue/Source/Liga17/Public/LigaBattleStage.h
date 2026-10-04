@@ -28,6 +28,8 @@ struct FLigaBillboard
 	UPROPERTY() TObjectPtr<UAnimSequence> IdleAnim;
 	UPROPERTY() TObjectPtr<UAnimSequence> AttackAnim;
 	UPROPERTY() TObjectPtr<UAnimSequence> FaintAnim;
+	UPROPERTY() TObjectPtr<UAnimSequence> PoseAnim;
+	bool bPosed = false;
 	bool bModel = false;
 	bool bSkeletal = false;
 	float ModelScale = 1.f;

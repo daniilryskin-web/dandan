@@ -38,7 +38,8 @@ KIT_PATH = ROOT + '/Kit'
 MAT_PATH = ROOT + '/Materials'
 TOWN_PATH = ROOT + '/Town'
 MAP_PATH = ROOT + '/Maps/PalletTown'
-VRM_ROOT = '/Game/Characters/VRM'
+VRM_ROOT = '/Game/Characters/VRoid'   # imported with animation retargeters (ULigaEditorTools)
+VRM_ROOT_PLAIN = '/Game/Characters/VRM'  # earlier imports without retargeters; also used when the C++ helper is missing
 
 asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 eal = unreal.EditorAssetLibrary
@@ -507,7 +508,8 @@ def save_char_state(state):
 
 @step('аниме-персонажи (VRoid)')
 def import_characters():
-    """Downloads the cast from cast.json and imports each model with VRM4U into /Game/Characters/VRM/<Name>/.
+    """Downloads the cast from cast.json and imports each model with VRM4U into /Game/Characters/VRoid/<Name>/,
+    together with the IK retargeter from the UE5 mannequin (needs the C++ helper ULigaEditorTools).
     A model is re-imported only when its file changed, so running the setup again is quick."""
     result = {'player_vrm': '', 'player_rtg': '', 'npc_vrm': {}, 'npc_rtg': {}}
     if not hasattr(unreal, 'VrmImporterBPFunctionLibrary'):
@@ -529,6 +531,12 @@ def import_characters():
     if not can_import:
         warn('плагин VRM4U устарел: в его версии есть ошибка, из-за которой падал редактор. Новые персонажи не импортируются, '
              f'пока его не обновить: {VRM4U_URL} (инструкция — в Docs/README_RU.md)')
+    tools = getattr(unreal, 'LigaEditorTools', None)
+    with_rtg = bool(tools) and tools.can_import_vrm_with_retargeter()
+    root = VRM_ROOT if with_rtg else VRM_ROOT_PLAIN
+    if not with_rtg:
+        warn('проект собран без VRM4U, поэтому персонажи импортируются без ретаргетера анимаций. Закройте Unreal, '
+             'откройте Liga17.uproject и согласитесь пересобрать проект (плагин должен лежать в Plugins/VRM4U), затем запустите настройку ещё раз')
     imported, ready = 0, 0
     with unreal.ScopedSlowTask(len(cast), 'Аниме-персонажи') as task:
         task.make_dialog(True)
@@ -537,7 +545,7 @@ def import_characters():
                 file = info['file']
                 name = os.path.splitext(file)[0]
                 path = os.path.join(CHARACTERS, file)
-                folder = f'{VRM_ROOT}/{name}'
+                folder = f'{root}/{name}'
                 task.enter_progress_frame(1, f'{name}: {info.get("source", "")}')
                 if not os.path.exists(path):
                     if not info.get('url'):
@@ -569,7 +577,10 @@ def import_characters():
                     os.makedirs(os.path.dirname(CHAR_GUARD), exist_ok=True)
                     with open(CHAR_GUARD, 'w', encoding='utf-8') as f:
                         json.dump({'role': role, 'sha': sha}, f)
-                    obj = unreal.VrmImporterBPFunctionLibrary.import_vrm_file_with_options(path, f'{folder}/{name}', opts)
+                    if with_rtg:
+                        obj = tools.import_vrm_with_retargeter(path, f'{folder}/{name}', True)
+                    else:
+                        obj = unreal.VrmImporterBPFunctionLibrary.import_vrm_file_with_options(path, f'{folder}/{name}', opts)
                     os.remove(CHAR_GUARD)
                     if obj is None:
                         warn(f'{file}: VRM4U не смог импортировать модель')
@@ -592,6 +603,9 @@ def import_characters():
                 warn(f'{info.get("file")}: {e}')
 
     save_char_state(state)
+    if with_rtg and ready == len(cast) and eal.does_directory_exist(VRM_ROOT_PLAIN):
+        ok = eal.delete_directory(VRM_ROOT_PLAIN)  # the old imports without retargeters; Unreal refuses while they are loaded
+        log(f'старые персонажи {VRM_ROOT_PLAIN}: ' + ('удалены' if ok else 'пока не удалось удалить (попробую в следующий раз)'))
     no_rtg = [r for r, v in result['npc_rtg'].items() if not v] + (['player'] if result['player_vrm'] and not result['player_rtg'] else [])
     log(f'аниме-персонажи: готово {ready} из {len(cast)} (импортировано сейчас: {imported})')
     if no_rtg:
@@ -599,16 +613,26 @@ def import_characters():
     return result
 
 
+_P3D = []
+
+
+def pokemon3d_module():
+    """liga_pokemon3d.py, freshly loaded once per run (the editor keeps Python modules between runs)."""
+    if not _P3D:
+        import importlib
+        import sys
+        here = os.path.join(PROJECT, 'Content', 'Python')
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import liga_pokemon3d
+        _P3D.append(importlib.reload(liga_pokemon3d))
+    return _P3D[0]
+
+
 @step('3D-покемоны')
 def import_pokemon3d():
     """3D models for the Pokémon in the game (starters, Route 1, Pikachu and Eevee lines), see liga_pokemon3d.py."""
-    import importlib
-    import sys
-    here = os.path.join(PROJECT, 'Content', 'Python')
-    if here not in sys.path:
-        sys.path.insert(0, here)
-    import liga_pokemon3d
-    importlib.reload(liga_pokemon3d)
+    liga_pokemon3d = pokemon3d_module()
     ids = liga_pokemon3d.GAME_SPECIES
     with unreal.ScopedSlowTask(len(ids), '3D-покемоны') as task:
         task.make_dialog(True)
@@ -780,7 +804,11 @@ def write_assets_json(meshes, chars, billboard, models3d=None):
         with open(path, encoding='utf-8') as f:
             old = json.load(f)
     data = dict(chars or {})
-    data['pokemon3d'] = dict(old.get('pokemon3d', {}), **(models3d or {}))  # keeps models added by liga_pokemon3d_all.py
+    try:  # keeps models added by liga_pokemon3d_all.py, but not those of an older converter (they may be broken)
+        kept = pokemon3d_module().current_entries(old.get('pokemon3d'))
+    except Exception:
+        kept = {}
+    data['pokemon3d'] = dict(kept, **(models3d or {}))
     data['kit'] = {k: sm.get_path_name() for k, sm in (meshes or {}).items()}
     data['billboard_material'] = billboard.get_path_name() if billboard else ''
     os.makedirs(DATA, exist_ok=True)

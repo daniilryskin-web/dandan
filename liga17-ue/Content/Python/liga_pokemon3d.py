@@ -27,7 +27,6 @@ import unreal
 
 COMMIT = '429de1288cea0d43f5b4f56305d2276e94239d65'
 BASE = f'https://raw.githubusercontent.com/Pokemon-3D-api/assets/{COMMIT}/models/opt'
-DEST = '/Game/Liga/Pokemon'
 
 # Starters with evolutions, Route 1, and Pikachu/Eevee lines.
 GAME_SPECIES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 133, 134, 135, 136]
@@ -36,8 +35,11 @@ PROJECT = os.path.abspath(unreal.Paths.convert_relative_path_to_full(unreal.Path
 CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')
 SITE = os.path.join(PROJECT, 'Content', 'Python', 'Lib', 'site-packages')
 
-# Bump when convert() changes: models imported by an older converter are deleted and imported again.
-CONVERTER_VERSION = 3
+# Bump when convert() changes: models are imported again into a new folder, and the old folders are deleted.
+CONVERTER_VERSION = 4
+DEST_ROOT = '/Game/Liga/Pokemon3D'
+DEST = f'{DEST_ROOT}/V{CONVERTER_VERSION}'
+OLD_DESTS = ['/Game/Liga/Pokemon']  # converter versions 1–3
 VERSION_FILE = os.path.join(CACHE, 'converter_version.txt')
 GUARD = os.path.join(CACHE, 'importing.json')   # the model being imported right now
 SKIP = os.path.join(CACHE, 'skip.json')         # models that crashed the editor once: they keep their picture
@@ -306,11 +308,34 @@ def _sanitize_transforms(gltf, views, add_view):
             gltf.pop('animations')
 
 
+def _set_attribute(gltf, add_view, prim, name, values):
+    """Stores float VEC3 data as a new accessor for prim's attribute `name`."""
+    import numpy as np
+    v = np.ascontiguousarray(values, dtype=np.float32)
+    acc = {'bufferView': add_view(v.tobytes(), 34962), 'byteOffset': 0, 'componentType': 5126, 'count': int(len(v)), 'type': 'VEC3'}
+    if name == 'POSITION':
+        acc['min'], acc['max'] = [float(x) for x in v.min(axis=0)], [float(x) for x in v.max(axis=0)]
+    gltf['accessors'].append(acc)
+    prim['attributes'][name] = len(gltf['accessors']) - 1
+
+
+def _bake_transform(gltf, views, add_view, prim, m):
+    """Moves a static primitive's vertices by the 4x4 matrix m."""
+    import numpy as np
+    if np.allclose(m, np.eye(4), atol=1e-7):
+        return
+    pos = _accessor(gltf, views, prim['attributes']['POSITION']).astype(np.float64)
+    _set_attribute(gltf, add_view, prim, 'POSITION', pos @ m[:3, :3].T + m[:3, 3])
+    if 'NORMAL' in prim['attributes']:
+        nrm = _accessor(gltf, views, prim['attributes']['NORMAL']).astype(np.float64) @ np.linalg.inv(m[:3, :3])
+        _set_attribute(gltf, add_view, prim, 'NORMAL', nrm / np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-12))
+    prim['attributes'].pop('TANGENT', None)
+
+
 def _merge_meshes(gltf, views, add_view):
     """Unreal makes a separate asset of every mesh in a glTF, and the battle shows one of them. Pokémon made of several
     meshes (eyes, wings, flames — Pikachu, Charizard, Eevee…) would lose all parts but one, so they become one mesh.
     Skinned parts are placed by their joints (the node transform does not count), static parts get it baked in."""
-    import numpy as np
     nodes = gltf.get('nodes', [])
     holders = [i for i, n in enumerate(nodes) if 'mesh' in n]
     if len(holders) < 2 or len({nodes[i].get('skin') for i in holders}) != 1:
@@ -321,22 +346,8 @@ def _merge_meshes(gltf, views, add_view):
         m = None if skinned else _world_matrix(gltf, i)
         for prim in gltf['meshes'][nodes[i]['mesh']]['primitives']:
             prim = json.loads(json.dumps(prim))
-            if m is not None and not np.allclose(m, np.eye(4)):
-                for name in ('POSITION', 'NORMAL'):
-                    if name in prim['attributes']:
-                        v = _accessor(gltf, views, prim['attributes'][name]).astype(np.float64)
-                        if name == 'POSITION':
-                            v = v @ m[:3, :3].T + m[:3, 3]
-                        else:
-                            v = v @ np.linalg.inv(m[:3, :3])
-                            v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
-                        v = np.ascontiguousarray(v, dtype=np.float32)
-                        acc = {'bufferView': add_view(v.tobytes(), 34962), 'byteOffset': 0, 'componentType': 5126, 'count': int(len(v)), 'type': 'VEC3'}
-                        if name == 'POSITION':
-                            acc['min'], acc['max'] = [float(x) for x in v.min(axis=0)], [float(x) for x in v.max(axis=0)]
-                        gltf['accessors'].append(acc)
-                        prim['attributes'][name] = len(gltf['accessors']) - 1
-                prim['attributes'].pop('TANGENT', None)
+            if m is not None:
+                _bake_transform(gltf, views, add_view, prim, m)
             prims.append(prim)
     gltf['meshes'].append({'name': gltf['meshes'][nodes[holders[0]]['mesh']].get('name', 'Body'), 'primitives': prims})
     merged = len(gltf['meshes']) - 1
@@ -349,6 +360,312 @@ def _merge_meshes(gltf, views, add_view):
     else:
         nodes.append({'name': 'Body', 'mesh': merged})
         gltf['scenes'][gltf.get('scene', 0)]['nodes'].append(len(nodes) - 1)
+
+
+def _quat_from_matrix(r):
+    import numpy as np
+    t = np.trace(r)
+    if t > 0:
+        k = 0.5 / np.sqrt(t + 1.0)
+        q = [(r[2, 1] - r[1, 2]) * k, (r[0, 2] - r[2, 0]) * k, (r[1, 0] - r[0, 1]) * k, 0.25 / k]
+    else:
+        i = int(np.argmax([r[0, 0], r[1, 1], r[2, 2]]))
+        j, k_ = (i + 1) % 3, (i + 2) % 3
+        sq = np.sqrt(max(1.0 + r[i, i] - r[j, j] - r[k_, k_], 1e-12)) * 2
+        q = [0.0, 0.0, 0.0, (r[k_, j] - r[j, k_]) / sq]
+        q[i] = 0.25 * sq
+        q[j] = (r[j, i] + r[i, j]) / sq
+        q[k_] = (r[k_, i] + r[i, k_]) / sq
+    q = np.array(q)
+    return q / np.linalg.norm(q)
+
+
+def _quat_mul(a, b):
+    """Hamilton product of xyzw quaternions; b may be an (n, 4) array."""
+    import numpy as np
+    b = np.asarray(b, dtype=np.float64)
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return np.stack([aw * bx + ax * bw + ay * bz - az * by,
+                     aw * by - ax * bz + ay * bw + az * bx,
+                     aw * bz + ax * by - ay * bx + az * bw,
+                     aw * bw - ax * bx - ay * by - az * bz], axis=-1)
+
+
+def _similarity(m):
+    """(rotation 3x3, uniform scale) of a 4x4 matrix without shear or non-uniform scale, else None."""
+    import numpy as np
+    det = np.linalg.det(m[:3, :3])
+    if not np.isfinite(det) or abs(det) < 1e-12:
+        return None
+    s = float(np.cbrt(det))
+    rot = m[:3, :3] / s
+    if not np.allclose(rot @ rot.T, np.eye(3), atol=1e-4):
+        return None
+    return rot, s
+
+
+def _canonicalize(gltf, views, add_view):
+    """One layout that every glTF importer reads the same way. The source files differ a lot: two or three root bones
+    (Charmander, Pidgey…), a model turned or scaled by plain nodes above the skeleton or by the mesh node itself, a bind
+    pose that differs from the rest pose. Unreal read some of that differently from the glTF rules — Pokémon came out
+    upside down or twisted. After this the skeleton has a single root bone at the scene root, the mesh node has no
+    transform, and the vertices are stored in the rest pose (bind pose = rest pose). What you see does not change."""
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    holders = [i for i, n in enumerate(nodes) if 'mesh' in n]
+    if len(holders) != 1:
+        return
+    mi = holders[0]
+    parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', [])}
+    skins = gltf.get('skins', [])
+    scene = gltf['scenes'][gltf.get('scene', 0)]
+
+    def keep_only(keep, roots):
+        """Drops every node outside `keep` and renumbers the references."""
+        index = {old: new for new, old in enumerate(sorted(keep))}
+        gltf['nodes'] = [nodes[i] for i in sorted(keep)]
+        for n in gltf['nodes']:
+            kids = [index[c] for c in n.get('children', []) if c in index]
+            if kids:
+                n['children'] = kids
+            else:
+                n.pop('children', None)
+        for skin in gltf.get('skins', []):
+            skin['joints'] = [index[j] for j in skin['joints']]
+            if 'skeleton' in skin:
+                skin['skeleton'] = index[skin['skeleton']]
+        for anim in gltf.get('animations', []):
+            used, samplers, channels = {}, [], []
+            for ch in anim['channels']:
+                if ch['target']['node'] not in index:
+                    continue
+                si = ch['sampler']
+                if si not in used:
+                    used[si] = len(samplers)
+                    samplers.append(anim['samplers'][si])
+                channels.append(dict(ch, sampler=used[si], target=dict(ch['target'], node=index[ch['target']['node']])))
+            anim['samplers'], anim['channels'] = samplers, channels
+        gltf['animations'] = [a for a in gltf.get('animations', []) if a['channels']]
+        if not gltf['animations']:
+            gltf.pop('animations')
+        gltf['scenes'] = [{'name': scene.get('name', 'Scene'), 'nodes': [index[r] for r in roots]}]
+        gltf['scene'] = 0
+
+    if 'skin' not in nodes[mi] or len(skins) != 1:
+        # static model: the node transforms go into the vertices
+        world = _world_matrix(gltf, mi)
+        for prim in gltf['meshes'][nodes[mi]['mesh']]['primitives']:
+            _bake_transform(gltf, views, add_view, prim, world)
+        for k in ('translation', 'rotation', 'scale', 'matrix', 'children', 'skin'):
+            nodes[mi].pop(k, None)
+        keep_only({mi}, [mi])
+        return
+
+    skin = skins[0]
+    joints = list(skin['joints'])
+    old_count = len(joints)
+    jset = set(joints)
+    for j in list(joints):  # plain nodes between two bones become bones too
+        path, p = [], parent.get(j)
+        while p is not None and p not in jset:
+            path.append(p)
+            p = parent.get(p)
+        if p is not None:
+            for q in path:
+                if q not in jset:
+                    joints.append(q)
+                    jset.add(q)
+    if mi in jset or any('matrix' in nodes[j] for j in joints):
+        return
+    tops = [j for j in joints if parent.get(j) not in jset]
+    lift = {}
+    for t in tops:
+        above = _world_matrix(gltf, parent[t]) if t in parent else np.eye(4)
+        sim = _similarity(above)
+        if sim is None:
+            return  # sheared or squashed above the skeleton: left as it is
+        lift[t] = (above, sim)
+    ancestors = set()
+    for t in tops:
+        p = parent.get(t)
+        while p is not None:
+            ancestors.add(p)
+            p = parent.get(p)
+    for anim in gltf.get('animations', []):
+        for ch in anim['channels']:
+            if ch['target']['node'] in ancestors and ch['target'].get('path') in _REST:
+                s = anim['samplers'][ch['sampler']]
+                out = _float_keys(gltf, views, s['output'])
+                rest = np.array(nodes[ch['target']['node']].get(ch['target']['path'], _REST[ch['target']['path']]))
+                moved = (1 - np.abs(out @ rest)) if ch['target']['path'] == 'rotation' else np.abs(out - rest).max(axis=1)
+                if moved.max() > 1e-4:
+                    return  # a node above the skeleton is animated: left as it is
+
+    world = {j: _world_matrix(gltf, j) for j in joints}  # stays the same for every bone through the changes below
+    if 'inverseBindMatrices' in skin:
+        ibm = _accessor(gltf, views, skin['inverseBindMatrices']).astype(np.float64).reshape(-1, 4, 4).transpose(0, 2, 1)
+    else:
+        ibm = np.tile(np.eye(4), (old_count, 1, 1))
+    bind_to_rest = np.array([world[j] @ ibm[k] for k, j in enumerate(joints[:old_count])])
+
+    # the transforms above each top bone go into it, its animation keys included
+    for t in tops:
+        above, (rot, s) = lift[t]
+        if np.allclose(above, np.eye(4), atol=1e-9):
+            continue
+        q_above = _quat_from_matrix(rot)
+        node = nodes[t]
+        node['translation'] = [float(x) for x in above[:3, :3] @ np.array(node.get('translation', _REST['translation'])) + above[:3, 3]]
+        node['rotation'] = [float(x) for x in _quat_mul(q_above, node.get('rotation', _REST['rotation']))]
+        node['scale'] = [float(x) * s for x in node.get('scale', _REST['scale'])]
+        for anim in gltf.get('animations', []):
+            for ci, ch in enumerate(anim['channels']):
+                path = ch['target'].get('path')
+                if ch['target']['node'] != t or path not in _REST:
+                    continue
+                sampler = dict(anim['samplers'][ch['sampler']])
+                out = _float_keys(gltf, views, sampler['output'])
+                if path == 'translation':
+                    out = out @ above[:3, :3].T + above[:3, 3]
+                elif path == 'rotation':
+                    out = _quat_mul(q_above, out)
+                else:
+                    out = out * s
+                arr = np.ascontiguousarray(out, dtype=np.float32)
+                gltf['accessors'].append({'bufferView': add_view(arr.tobytes()), 'byteOffset': 0, 'componentType': 5126,
+                                          'count': int(len(arr)), 'type': 'VEC4' if path == 'rotation' else 'VEC3'})
+                sampler['output'] = len(gltf['accessors']) - 1
+                anim['samplers'].append(sampler)
+                anim['channels'][ci] = dict(ch, sampler=len(anim['samplers']) - 1)
+
+    # one root bone
+    if len(tops) > 1:
+        nodes.append({'name': 'Root', 'children': list(tops)})
+        root = len(nodes) - 1
+        joints.append(root)
+        world[root] = np.eye(4)
+    else:
+        root = tops[0]
+    for n in nodes[:-1] if len(tops) > 1 else nodes:
+        if 'children' in n:
+            n['children'] = [c for c in n['children'] if c not in tops and c != mi]
+    for k in ('translation', 'rotation', 'scale', 'matrix', 'children'):
+        nodes[mi].pop(k, None)
+
+    # Bind pose = rest pose. First the part common to all bones goes into the vertices (exact: often the source keeps
+    # them lying on their back in Blender's Z-up and turns the skeleton upright).
+    weight = np.zeros(old_count)
+    prims = gltf['meshes'][nodes[mi]['mesh']]['primitives']
+    for prim in prims:
+        for set_no in range(4):
+            if f'JOINTS_{set_no}' not in prim['attributes'] or f'WEIGHTS_{set_no}' not in prim['attributes']:
+                break
+            jj = np.minimum(_accessor(gltf, views, prim['attributes'][f'JOINTS_{set_no}']).astype(np.int64), old_count - 1)
+            np.add.at(weight, jj.ravel(), _float_keys(gltf, views, prim['attributes'][f'WEIGHTS_{set_no}']).ravel())
+    weighted = [k for k in range(old_count) if weight[k] > 1e-6]
+    common = bind_to_rest[int(np.argmax(weight))]
+    for prim in prims:
+        _bake_transform(gltf, views, add_view, prim, common)
+    ibm = ibm @ np.linalg.inv(common)
+    bind = {j: (np.linalg.inv(ibm[k]) if k in weighted else world[j]) for k, j in enumerate(joints[:old_count])}
+    for j in joints[old_count:]:
+        bind[j] = world[j]
+    scale = max(1e-6, max(np.abs(world[j][:3, 3]).max() for j in joints))
+    differs = [j for j in joints if not np.allclose(bind[j], world[j], atol=1e-4 * scale + 1e-7)]
+    keep_bind = False
+
+    if differs and gltf.get('animations'):
+        # Some bones are bound in another pose (Eevee, Thwackey: parts folded away at rest). The rest pose becomes
+        # the bind pose, and every animation gets the old rest values as constant keys for whatever it leaves alone,
+        # so the animations stay exact.
+        new_parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', []) if i in jset or i == root}
+        trs = {}
+        for j in joints:
+            local = np.linalg.inv(bind[new_parent[j]]) @ bind[j] if j in new_parent else bind[j]
+            if np.allclose(local, _local_matrix(nodes[j]), atol=1e-6 * scale + 1e-9):
+                continue  # this bone keeps its rest transform
+            trs[j] = _decompose(local)
+            if trs[j] is None:
+                keep_bind = True  # sheared bind pose (Thwackey): bones and vertices are left in their bind pose
+                break
+        else:
+            old = {j: {p: list(nodes[j].get(p, _REST[p])) for p in _REST} for j in trs}
+            for j, (t, q, sc) in trs.items():
+                nodes[j]['translation'], nodes[j]['rotation'], nodes[j]['scale'] = t, q, sc
+            for anim in gltf['animations']:
+                animated = {(ch['target']['node'], ch['target']['path']) for ch in anim['channels']}
+                t0 = None
+                for j in trs:
+                    for p in _REST:
+                        a, b = np.array(old[j][p]), np.array(nodes[j][p])
+                        same = abs(float(a @ b)) > 1 - 1e-9 if p == 'rotation' else np.allclose(a, b, atol=1e-6 * scale + 1e-9)
+                        if (j, p) in animated or same:
+                            continue
+                        if t0 is None:
+                            t0 = len(gltf['accessors'])
+                            gltf['accessors'].append({'bufferView': add_view(np.zeros(1, dtype=np.float32).tobytes()), 'byteOffset': 0,
+                                                      'componentType': 5126, 'count': 1, 'type': 'SCALAR', 'min': [0.0], 'max': [0.0]})
+                        value = np.asarray([old[j][p]], dtype=np.float32)
+                        gltf['accessors'].append({'bufferView': add_view(value.tobytes()), 'byteOffset': 0, 'componentType': 5126,
+                                                  'count': 1, 'type': 'VEC4' if p == 'rotation' else 'VEC3'})
+                        anim['samplers'].append({'input': t0, 'output': len(gltf['accessors']) - 1, 'interpolation': 'STEP'})
+                        anim['channels'].append({'sampler': len(anim['samplers']) - 1, 'target': {'node': j, 'path': p}})
+            world = bind
+            differs = []
+    if differs and not keep_bind:
+        # no animations: the vertices go into the rest pose, the only pose ever shown
+        rest_from_bind = np.array([world[j] @ ibm[k] for k, j in enumerate(joints[:old_count])])
+        for prim in prims:
+            attrs = prim['attributes']
+            pos = _accessor(gltf, views, attrs['POSITION']).astype(np.float64)
+            nrm = _accessor(gltf, views, attrs['NORMAL']).astype(np.float64) if 'NORMAL' in attrs else None
+            new_pos, new_nrm, total = np.zeros_like(pos), (np.zeros_like(nrm) if nrm is not None else None), np.zeros(len(pos))
+            normal_mats = np.linalg.inv(rest_from_bind[:, :3, :3]).transpose(0, 2, 1)
+            for set_no in range(4):
+                if f'JOINTS_{set_no}' not in attrs or f'WEIGHTS_{set_no}' not in attrs:
+                    break
+                jj = np.minimum(_accessor(gltf, views, attrs[f'JOINTS_{set_no}']).astype(np.int64), old_count - 1)
+                ww = _float_keys(gltf, views, attrs[f'WEIGHTS_{set_no}'])
+                for c in range(jj.shape[1]):
+                    m, w = rest_from_bind[jj[:, c]], ww[:, c]
+                    new_pos += w[:, None] * (np.einsum('nij,nj->ni', m[:, :3, :3], pos) + m[:, :3, 3])
+                    if nrm is not None:
+                        new_nrm += w[:, None] * np.einsum('nij,nj->ni', normal_mats[jj[:, c]], nrm)
+                    total += w
+            ok = total > 1e-8
+            new_pos[ok] /= total[ok, None]
+            new_pos[~ok] = pos[~ok]
+            _set_attribute(gltf, add_view, prim, 'POSITION', new_pos)
+            if nrm is not None:
+                new_nrm[~ok] = nrm[~ok]
+                _set_attribute(gltf, add_view, prim, 'NORMAL', new_nrm / np.maximum(np.linalg.norm(new_nrm, axis=1, keepdims=True), 1e-12))
+            attrs.pop('TANGENT', None)
+    if keep_bind:
+        ibm_new = np.array([(ibm[k] if k < old_count else np.linalg.inv(world[j])).T for k, j in enumerate(joints)], dtype=np.float32).reshape(-1, 16)
+    else:
+        ibm_new = np.array([np.linalg.inv(world[j]).T for j in joints], dtype=np.float32).reshape(-1, 16)
+    gltf['accessors'].append({'bufferView': add_view(np.ascontiguousarray(ibm_new).tobytes()), 'byteOffset': 0,
+                              'componentType': 5126, 'count': len(joints), 'type': 'MAT4'})
+    skin['inverseBindMatrices'] = len(gltf['accessors']) - 1
+    skin['joints'] = joints
+    skin['skeleton'] = root
+    keep_only(set(joints) | {mi}, [root, mi])
+
+
+def _decompose(m):
+    """4x4 -> ([t], [quaternion xyzw], [scale]) when it is translation * rotation * scale (no shear), else None."""
+    import numpy as np
+    a = m[:3, :3]
+    sc = np.linalg.norm(a, axis=0)
+    if not np.isfinite(sc).all() or (sc < 1e-9).any():
+        return None
+    rot = a / sc
+    if np.linalg.det(rot) < 0:
+        sc[0], rot[:, 0] = -sc[0], -rot[:, 0]
+    if not np.allclose(rot.T @ rot, np.eye(3), atol=1e-4):
+        return None
+    return [float(x) for x in m[:3, 3]], [float(x) for x in _quat_from_matrix(rot)], [float(x) for x in sc]
 
 
 def _ensure_normals(gltf, views, add_view):
@@ -541,6 +858,7 @@ def convert(data):
     for node in gltf.get('nodes', []):
         if 'mesh' in node:
             node['mesh'] = remap[node['mesh']]
+    _canonicalize(gltf, views, add_view)
     _ensure_normals(gltf, views, add_view)
     _validate(gltf, views)
 
@@ -574,10 +892,17 @@ def describe(folder):
     if not skel and not static:
         return None
     out = {'mesh': skel[0] if skel else static[0]}
+    anims.sort()
     for key, rx in (('idle', IDLE), ('attack', ATTACK), ('faint', FAINT)):
         hit = next((p for n, p in anims if rx.search(n)), None)
         if hit:
             out[key] = hit
+    if anims and 'attack' not in out:  # a clip with another name (Pikachu's "Impactrueno") serves as the attack
+        other = [p for n, p in anims if p not in (out.get('idle'), out.get('faint'))]
+        if other:
+            out['attack'] = other[0]
+    if anims and 'idle' not in out:  # no idle clip: the battle shows the first frame of this one, not the rest pose
+        out['pose'] = out.get('attack') or anims[0][1]
     return out
 
 
@@ -648,26 +973,45 @@ def import_one(species, shiny=False, log=print, warn=print):
     return got
 
 
+def old_folders():
+    eal = unreal.EditorAssetLibrary
+    found = [d for d in OLD_DESTS if eal.does_directory_exist(d)]
+    if eal.does_directory_exist(DEST_ROOT):
+        for path in eal.list_assets(DEST_ROOT, recursive=True, include_folder=True):
+            parts = str(path).rstrip('/').split('/')
+            if len(parts) > 4 and parts[4].startswith('V') and parts[4] != f'V{CONVERTER_VERSION}':
+                folder = '/'.join(parts[:5])
+                if folder not in found:
+                    found.append(folder)
+    return found
+
+
 def refresh_old_imports(log=print, warn=print):
+    """A new converter imports into its own folder (DEST), so old models never stand in the way. The old folders are
+    deleted when Unreal allows it (it refuses while their assets are loaded; then the next run tries again)."""
     try:
         with open(VERSION_FILE, encoding='utf-8') as f:
             version = int(f.read().strip() or 0)
     except Exception:
         version = 0
-    if version == CONVERTER_VERSION:
-        return
-    eal = unreal.EditorAssetLibrary
-    if eal.does_directory_exist(DEST):
-        log('удаляю 3D-модели, импортированные старой версией конвертера…')
-        if not eal.delete_directory(DEST):
-            warn(f'не удалось удалить {DEST}: перезапустите редактор и запустите настройку ещё раз')
-            return
-    for path in (GUARD, SKIP):
-        if os.path.exists(path):
-            os.remove(path)
-    os.makedirs(CACHE, exist_ok=True)
-    with open(VERSION_FILE, 'w', encoding='utf-8') as f:
-        f.write(str(CONVERTER_VERSION))
+    if version != CONVERTER_VERSION:
+        for path in (GUARD, SKIP):  # a new converter gets a clean slate, including models that crashed before
+            if os.path.exists(path):
+                os.remove(path)
+        os.makedirs(CACHE, exist_ok=True)
+        with open(VERSION_FILE, 'w', encoding='utf-8') as f:
+            f.write(str(CONVERTER_VERSION))
+    for folder in old_folders():
+        try:
+            ok = unreal.EditorAssetLibrary.delete_directory(folder)
+        except Exception:
+            ok = False
+        log(f'старые 3D-модели {folder}: ' + ('удалены' if ok else 'пока не удалось удалить (попробую в следующий раз)'))
+
+
+def current_entries(entries):
+    """assets.json entries that point into this converter's folder (older ones may be broken)."""
+    return {k: v for k, v in (entries or {}).items() if isinstance(v, dict) and str(v.get('mesh', '')).startswith(DEST + '/')}
 
 
 def import_species(ids, with_shiny=True, log=print, warn=print, task=None):
@@ -695,7 +1039,7 @@ def merge_into_assets_json(models):
     if os.path.exists(path):
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
-    data.setdefault('pokemon3d', {}).update(models)
+    data['pokemon3d'] = dict(current_entries(data.get('pokemon3d')), **models)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 

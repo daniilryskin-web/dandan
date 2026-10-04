@@ -17,6 +17,8 @@ struct FLigaModel3D
 	FString Idle;
 	FString Attack;
 	FString Faint;
+	/** Shown frozen at its first frame when there is no idle clip (Pikachu's rest pose lies on its belly). */
+	FString Pose;
 };
 
 struct LIGA17_API FLigaAssets

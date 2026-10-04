@@ -104,6 +104,7 @@ void FLigaAssets::Load()
 			M->TryGetStringField(TEXT("idle"), D.Idle);
 			M->TryGetStringField(TEXT("attack"), D.Attack);
 			M->TryGetStringField(TEXT("faint"), D.Faint);
+			M->TryGetStringField(TEXT("pose"), D.Pose);
 			if (!D.Mesh.IsEmpty()) Pokemon3D.Add(LigaJsonKey(KV.Key), D);
 		}
 	}

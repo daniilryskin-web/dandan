@@ -166,11 +166,23 @@ void ALigaBattleStage::SetupMon(int32 Side, const FLigaPokemon& Pk, const FVecto
 	SetupModel(Side, Pk);
 }
 
+namespace
+{
+	/** A model without an idle clip stands in the first frame of its pose clip: some rest poses are not meant to be seen. */
+	void ShowPose(FLigaBillboard& M)
+	{
+		if (!M.PoseAnim) return;
+		M.Skel->PlayAnimation(M.PoseAnim.Get(), false);
+		M.Skel->Stop();
+		M.bPosed = true;
+	}
+}
+
 bool ALigaBattleStage::SetupModel(int32 Side, const FLigaPokemon& Pk)
 {
 	FLigaBillboard& M = Mons[Side];
-	M.bModel = M.bSkeletal = false;
-	M.IdleAnim = M.AttackAnim = M.FaintAnim = nullptr;
+	M.bModel = M.bSkeletal = M.bPosed = false;
+	M.IdleAnim = M.AttackAnim = M.FaintAnim = M.PoseAnim = nullptr;
 	M.Skel->SetVisibility(false);
 	M.Static->SetVisibility(false);
 	const FLigaModel3D* Def = FLigaAssets::Get().FindModel3D(Pk.Species, Pk.bShiny);
@@ -185,7 +197,9 @@ bool ALigaBattleStage::SetupModel(int32 Side, const FLigaPokemon& Pk)
 		M.IdleAnim = LoadAnim(Def->Idle);
 		M.AttackAnim = LoadAnim(Def->Attack);
 		M.FaintAnim = LoadAnim(Def->Faint);
+		M.PoseAnim = LoadAnim(Def->Pose);
 		if (M.IdleAnim) M.Skel->PlayAnimation(M.IdleAnim.Get(), true);
+		else ShowPose(M);
 		B = SK->GetBounds();
 		M.bSkeletal = true;
 	}
@@ -226,7 +240,11 @@ void ALigaBattleStage::Animate(int32 Side, FName Anim)
 	if (M.bModel && M.bSkeletal)
 	{
 		UAnimSequence* Clip = Anim == TEXT("attack") ? M.AttackAnim.Get() : Anim == TEXT("faint") ? M.FaintAnim.Get() : nullptr;
-		if (Clip) M.Skel->PlayAnimation(Clip, false);
+		if (Clip)
+		{
+			M.Skel->PlayAnimation(Clip, false);
+			M.bPosed = false;
+		}
 		else if (M.IdleAnim && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim.Get(), true);
 	}
 }
@@ -446,7 +464,11 @@ void ALigaBattleStage::UpdateMon(int32 Side, float Dt)
 		C->SetWorldLocation(M.Home + Offset + FVector(0, 0, M.ModelLift * S) - Rot.RotateVector(M.ModelCenter * S));
 		C->SetWorldScale3D(FVector(S, S, S * Breath));
 		C->SetWorldRotation(Rot);
-		if (M.bSkeletal && M.IdleAnim && M.Anim != TEXT("faint") && !M.Skel->IsPlaying()) M.Skel->PlayAnimation(M.IdleAnim.Get(), true);
+		if (M.bSkeletal && M.Anim != TEXT("faint") && !M.Skel->IsPlaying())
+		{
+			if (M.IdleAnim) M.Skel->PlayAnimation(M.IdleAnim.Get(), true);
+			else if (!M.bPosed) ShowPose(M);  // back from an attack clip
+		}
 		return;
 	}
 	const bool bVisible = M.bHasTexture && !bGone;

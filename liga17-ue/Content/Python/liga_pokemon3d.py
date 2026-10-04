@@ -5,9 +5,10 @@ As that repository states, the models are the property of Nintendo / Creatures I
 they are downloaded on your own computer for a personal fan game, like the HOME pictures, and are not part of
 this project's repository. Do not publish or sell a game that contains them.
 
-The files use Draco mesh compression and WebP textures. Each one is converted to a plain .glb (DracoPy, Pillow),
-the helper sphere every file carries is dropped, and the result is imported with Unreal's glTF importer into
-/Game/Liga/Pokemon/P<id>. Pokémon without a model keep their HOME picture.
+The files use Draco mesh compression and WebP textures. Each one is converted to a plain .glb (DracoPy, Pillow):
+the helper sphere every file carries is dropped, the parts are joined into one mesh, broken bones and animation
+keys are repaired, and the result is imported with Unreal's glTF importer into /Game/Liga/Pokemon/P<id>.
+Pokémon without a model, or whose file cannot be repaired, keep their HOME picture.
 
 Used by liga_setup.py for the Pokémon the game can show. To import every available model (about 1 GB and a long
 wait), run liga_pokemon3d_all.py with Tools → Execute Python Script….
@@ -36,7 +37,7 @@ CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')
 SITE = os.path.join(PROJECT, 'Content', 'Python', 'Lib', 'site-packages')
 
 # Bump when convert() changes: models imported by an older converter are deleted and imported again.
-CONVERTER_VERSION = 2
+CONVERTER_VERSION = 3
 VERSION_FILE = os.path.join(CACHE, 'converter_version.txt')
 GUARD = os.path.join(CACHE, 'importing.json')   # the model being imported right now
 SKIP = os.path.join(CACHE, 'skip.json')         # models that crashed the editor once: they keep their picture
@@ -170,6 +171,244 @@ def _merge_skins(gltf, views, add_view):
             node['skin'] = 0
 
 
+_REST = {'translation': (0.0, 0.0, 0.0), 'rotation': (0.0, 0.0, 0.0, 1.0), 'scale': (1.0, 1.0, 1.0)}
+_LIMIT = 1e5  # no bone of these models moves or scales this far; bigger values are garbage
+
+
+def _float_keys(gltf, views, index):
+    import numpy as np
+    acc = gltf['accessors'][index]
+    arr = _accessor(gltf, views, index).astype(np.float64)
+    if acc['componentType'] != 5126 and acc.get('normalized'):
+        arr = np.maximum(arr / {5120: 127.0, 5121: 255.0, 5122: 32767.0, 5123: 65535.0}[acc['componentType']], -1.0)
+    return arr
+
+
+def _fix_keys(path, arr, rest):
+    """Non-finite or absurd keys -> the rest value; rotations normalised (a zero quaternion -> the rest rotation)."""
+    import numpy as np
+    arr = np.array(arr, dtype=np.float64)
+    rest = np.array(rest, dtype=np.float64)
+    bad = ~np.isfinite(arr).all(axis=1) | (np.abs(np.nan_to_num(arr)).max(axis=1) > _LIMIT)
+    arr[bad] = rest
+    if path == 'rotation':
+        norm = np.linalg.norm(arr, axis=1, keepdims=True)
+        arr = np.where(norm > 1e-6, arr / np.maximum(norm, 1e-12), rest)
+    return arr.astype(np.float32)
+
+
+def _local_matrix(node):
+    import numpy as np
+    if 'matrix' in node:
+        return np.array(node['matrix'], dtype=np.float64).reshape(4, 4).T
+    x, y, z, w = node.get('rotation', _REST['rotation'])
+    rot = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                    [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                    [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    m = np.eye(4)
+    m[:3, :3] = rot * np.array(node.get('scale', _REST['scale']), dtype=np.float64)
+    m[:3, 3] = node.get('translation', _REST['translation'])
+    return m
+
+
+def _world_matrix(gltf, index):
+    nodes = gltf['nodes']
+    parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', [])}
+    m, seen = _local_matrix(nodes[index]), {index}
+    while index in parent and parent[index] not in seen:
+        index = parent[index]
+        seen.add(index)
+        m = _local_matrix(nodes[index]) @ m
+    return m
+
+
+def _sanitize_transforms(gltf, views, add_view):
+    """Rest poses and animation keys that Unreal can turn into a crash: NaN, inf, huge values, zero quaternions,
+    times going backwards. Bad keys get the bone's rest value; a track that cannot be repaired is dropped."""
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    for node in nodes:
+        if 'matrix' in node:
+            m = np.array(node['matrix'], dtype=np.float64)
+            if not np.isfinite(m).all() or np.abs(m).max() > _LIMIT:
+                node.pop('matrix')
+        for path, rest in _REST.items():
+            if path in node:
+                node[path] = [float(x) for x in _fix_keys(path, [node[path]], rest)[0]]
+
+    # Bind poses: some unused bones (Bulbasaur's feelers) have inverse bind matrices that put them 30 000 km away.
+    # Unreal builds the reference skeleton from them, and such bone matrices overflow on the GPU. A bind matrix that
+    # is huge or not invertible is rebuilt from the bone's rest pose.
+    for skin in gltf.get('skins', []):
+        if 'inverseBindMatrices' not in skin:
+            continue
+        ibm = _accessor(gltf, views, skin['inverseBindMatrices']).astype(np.float64).reshape(-1, 4, 4)
+        changed = False
+        for k, j in enumerate(skin['joints'][:len(ibm)]):
+            m = ibm[k]
+            if np.isfinite(m).all() and np.abs(m).max() <= _LIMIT and abs(np.linalg.det(m)) > 1e-12:
+                continue
+            w = _world_matrix(gltf, j)
+            ibm[k] = (np.linalg.inv(w) if abs(np.linalg.det(w)) > 1e-12 else np.eye(4)).T  # glTF stores columns first
+            changed = True
+        if changed:
+            arr = np.ascontiguousarray(ibm.reshape(-1, 16), dtype=np.float32)
+            gltf['accessors'].append({'bufferView': add_view(arr.tobytes()), 'byteOffset': 0, 'componentType': 5126,
+                                      'count': int(arr.shape[0]), 'type': 'MAT4'})
+            skin['inverseBindMatrices'] = len(gltf['accessors']) - 1
+
+    def add_accessor(arr, kind):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        acc = {'bufferView': add_view(arr.tobytes()), 'byteOffset': 0, 'componentType': 5126, 'count': int(arr.shape[0]), 'type': kind}
+        if kind == 'SCALAR':
+            acc['min'], acc['max'] = [float(arr.min())], [float(arr.max())]
+        gltf['accessors'].append(acc)
+        return len(gltf['accessors']) - 1
+
+    kept = []
+    for anim in gltf.get('animations', []):
+        samplers, channels, done = [], [], {}
+        for ch in anim.get('channels', []):
+            target = ch.get('target', {})
+            path, ni = target.get('path'), target.get('node')
+            si = ch.get('sampler')
+            if ni is None or si is None or not (0 <= ni < len(nodes)) or not (0 <= si < len(anim.get('samplers', []))):
+                continue
+            key = (si, path, ni)   # the rest value depends on the bone
+            if key not in done:
+                s = dict(anim['samplers'][si])
+                if path in _REST and s.get('interpolation', 'LINEAR') in ('LINEAR', 'STEP'):
+                    t = _float_keys(gltf, views, s['input']).ravel()
+                    out = _float_keys(gltf, views, s['output'])
+                    if len(t) == 0 or len(out) != len(t) or not np.isfinite(t).all() or (np.diff(t) < 0).any():
+                        done[key] = None   # broken track: the bone keeps its rest pose
+                    else:
+                        keep = np.concatenate([[True], np.diff(t) > 0])   # duplicate times -> one key
+                        rest = nodes[ni].get(path, _REST[path])
+                        fixed = _fix_keys(path, out[keep], rest)
+                        if not keep.all():
+                            s['input'] = add_accessor(t[keep].reshape(-1, 1), 'SCALAR')
+                        if not keep.all() or not np.array_equal(fixed, out.astype(np.float32), equal_nan=True):
+                            s['output'] = add_accessor(fixed, gltf['accessors'][s['output']]['type'])
+                        samplers.append(s)
+                        done[key] = len(samplers) - 1
+                else:
+                    samplers.append(s)
+                    done[key] = len(samplers) - 1
+            if done[key] is not None:
+                channels.append(dict(ch, sampler=done[key]))
+        if channels:
+            anim['samplers'], anim['channels'] = samplers, channels
+            kept.append(anim)
+    if 'animations' in gltf:
+        gltf['animations'] = kept
+        if not kept:
+            gltf.pop('animations')
+
+
+def _merge_meshes(gltf, views, add_view):
+    """Unreal makes a separate asset of every mesh in a glTF, and the battle shows one of them. Pokémon made of several
+    meshes (eyes, wings, flames — Pikachu, Charizard, Eevee…) would lose all parts but one, so they become one mesh.
+    Skinned parts are placed by their joints (the node transform does not count), static parts get it baked in."""
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    holders = [i for i, n in enumerate(nodes) if 'mesh' in n]
+    if len(holders) < 2 or len({nodes[i].get('skin') for i in holders}) != 1:
+        return  # one mesh already, or a mix of skeletons: left as it is
+    skinned = 'skin' in nodes[holders[0]]
+    prims = []
+    for i in holders:
+        m = None if skinned else _world_matrix(gltf, i)
+        for prim in gltf['meshes'][nodes[i]['mesh']]['primitives']:
+            prim = json.loads(json.dumps(prim))
+            if m is not None and not np.allclose(m, np.eye(4)):
+                for name in ('POSITION', 'NORMAL'):
+                    if name in prim['attributes']:
+                        v = _accessor(gltf, views, prim['attributes'][name]).astype(np.float64)
+                        if name == 'POSITION':
+                            v = v @ m[:3, :3].T + m[:3, 3]
+                        else:
+                            v = v @ np.linalg.inv(m[:3, :3])
+                            v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+                        v = np.ascontiguousarray(v, dtype=np.float32)
+                        acc = {'bufferView': add_view(v.tobytes(), 34962), 'byteOffset': 0, 'componentType': 5126, 'count': int(len(v)), 'type': 'VEC3'}
+                        if name == 'POSITION':
+                            acc['min'], acc['max'] = [float(x) for x in v.min(axis=0)], [float(x) for x in v.max(axis=0)]
+                        gltf['accessors'].append(acc)
+                        prim['attributes'][name] = len(gltf['accessors']) - 1
+                prim['attributes'].pop('TANGENT', None)
+            prims.append(prim)
+    gltf['meshes'].append({'name': gltf['meshes'][nodes[holders[0]]['mesh']].get('name', 'Body'), 'primitives': prims})
+    merged = len(gltf['meshes']) - 1
+    for i in holders:
+        nodes[i].pop('mesh')
+        if skinned and i != holders[0]:
+            nodes[i].pop('skin')
+    if skinned:
+        nodes[holders[0]]['mesh'] = merged
+    else:
+        nodes.append({'name': 'Body', 'mesh': merged})
+        gltf['scenes'][gltf.get('scene', 0)]['nodes'].append(len(nodes) - 1)
+
+
+def _ensure_normals(gltf, views, add_view):
+    """Smooth normals for parts that have none, so a merged mesh does not mix imported and generated normals."""
+    import numpy as np
+    for mesh in gltf.get('meshes', []):
+        for prim in mesh.get('primitives', []):
+            if 'NORMAL' in prim['attributes'] or prim.get('mode', 4) != 4:
+                continue
+            pos = _accessor(gltf, views, prim['attributes']['POSITION']).astype(np.float64)
+            tri = (_accessor(gltf, views, prim['indices']).reshape(-1) if 'indices' in prim else np.arange(len(pos))).astype(np.int64)
+            tri = tri[:len(tri) // 3 * 3].reshape(-1, 3)
+            face = np.cross(pos[tri[:, 1]] - pos[tri[:, 0]], pos[tri[:, 2]] - pos[tri[:, 0]])
+            nrm = np.zeros_like(pos)
+            for k in range(3):
+                np.add.at(nrm, tri[:, k], face)
+            length = np.linalg.norm(nrm, axis=1, keepdims=True)
+            nrm = np.where(length > 1e-12, nrm / np.maximum(length, 1e-12), [0.0, 0.0, 1.0])
+            nrm = np.ascontiguousarray(nrm, dtype=np.float32)
+            gltf['accessors'].append({'bufferView': add_view(nrm.tobytes(), 34962), 'byteOffset': 0, 'componentType': 5126,
+                                      'count': int(len(nrm)), 'type': 'VEC3'})
+            prim['attributes']['NORMAL'] = len(gltf['accessors']) - 1
+
+
+def _validate(gltf, views):
+    """Last check before Unreal sees the file: anything still broken is refused, and the Pokémon keeps its picture."""
+    import numpy as np
+    for i, acc in enumerate(gltf.get('accessors', [])):
+        if 'bufferView' not in acc or 'sparse' in acc:
+            raise ValueError(f'accessor {i}: no plain data')
+        arr = _accessor(gltf, views, i)
+        if acc['componentType'] == 5126 and not np.isfinite(arr).all():
+            raise ValueError(f'accessor {i}: NaN/inf')
+    for mesh in gltf.get('meshes', []):
+        for prim in mesh.get('primitives', []):
+            pos = _accessor(gltf, views, prim['attributes']['POSITION'])
+            if len(pos) == 0 or np.abs(pos).max() > _LIMIT:
+                raise ValueError(f'mesh {mesh.get("name")}: bad vertex positions')
+            for name, ai in prim['attributes'].items():
+                if gltf['accessors'][ai]['count'] != len(pos):
+                    raise ValueError(f'mesh {mesh.get("name")}: {name} does not match the vertices')
+            if 'indices' in prim:
+                idx = _accessor(gltf, views, prim['indices'])
+                if len(idx) and int(idx.max()) >= len(pos):
+                    raise ValueError(f'mesh {mesh.get("name")}: index out of range')
+    skins = gltf.get('skins', [])
+    for skin in skins:
+        if 'inverseBindMatrices' in skin:
+            ibm = _accessor(gltf, views, skin['inverseBindMatrices']).reshape(-1, 4, 4)
+            if len(ibm) != len(skin['joints']) or np.abs(ibm).max() > _LIMIT or (np.abs(np.linalg.det(ibm.astype(np.float64))) < 1e-12).any():
+                raise ValueError('skin: bad bind pose')
+    for node in gltf.get('nodes', []):
+        if 'mesh' in node and 'skin' in node:
+            joints = len(skins[node['skin']]['joints'])
+            for prim in gltf['meshes'][node['mesh']]['primitives']:
+                for name, ai in prim['attributes'].items():
+                    if name.startswith('JOINTS_') and int(_accessor(gltf, views, ai).max(initial=0)) >= joints:
+                        raise ValueError(f'{name}: joint out of range')
+
+
 def convert(data):
     """Draco + WebP .glb -> plain .glb with PNG textures, without the helper sphere."""
     import DracoPy
@@ -245,8 +484,10 @@ def convert(data):
         acc.pop('sparse')
         acc.update(bufferView=add_view(np.ascontiguousarray(base).tobytes()), byteOffset=0)
 
-    # Accessors without a bufferView mean "all zeros" in glTF (the source files use that for JOINTS_0 when every vertex
-    # follows joint 0). Unreal's importer reads garbage from them and crashes, so write the zeros out explicitly.
+    # Accessors without a bufferView mean "all zeros" in glTF. The source files use that for JOINTS_0 when every vertex
+    # follows joint 0, and for animation keys (still root translations, the time of one-key tracks). Unreal's importer
+    # reads garbage from them: a crash for meshes, NaN or huge bone transforms for animations, which then took the
+    # GPU down while the editor drew the thumbnail. Write the zeros out explicitly.
     for mesh in gltf.get('meshes', []):
         for prim in mesh.get('primitives', []):
             count = gltf['accessors'][prim['attributes']['POSITION']]['count']
@@ -262,6 +503,10 @@ def convert(data):
                 acc.update(bufferView=add_view(arr.tobytes(), 34962), byteOffset=0, componentType=5123 if joints else 5126, count=count)
                 for k in ('normalized', 'min', 'max'):
                     acc.pop(k, None)
+    for acc in gltf.get('accessors', []):
+        if 'bufferView' not in acc and 'sparse' not in acc:
+            arr = np.zeros((acc['count'], _NCOMP[acc['type']]), dtype=np.dtype(_DTYPE[acc['componentType']]))
+            acc.update(bufferView=add_view(arr.tobytes()), byteOffset=0)
 
     _merge_skins(gltf, views, add_view)
 
@@ -286,6 +531,18 @@ def convert(data):
             mesh = gltf['meshes'][m]
             if node.get('name', '').startswith('Icosphere') or mesh.get('name', '').startswith('Icosphere'):
                 node.pop('mesh')
+                node.pop('skin', None)
+
+    _sanitize_transforms(gltf, views, add_view)
+    _merge_meshes(gltf, views, add_view)
+    used = sorted({n['mesh'] for n in gltf.get('nodes', []) if 'mesh' in n})  # unused meshes would become extra assets
+    remap = {old: new for new, old in enumerate(used)}
+    gltf['meshes'] = [gltf['meshes'][i] for i in used]
+    for node in gltf.get('nodes', []):
+        if 'mesh' in node:
+            node['mesh'] = remap[node['mesh']]
+    _ensure_normals(gltf, views, add_view)
+    _validate(gltf, views)
 
     for key in ('extensionsUsed', 'extensionsRequired'):
         if key in gltf:
@@ -379,11 +636,13 @@ def import_one(species, shiny=False, log=print, warn=print):
     t.automated = True
     t.replace_existing = True
     t.save = True
-    _save_json(GUARD, tag)  # if the import kills the editor, the next run skips this model
-    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([t])
-    os.remove(GUARD)
-    unreal.EditorAssetLibrary.save_directory(folder, only_if_is_dirty=True, recursive=True)
-    got = describe(folder)
+    _save_json(GUARD, tag)  # if the import or the save (it draws thumbnails on the GPU) kills the editor, the next run skips this model
+    try:
+        unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([t])
+        unreal.EditorAssetLibrary.save_directory(folder, only_if_is_dirty=True, recursive=True)
+        got = describe(folder)
+    finally:
+        os.remove(GUARD)
     if not got:
         warn(f'3D {tag}: импорт не дал модели')
     return got

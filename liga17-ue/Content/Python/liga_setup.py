@@ -446,33 +446,51 @@ def spawn(cls, loc, rot=None):
     return actors_sub.spawn_actor_from_class(cls, unreal.Vector(*loc), rot or unreal.Rotator(0, 0, 0))
 
 
+def set_props(obj, what, values):
+    """Sets editor properties one at a time, so one renamed property does not skip the rest.
+    A name can be a tuple of alternatives (Python names differ between engine versions)."""
+    for names, value in values:
+        names = (names,) if isinstance(names, str) else names
+        for n in names:
+            try:
+                obj.set_editor_property(n, value)
+                break
+            except Exception:
+                continue
+        else:
+            warn(f'{what}: свойство {names[0]} не найдено')
+
+
 @step('освещение')
 def add_lighting():
     sun = spawn(unreal.DirectionalLight, (0, 0, 5000), unreal.Rotator(roll=0, pitch=-38, yaw=215))
-    lc = sun.get_component_by_class(unreal.DirectionalLightComponent)
-    lc.set_editor_property('mobility', unreal.ComponentMobility.MOVABLE)
-    lc.set_editor_property('intensity', 9.5)
-    lc.set_editor_property('light_color', unreal.Color(r=255, g=242, b=219, a=255))
-    lc.set_editor_property('atmosphere_sun_light', True)
-    lc.set_editor_property('dynamic_shadow_distance_movable_light', 20000.0)
-    lc.set_editor_property('light_source_angle', 1.2)
+    set_props(sun.get_component_by_class(unreal.DirectionalLightComponent), 'солнце', (
+        ('mobility', unreal.ComponentMobility.MOVABLE),
+        ('intensity', 9.5),
+        ('light_color', unreal.Color(r=255, g=242, b=219, a=255)),
+        ('atmosphere_sun_light', True),
+        ('dynamic_shadow_distance_movable_light', 20000.0),
+        ('light_source_angle', 1.2),
+    ))
     sky = spawn(unreal.SkyLight, (0, 0, 300))
-    sc = sky.get_component_by_class(unreal.SkyLightComponent)
-    sc.set_editor_property('mobility', unreal.ComponentMobility.MOVABLE)
-    sc.set_editor_property('real_time_capture', True)
-    sc.set_editor_property('intensity', 1.15)
+    set_props(sky.get_component_by_class(unreal.SkyLightComponent), 'небесный свет', (
+        ('mobility', unreal.ComponentMobility.MOVABLE),
+        ('real_time_capture', True),
+        ('intensity', 1.15),
+    ))
     spawn(unreal.SkyAtmosphere, (0, 0, 0))
     clouds = spawn(unreal.VolumetricCloud, (0, 0, 0))
     cloud_mat = unreal.load_asset('/Engine/EngineSky/VolumetricClouds/m_SimpleVolumetricCloud_Inst')
     if cloud_mat:
-        clouds.get_component_by_class(unreal.VolumetricCloudComponent).set_editor_property('material', cloud_mat)
+        set_props(clouds.get_component_by_class(unreal.VolumetricCloudComponent), 'облака', (('material', cloud_mat),))
     fog = spawn(unreal.ExponentialHeightFog, (0, 0, -100))
-    fc = fog.get_component_by_class(unreal.ExponentialHeightFogComponent)
-    fc.set_editor_property('fog_density', 0.006)
-    fc.set_editor_property('fog_height_falloff', 0.12)
-    fc.set_editor_property('volumetric_fog', True)
+    set_props(fog.get_component_by_class(unreal.ExponentialHeightFogComponent), 'туман', (
+        ('fog_density', 0.006),
+        ('fog_height_falloff', 0.12),
+        (('enable_volumetric_fog', 'volumetric_fog'), True),
+    ))
     ppv = spawn(unreal.PostProcessVolume, (0, 0, 0))
-    ppv.set_editor_property('unbound', True)
+    set_props(ppv, 'пост-обработка', (('unbound', True),))
     s = ppv.get_editor_property('settings')
     for prop, value in (
         ('auto_exposure_bias', 0.4), ('bloom_intensity', 0.55), ('vignette_intensity', 0.25),
@@ -588,10 +606,16 @@ def write_assets_json(meshes, chars, billboard):
     log('assets.json записан')
 
 
+NEXT_STEPS = ('\n\nЧто дальше:\n'
+              '1. Нажмите OK и подождите, пока справа внизу пропадёт счётчик «Compiling Shaders».\n'
+              '2. Нажмите зелёный треугольник ▶ вверху экрана — игра запустится.\n'
+              '3. Esc останавливает игру в редакторе; «назад» в меню — Backspace.')
+
+
 def summary():
     text = '\n'.join(REPORT)
     unreal.log('[Liga] ===== Итог настройки =====\n' + text)
-    unreal.EditorDialog.show_message('Лига 17 — настройка', 'Готово!\n\n' + text[-1800:], unreal.AppMsgType.OK)
+    unreal.EditorDialog.show_message('Лига 17 — настройка', 'Готово!\n\n' + text[-1500:] + NEXT_STEPS, unreal.AppMsgType.OK)
 
 
 def wrong_project():

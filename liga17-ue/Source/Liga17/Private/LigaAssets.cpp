@@ -4,6 +4,7 @@
 #include "Dom/JsonObject.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
+#include "HAL/FileManager.h"
 #include "LigaData.h"
 #include "LigaJson.h"
 #include "Materials/MaterialInterface.h"
@@ -50,11 +51,16 @@ namespace
 
 const FLigaAssets& FLigaAssets::Get()
 {
+	// Reloaded whenever assets.json changes: the setup script rewrites it while the editor (and this static) stays alive.
 	static FLigaAssets Instance;
 	static bool bLoaded = false;
-	if (!bLoaded)
+	static FDateTime Stamp;
+	const FDateTime Now = IFileManager::Get().GetTimeStamp(*(FLigaDatabase::DataDir() / TEXT("assets.json")));
+	if (!bLoaded || Now != Stamp)
 	{
 		bLoaded = true;
+		Stamp = Now;
+		Instance = FLigaAssets();
 		Instance.Load();
 	}
 	return Instance;

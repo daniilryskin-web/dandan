@@ -179,57 +179,70 @@ def scalar(m, name, v, x, y):
 
 
 def wind_offset(m, x0, y0):
-    """WPO = sway(time, world xy) * Amp * saturate(height above the instance pivot / HeightRef)^2."""
-    wp = expr(m, unreal.MaterialExpressionWorldPosition, x0, y0)
-    op = expr(m, unreal.MaterialExpressionObjectPositionWS, x0, y0 + 120)
-    sub = expr(m, unreal.MaterialExpressionSubtract, x0 + 200, y0 + 60)
-    link(wp, '', sub, 'A')
-    link(op, '', sub, 'B')
-    hz = expr(m, unreal.MaterialExpressionComponentMask, x0 + 360, y0 + 60, r=False, g=False, b=True, a=False)
-    link(sub, '', hz, '')
-    href = scalar(m, 'HeightRef', 100.0, x0 + 360, y0 + 160)
-    div = expr(m, unreal.MaterialExpressionDivide, x0 + 520, y0 + 60)
+    """WPO = sway(time, per-instance phase) * Amp * saturate(height above the mesh pivot / HeightRef)^2.
+    Uses local position and PerInstanceRandom only: world-position math is double precision (LWC) in UE5
+    and breaks some nodes, which made the whole foliage material fall back to the default grey."""
+    lp = expr(m, unreal.MaterialExpressionLocalPosition, x0, y0)
+    hz = expr(m, unreal.MaterialExpressionComponentMask, x0 + 200, y0 + 60, r=False, g=False, b=True, a=False)
+    link(lp, '', hz, '')
+    href = scalar(m, 'HeightRef', 100.0, x0 + 200, y0 + 160)
+    div = expr(m, unreal.MaterialExpressionDivide, x0 + 360, y0 + 60)
     link(hz, '', div, 'A')
     link(href, '', div, 'B')
-    sat = expr(m, unreal.MaterialExpressionSaturate, x0 + 660, y0 + 60)
+    sat = expr(m, unreal.MaterialExpressionSaturate, x0 + 500, y0 + 60)
     link(div, '', sat, '')
-    sq = expr(m, unreal.MaterialExpressionMultiply, x0 + 800, y0 + 60)
+    sq = expr(m, unreal.MaterialExpressionMultiply, x0 + 640, y0 + 60)
     link(sat, '', sq, 'A')
     link(sat, '', sq, 'B')
-    # phase = world.x * 0.004 + world.y * 0.006 + time * speed
-    xy = expr(m, unreal.MaterialExpressionComponentMask, x0 + 200, y0 - 160, r=True, g=True, b=False, a=False)
-    link(wp, '', xy, '')
-    dirv = expr(m, unreal.MaterialExpressionConstant2Vector, x0 + 200, y0 - 60, r=0.004, g=0.006)
-    dot = expr(m, unreal.MaterialExpressionDotProduct, x0 + 360, y0 - 160)
-    link(xy, '', dot, 'A')
-    link(dirv, '', dot, 'B')
-    time = expr(m, unreal.MaterialExpressionTime, x0 + 200, y0 - 260)
-    speed = scalar(m, 'WindSpeed', 1.6, x0 + 200, y0 - 340)
-    tmul = expr(m, unreal.MaterialExpressionMultiply, x0 + 360, y0 - 280)
+    # phase = time * speed + random per instance + a little along the mesh so blades do not move in lockstep
+    time = expr(m, unreal.MaterialExpressionTime, x0, y0 - 260)
+    speed = scalar(m, 'WindSpeed', 1.6, x0, y0 - 340)
+    tmul = expr(m, unreal.MaterialExpressionMultiply, x0 + 200, y0 - 280)
     link(time, '', tmul, 'A')
     link(speed, '', tmul, 'B')
-    phase = expr(m, unreal.MaterialExpressionAdd, x0 + 520, y0 - 200)
-    link(dot, '', phase, 'A')
-    link(tmul, '', phase, 'B')
-    s = expr(m, unreal.MaterialExpressionSine, x0 + 660, y0 - 240)
+    rnd = expr(m, unreal.MaterialExpressionPerInstanceRandom, x0, y0 - 160)
+    rmul = expr(m, unreal.MaterialExpressionMultiply, x0 + 200, y0 - 160)
+    link(rnd, '', rmul, 'A')
+    link(const(m, 6.283, x0, y0 - 100), '', rmul, 'B')
+    lx = expr(m, unreal.MaterialExpressionComponentMask, x0 + 200, y0 - 60, r=True, g=False, b=False, a=False)
+    link(lp, '', lx, '')
+    lxm = expr(m, unreal.MaterialExpressionMultiply, x0 + 340, y0 - 60)
+    link(lx, '', lxm, 'A')
+    link(const(m, 0.02, x0 + 200, y0), '', lxm, 'B')
+    p1 = expr(m, unreal.MaterialExpressionAdd, x0 + 360, y0 - 240)
+    link(tmul, '', p1, 'A')
+    link(rmul, '', p1, 'B')
+    phase = expr(m, unreal.MaterialExpressionAdd, x0 + 500, y0 - 200)
+    link(p1, '', phase, 'A')
+    link(lxm, '', phase, 'B')
+    s = expr(m, unreal.MaterialExpressionSine, x0 + 640, y0 - 240)
     link(phase, '', s, '')
-    c = expr(m, unreal.MaterialExpressionCosine, x0 + 660, y0 - 150)
+    c = expr(m, unreal.MaterialExpressionCosine, x0 + 640, y0 - 150)
     link(phase, '', c, '')
-    app = expr(m, unreal.MaterialExpressionAppendVector, x0 + 800, y0 - 200)
+    app = expr(m, unreal.MaterialExpressionAppendVector, x0 + 780, y0 - 200)
     link(s, '', app, 'A')
     link(c, '', app, 'B')
-    zero = const(m, 0.0, x0 + 800, y0 - 100)
-    app3 = expr(m, unreal.MaterialExpressionAppendVector, x0 + 940, y0 - 160)
+    app3 = expr(m, unreal.MaterialExpressionAppendVector, x0 + 920, y0 - 160)
     link(app, '', app3, 'A')
-    link(zero, '', app3, 'B')
-    amp = scalar(m, 'Amp', 8.0, x0 + 940, y0 - 40)
-    m1 = expr(m, unreal.MaterialExpressionMultiply, x0 + 1100, y0 - 100)
+    link(const(m, 0.0, x0 + 780, y0 - 100), '', app3, 'B')
+    amp = scalar(m, 'Amp', 8.0, x0 + 920, y0 - 40)
+    m1 = expr(m, unreal.MaterialExpressionMultiply, x0 + 1080, y0 - 100)
     link(app3, '', m1, 'A')
     link(amp, '', m1, 'B')
-    m2 = expr(m, unreal.MaterialExpressionMultiply, x0 + 1240, y0)
+    m2 = expr(m, unreal.MaterialExpressionMultiply, x0 + 1220, y0)
     link(m1, '', m2, 'A')
     link(sq, '', m2, 'B')
     return m2
+
+
+def check_compiled(m, what):
+    """Warns when a material failed to compile (Unreal then silently renders the default grey material)."""
+    try:
+        st = mel.get_statistics(m)
+        if st.get_editor_property('num_pixel_shader_instructions') <= 0:
+            warn(f'{what}: материал не скомпилировался — откройте {m.get_path_name()} и пришлите скриншот ошибки')
+    except Exception:
+        pass
 
 
 @step('материал листвы')
@@ -240,10 +253,12 @@ def make_foliage_material(textures):
     tex = expr(m, unreal.MaterialExpressionTextureSampleParameter2D, -700, -100, parameter_name='BaseColor')
     if 'leaves_albedo' in textures:
         tex.set_editor_property('texture', textures['leaves_albedo'])
-    tint = expr(m, unreal.MaterialExpressionVectorParameter, -700, 140, parameter_name='Tint', default_value=unreal.LinearColor(1, 1, 1, 1))
+    tint = expr(m, unreal.MaterialExpressionVectorParameter, -900, 140, parameter_name='Tint', default_value=unreal.LinearColor(1, 1, 1, 1))
+    tint3 = expr(m, unreal.MaterialExpressionComponentMask, -700, 140, r=True, g=True, b=True, a=False)
+    link(tint, '', tint3, '')
     mul = expr(m, unreal.MaterialExpressionMultiply, -420, -40)
     link(tex, 'RGB', mul, 'A')
-    link(tint, '', mul, 'B')
+    link(tint3, '', mul, 'B')
     mel.connect_material_property(mul, '', unreal.MaterialProperty.MP_BASE_COLOR)
     sss = expr(m, unreal.MaterialExpressionMultiply, -260, 160)
     link(mul, '', sss, 'A')
@@ -255,6 +270,7 @@ def make_foliage_material(textures):
     wpo = wind_offset(m, -1800, 600)
     mel.connect_material_property(wpo, '', unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
     mel.recompile_material(m)
+    check_compiled(m, 'листва')
     eal.save_loaded_asset(m)
     return m
 
@@ -323,6 +339,7 @@ def make_terrain_material(textures):
     mel.connect_material_property(ln, '', unreal.MaterialProperty.MP_NORMAL)
     mel.connect_material_property(const(m, 0.92, -150, 200), '', unreal.MaterialProperty.MP_ROUGHNESS)
     mel.recompile_material(m)
+    check_compiled(m, 'рельеф')
     eal.save_loaded_asset(m)
     return m
 
@@ -331,7 +348,7 @@ def make_terrain_material(textures):
 def make_water_material(textures):
     m = new_material('M_LigaSea')
     m.set_editor_property('two_sided', True)
-    wp = expr(m, unreal.MaterialExpressionWorldPosition, -1400, 0)
+    wp = expr(m, unreal.MaterialExpressionLocalPosition, -1400, 0)  # not world position: see wind_offset
     xy = expr(m, unreal.MaterialExpressionComponentMask, -1200, 0, r=True, g=True, b=False, a=False)
     link(wp, '', xy, '')
     sc = const(m, 0.0006, -1200, 100)
@@ -358,6 +375,7 @@ def make_water_material(textures):
     mel.connect_material_property(const(m, 0.04, -300, 200), '', unreal.MaterialProperty.MP_ROUGHNESS)
     mel.connect_material_property(const(m, 0.9, -300, 280), '', unreal.MaterialProperty.MP_SPECULAR)
     mel.recompile_material(m)
+    check_compiled(m, 'море')
     eal.save_loaded_asset(m)
     return m
 
@@ -385,6 +403,7 @@ def make_billboard_material():
     mel.connect_material_property(em2, '', unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     mel.connect_material_property(const(m, 0.8, -300, 380), '', unreal.MaterialProperty.MP_ROUGHNESS)
     mel.recompile_material(m)
+    check_compiled(m, 'картинки покемонов')
     eal.save_loaded_asset(m)
     return m
 

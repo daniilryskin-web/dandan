@@ -5,6 +5,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "LigaData.h"
+#include "LigaJson.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
@@ -75,11 +76,11 @@ void FLigaAssets::Load()
 	const TSharedPtr<FJsonObject>* Obj;
 	if (Root->TryGetObjectField(TEXT("npc_vrm"), Obj))
 	{
-		for (const auto& KV : (*Obj)->Values) NpcVrm.Add(KV.Key, KV.Value->AsString());
+		for (const auto& KV : (*Obj)->Values) NpcVrm.Add(LigaJsonKey(KV.Key), KV.Value->AsString());
 	}
 	if (Root->TryGetObjectField(TEXT("kit"), Obj))
 	{
-		for (const auto& KV : (*Obj)->Values) Kit.Add(KV.Key, KV.Value->AsString());
+		for (const auto& KV : (*Obj)->Values) Kit.Add(LigaJsonKey(KV.Key), KV.Value->AsString());
 	}
 }
 
@@ -158,7 +159,7 @@ void FLigaLayout::Load()
 			for (const auto& KV : (*DoorsObj)->Values)
 			{
 				const FVector P = Vec3(KV.Value->AsObject());
-				Doors.Add(KV.Key, FVector2D(P.X, P.Y));
+				Doors.Add(LigaJsonKey(KV.Key), FVector2D(P.X, P.Y));
 			}
 		}
 		const TArray<TSharedPtr<FJsonValue>>* NpcArr;
@@ -205,7 +206,7 @@ void FLigaLayout::Load()
 	{
 		for (const auto& KV : (*Inst)->Values)
 		{
-			TArray<FLigaInstance>& List = Instances.Add(KV.Key);
+			TArray<FLigaInstance>& List = Instances.Add(LigaJsonKey(KV.Key));
 			for (const TSharedPtr<FJsonValue>& Item : KV.Value->AsArray())
 			{
 				const TArray<TSharedPtr<FJsonValue>>& A = Item->AsArray();

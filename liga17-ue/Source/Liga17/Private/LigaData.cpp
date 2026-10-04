@@ -1,6 +1,7 @@
 ﻿#include "LigaData.h"
 
 #include "Dom/JsonObject.h"
+#include "LigaJson.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
@@ -142,7 +143,7 @@ bool FLigaDatabase::LoadMoves(const FString& Path)
 				{
 					for (const auto& KV : (*Ch)->Values)
 					{
-						const int32 Stat = LigaTypes::ParseBattleStat(KV.Key);
+						const int32 Stat = LigaTypes::ParseBattleStat(LigaJsonKey(KV.Key));
 						if (Stat >= 0) E.StatChanges[Stat] = (int32)KV.Value->AsNumber();
 					}
 				}

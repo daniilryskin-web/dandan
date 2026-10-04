@@ -171,7 +171,20 @@ def expr(m, cls, x, y, **props):
 
 
 def link(a, a_out, b, b_in):
-    mel.connect_material_expressions(a, a_out, b, b_in)
+    """Connects two nodes. An empty input name means the node's only input; its real name differs between nodes
+    (Normalize calls it VectorInput), so the usual names are tried. A link that fails is reported: the material would
+    not compile and Unreal would draw it grey."""
+    for name in ([b_in] if b_in else ['', 'Input', 'VectorInput', 'A']):
+        if mel.connect_material_expressions(a, a_out, b, name):
+            return True
+    warn(f'материал {b.get_outer().get_name()}: не удалось соединить {a.get_class().get_name()} → {b.get_class().get_name()} {b_in}')
+    return False
+
+
+def instanced_usage(m):
+    """Trees, bushes, rocks, flowers and grass are drawn as instances (HISM). A material without this flag is drawn with
+    the default grey material on them, and the editor cannot fix that for good during play."""
+    set_props(m, m.get_name(), ((('used_with_instanced_static_meshes', 'b_used_with_instanced_static_meshes'), True),))
 
 
 def const(m, v, x, y):
@@ -254,6 +267,7 @@ def make_foliage_material(textures):
     m = new_material('M_LigaFoliage')
     m.set_editor_property('two_sided', True)
     m.set_editor_property('shading_model', unreal.MaterialShadingModel.MSM_TWO_SIDED_FOLIAGE)
+    instanced_usage(m)
     tex = expr(m, unreal.MaterialExpressionTextureSampleParameter2D, -700, -100, parameter_name='BaseColor')
     if 'leaves_albedo' in textures:
         tex.set_editor_property('texture', textures['leaves_albedo'])
@@ -277,6 +291,58 @@ def make_foliage_material(textures):
     check_compiled(m, 'листва')
     eal.save_loaded_asset(m)
     return m
+
+
+@step('материал деревьев, камней и цветов')
+def make_kit_material(textures):
+    """Opaque material for the parts of instanced kit models that are not leaves or grass: bark, stone, flowers.
+    The importer's own glTF materials lack the instancing flag (see instanced_usage)."""
+    m = new_material('M_LigaKit')
+    instanced_usage(m)
+    white = unreal.load_asset('/Engine/EngineResources/WhiteSquareTexture')
+    tex = expr(m, unreal.MaterialExpressionTextureSampleParameter2D, -700, -200, parameter_name='BaseColor')
+    if white:
+        tex.set_editor_property('texture', white)
+    tint = expr(m, unreal.MaterialExpressionVectorParameter, -900, 40, parameter_name='Tint', default_value=unreal.LinearColor(1, 1, 1, 1))
+    tint3 = expr(m, unreal.MaterialExpressionComponentMask, -700, 40, r=True, g=True, b=True, a=False)
+    link(tint, '', tint3, '')
+    mul = expr(m, unreal.MaterialExpressionMultiply, -420, -120)
+    link(tex, 'RGB', mul, 'A')
+    link(tint3, '', mul, 'B')
+    mel.connect_material_property(mul, '', unreal.MaterialProperty.MP_BASE_COLOR)
+    nrm = expr(m, unreal.MaterialExpressionTextureSampleParameter2D, -700, 200, parameter_name='Normal',
+               sampler_type=unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
+    if 'stone_normal' in textures:
+        nrm.set_editor_property('texture', textures['stone_normal'])
+    flat = expr(m, unreal.MaterialExpressionConstant3Vector, -700, 420, constant=unreal.LinearColor(0, 0, 1, 1))
+    strength = scalar(m, 'NormalStrength', 1.0, -700, 520)
+    lerp = expr(m, unreal.MaterialExpressionLinearInterpolate, -420, 300)
+    link(flat, '', lerp, 'A')
+    link(nrm, 'RGB', lerp, 'B')
+    link(strength, '', lerp, 'Alpha')
+    mel.connect_material_property(lerp, '', unreal.MaterialProperty.MP_NORMAL)
+    mel.connect_material_property(scalar(m, 'Roughness', 0.8, -420, 520), '', unreal.MaterialProperty.MP_ROUGHNESS)
+    mel.recompile_material(m)
+    check_compiled(m, 'деревья, камни и цветы')
+    eal.save_loaded_asset(m)
+    return m
+
+
+def kit_colors():
+    """baseColorFactor of the kit's untextured glTF materials (flowers, stems), by material name."""
+    out = {}
+    kit_dir = os.path.join(EXPORTS, 'Kit')
+    for f in sorted(os.listdir(kit_dir)):
+        if not f.endswith('.glb'):
+            continue
+        with open(os.path.join(kit_dir, f), 'rb') as fh:
+            data = fh.read()
+        n = int.from_bytes(data[12:16], 'little')
+        for mat in json.loads(data[20:20 + n]).get('materials', []):
+            pbr = mat.get('pbrMetallicRoughness', {})
+            if 'baseColorFactor' in pbr and 'baseColorTexture' not in pbr:
+                out[mat.get('name', '').lower()] = pbr['baseColorFactor']
+    return out
 
 
 def make_instance(parent, name, scalars=None, textures=None, vectors=None):
@@ -413,9 +479,22 @@ def make_billboard_material():
 
 
 @step('материалы набора')
-def apply_kit_materials(meshes, foliage, textures):
+def apply_kit_materials(meshes, foliage, textures, kit=None):
     if foliage is None:
         return
+    colors = kit_colors() if kit is not None else {}
+    kit_instances = {}
+
+    def kit_instance(slot):
+        """MI_Kit_<slot>: the slot's own textures from ArtSource/Textures, or its flat glTF colour."""
+        if slot not in kit_instances:
+            albedo, normal = textures.get(f'{slot}_albedo'), textures.get(f'{slot}_normal')
+            color = colors.get(slot, [1.0, 1.0, 1.0, 1.0])
+            kit_instances[slot] = make_instance(
+                kit, f'MI_Kit_{slot}', {'NormalStrength': 1.0 if normal else 0.0, 'Roughness': 0.85 if albedo else 0.6},
+                {'BaseColor': albedo, 'Normal': normal}, {'Tint': unreal.LinearColor(*color[:3], 1.0)})
+        return kit_instances[slot]
+
     variants = {
         'grass_blade': make_instance(foliage, 'MI_Grass', {'Amp': 9.0, 'HeightRef': 100.0, 'Roughness': 0.6}, {'BaseColor': textures.get('grass_blade_albedo')}),
         'leaves': make_instance(foliage, 'MI_Leaves', {'Amp': 5.0, 'HeightRef': 700.0}, {'BaseColor': textures.get('leaves_albedo')}),
@@ -424,11 +503,16 @@ def apply_kit_materials(meshes, foliage, textures):
     }
     for name, sm in meshes.items():
         foliage_mesh = name.startswith(('grass', 'tree', 'pine', 'bush', 'hedge', 'flower'))
+        instanced = name.startswith(('grass', 'tree', 'pine', 'bush', 'flower', 'rock'))  # placed by LigaWorldBuilder
         for i, slot in enumerate(sm.get_editor_property('static_materials')):
             slot_name = short(slot.get_editor_property('material_slot_name'))
             for key, mi in variants.items():
                 if slot_name == key or slot_name.endswith(key):
                     sm.set_material(i, mi)
+                    break
+            else:
+                if instanced and kit is not None:
+                    sm.set_material(i, kit_instance(slot_name))
         set_collision(sm, complex_as_simple=not name.startswith(('grass', 'flower')))
         if foliage_mesh:
             sm.set_editor_property('light_map_resolution', 32)
@@ -865,7 +949,8 @@ def main():
         terrain = make_terrain_material(textures)
         sea = make_water_material(textures)
         billboard = make_billboard_material()
-        apply_kit_materials(meshes, foliage, textures)
+        kit = make_kit_material(textures)
+        apply_kit_materials(meshes, foliage, textures, kit)
         task.enter_progress_frame(1, 'Персонажи')
         chars = find_characters() or {}
         task.enter_progress_frame(1, 'Аниме-персонажи (первый раз — несколько минут)')

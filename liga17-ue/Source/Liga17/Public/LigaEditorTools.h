@@ -11,7 +11,7 @@ class LIGA17_API ULigaEditorTools : public UBlueprintFunctionLibrary
 	GENERATED_BODY()
 
 public:
-	/** True when this editor build links VRM4U (Plugins/VRM4U was present when the project was built). */
+	/** True when VRM4U is loaded and ImportVrmWithRetargeter can ask it for the retargeter. */
 	UFUNCTION(BlueprintCallable, Category = "Liga")
 	static bool CanImportVrmWithRetargeter();
 

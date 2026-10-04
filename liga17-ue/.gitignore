@@ -1,0 +1,30 @@
+# Unreal build products
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.sln
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+*.xcodeproj
+*.xcworkspace
+
+# Assets generated in the editor by Content/Python/liga_setup.py (rebuilt from ArtSource on any machine)
+Content/Liga/Textures/
+Content/Liga/Kit/
+Content/Liga/Materials/
+Content/Liga/Town/
+Content/Liga/Maps/
+Content/Liga/Data/assets.json
+Content/Characters/
+Content/ThirdPerson/
+Content/LevelPrototyping/
+Content/Input/
+Content/VRM/
+Plugins/VRM4U/
+
+# Blender helper caches
+ArtSource/__pycache__/

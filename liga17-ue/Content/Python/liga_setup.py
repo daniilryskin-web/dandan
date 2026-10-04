@@ -802,6 +802,7 @@ def main():
         chars = find_characters() or {}
         task.enter_progress_frame(1, 'Аниме-персонажи (первый раз — несколько минут)')
         chars.update(import_characters() or {})
+        write_assets_json(meshes, chars, billboard)  # saved first: the 3D step below can be the slowest and riskiest
         task.enter_progress_frame(1, '3D-покемоны')
         models3d = import_pokemon3d() or {}
         write_assets_json(meshes, chars, billboard, models3d)

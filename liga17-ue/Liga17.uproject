@@ -2,7 +2,7 @@
 	"FileVersion": 3,
 	"EngineAssociation": "5.8",
 	"Category": "",
-	"Description": "Лига 17 — фанатская 3D RPG про покемонов (Канто)",
+	"Description": "Liga 17 - fan-made 3D Pokemon RPG (Kanto)",
 	"Modules": [
 		{
 			"Name": "Liga17",

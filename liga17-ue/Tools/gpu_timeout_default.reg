@@ -1,0 +1,6 @@
+Windows Registry Editor Version 5.00
+
+; Liga 17: restore the Windows default GPU timeout. Restart the computer after applying.
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers]
+"TdrDelay"=-
+"TdrDdiDelay"=-

@@ -1,0 +1,7 @@
+Windows Registry Editor Version 5.00
+
+; Liga 17: give the video card 60 s instead of 2 s before Windows resets it ("GPU crashed or D3D device removed").
+; Restart the computer after applying. To undo, run gpu_timeout_default.reg.
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers]
+"TdrDelay"=dword:0000003c
+"TdrDdiDelay"=dword:0000003c

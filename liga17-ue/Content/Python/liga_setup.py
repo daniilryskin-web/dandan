@@ -28,6 +28,9 @@ TEXTURES = os.path.join(ART, 'Textures')
 DATA = os.path.join(PROJECT, 'Content', 'Liga', 'Data')
 CHARACTERS = os.path.join(ART, 'Characters')
 CHAR_STATE = os.path.join(PROJECT, 'Saved', 'Liga', 'characters.json')
+CHAR_GUARD = os.path.join(PROJECT, 'Saved', 'Liga', 'character_importing.json')
+VRM4U_CONVERT = os.path.join(PROJECT, 'Plugins', 'VRM4U', 'Source', 'VRM4ULoader', 'Private', 'VrmConvert.cpp')
+VRM4U_URL = 'https://github.com/ruyo/VRM4U/archive/refs/heads/master.zip'
 
 ROOT = '/Game/Liga'
 TEX_PATH = ROOT + '/Textures'
@@ -486,6 +489,22 @@ def download(url, dest, sha):
     os.replace(tmp, dest)
 
 
+def vrm4u_too_old():
+    """VRM4U before 23.09.2026 kept a pointer to options owned by a temporary factory in its scripted import, and the
+    editor crashed in VRMConverter::ConvertHumanoid. Fixed builds copy the options (ImportOptionStorage)."""
+    try:
+        with open(VRM4U_CONVERT, encoding='utf-8', errors='ignore') as f:
+            return 'ImportOptionStorage' not in f.read()
+    except OSError:
+        return False  # plugin without sources: cannot tell, try anyway
+
+
+def save_char_state(state):
+    os.makedirs(os.path.dirname(CHAR_STATE), exist_ok=True)
+    with open(CHAR_STATE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=1)
+
+
 @step('аниме-персонажи (VRoid)')
 def import_characters():
     """Downloads the cast from cast.json and imports each model with VRM4U into /Game/Characters/VRM/<Name>/.
@@ -500,6 +519,16 @@ def import_characters():
     if os.path.exists(CHAR_STATE):
         with open(CHAR_STATE, encoding='utf-8') as f:
             state = json.load(f)
+    if os.path.exists(CHAR_GUARD):  # the editor died while importing this model last time
+        with open(CHAR_GUARD, encoding='utf-8') as f:
+            g = json.load(f)
+        state[g['role']] = 'crashed:' + g['sha']
+        save_char_state(state)
+        os.remove(CHAR_GUARD)
+    can_import = not vrm4u_too_old()
+    if not can_import:
+        warn('плагин VRM4U устарел: в его версии есть ошибка, из-за которой падал редактор. Новые персонажи не импортируются, '
+             f'пока его не обновить: {VRM4U_URL} (инструкция — в Docs/README_RU.md)')
     imported, ready = 0, 0
     with unreal.ScopedSlowTask(len(cast), 'Аниме-персонажи') as task:
         task.make_dialog(True)
@@ -522,6 +551,11 @@ def import_characters():
                         continue
                 sha = file_sha256(path)
                 lists = assets_matching(folder, lambda c, n: 'VrmAssetList' in c)
+                if state.get(role) == 'crashed:' + sha:
+                    warn(f'{name}: эта модель в прошлый раз уронила редактор — пропущена (замените файл {file}, чтобы попробовать снова)')
+                    continue
+                if (not lists or state.get(role) != sha) and not can_import:
+                    continue
                 if not lists or state.get(role) != sha:
                     if eal.does_directory_exist(folder) and not eal.delete_directory(folder):
                         warn(f'{name}: не удалось удалить старый импорт {folder} — перезапустите редактор и запустите настройку ещё раз')
@@ -532,12 +566,17 @@ def import_characters():
                             opts.set_editor_property(prop, value)
                         except Exception:
                             pass
+                    os.makedirs(os.path.dirname(CHAR_GUARD), exist_ok=True)
+                    with open(CHAR_GUARD, 'w', encoding='utf-8') as f:
+                        json.dump({'role': role, 'sha': sha}, f)
                     obj = unreal.VrmImporterBPFunctionLibrary.import_vrm_file_with_options(path, f'{folder}/{name}', opts)
+                    os.remove(CHAR_GUARD)
                     if obj is None:
                         warn(f'{file}: VRM4U не смог импортировать модель')
                         continue
                     eal.save_directory(folder, only_if_is_dirty=False, recursive=True)
                     state[role] = sha
+                    save_char_state(state)
                     imported += 1
                     lists = [obj.get_path_name()]
                 rtg = f'{folder}/RTG_{name}.RTG_{name}'
@@ -552,9 +591,7 @@ def import_characters():
             except Exception as e:  # one broken model must not cost the whole cast
                 warn(f'{info.get("file")}: {e}')
 
-    os.makedirs(os.path.dirname(CHAR_STATE), exist_ok=True)
-    with open(CHAR_STATE, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=1)
+    save_char_state(state)
     no_rtg = [r for r, v in result['npc_rtg'].items() if not v] + (['player'] if result['player_vrm'] and not result['player_rtg'] else [])
     log(f'аниме-персонажи: готово {ready} из {len(cast)} (импортировано сейчас: {imported})')
     if no_rtg:

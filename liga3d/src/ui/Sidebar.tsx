@@ -1,6 +1,6 @@
 import { BADGES } from '../data/world';
 import { useStore } from '../state/store';
-import { MonCard, Money } from './common';
+import { MonCard, Modal, Money } from './common';
 
 export function TopBar() {
   const game = useStore((s) => s.game)!;
@@ -23,6 +23,9 @@ export function TopBar() {
         </span>
       </div>
       <nav className="topnav">
+        <button className="btn ghost" type="button" onClick={() => setModal('team')}>
+          ◓ Команда
+        </button>
         <button className="btn ghost" type="button" onClick={() => setModal('bag')}>
           🎒 Сумка
         </button>
@@ -37,6 +40,15 @@ export function TopBar() {
         </button>
       </nav>
     </header>
+  );
+}
+
+export function TeamJournalModal() {
+  const setModal = useStore((s) => s.setModal);
+  return (
+    <Modal title="◓ Команда и дневник" onClose={() => setModal(null)} wide>
+      <Sidebar />
+    </Modal>
   );
 }
 

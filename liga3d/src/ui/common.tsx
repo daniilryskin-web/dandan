@@ -1,10 +1,12 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { itemIconUrl } from '../data/items';
 import { STATUS_INFO, type StatusId } from '../data/moves';
 import { getSpecies } from '../data/species';
 import { TYPE_INFO, type PokeType } from '../data/types';
 import type { Pokemon } from '../engine/model';
 import { displayName, expProgress, maxHp } from '../engine/pokemon';
 import { paletteFor } from '../three/CreatureModel';
+import { homeUrl } from '../three/art';
 import { loadSprite, spriteUrl, useSpriteManifest } from '../three/sprites';
 import { useStore } from '../state/store';
 
@@ -66,17 +68,35 @@ export function GenderMark({ gender }: { gender: Pokemon['gender'] }) {
 /** Small 2D picture: imported image when available, otherwise a stylised token in the species colours. */
 export function MonIcon({ species, shiny = false, size = 44, silhouette = false }: { species: number; shiny?: boolean; size?: number; silhouette?: boolean }) {
   const useSprites = useStore((s) => s.settings.useSprites);
+  const artSource = useStore((s) => s.settings.artSource);
   const manifest = useSpriteManifest();
   const url = useSprites ? spriteUrl(manifest, species) : null;
   const [img, setImg] = useState<string | null>(null);
+  const [remoteFailed, setRemoteFailed] = useState(false);
   useEffect(() => {
     let alive = true;
     setImg(null);
+    setRemoteFailed(false);
     if (url) loadSprite(url, shiny).then((s) => alive && setImg(s.dataUrl)).catch(() => undefined);
     return () => {
       alive = false;
     };
-  }, [url, shiny]);
+  }, [url, shiny, species]);
+  if (!img && !url && artSource !== 'models' && !remoteFailed) {
+    return (
+      <img
+        className="mon-icon img"
+        src={homeUrl(species, shiny)}
+        alt={silhouette ? '???' : getSpecies(species).name}
+        width={size}
+        height={size}
+        loading="lazy"
+        crossOrigin="anonymous"
+        onError={() => setRemoteFailed(true)}
+        style={{ filter: silhouette ? 'brightness(0) opacity(0.55)' : undefined }}
+      />
+    );
+  }
   const sp = getSpecies(species);
   if (img) {
     return (
@@ -173,4 +193,11 @@ export function Money({ value }: { value: number }) {
       {value.toLocaleString('ru-RU')}
     </span>
   );
+}
+
+/** Item sprite from PokeAPI, falling back to a coloured dot. */
+export function ItemIcon({ id, color, size = 28 }: { id: string; color: string; size?: number }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <span className="item-dot" style={{ background: color, width: size * 0.5, height: size * 0.5 }} />;
+  return <img className="item-icon" src={itemIconUrl(id)} width={size} height={size} alt="" loading="lazy" onError={() => setFailed(true)} />;
 }

@@ -143,6 +143,7 @@ export function loadSprite(url: string, shiny: boolean): Promise<SpriteImage> {
         resolve({ texture, aspect: tw / th, dataUrl: out.toDataURL('image/png') });
       };
       img.onerror = () => reject(new Error(`Не удалось загрузить ${url}`));
+      img.crossOrigin = 'anonymous';
       img.src = url;
     });
     cache.set(key, p);

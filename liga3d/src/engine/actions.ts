@@ -79,6 +79,24 @@ export function explore(state: GameState, rng: Rng): ActionResult {
   return ok(quiet[Math.floor(rng() * quiet.length)]);
 }
 
+/** Battle with a wild Pokémon met in the overworld. */
+export function encounterWild(state: GameState, speciesId: number, level: number, shiny: boolean, rng: Rng): ActionResult {
+  const blocked = inBattle(state);
+  if (blocked) return blocked;
+  if (firstAliveIndex(state.team) < 0) return fail('Все ваши покемоны без сил. Сходите в покецентр.');
+  startWildBattle(state, speciesId, level, rng, { shiny });
+  return ok(`Дикий ${getSpecies(speciesId).name}!`, { battle: true });
+}
+
+/** Item found lying on the ground. */
+export function pickupItem(state: GameState, itemId: string): ActionResult {
+  const item = getItem(itemId);
+  state.bag[itemId] = (state.bag[itemId] ?? 0) + 1;
+  state.stats.itemsFound++;
+  addLog(state, `Найден предмет: ${item.name} (${getLocation(state.location).name}).`, item.id === 'master-ball' ? 'rare' : 'good');
+  return ok(`Найдено: ${item.name}!`);
+}
+
 export function bestRod(state: GameState): 1 | 2 | 0 {
   if ((state.bag['good-rod'] ?? 0) > 0) return 2;
   if ((state.bag['old-rod'] ?? 0) > 0) return 1;

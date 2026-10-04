@@ -100,7 +100,7 @@ for (const [id, { file, ext }] of [...best.entries()].sort((a, b) => a[0] - b[0]
 }
 writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest, null, 0));
 
-const gameIds = [...readFileSync(join(root, 'src/data/species.ts'), 'utf8').matchAll(/\{ id: (\d+), name: '/g)].map((m) => Number(m[1]));
+const gameIds = JSON.parse(readFileSync(join(root, 'src/data/gen/species.json'), 'utf8')).map((sp) => sp.id);
 const missing = gameIds.filter((id) => !manifest[id]).sort((a, b) => a - b);
 console.log(`Просмотрено файлов: ${scanned}. Сопоставлено видов: ${Object.keys(manifest).length}.`);
 console.log(`Покемоны игры с картинкой: ${gameIds.length - missing.length} из ${gameIds.length}.`);

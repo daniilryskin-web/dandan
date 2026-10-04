@@ -505,9 +505,9 @@ function baseBattle(state: GameState, kind: BattleState['kind'], enemyTeam: Poke
   };
 }
 
-export function startWildBattle(state: GameState, speciesId: number, level: number, rng: Rng): BattleState {
+export function startWildBattle(state: GameState, speciesId: number, level: number, rng: Rng, opts: { shiny?: boolean } = {}): BattleState {
   const loc = getLocation(state.location);
-  const enemy = createPokemon(speciesId, level, rng, { uid: newUid(state), metAt: loc.name });
+  const enemy = createPokemon(speciesId, level, rng, { uid: newUid(state), metAt: loc.name, shiny: opts.shiny });
   const battle = baseBattle(state, 'wild', [enemy]);
   state.battle = battle;
   markSeen(state, speciesId);

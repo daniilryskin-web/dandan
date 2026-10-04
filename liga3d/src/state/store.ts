@@ -12,10 +12,18 @@ export interface Toast {
   kind: 'ok' | 'error' | 'rare';
 }
 
+export type Quality = 'high' | 'medium' | 'low';
+
 export interface Settings {
   useSprites: boolean;
   battleSpeed: 1 | 2 | 3;
+  /** Pokémon images: HOME renders, official artwork or procedural 3D models (offline). */
+  artSource: 'home' | 'artwork' | 'models';
+  quality: Quality;
+  sound: boolean;
 }
+
+const DEFAULT_SETTINGS: Settings = { useSprites: true, battleSpeed: 1, artSource: 'home', quality: 'high', sound: true };
 
 export type ModalId = 'team' | 'bag' | 'shop' | 'storage' | 'dex' | 'map' | 'settings' | 'pokemon' | null;
 
@@ -24,11 +32,11 @@ const SETTINGS_KEY = 'liga3d-settings';
 function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { useSprites: true, battleSpeed: 1, ...JSON.parse(raw) };
+    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
   } catch {
     /* ignore */
   }
-  return { useSprites: true, battleSpeed: 1 };
+  return { ...DEFAULT_SETTINGS };
 }
 
 interface Store {

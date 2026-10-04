@@ -1,24 +1,27 @@
-# Исходные датасеты
+# Источники данных
 
-- `pokemon.csv` — Kaggle «The Complete Pokemon Dataset» (801 покемон, поколения 1–7: характеристики, типы,
-  шанс поимки, скорость роста, пол, рост, вес). У части записей вместо обычной формы стоят значения
-  мега-эволюций (Venusaur, Charizard, Blastoise, Beedrill, Pidgeot, Alakazam, Gengar, Gyarados) и алольских
-  форм (Rattata, Raticate, Raichu, Sandshrew, Sandslash, Vulpix, Ninetales, Diglett, Dugtrio, Meowth, Persian) —
-  их нельзя брать без проверки.
-- `pokemon-stats.csv` — Kaggle «Pokemon with stats» (800 записей, поколения 1–6, мега-формы отдельными строками).
-  Характеристики обычных форм — по 6-му поколению (у Арбока и Дагтрио в 7-м поколении атака выше).
-- `pokemon-species.csv` — 807 видов (поколения 1–7), по одной строке на вид, только обычные формы:
-  характеристики, типы, базовый опыт, рост, вес.
-- `pokemon-gen9.csv` — самый свежий: все 1025 видов (до 9-го поколения включительно) и 236 альтернативных форм
-  (мега, региональные и т. п.) отдельными строками; первая строка для каждого номера — обычная форма.
-  Колонки: номер, имя, типы, характеристики.
+Данные игры генерирует `scripts/build-data.mjs` в `src/data/gen/species.json` и `src/data/gen/moves.json`:
 
-`scripts/gen-dexinfo.mjs` берёт из `pokemon-species.csv` рост и вес для покедекса (`src/data/dexinfo.ts`).
-Характеристики, типы и базовый опыт в `src/data/species.ts` полностью совпадают с `pokemon-species.csv`;
-шанс поимки, скорость роста и соотношение полов сверены с `pokemon.csv`.
-Все 81 покемон игры совпадают с `pokemon-gen9.csv` по характеристикам и типам.
-`scripts/import-sprites.mjs` берёт из `pokemon-gen9.csv` имена всех 1025 видов для сопоставления картинок.
+```
+git clone --depth 1 --filter=blob:none --sparse https://github.com/PokeAPI/pokeapi
+(cd pokeapi && git sparse-checkout set data/v2/csv)
+git clone --depth 1 https://github.com/sindresorhus/pokemon
+npm run build-data -- pokeapi/data/v2/csv pokemon
+```
 
-Для расширения списка покемонов: характеристики и типы — из `pokemon-gen9.csv`, базовый опыт — из
-`pokemon-species.csv`, шанс поимки/скорость роста/пол — из `pokemon.csv`; эволюции, атаки и внешний вид
-3D-моделей задаются вручную.
+- **PokeAPI** (BSD-3-Clause) — 1025 видов: характеристики, типы, шанс поимки, скорость роста, пол, рост, вес,
+  эволюции, списки атак по уровням (берётся самая новая игра, где они есть: Scarlet/Violet → Sword/Shield → …),
+  атаки и их механика (`move_meta`: статусы, изменения характеристик, вампиризм, отдача, лечение, криты, серии).
+- **sindresorhus/pokemon** (MIT) — русские имена покемонов; недостающие имена — в `species-names-ru.txt`.
+- `move-names-ru.txt` — русские названия атак, переведённые для этой игры.
+
+Статусные атаки, механику которых движок пока не поддерживает, не попадают в списки атак покемонов.
+
+Таблицы с Kaggle, по которым сверялись данные первой версии (характеристики всех видов совпадают с PokeAPI):
+
+- `pokemon.csv` — «The Complete Pokemon Dataset» (801 покемон, поколения 1–7). У части записей стоят значения
+  мега-эволюций и алольских форм вместо обычных.
+- `pokemon-stats.csv` — «Pokemon with stats» (800 записей, поколения 1–6, мега-формы отдельными строками).
+- `pokemon-species.csv` — 807 видов (поколения 1–7), только обычные формы, с базовым опытом.
+- `pokemon-gen9.csv` — 1025 видов и альтернативные формы; по нему `scripts/import-sprites.mjs` сопоставляет
+  имена файлов картинок.

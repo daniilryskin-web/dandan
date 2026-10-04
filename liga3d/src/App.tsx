@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useStore } from './state/store';
 import { BattleView } from './ui/BattleView';
-import { LocationView } from './ui/LocationView';
+import { OverworldView } from './ui/OverworldView';
 import { BagModal, DexModal, EvolutionModal, LearnMoveModal, MapModal, SettingsModal, ShopModal, StorageModal } from './ui/Modals';
 import { PokemonModal } from './ui/PokemonModal';
-import { Sidebar, TopBar } from './ui/Sidebar';
+import { TeamJournalModal, TopBar } from './ui/Sidebar';
 import { TitleScreen } from './ui/TitleScreen';
 
 function Toasts() {
@@ -29,10 +29,8 @@ function GameScreen() {
   return (
     <div className="game">
       <TopBar />
-      <main className="game-main">
-        <section className="stage">{inBattle ? <BattleView key={game.battle!.enemyTeam[0].uid} /> : <LocationView />}</section>
-        <Sidebar />
-      </main>
+      <main className="game-stage">{inBattle ? <BattleView key={game.battle!.enemyTeam[0].uid} /> : <OverworldView />}</main>
+      {modal === 'team' && <TeamJournalModal />}
       {modal === 'bag' && <BagModal />}
       {modal === 'shop' && <ShopModal />}
       {modal === 'storage' && <StorageModal />}

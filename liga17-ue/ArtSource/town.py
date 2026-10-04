@@ -169,6 +169,10 @@ def build_terrain(step=1.0):
     me = bpy.data.meshes.new('Terrain')
     bm.to_mesh(me)
     bm.free()
+    # Make 'Col' the active/render colour. Otherwise the glTF exporter writes a white placeholder
+    # as COLOR_0 (the only set Unreal reads) and the masks as COLOR_1, and the whole ground turns to sand.
+    me.color_attributes.active_color = me.color_attributes['Col']
+    me.color_attributes.render_color_index = me.color_attributes.active_color_index
     for p in me.polygons:
         p.use_smooth = True
     me.materials.append(terrain_material())
@@ -501,7 +505,7 @@ def gltf_export(path):
     opts = dict(filepath=path, use_selection=True, export_format='GLB', export_apply=True, export_yup=True,
                 export_image_format='JPEG', export_jpeg_quality=88, export_materials='EXPORT')
     try:
-        bpy.ops.export_scene.gltf(export_vertex_color='ACTIVE', **opts)
+        bpy.ops.export_scene.gltf(export_vertex_color='ACTIVE', export_all_vertex_colors=False, **opts)
     except TypeError:
         bpy.ops.export_scene.gltf(**opts)
 

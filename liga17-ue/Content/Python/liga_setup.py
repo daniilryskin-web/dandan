@@ -594,7 +594,24 @@ def summary():
     unreal.EditorDialog.show_message('Лига 17 — настройка', 'Готово!\n\n' + text[-1800:], unreal.AppMsgType.OK)
 
 
+def wrong_project():
+    """The script only works inside the downloaded liga17-ue project (next to ArtSource/ and Source/Liga17/)."""
+    if os.path.isdir(ART) and os.path.isdir(os.path.join(PROJECT, 'Source', 'Liga17')):
+        return False
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) if '__file__' in globals() else '?'
+    msg = ('Открыт не тот проект.\n\n'
+           f'Сейчас в редакторе: {PROJECT}\n'
+           f'Нужен файл: {os.path.join(here, "Liga17.uproject")}\n\n'
+           'Закройте Unreal и откройте Liga17.uproject, который лежит рядом с папками ArtSource, Source и Content. '
+           'Папку с новым пустым проектом, созданную Unreal, можно удалить.')
+    unreal.log_error('[Liga] ' + msg)
+    unreal.EditorDialog.show_message('Лига 17 — настройка', msg, unreal.AppMsgType.OK)
+    return True
+
+
 def main():
+    if wrong_project():
+        return
     os.makedirs(DATA, exist_ok=True)
     src_layout = os.path.join(EXPORTS, 'layout.json')
     if os.path.exists(src_layout):

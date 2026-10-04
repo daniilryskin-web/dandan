@@ -534,9 +534,12 @@ def import_characters():
     tools = getattr(unreal, 'LigaEditorTools', None)
     with_rtg = bool(tools) and tools.can_import_vrm_with_retargeter()
     root = VRM_ROOT if with_rtg else VRM_ROOT_PLAIN
-    if not with_rtg:
-        warn('проект собран без VRM4U, поэтому персонажи импортируются без ретаргетера анимаций. Закройте Unreal, '
-             'откройте Liga17.uproject и согласитесь пересобрать проект (плагин должен лежать в Plugins/VRM4U), затем запустите настройку ещё раз')
+    if not tools:  # Unreal does not rebuild the project by itself when only its source code changed
+        warn('редактор работает со старой сборкой проекта, поэтому персонажи импортируются без ретаргетера анимаций. Закройте Unreal, '
+             'удалите папку Binaries в папке проекта (не в Plugins), откройте Liga17.uproject, согласитесь пересобрать и запустите настройку ещё раз')
+    elif not with_rtg:
+        warn('проект собран без VRM4U, поэтому персонажи импортируются без ретаргетера анимаций. Плагин должен лежать в '
+             'Plugins/VRM4U/VRM4U.uplugin; затем закройте Unreal, удалите папку Binaries в папке проекта, откройте Liga17.uproject и пересоберите')
     imported, ready = 0, 0
     with unreal.ScopedSlowTask(len(cast), 'Аниме-персонажи') as task:
         task.make_dialog(True)

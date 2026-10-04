@@ -42,8 +42,12 @@ void ALigaNPC::BeginPlay()
 {
 	Super::BeginPlay();
 	HomeYaw = GetActorRotation().Yaw;
-	const FString* Vrm = FLigaAssets::Get().NpcVrm.Find(Look);
-	LigaVisuals::SetupBody(this, VrmMesh, Vrm ? *Vrm : FString());
+	// The cast is keyed by NPC id; the look ("man", "girl"…) is the fallback for hand-added models.
+	const FLigaAssets& A = FLigaAssets::Get();
+	const FString Key = A.NpcVrm.Contains(Id) ? Id : Look;
+	const FString* Vrm = A.NpcVrm.Find(Key);
+	const FString* Rtg = A.NpcRtg.Find(Key);
+	LigaVisuals::SetupBody(this, VrmMesh, Vrm ? *Vrm : FString(), Rtg ? *Rtg : FString());
 	NameTag->SetSlateWidget(
 		SNew(SBorder)
 		.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))

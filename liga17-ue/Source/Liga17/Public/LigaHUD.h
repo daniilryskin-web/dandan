@@ -13,6 +13,8 @@ class LIGA17_API ALigaHUD : public AHUD
 	GENERATED_BODY()
 
 public:
+	ALigaHUD();
+	virtual void Tick(float DeltaSeconds) override;
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 	/** Floating damage numbers over the battle billboards. */

@@ -5,15 +5,18 @@
 What it does:
   1. imports the generated textures and the Pallet Town art kit (ArtSource/Exports/Kit/*.glb);
   2. builds materials: wind-animated foliage, vertex-colour terrain blend, sea, Pokémon billboard;
-  3. finds the Third Person mannequin and any VRoid (VRM4U) characters;
+  3. finds the Third Person mannequin; downloads the anime (VRoid, CC0) cast listed in ArtSource/Characters/cast.json
+     and imports it with the VRM4U plugin (your own <Role>.vrm in that folder replaces a model);
   4. creates /Game/Liga/Maps/PalletTown, imports the town scene into it, adds sky, sun, clouds, fog;
   5. writes Content/Liga/Data/assets.json for the game code and saves everything.
 Safe to run again: it rebuilds the level and replaces imported assets.
 """
+import hashlib
 import json
 import math
 import os
 import shutil
+import urllib.request
 
 import unreal
 
@@ -22,6 +25,8 @@ ART = os.path.join(PROJECT, 'ArtSource')
 EXPORTS = os.path.join(ART, 'Exports')
 TEXTURES = os.path.join(ART, 'Textures')
 DATA = os.path.join(PROJECT, 'Content', 'Liga', 'Data')
+CHARACTERS = os.path.join(ART, 'Characters')
+CHAR_STATE = os.path.join(PROJECT, 'Saved', 'Liga', 'characters.json')
 
 ROOT = '/Game/Liga'
 TEX_PATH = ROOT + '/Textures'
@@ -29,6 +34,7 @@ KIT_PATH = ROOT + '/Kit'
 MAT_PATH = ROOT + '/Materials'
 TOWN_PATH = ROOT + '/Town'
 MAP_PATH = ROOT + '/Maps/PalletTown'
+VRM_ROOT = '/Game/Characters/VRM'
 
 asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 eal = unreal.EditorAssetLibrary
@@ -410,33 +416,129 @@ def apply_kit_materials(meshes, foliage, textures):
 @step('поиск персонажей')
 def find_characters():
     ar = unreal.AssetRegistryHelpers.get_asset_registry()
-    result = {'character_mesh': '', 'character_anim': '', 'player_vrm': '', 'npc_vrm': {}}
-    meshes, anims, vrms = [], [], []
+    result = {'character_mesh': '', 'character_anim': ''}
+    meshes, anims = [], []
     for data in ar.get_assets_by_path('/Game', recursive=True):
-        cls = str(data.asset_class_path.asset_name) if hasattr(data, 'asset_class_path') else str(data.asset_class)
+        cls = asset_class(data)
         name = str(data.asset_name)
         pkg = str(data.package_name)
         if cls == 'SkeletalMesh' and name.startswith(('SKM_Manny', 'SKM_Quinn')):
             meshes.append((0 if name == 'SKM_Manny_Simple' else 1 if name == 'SKM_Manny' else 2, f'{pkg}.{name}'))
         elif cls == 'AnimBlueprint' and name in ('ABP_Unarmed', 'ABP_Manny', 'ABP_Quinn'):
             anims.append((0 if name == 'ABP_Unarmed' else 1, f'{pkg}.{name}_C'))
-        elif cls == 'VrmAssetListObject':
-            vrms.append((name, f'{pkg}.{name}'))
     if meshes:
         result['character_mesh'] = sorted(meshes)[0][1]
     else:
         warn('манекен не найден — добавьте Third Person: Content Browser → Add → Add Feature or Content Pack → Third Person')
     if anims:
         result['character_anim'] = sorted(anims)[0][1]
-    looks = ('oak', 'mom', 'girl', 'man', 'rival', 'sailor')
-    for name, path in vrms:
-        low = name.lower()
-        hit = next((l for l in looks if l in low), None)
-        if hit:
-            result['npc_vrm'][hit] = path
-        elif not result['player_vrm'] or 'player' in low:
-            result['player_vrm'] = path
-    log(f"персонаж: {result['character_mesh'] or '—'}, анимации: {result['character_anim'] or '—'}, VRoid моделей: {len(vrms)}")
+    log(f"манекен: {result['character_mesh'] or '—'}, анимации: {result['character_anim'] or '—'}")
+    return result
+
+
+def asset_class(data):
+    return str(data.asset_class_path.asset_name) if hasattr(data, 'asset_class_path') else str(data.asset_class)
+
+
+def assets_matching(folder, pred):
+    ar = unreal.AssetRegistryHelpers.get_asset_registry()
+    if hasattr(ar, 'scan_paths_synchronous'):
+        ar.scan_paths_synchronous([folder], True)
+    return [f'{d.package_name}.{d.asset_name}' for d in ar.get_assets_by_path(folder, recursive=True)
+            if pred(asset_class(d), str(d.asset_name))]
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download(url, dest, sha):
+    tmp = dest + '.part'
+    with urllib.request.urlopen(url, timeout=90) as r, open(tmp, 'wb') as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+    if sha and file_sha256(tmp) != sha:
+        os.remove(tmp)
+        raise RuntimeError('файл повреждён (контрольная сумма не совпала)')
+    os.replace(tmp, dest)
+
+
+@step('аниме-персонажи (VRoid)')
+def import_characters():
+    """Downloads the cast from cast.json and imports each model with VRM4U into /Game/Characters/VRM/<Name>/.
+    A model is re-imported only when its file changed, so running the setup again is quick."""
+    result = {'player_vrm': '', 'player_rtg': '', 'npc_vrm': {}, 'npc_rtg': {}}
+    if not hasattr(unreal, 'VrmImporterBPFunctionLibrary'):
+        warn('плагин VRM4U не найден: люди останутся манекенами. Установка плагина — шаг 4 в Docs/README_RU.md')
+        return result
+    with open(os.path.join(CHARACTERS, 'cast.json'), encoding='utf-8') as f:
+        cast = json.load(f)['roles']
+    state = {}
+    if os.path.exists(CHAR_STATE):
+        with open(CHAR_STATE, encoding='utf-8') as f:
+            state = json.load(f)
+    imported, ready = 0, 0
+    with unreal.ScopedSlowTask(len(cast), 'Аниме-персонажи') as task:
+        task.make_dialog(True)
+        for role, info in cast.items():
+            try:
+                file = info['file']
+                name = os.path.splitext(file)[0]
+                path = os.path.join(CHARACTERS, file)
+                folder = f'{VRM_ROOT}/{name}'
+                task.enter_progress_frame(1, f'{name}: {info.get("source", "")}')
+                if not os.path.exists(path):
+                    if not info.get('url'):
+                        warn(f'{file}: файла нет в ArtSource/Characters')
+                        continue
+                    try:
+                        log(f'скачиваю {file} ({info.get("source")})')
+                        download(info['url'], path, info.get('sha256'))
+                    except Exception as e:
+                        warn(f'{file}: не удалось скачать ({e}). Скачайте вручную {info["url"]} и сохраните как ArtSource/Characters/{file}')
+                        continue
+                sha = file_sha256(path)
+                lists = assets_matching(folder, lambda c, n: 'VrmAssetList' in c)
+                if not lists or state.get(role) != sha:
+                    if eal.does_directory_exist(folder) and not eal.delete_directory(folder):
+                        warn(f'{name}: не удалось удалить старый импорт {folder} — перезапустите редактор и запустите настройку ещё раз')
+                        continue
+                    opts = unreal.ImportOptionData()
+                    for prop, value in (('mipmap_generate_mode', True), ('bc7_mode', True)):
+                        try:
+                            opts.set_editor_property(prop, value)
+                        except Exception:
+                            pass
+                    obj = unreal.VrmImporterBPFunctionLibrary.import_vrm_file_with_options(path, f'{folder}/{name}', opts)
+                    if obj is None:
+                        warn(f'{file}: VRM4U не смог импортировать модель')
+                        continue
+                    eal.save_directory(folder, only_if_is_dirty=False, recursive=True)
+                    state[role] = sha
+                    imported += 1
+                    lists = [obj.get_path_name()]
+                rtg = f'{folder}/RTG_{name}.RTG_{name}'
+                if not eal.does_asset_exist(rtg):
+                    found = assets_matching(folder, lambda c, n: c == 'IKRetargeter' and n.startswith('RTG_') and not n.startswith(('RTG_UE4_', 'RTG_UEFN_')))
+                    rtg = found[0] if found else ''
+                if role == 'player':
+                    result['player_vrm'], result['player_rtg'] = lists[0], rtg
+                else:
+                    result['npc_vrm'][role], result['npc_rtg'][role] = lists[0], rtg
+                ready += 1
+            except Exception as e:  # one broken model must not cost the whole cast
+                warn(f'{info.get("file")}: {e}')
+
+    os.makedirs(os.path.dirname(CHAR_STATE), exist_ok=True)
+    with open(CHAR_STATE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=1)
+    no_rtg = [r for r, v in result['npc_rtg'].items() if not v] + (['player'] if result['player_vrm'] and not result['player_rtg'] else [])
+    log(f'аниме-персонажи: готово {ready} из {len(cast)} (импортировано сейчас: {imported})')
+    if no_rtg:
+        warn('нет ретаргетера анимаций для: ' + ', '.join(no_rtg) + ' — они будут двигаться упрощённо')
     return result
 
 
@@ -640,7 +742,7 @@ def main():
     src_layout = os.path.join(EXPORTS, 'layout.json')
     if os.path.exists(src_layout):
         shutil.copyfile(src_layout, os.path.join(DATA, 'layout.json'))
-    with unreal.ScopedSlowTask(6, 'Лига 17: настройка проекта') as task:
+    with unreal.ScopedSlowTask(7, 'Лига 17: настройка проекта') as task:
         task.make_dialog(True)
         task.enter_progress_frame(1, 'Текстуры')
         textures = import_textures() or {}
@@ -653,7 +755,9 @@ def main():
         billboard = make_billboard_material()
         apply_kit_materials(meshes, foliage, textures)
         task.enter_progress_frame(1, 'Персонажи')
-        chars = find_characters()
+        chars = find_characters() or {}
+        task.enter_progress_frame(1, 'Аниме-персонажи (первый раз — несколько минут)')
+        chars.update(import_characters() or {})
         write_assets_json(meshes, chars, billboard)
         task.enter_progress_frame(1, 'Уровень')
         open_fresh_level()

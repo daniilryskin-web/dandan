@@ -11,10 +11,11 @@ class UInputAction;
 class UInputMappingContext;
 class USpringArmComponent;
 
-/** Sets up the mannequin (Third Person content) and, if VRM4U and a VRoid model are present, the anime model driven by it. */
+/** Sets up the mannequin (Third Person content) and, if VRM4U and a VRoid model are present, the anime model driven by it.
+ *  VrmRetargeter is the IK retargeter VRM4U generated on import (mannequin -> model); without it the pose is copied bone by bone. */
 namespace LigaVisuals
 {
-	LIGA17_API void SetupBody(ACharacter* Character, USkeletalMeshComponent* VrmMesh, const FString& VrmAssetList);
+	LIGA17_API void SetupBody(ACharacter* Character, USkeletalMeshComponent* VrmMesh, const FString& VrmAssetList, const FString& VrmRetargeter = FString());
 }
 
 UCLASS()

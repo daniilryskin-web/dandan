@@ -250,7 +250,8 @@ void ALigaWorldBuilder::SpawnFoliage()
 		UHierarchicalInstancedStaticMeshComponent* H = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, *FString::Printf(TEXT("HISM_%s"), *KV.Key));
 		H->SetupAttachment(RootComponent);
 		H->SetStaticMesh(Mesh);
-		H->SetMobility(EComponentMobility::Static);
+		// Movable: these are spawned at runtime, and Static meshes with no built lighting render black.
+		H->SetMobility(EComponentMobility::Movable);
 		if (bGrass)
 		{
 			H->SetCollisionEnabled(ECollisionEnabled::NoCollision);

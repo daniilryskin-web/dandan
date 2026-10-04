@@ -18,7 +18,9 @@ struct LIGA17_API FLigaAssets
 	FString CharacterAnimClass;
 	FString BillboardMaterial;
 	FString PlayerVrm;                 // VrmAssetListObject of the player's VRoid character
-	TMap<FString, FString> NpcVrm;     // NPC look id -> VrmAssetListObject
+	FString PlayerRtg;                 // IK retargeter mannequin -> that character (made by VRM4U on import)
+	TMap<FString, FString> NpcVrm;     // NPC id (or look) -> VrmAssetListObject
+	TMap<FString, FString> NpcRtg;     // NPC id (or look) -> IK retargeter
 	TMap<FString, FString> Kit;        // kit asset name -> static mesh path
 
 	UStaticMesh* KitMesh(const FString& Name) const;

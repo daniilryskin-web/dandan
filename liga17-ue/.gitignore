@@ -28,3 +28,9 @@ Plugins/VRM4U/
 
 # Blender helper caches
 ArtSource/__pycache__/
+
+# Anime cast: downloaded by the setup script (CC0 VRoid samples); Oak.vrm is our recolour and is shipped
+ArtSource/Characters/*.vrm
+!ArtSource/Characters/Oak.vrm
+ArtSource/Characters/_src/
+ArtSource/Characters/*.part

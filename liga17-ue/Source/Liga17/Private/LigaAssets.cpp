@@ -73,10 +73,15 @@ void FLigaAssets::Load()
 	Root->TryGetStringField(TEXT("character_anim"), CharacterAnimClass);
 	Root->TryGetStringField(TEXT("billboard_material"), BillboardMaterial);
 	Root->TryGetStringField(TEXT("player_vrm"), PlayerVrm);
+	Root->TryGetStringField(TEXT("player_rtg"), PlayerRtg);
 	const TSharedPtr<FJsonObject>* Obj;
 	if (Root->TryGetObjectField(TEXT("npc_vrm"), Obj))
 	{
 		for (const auto& KV : (*Obj)->Values) NpcVrm.Add(LigaJsonKey(KV.Key), KV.Value->AsString());
+	}
+	if (Root->TryGetObjectField(TEXT("npc_rtg"), Obj))
+	{
+		for (const auto& KV : (*Obj)->Values) NpcRtg.Add(LigaJsonKey(KV.Key), KV.Value->AsString());
 	}
 	if (Root->TryGetObjectField(TEXT("kit"), Obj))
 	{

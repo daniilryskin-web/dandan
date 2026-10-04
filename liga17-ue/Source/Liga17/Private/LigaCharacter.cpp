@@ -15,12 +15,45 @@
 #include "LigaEncounterZone.h"
 #include "LigaInteractable.h"
 #include "LigaPlayerController.h"
+#include "Misc/PackageName.h"
+#include "UObject/UnrealType.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogLigaChar, Log, All);
 
 // ——— visuals shared by the player and NPCs ———
 
-void LigaVisuals::SetupBody(ACharacter* Character, USkeletalMeshComponent* VrmMesh, const FString& VrmAssetList)
+namespace
+{
+	/** Calls a UFUNCTION by name, filling its parameters in order (VRM4U is an optional plugin, so no headers or linking). */
+	bool CallWithArgs(UObject* Target, FName FuncName, TFunctionRef<void(FProperty*, void*)> Fill)
+	{
+		UFunction* Func = Target ? Target->FindFunction(FuncName) : nullptr;
+		if (!Func) return false;
+		uint8* Parms = (uint8*)FMemory_Alloca_Aligned(Func->ParmsSize, Func->GetMinAlignment());
+		FMemory::Memzero(Parms, Func->ParmsSize);
+		for (TFieldIterator<FProperty> It(Func); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+		{
+			It->InitializeValue_InContainer(Parms);
+			if (!It->HasAnyPropertyFlags(CPF_ReturnParm | CPF_OutParm)) Fill(*It, It->ContainerPtrToValuePtr<void>(Parms));
+		}
+		Target->ProcessEvent(Func, Parms);
+		for (TFieldIterator<FProperty> It(Func); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+		{
+			It->DestroyValue_InContainer(Parms);
+		}
+		return true;
+	}
+
+	void SetObjectProp(UObject* Target, const TCHAR* Name, UObject* Value)
+	{
+		if (FObjectProperty* P = FindFProperty<FObjectProperty>(Target->GetClass(), Name))
+		{
+			P->SetObjectPropertyValue_InContainer(Target, Value);
+		}
+	}
+}
+
+void LigaVisuals::SetupBody(ACharacter* Character, USkeletalMeshComponent* VrmMesh, const FString& VrmAssetList, const FString& VrmRetargeter)
 {
 	USkeletalMeshComponent* Body = Character->GetMesh();
 	const FLigaAssets& A = FLigaAssets::Get();
@@ -35,9 +68,30 @@ void LigaVisuals::SetupBody(ACharacter* Character, USkeletalMeshComponent* VrmMe
 	}
 	if (!VrmMesh || VrmAssetList.IsEmpty()) return;
 
-	// VRoid model through VRM4U: copy the mannequin's pose every frame (UVrmAnimInstanceCopy), hide the mannequin.
+	// VRoid model through VRM4U, driven by the (hidden) mannequin every frame. Preferred: VRM4U's IK-retargeter instance with
+	// the RTG_<model> asset it generated on import; fallback: bone-by-bone pose copy (UVrmAnimInstanceCopy).
 	UObject* AssetList = LoadObject<UObject>(nullptr, *VrmAssetList, nullptr, LOAD_NoWarn | LOAD_Quiet);
-	UClass* CopyClass = LoadClass<UAnimInstance>(nullptr, TEXT("/Script/VRM4U.VrmAnimInstanceCopy"), nullptr, LOAD_NoWarn | LOAD_Quiet);
+	UObject* Retargeter = nullptr;
+	if (AssetList)
+	{
+		FString Rtg = VrmRetargeter;
+		if (Rtg.IsEmpty())
+		{
+			// VRM4U puts RTG_<file name> next to the asset list.
+			const FString Folder = FPackageName::GetLongPackagePath(AssetList->GetOutermost()->GetName());
+			FString Base = AssetList->GetName();
+			if (FStrProperty* P = FindFProperty<FStrProperty>(AssetList->GetClass(), TEXT("BaseFileName")))
+			{
+				const FString Value = P->GetPropertyValue_InContainer(AssetList);
+				if (!Value.IsEmpty()) Base = Value;
+			}
+			Rtg = FString::Printf(TEXT("%s/RTG_%s.RTG_%s"), *Folder, *Base, *Base);
+		}
+		Retargeter = LoadObject<UObject>(nullptr, *Rtg, nullptr, LOAD_NoWarn | LOAD_Quiet);
+		if (Retargeter && Retargeter->GetClass()->GetName() != TEXT("IKRetargeter")) Retargeter = nullptr;
+	}
+	UClass* RetargetClass = Retargeter ? LoadClass<UAnimInstance>(nullptr, TEXT("/Script/VRM4U.VrmAnimInstanceRetargetFromMannequin"), nullptr, LOAD_NoWarn | LOAD_Quiet) : nullptr;
+	UClass* CopyClass = RetargetClass ? RetargetClass : LoadClass<UAnimInstance>(nullptr, TEXT("/Script/VRM4U.VrmAnimInstanceCopy"), nullptr, LOAD_NoWarn | LOAD_Quiet);
 	if (!AssetList || !CopyClass)
 	{
 		UE_LOG(LogLigaChar, Warning, TEXT("VRM model or VRM4U plugin missing (%s) — using the mannequin"), *VrmAssetList);
@@ -55,17 +109,22 @@ void LigaVisuals::SetupBody(ACharacter* Character, USkeletalMeshComponent* VrmMe
 	}
 	VrmMesh->SetSkeletalMesh(VrmSkel);
 	VrmMesh->SetAnimInstanceClass(CopyClass);
+	VrmMesh->AddTickPrerequisiteComponent(Body);  // read the mannequin's pose after it has been updated this frame
 	if (UAnimInstance* Inst = VrmMesh->GetAnimInstance())
 	{
-		if (FObjectProperty* P = FindFProperty<FObjectProperty>(Inst->GetClass(), TEXT("DstVrmAssetList")))
+		SetObjectProp(Inst, TEXT("DstVrmAssetList"), AssetList);
+		SetObjectProp(Inst, TEXT("SrcSkeletalMeshComponent"), Body);
+		if (RetargetClass)
 		{
-			P->SetObjectPropertyValue_InContainer(Inst, AssetList);
-		}
-		if (FObjectProperty* P = FindFProperty<FObjectProperty>(Inst->GetClass(), TEXT("SrcSkeletalMeshComponent")))
-		{
-			P->SetObjectPropertyValue_InContainer(Inst, Body);
+			// SetRetargetData(bool bUseRetargeter, UIKRetargeter* IKRetargeter)
+			CallWithArgs(Inst, TEXT("SetRetargetData"), [Retargeter](FProperty* P, void* Value)
+			{
+				if (FBoolProperty* B = CastField<FBoolProperty>(P)) B->SetPropertyValue(Value, true);
+				else if (FObjectProperty* O = CastField<FObjectProperty>(P)) O->SetObjectPropertyValue(Value, Retargeter);
+			});
 		}
 	}
+	UE_LOG(LogLigaChar, Log, TEXT("%s: VRoid model %s (%s)"), *Character->GetName(), *VrmSkel->GetName(), RetargetClass ? TEXT("IK retarget") : TEXT("pose copy"));
 	VrmMesh->SetVisibility(true);
 	Body->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
 	Body->SetVisibility(false);
@@ -115,7 +174,7 @@ ALigaCharacter::ALigaCharacter()
 void ALigaCharacter::BeginPlay()
 {
 	Super::BeginPlay();
-	LigaVisuals::SetupBody(this, VrmMesh, FLigaAssets::Get().PlayerVrm);
+	LigaVisuals::SetupBody(this, VrmMesh, FLigaAssets::Get().PlayerVrm, FLigaAssets::Get().PlayerRtg);
 	LastPos = GetActorLocation();
 	if (AController* C = GetController())
 	{

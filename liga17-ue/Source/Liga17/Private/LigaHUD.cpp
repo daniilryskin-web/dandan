@@ -56,12 +56,14 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& Args);
-	virtual void Tick(const FGeometry& Geometry, const double Time, const float Dt) override;
+	/** Rebuilds the dynamic panels. Called from the HUD actor's tick, i.e. before Slate lays out and paints the frame:
+	 *  widgets swapped in during Slate's own Tick (which runs inside paint) get no layout that frame and draw without backgrounds. */
+	void Refresh();
 
 private:
 	TWeakObjectPtr<ALigaPlayerController> PC;
 	int32 LastSerial = -1;
-	float TeamTimer = 0.f;
+	FString TeamSignature;
 
 	// Brushes and styles must outlive the widgets that point to them.
 	FSlateRoundedBoxBrush PlateBrush{Plate, 16.f};
@@ -251,7 +253,12 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildExplore()
 			]
 		]
 		// team
-		+ SOverlay::Slot().HAlign(HAlign_Left).VAlign(VAlign_Bottom).Padding(28, 28)[SAssignNew(TeamBox, SBox)]
+		+ SOverlay::Slot().HAlign(HAlign_Left).VAlign(VAlign_Bottom).Padding(28, 28)
+		[
+			SNew(SBorder).BorderImage(&PanelBrush).Padding(FMargin(10, 8, 16, 8))
+			.Visibility_Lambda([this] { const ULigaGameInstance* G = GI(); return G && G->Data.Team.Num() > 0 ? EVisibility::SelfHitTestInvisible : EVisibility::Collapsed; })
+			[SAssignNew(TeamBox, SBox)]
+		]
 		// interaction prompt
 		+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Bottom).Padding(0, 0, 0, 60)
 		[
@@ -282,12 +289,12 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildTeamStrip()
 	for (const FLigaPokemon& P : G->Data.Team)
 	{
 		const float R = FMath::Clamp(float(P.HP) / float(FMath::Max(1, LigaRules::MaxHp(P))), 0.f, 1.f);
-		Box->AddSlot().AutoHeight().Padding(0, 3)
+		Box->AddSlot().AutoHeight().Padding(0, 2)
 		[
-			SNew(SBox).WidthOverride(270)
+			SNew(SBox).WidthOverride(262)
 			[
-				SNew(SBorder).BorderImage(&PlateBrush).Padding(FMargin(4, 2, 14, 2))
-				.ColorAndOpacity(P.IsFainted() ? FLinearColor(1, 1, 1, 0.55f) : FLinearColor::White)
+				SNew(SBorder).BorderImage(&NoBrush).Padding(0)
+				.ColorAndOpacity(P.IsFainted() ? FLinearColor(1, 1, 1, 0.5f) : FLinearColor::White)
 				[
 					SNew(SHorizontalBox)
 					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)[MonImage(P.Species, P.bShiny, 46)]
@@ -296,7 +303,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildTeamStrip()
 						SNew(SVerticalBox)
 						+ SVerticalBox::Slot().AutoHeight()
 						[
-							SNew(STextBlock).Font(Font(13)).ColorAndOpacity(Ink)
+							SNew(STextBlock).Font(Font(13)).ColorAndOpacity(FLinearColor::White)
 							.Text(FText::FromString(FString::Printf(TEXT("%s  ур. %d"), *LigaRules::DisplayName(P), P.Level)))
 						]
 						+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
@@ -752,15 +759,21 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildMenu()
 	];
 }
 
-void SLigaHUDWidget::Tick(const FGeometry& Geometry, const double Time, const float Dt)
+void SLigaHUDWidget::Refresh()
 {
-	SCompoundWidget::Tick(Geometry, Time, Dt);
 	if (!PC.IsValid()) return;
-	TeamTimer -= Dt;
-	if (TeamTimer <= 0.f && TeamBox.IsValid())
+	if (const ULigaGameInstance* G = GI(); G && TeamBox.IsValid())
 	{
-		TeamTimer = 0.5f;
-		TeamBox->SetContent(BuildTeamStrip());
+		FString Sig;
+		for (const FLigaPokemon& P : G->Data.Team)
+		{
+			Sig += FString::Printf(TEXT("%d/%d/%d/%d/%d/%d;"), P.Uid, P.Species, P.Level, P.HP, (int32)P.Status, P.bShiny ? 1 : 0);
+		}
+		if (Sig != TeamSignature)
+		{
+			TeamSignature = Sig;
+			TeamBox->SetContent(BuildTeamStrip());
+		}
 	}
 	if (PC->UiSerial != LastSerial)
 	{
@@ -777,6 +790,18 @@ void SLigaHUDWidget::Tick(const FGeometry& Geometry, const double Time, const fl
 }
 
 // ——— HUD actor ———
+
+ALigaHUD::ALigaHUD()
+{
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bTickEvenWhenPaused = true;
+}
+
+void ALigaHUD::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	if (Widget.IsValid()) Widget->Refresh();
+}
 
 void ALigaHUD::BeginPlay()
 {

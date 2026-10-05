@@ -68,7 +68,7 @@ UObject* ULigaEditorTools::ImportVrmWithRetargeter(const FString& SourceFile, co
 		return nullptr;
 	}
 	UFunction* Func = Vrm.Function;
-	uint8* Parms = static_cast<uint8*>(FMemory::Malloc(FMath::Max(1, Func->ParmsSize), Func->GetMinAlignment()));
+	uint8* Parms = static_cast<uint8*>(FMemory::Malloc(FMath::Max<int32>(1, Func->ParmsSize), Func->GetMinAlignment()));
 	FMemory::Memzero(Parms, Func->ParmsSize);
 	UObject* Result = nullptr;
 	int32 StringIndex = 0;

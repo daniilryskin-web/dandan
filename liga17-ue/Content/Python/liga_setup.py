@@ -514,6 +514,14 @@ def apply_kit_materials(meshes, foliage, textures, kit=None):
                 if instanced and kit is not None:
                     sm.set_material(i, kit_instance(slot_name))
         set_collision(sm, complex_as_simple=not name.startswith(('grass', 'flower')))
+        if instanced:  # small low-poly props drawn by the thousand: plain meshes are safer than Nanite here
+            try:
+                nanite = sm.get_editor_property('nanite_settings')
+                if nanite.get_editor_property('enabled'):
+                    nanite.set_editor_property('enabled', False)
+                    sm.set_editor_property('nanite_settings', nanite)
+            except Exception:
+                pass
         if foliage_mesh:
             sm.set_editor_property('light_map_resolution', 32)
         eal.save_loaded_asset(sm)
@@ -624,7 +632,7 @@ def import_characters():
     elif not with_rtg:
         warn('проект собран без VRM4U, поэтому персонажи импортируются без ретаргетера анимаций. Плагин должен лежать в '
              'Plugins/VRM4U/VRM4U.uplugin; затем закройте Unreal, удалите папку Binaries в папке проекта, откройте Liga17.uproject и пересоберите')
-    imported, ready = 0, 0
+    imported, ready, plain = 0, 0, 0
     with unreal.ScopedSlowTask(len(cast), 'Аниме-персонажи') as task:
         task.make_dialog(True)
         for role, info in cast.items():
@@ -664,19 +672,26 @@ def import_characters():
                     os.makedirs(os.path.dirname(CHAR_GUARD), exist_ok=True)
                     with open(CHAR_GUARD, 'w', encoding='utf-8') as f:
                         json.dump({'role': role, 'sha': sha}, f)
+                    obj = None
                     if with_rtg:
                         obj = tools.import_vrm_with_retargeter(path, f'{folder}/{name}', True)
-                    else:
+                        if obj is None:  # better a model without the retargeter than none (see Saved/Logs/Liga17.log)
+                            warn(f'{name}: импорт с ретаргетером не удался — импортирую без него')
+                            plain += 1
+                            folder = f'{VRM_ROOT_PLAIN}/{name}'
+                            lists = assets_matching(folder, lambda c, n: 'VrmAssetList' in c)  # an earlier plain import, if any
+                    if obj is None and not (with_rtg and lists and folder.startswith(VRM_ROOT_PLAIN)):
                         obj = unreal.VrmImporterBPFunctionLibrary.import_vrm_file_with_options(path, f'{folder}/{name}', opts)
                     os.remove(CHAR_GUARD)
-                    if obj is None:
+                    if obj is None and not lists:
                         warn(f'{file}: VRM4U не смог импортировать модель')
                         continue
-                    eal.save_directory(folder, only_if_is_dirty=False, recursive=True)
+                    if obj is not None:
+                        eal.save_directory(folder, only_if_is_dirty=False, recursive=True)
+                        lists = [obj.get_path_name()]
+                        imported += 1
                     state[role] = sha
                     save_char_state(state)
-                    imported += 1
-                    lists = [obj.get_path_name()]
                 rtg = f'{folder}/RTG_{name}.RTG_{name}'
                 if not eal.does_asset_exist(rtg):
                     found = assets_matching(folder, lambda c, n: c == 'IKRetargeter' and n.startswith('RTG_') and not n.startswith(('RTG_UE4_', 'RTG_UEFN_')))
@@ -690,7 +705,7 @@ def import_characters():
                 warn(f'{info.get("file")}: {e}')
 
     save_char_state(state)
-    if with_rtg and ready == len(cast) and eal.does_directory_exist(VRM_ROOT_PLAIN):
+    if with_rtg and not plain and ready == len(cast) and eal.does_directory_exist(VRM_ROOT_PLAIN):
         ok = eal.delete_directory(VRM_ROOT_PLAIN)  # the old imports without retargeters; Unreal refuses while they are loaded
         log(f'старые персонажи {VRM_ROOT_PLAIN}: ' + ('удалены' if ok else 'пока не удалось удалить (попробую в следующий раз)'))
     no_rtg = [r for r, v in result['npc_rtg'].items() if not v] + (['player'] if result['player_vrm'] and not result['player_rtg'] else [])

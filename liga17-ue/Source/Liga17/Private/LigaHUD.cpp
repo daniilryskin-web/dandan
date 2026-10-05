@@ -249,7 +249,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildExplore()
 			SNew(SBorder).BorderImage(&PanelBrush).Padding(FMargin(16, 10))
 			[
 				SNew(STextBlock).Font(Font(11, false)).ColorAndOpacity(FLinearColor(1, 1, 1, 0.85f))
-				.Text(FText::FromString(TEXT("WASD — ходить   Shift — бег   Пробел — прыжок\nE — действие   Tab — меню   Колесо — камера")))
+				.Text(FText::FromString(TEXT("WASD — ходить   Shift — бег   Пробел — прыжок\nE — действие   Tab — меню   R — покемон   Колесо — камера")))
 			]
 		]
 		// team

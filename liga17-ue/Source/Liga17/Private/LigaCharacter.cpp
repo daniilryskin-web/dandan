@@ -3,6 +3,7 @@
 #include "Camera/CameraComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Engine/World.h"
 #include "EngineUtils.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -13,6 +14,8 @@
 #include "InputModifiers.h"
 #include "LigaAssets.h"
 #include "LigaEncounterZone.h"
+#include "LigaFollower.h"
+#include "LigaGameInstance.h"
 #include "LigaInteractable.h"
 #include "LigaPlayerController.h"
 #include "Misc/PackageName.h"
@@ -206,6 +209,7 @@ void ALigaCharacter::BuildInput()
 	MenuAction = MakeAction(TEXT("IA_Menu"), EInputActionValueType::Boolean);
 	ZoomAction = MakeAction(TEXT("IA_Zoom"), EInputActionValueType::Axis1D);
 	NumberAction = MakeAction(TEXT("IA_Number"), EInputActionValueType::Axis1D);
+	FollowerAction = MakeAction(TEXT("IA_Follower"), EInputActionValueType::Boolean);
 
 	UInputMappingContext* M = Mapping;
 	auto Swizzle = [M]()
@@ -261,6 +265,8 @@ void ALigaCharacter::BuildInput()
 	M->MapKey(MenuAction, EKeys::M);
 	M->MapKey(MenuAction, EKeys::Gamepad_Special_Right);
 	M->MapKey(ZoomAction, EKeys::MouseWheelAxis);
+	M->MapKey(FollowerAction, EKeys::R);
+	M->MapKey(FollowerAction, EKeys::Gamepad_LeftShoulder);
 	const FKey Numbers[] = {EKeys::One, EKeys::Two, EKeys::Three, EKeys::Four, EKeys::Five, EKeys::Six};
 	for (int32 i = 0; i < 6; ++i)
 	{
@@ -302,6 +308,7 @@ void ALigaCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 	In->BindAction(MenuAction, ETriggerEvent::Started, this, &ALigaCharacter::OnMenu);
 	In->BindAction(ZoomAction, ETriggerEvent::Triggered, this, &ALigaCharacter::OnZoom);
 	In->BindAction(NumberAction, ETriggerEvent::Started, this, &ALigaCharacter::OnNumber);
+	In->BindAction(FollowerAction, ETriggerEvent::Started, this, &ALigaCharacter::OnFollower);
 }
 
 void ALigaCharacter::OnMove(const FInputActionValue& V)
@@ -383,6 +390,86 @@ void ALigaCharacter::Tick(float Dt)
 		UpdateFocus();
 	}
 	UpdateEncounters(Dt);
+	UpdateFollower(Dt);
+}
+
+void ALigaCharacter::OnFollower()
+{
+	ALigaPlayerController* PC = LigaPC();
+	if (!PC || !PC->IsExploring()) return;
+	if (ALigaFollower* F = Follower.Get())
+	{
+		F->Recall();
+		Follower = nullptr;
+		bFollowerWanted = false;
+		return;
+	}
+	bFollowerWanted = SpawnFollower();
+}
+
+bool ALigaCharacter::SpawnFollower()
+{
+	ALigaPlayerController* PC = LigaPC();
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	const FLigaPokemon* Lead = nullptr;
+	if (GI)
+	{
+		for (const FLigaPokemon& Mon : GI->Data.Team)
+		{
+			if (Mon.HP > 0)
+			{
+				Lead = &Mon;
+				break;
+			}
+		}
+	}
+	if (!Lead)
+	{
+		if (PC) PC->ShowToast(TEXT("Некого выпустить: в команде нет покемонов, готовых к прогулке"));
+		return false;
+	}
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	ALigaFollower* F = GetWorld()->SpawnActor<ALigaFollower>(GetActorLocation(), GetActorRotation(), Params);
+	if (!F) return false;
+	if (!F->Setup(this, Lead->Species, Lead->bShiny))
+	{
+		F->Destroy();
+		if (PC) PC->ShowToast(TEXT("У этого покемона нет 3D-модели — запустите настройку (liga_setup.py)"));
+		return false;
+	}
+	Follower = F;
+	return true;
+}
+
+void ALigaCharacter::UpdateFollower(float Dt)
+{
+	FollowerCheck -= Dt;
+	if (!bFollowerWanted || FollowerCheck > 0.f) return;
+	FollowerCheck = 0.5f;
+	// The lead changed (swapped, fainted, evolved): the new lead comes out instead.
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	const FLigaPokemon* Lead = nullptr;
+	if (GI)
+	{
+		for (const FLigaPokemon& Mon : GI->Data.Team)
+		{
+			if (Mon.HP > 0)
+			{
+				Lead = &Mon;
+				break;
+			}
+		}
+	}
+	ALigaFollower* F = Follower.Get();
+	if (F && Lead && F->Species == Lead->Species && F->bShiny == Lead->bShiny) return;
+	if (F)
+	{
+		F->Recall();
+		Follower = nullptr;
+	}
+	ALigaPlayerController* PC = LigaPC();
+	if (Lead && PC && PC->IsExploring()) bFollowerWanted = SpawnFollower();
 }
 
 void ALigaCharacter::UpdateFocus()

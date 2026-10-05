@@ -4,6 +4,7 @@
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Materials/Material.h"
 #include "Components/PostProcessComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
 #include "Components/SkyLightComponent.h"
@@ -273,6 +274,14 @@ void ALigaWorldBuilder::SpawnFoliage()
 		}
 		H->AddInstances(Xf, false, true);
 		Foliage.Add(H);
+		// One line per material in Saved/Logs/Liga17.log: grey foliage means a material that cannot draw instances.
+		for (int32 i = 0; i < H->GetNumMaterials(); ++i)
+		{
+			UMaterialInterface* Mi = H->GetMaterial(i);
+			const UMaterial* Base = Mi ? Mi->GetMaterial() : nullptr;
+			UE_LOG(LogLigaWorld, Log, TEXT("Foliage %s slot %d: %s (instancing %d, Nanite %d)"), *KV.Key, i,
+				Mi ? *Mi->GetPathName() : TEXT("none"), Base ? int32(Base->bUsedWithInstancedStaticMeshes) : -1, int32(Mesh->IsNaniteEnabled()));
+		}
 	}
 }
 

@@ -36,7 +36,7 @@ CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')
 SITE = os.path.join(PROJECT, 'Content', 'Python', 'Lib', 'site-packages')
 
 # Bump when convert() changes: models are imported again into a new folder, and the old folders are deleted.
-CONVERTER_VERSION = 4
+CONVERTER_VERSION = 5
 DEST_ROOT = '/Game/Liga/Pokemon3D'
 DEST = f'{DEST_ROOT}/V{CONVERTER_VERSION}'
 OLD_DESTS = ['/Game/Liga/Pokemon']  # converter versions 1–3
@@ -45,8 +45,19 @@ GUARD = os.path.join(CACHE, 'importing.json')   # the model being imported right
 SKIP = os.path.join(CACHE, 'skip.json')         # models that crashed the editor once: they keep their picture
 
 IDLE = re.compile(r'idle|wait|stand|loop|armatureaction|take ?0*1', re.I)
-ATTACK = re.compile(r'attack|fight|atk', re.I)
+ATTACK = re.compile(r'attack|fight|atk|impact|thunder|trueno|bolt|punch|bite|tackle|scratch', re.I)
 FAINT = re.compile(r'\bko\b|faint|down|dead|_ko|\|ko|ko$', re.I)
+WALK = re.compile(r'walk|(?<![a-z])run', re.I)
+
+
+def clip_role(name):
+    """'idle' / 'walk' / 'attack' / 'faint' / None for an animation name (the same rules for files and for assets)."""
+    if WALK.search(name):
+        return 'walk'
+    for role, rx in (('idle', IDLE), ('attack', ATTACK), ('faint', FAINT)):
+        if rx.search(name):
+            return role
+    return None
 
 
 # ——— Python packages (installed into the project, not into the engine) ———
@@ -690,6 +701,301 @@ def _ensure_normals(gltf, views, add_view):
             prim['attributes']['NORMAL'] = len(gltf['accessors']) - 1
 
 
+# ——— procedural clips ———
+# Most models in the repository have no animation at all, so a Pokémon would stand frozen in its bind pose (arms
+# straight out). The bones follow one naming scheme (Hips, Spine1, Head, LArm, RThigh, Tail1…), so simple clips can be
+# made for any of them: idle (breathing, arms lowered, tail and head moving), walk, attack (wind-up and lunge), faint.
+# Clips the file already has are kept; only missing roles are added, named liga_<role>.
+
+_SIDE = re.compile(r'^(?:L|R)(?=[A-Z_0-9])')
+
+
+def _bone_kind(name):
+    """(side -1/0/1, kind, index) from a bone name like 'LForeArm', '035 Spine2', 'Tail3_28'."""
+    n = re.sub(r'_\d+$', '', re.sub(r'^\d+\s*', '', name or '')).replace('_end', '')
+    side = 0
+    m = _SIDE.match(n)
+    if m:
+        side = 1 if n[0] == 'L' else -1  # the model faces +Z, so its left side is +X
+        n = n[1:].lstrip('_')
+    idx = int(re.findall(r'\d+', n)[-1]) if re.findall(r'\d+', n) else 0
+    low = n.lower()
+    for kind, words in (('forearm', ('forearm',)), ('arm', ('arm',)), ('shoulder', ('shoulder', 'clavicle')), ('hand', ('hand',)),
+                        ('thigh', ('thigh',)), ('shin', ('leg',)), ('foot', ('foot',)), ('toe', ('toe',)), ('finger', ('finger',)),
+                        ('tail', ('tail',)), ('neck', ('neck',)), ('head', ('head',)), ('jaw', ('jaw', 'beak')), ('ear', ('ear',)),
+                        ('wing', ('wing', 'wind')), ('spine', ('spine', 'chest')), ('pelvis', ('hips', 'waist', 'pelvis')),
+                        ('feeler', ('feeler', 'hair'))):
+        if any(w in low for w in words):
+            return side, kind, idx
+    return side, None, idx
+
+
+def _sample_anim(gltf, views, anim, t):
+    """{(node, path): value} of an animation at time t (linear / step; slerp for rotations)."""
+    import numpy as np
+    out = {}
+    for ch in anim['channels']:
+        s = anim['samplers'][ch['sampler']]
+        ts = _float_keys(gltf, views, s['input']).ravel()
+        vals = _float_keys(gltf, views, s['output'])
+        path = ch['target']['path']
+        if path not in _REST:
+            continue
+        if t <= ts[0] or len(ts) == 1:
+            v = vals[0]
+        elif t >= ts[-1]:
+            v = vals[-1]
+        else:
+            i = int(np.searchsorted(ts, t, side='right') - 1)
+            u = (t - ts[i]) / max(ts[i + 1] - ts[i], 1e-9)
+            a, b = vals[i], vals[i + 1]
+            if s.get('interpolation') == 'STEP':
+                v = a
+            elif path == 'rotation':
+                if float(a @ b) < 0:
+                    b = -b
+                v = a * (1 - u) + b * u
+                v = v / np.linalg.norm(v)
+            else:
+                v = a * (1 - u) + b * u
+        out[(ch['target']['node'], path)] = np.array(v, dtype=np.float64)
+    return out
+
+
+def _axis_quat(axis, deg):
+    import numpy as np
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / max(np.linalg.norm(axis), 1e-12)
+    h = np.radians(deg) * 0.5
+    return np.array([*(axis * np.sin(h)), np.cos(h)])
+
+
+def _quat_conj(q):
+    import numpy as np
+    return np.array([-q[0], -q[1], -q[2], q[3]])
+
+
+def _procedural_clips(gltf, views, add_view):
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    skins = gltf.get('skins', [])
+    holders = [i for i, n in enumerate(nodes) if 'mesh' in n and 'skin' in n]
+    if len(skins) != 1 or len(holders) != 1:
+        return
+    anims = gltf.get('animations', [])
+    have = {clip_role(a.get('name', '')) for a in anims}
+    missing = [r for r in ('idle', 'walk', 'attack', 'faint') if r not in have]
+    if not missing:
+        return
+    joints = list(skins[0]['joints'])
+    jset = set(joints)
+    parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', [])}
+    root = skins[0].get('skeleton', joints[0])
+    if parent.get(root) is not None:
+        return  # not canonical (see _canonicalize): leave it
+
+    # Base pose: the rest pose, or the first frame of the file's own idle (or first) clip — some rest poses are odd.
+    base = {j: {p: np.array(nodes[j].get(p, _REST[p]), dtype=np.float64) for p in _REST} for j in joints}
+    if anims:
+        src = next((a for a in anims if clip_role(a.get('name', '')) == 'idle'), anims[0])
+        t0 = min(float(_float_keys(gltf, views, s['input']).min()) for s in src['samplers'])
+        for (j, p), v in _sample_anim(gltf, views, src, t0).items():
+            if j in base:
+                base[j][p] = v
+    local = {j: _local_matrix({'translation': list(base[j]['translation']), 'rotation': list(base[j]['rotation']),
+                               'scale': list(base[j]['scale'])}) for j in joints}
+    world = {}
+
+    def w(j):
+        if j not in world:
+            world[j] = (w(parent[j]) @ local[j]) if parent.get(j) in jset else local[j]
+        return world[j]
+
+    for j in joints:
+        w(j)
+    pos = {j: world[j][:3, 3] for j in joints}
+    qworld = {}
+    for j in joints:
+        r = world[j][:3, :3]
+        sc = np.linalg.norm(r, axis=0)
+        qworld[j] = _quat_from_matrix(r / np.where(sc > 1e-12, sc, 1.0)) if (sc > 1e-12).all() else np.array([0, 0, 0, 1.0])
+    children = {j: [c for c in nodes[j].get('children', []) if c in jset] for j in joints}
+    info = {j: _bone_kind(nodes[j].get('name', '')) for j in joints}
+
+    # body size from the mesh (bind pose = rest pose after _canonicalize)
+    mesh = gltf['meshes'][nodes[holders[0]]['mesh']]
+    pts = np.concatenate([_accessor(gltf, views, p['attributes']['POSITION']) for p in mesh['primitives']]).astype(np.float64)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    height = max(hi[1] - lo[1], 1e-6)
+    ground = lo[1]
+
+    def deepest(j):
+        best, stack = j, [j]
+        while stack:
+            k = stack.pop()
+            if pos[k][1] < pos[best][1]:
+                best = k
+            stack.extend(children.get(k, []))
+        return best
+
+    def kind(j):
+        return info[j][1]
+
+    # upper arms: 'LArm' but not the 'LArm2' below it
+    arms = [j for j in joints if kind(j) == 'arm' and info[j][0] != 0 and not (parent.get(j) in jset and kind(parent[j]) == 'arm')]
+    thighs = [j for j in joints if kind(j) == 'thigh' and info[j][0] != 0]
+    front_legs = [j for j in arms if pos[deepest(j)][1] < ground + 0.18 * height]  # quadrupeds walk on their arms
+    hands_up = [j for j in arms if j not in front_legs]
+
+    def lower_rotation(j):
+        """World rotation (axis, degrees) that brings a raised arm (T-pose) down to 45° from vertical."""
+        kids = children.get(j, [])
+        if not kids:
+            return None
+        d = pos[kids[0]] - pos[j]
+        if np.linalg.norm(d) < 1e-9:
+            return None
+        d = d / np.linalg.norm(d)
+        down = np.array([0.0, -1.0, 0.0])
+        ang = np.degrees(np.arccos(np.clip(d @ down, -1, 1)))
+        if ang < 60:
+            return None
+        axis = np.cross(d, down)
+        if np.linalg.norm(axis) < 1e-6:
+            return None
+        return axis / np.linalg.norm(axis), min(ang - 45.0, 70.0)
+
+    lowering = {j: lower_rotation(j) for j in hands_up}
+    tails = sorted([j for j in joints if kind(j) == 'tail' and info[j][0] == 0], key=lambda j: info[j][2])
+    spines = sorted([j for j in joints if kind(j) == 'spine'], key=lambda j: info[j][2])
+    necks = [j for j in joints if kind(j) == 'neck']
+    heads = [j for j in joints if kind(j) == 'head']
+    jaws = [j for j in joints if kind(j) == 'jaw' and info[j][0] == 0]
+    ears = [j for j in joints if kind(j) == 'ear' and children.get(j)]
+    shins = {info[j][0]: j for j in joints if kind(j) == 'shin' and info[j][0] != 0}
+    legless = not thighs and not front_legs
+    X, Y, Z = np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0])
+
+    def smooth(a, b, t):
+        x = np.clip((t - a) / (b - a), 0.0, 1.0)
+        return x * x * (3 - 2 * x)
+
+    def pose_at(role, t, T):
+        """{joint: [(axis, degrees), ...]} world rotations and a root offset for one moment of a clip."""
+        rot, off = {}, np.zeros(3)
+        wv = 2 * np.pi * t / T
+
+        def add(j, axis, deg):
+            if abs(deg) > 1e-6:
+                rot.setdefault(j, []).append((axis, deg))
+
+        for j, low in lowering.items():
+            if low is not None:
+                add(j, low[0], low[1])
+        if role == 'idle':
+            for k, j in enumerate(spines):
+                add(j, X, 1.2 * np.sin(wv - 0.3 * k))
+            for j in necks:
+                add(j, X, 1.5 * np.sin(wv - 0.8))
+            for j in heads:
+                add(j, X, 2.5 * np.sin(wv - 1.0))
+                add(j, Y, 2.0 * np.sin(wv + 0.5))
+            for j in hands_up:
+                add(j, X, 2.5 * np.sin(wv + info[j][0]))
+            for k, j in enumerate(tails):
+                add(j, Y, 4.0 * np.sin(wv + 0.7 * k))
+            for j in ears:
+                add(j, Z, 3.0 * info[j][0] * np.sin(2 * wv))
+        elif role == 'walk':
+            for j in thighs:
+                ph = 0.0 if info[j][0] > 0 else np.pi
+                add(j, X, 24.0 * np.sin(wv + ph))
+                shin = shins.get(info[j][0])
+                if shin is not None:
+                    add(shin, X, -18.0 * max(0.0, np.sin(wv + ph + np.pi / 2)))
+            for j in front_legs:  # diagonal pairs, like a trot
+                ph = 0.0 if info[j][0] < 0 else np.pi
+                add(j, X, 22.0 * np.sin(wv + ph))
+            for j in hands_up:
+                ph = np.pi if info[j][0] > 0 else 0.0
+                add(j, X, 12.0 * np.sin(wv + ph))
+            for k, j in enumerate(spines):
+                add(j, Y, (7.0 * np.sin(wv + 0.9 * k)) if legless else 3.0 * np.sin(wv))
+            for j in heads:
+                add(j, X, 2.0 * np.sin(2 * wv))
+            for k, j in enumerate(tails):
+                add(j, Y, (9.0 if legless else 8.0) * np.sin(wv + 0.7 * k + (0.9 * len(spines) if legless else 0)))
+            off = off + Y * (0.025 * height * 0.5 * (1 - np.cos(2 * wv)))
+        elif role == 'attack':
+            a = smooth(0.0, 0.35, t) - smooth(0.35, 0.5, t)    # wind-up
+            s = smooth(0.35, 0.5, t) - smooth(0.6, 1.0, t)     # strike
+            for j in spines:
+                add(j, X, -8.0 * a + 14.0 * s)
+            for j in necks + heads:
+                add(j, X, -6.0 * a + 10.0 * s)
+            for j in jaws:
+                add(j, X, 18.0 * s)
+            for j in hands_up:
+                add(j, X, 20.0 * a - 45.0 * s)
+            for j in front_legs:
+                add(j, X, -20.0 * s)
+            for k, j in enumerate(tails):
+                add(j, Y, 12.0 * (a + s) * np.sin(np.pi * t / T * 3 + 0.6 * k))
+            off = off + Z * (0.15 * height * s) + Y * (0.05 * height * a)
+        elif role == 'faint':
+            f = smooth(0.0, 0.6, t)
+            add(root, Z, 75.0 * f)
+            for j in necks + heads:
+                add(j, X, 20.0 * f)
+            off = off - Y * (0.15 * height * f)
+        return rot, off
+
+    specs = {'idle': (2.4, 24, True), 'walk': (0.8, 16, True), 'attack': (1.0, 25, False), 'faint': (0.7, 14, False)}
+    for role in missing:
+        if role == 'walk' and legless and not spines and not tails:
+            continue
+        T, n, loop = specs[role]
+        times = np.linspace(0.0, T, n + 1)
+        rot_keys, root_keys = {}, []
+        for t in times:
+            rot, off = pose_at(role, t, T)
+            for j in joints:
+                q = base[j]['rotation']
+                if j in rot:
+                    qd = np.array([0, 0, 0, 1.0])
+                    for axis, deg in rot[j]:
+                        qd = _quat_mul(_axis_quat(axis, deg), qd)
+                    # a world-axis turn about the bone's own pivot, written in the bone's local frame
+                    q = _quat_mul(q, _quat_mul(_quat_conj(qworld[j]), _quat_mul(qd, qworld[j])))
+                rot_keys.setdefault(j, []).append(q / np.linalg.norm(q))
+            root_keys.append(base[root]['translation'] + off)
+        anim = {'name': f'liga_{role}', 'samplers': [], 'channels': []}
+        tarr = np.ascontiguousarray(times.reshape(-1, 1), dtype=np.float32)
+        gltf['accessors'].append({'bufferView': add_view(tarr.tobytes()), 'byteOffset': 0, 'componentType': 5126,
+                                  'count': len(times), 'type': 'SCALAR', 'min': [0.0], 'max': [float(T)]})
+        t_acc = len(gltf['accessors']) - 1
+
+        def channel(j, path, values):
+            arr = np.ascontiguousarray(values, dtype=np.float32)
+            gltf['accessors'].append({'bufferView': add_view(arr.tobytes()), 'byteOffset': 0, 'componentType': 5126,
+                                      'count': len(arr), 'type': 'VEC4' if path == 'rotation' else 'VEC3'})
+            anim['samplers'].append({'input': t_acc, 'output': len(gltf['accessors']) - 1, 'interpolation': 'LINEAR'})
+            anim['channels'].append({'sampler': len(anim['samplers']) - 1, 'target': {'node': j, 'path': path}})
+
+        for j in joints:
+            keys = np.array(rot_keys[j])
+            rest_q = np.array(nodes[j].get('rotation', _REST['rotation']))
+            if np.abs(np.abs(keys @ rest_q) - 1).max() > 1e-7:
+                channel(j, 'rotation', keys)
+            for p in ('translation', 'scale'):
+                if j == root and p == 'translation':
+                    continue
+                if not np.allclose(base[j][p], nodes[j].get(p, _REST[p]), atol=1e-7):
+                    channel(j, p, np.tile(base[j][p], (len(times), 1)))
+        channel(root, 'translation', np.array(root_keys))
+        gltf.setdefault('animations', []).append(anim)
+
+
 def _validate(gltf, views):
     """Last check before Unreal sees the file: anything still broken is refused, and the Pokémon keeps its picture."""
     import numpy as np
@@ -860,6 +1166,7 @@ def convert(data):
             node['mesh'] = remap[node['mesh']]
     _canonicalize(gltf, views, add_view)
     _ensure_normals(gltf, views, add_view)
+    _procedural_clips(gltf, views, add_view)
     _validate(gltf, views)
 
     for key in ('extensionsUsed', 'extensionsRequired'):
@@ -884,7 +1191,7 @@ def _assets(folder):
 
 
 def describe(folder):
-    """{'mesh': skeletal or static mesh, 'idle'/'attack'/'faint': animation sequences} found in an imported folder."""
+    """{'mesh': skeletal or static mesh, 'idle'/'walk'/'attack'/'faint'/'pose': animation sequences} found in an imported folder."""
     found = _assets(folder)
     skel = [p for c, n, p in found if c == 'SkeletalMesh']
     static = [p for c, n, p in found if c == 'StaticMesh' and 'icosphere' not in n.lower()]
@@ -892,11 +1199,11 @@ def describe(folder):
     if not skel and not static:
         return None
     out = {'mesh': skel[0] if skel else static[0]}
-    anims.sort()
-    for key, rx in (('idle', IDLE), ('attack', ATTACK), ('faint', FAINT)):
-        hit = next((p for n, p in anims if rx.search(n)), None)
-        if hit:
-            out[key] = hit
+    anims.sort(key=lambda a: ('run' in a[0].lower() and 'walk' not in a[0].lower(), a[0]))  # walk before run
+    for n, p in anims:
+        role = clip_role(n)
+        if role and role not in out:
+            out[role] = p
     if anims and 'attack' not in out:  # a clip with another name (Pikachu's "Impactrueno") serves as the attack
         other = [p for n, p in anims if p not in (out.get('idle'), out.get('faint'))]
         if other:

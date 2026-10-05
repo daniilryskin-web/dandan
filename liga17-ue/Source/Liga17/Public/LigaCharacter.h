@@ -6,6 +6,7 @@
 #include "InputActionValue.h"
 #include "LigaCharacter.generated.h"
 
+class ALigaFollower;
 class UCameraComponent;
 class UInputAction;
 class UInputMappingContext;
@@ -57,6 +58,12 @@ private:
 	UPROPERTY() TObjectPtr<UInputAction> MenuAction;
 	UPROPERTY() TObjectPtr<UInputAction> ZoomAction;
 	UPROPERTY() TObjectPtr<UInputAction> NumberAction;
+	UPROPERTY() TObjectPtr<UInputAction> FollowerAction;
+
+	/** The lead Pokémon walking along (R); kept out of its ball until R is pressed again. */
+	TWeakObjectPtr<ALigaFollower> Follower;
+	bool bFollowerWanted = false;
+	float FollowerCheck = 0.f;
 
 	float FocusTimer = 0.f;
 	float ZoomGoal = 430.f;
@@ -73,6 +80,9 @@ private:
 	void OnMenu();
 	void OnZoom(const FInputActionValue& V);
 	void OnNumber(const FInputActionValue& V);
+	void OnFollower();
+	bool SpawnFollower();
+	void UpdateFollower(float Dt);
 	void UpdateFocus();
 	void UpdateEncounters(float Dt);
 	class ALigaPlayerController* LigaPC() const;

@@ -182,9 +182,11 @@ def link(a, a_out, b, b_in):
 
 
 def instanced_usage(m):
-    """Trees, bushes, rocks, flowers and grass are drawn as instances (HISM). A material without this flag is drawn with
-    the default grey material on them, and the editor cannot fix that for good during play."""
-    set_props(m, m.get_name(), ((('used_with_instanced_static_meshes', 'b_used_with_instanced_static_meshes'), True),))
+    """Trees, bushes, rocks, flowers and grass are drawn as instances (HISM), and meshes imported by UE 5.8 are Nanite.
+    A material without these usage flags is drawn with the default grey material ("missing usage flag
+    InstancedStaticMeshes / Nanite! Default Material will be used" in the log), and the editor cannot fix that during play."""
+    set_props(m, m.get_name(), ((('used_with_instanced_static_meshes', 'b_used_with_instanced_static_meshes'), True),
+                                (('used_with_nanite', 'b_used_with_nanite'), True)))
 
 
 def const(m, v, x, y):
@@ -418,6 +420,7 @@ def make_terrain_material(textures):
 def make_water_material(textures):
     m = new_material('M_LigaSea')
     m.set_editor_property('two_sided', True)
+    instanced_usage(m)
     wp = expr(m, unreal.MaterialExpressionLocalPosition, -1400, 0)  # not world position: see wind_offset
     xy = expr(m, unreal.MaterialExpressionComponentMask, -1200, 0, r=True, g=True, b=False, a=False)
     link(wp, '', xy, '')
@@ -605,7 +608,12 @@ def import_characters():
     A model is re-imported only when its file changed, so running the setup again is quick."""
     result = {'player_vrm': '', 'player_rtg': '', 'npc_vrm': {}, 'npc_rtg': {}}
     if not hasattr(unreal, 'VrmImporterBPFunctionLibrary'):
-        warn('плагин VRM4U не найден: люди останутся манекенами. Установка плагина — шаг 4 в Docs/README_RU.md')
+        if os.path.exists(os.path.join(PROJECT, 'Plugins', 'VRM4U', 'VRM4U.uplugin')):
+            warn('плагин VRM4U лежит в Plugins, но выключен: люди останутся манекенами. Включите его: Правка → Плагины → '
+                 'найдите VRM4U → поставьте галочку → перезапустите Unreal (или замените Liga17.uproject файлом из архива), '
+                 'затем запустите настройку ещё раз')
+        else:
+            warn('плагин VRM4U не найден: люди останутся манекенами. Установка плагина — шаг 4 в Docs/README_RU.md')
         return result
     with open(os.path.join(CHARACTERS, 'cast.json'), encoding='utf-8') as f:
         cast = json.load(f)['roles']

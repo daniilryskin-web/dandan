@@ -440,7 +440,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildChoice()
 		if (PC->bChoiceCancelable)
 		{
 			Col->AddSlot().AutoHeight().HAlign(HAlign_Right).Padding(0, 6, 0, 0)
-			[SNew(STextBlock).Text(FText::FromString(TEXT("Backspace — назад"))).Font(Font(11, false)).ColorAndOpacity(Muted)]
+			[SNew(STextBlock).Text(FText::FromString(TEXT("Backspace — назад"))).Font(Font(11, false)).ColorAndOpacity(Muted)];
 		}
 	}
 	return SNew(SBorder).BorderImage(&CardBrush).Padding(FMargin(30, 24))[Col];

@@ -59,8 +59,8 @@ public:
 	void TalkToMom();
 	/** Quests first (reports, new quests, reminders), then what this person does: heal, shop, chat. */
 	void TalkToNpc(ALigaNPC* Npc);
-	void NurseHeal(const FString& Speaker);
-	void OpenShop(const FString& Speaker);
+	void NurseHeal(const FString& Who);
+	void OpenShop(const FString& Who);
 	void OpenStorage();
 	/** Finishes quests that complete by themselves and announces the ones ready to report. */
 	void CheckQuests();
@@ -124,7 +124,7 @@ private:
 	void AfterTurn();
 	void UpdatePlace(float Dt);
 	void UpdateTravel(float Dt);
-	void BuyAmount(const FString& Speaker, const FString& ItemId);
+	void BuyAmount(const FString& Who, const FString& ItemId);
 	void StorageList(bool bWithdraw);
 	FString NpcName(const FString& Id) const;
 	void QuestStarted(const FLigaQuestDef& Q);

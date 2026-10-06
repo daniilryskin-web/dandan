@@ -414,13 +414,13 @@ void ALigaPlayerController::TalkToNpc(ALigaNPC* Npc)
 	ShowDialogue(Name, Npc->Lines);
 }
 
-void ALigaPlayerController::NurseHeal(const FString& Speaker)
+void ALigaPlayerController::NurseHeal(const FString& Who)
 {
 	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
 	if (!GI) return;
 	if (!GI->HasStarter())
 	{
-		ShowDialogue(Speaker, {TEXT("Добро пожаловать в Покецентр!"), TEXT("Когда у вас появятся покемоны, я с радостью их вылечу.")});
+		ShowDialogue(Who, {TEXT("Добро пожаловать в Покецентр!"), TEXT("Когда у вас появятся покемоны, я с радостью их вылечу.")});
 		return;
 	}
 	FLigaChoice Yes;
@@ -429,22 +429,22 @@ void ALigaPlayerController::NurseHeal(const FString& Speaker)
 	Yes.Color = PcHex(TEXT("D9487A"));
 	FLigaChoice No;
 	No.Label = TEXT("Нет, спасибо");
-	ShowChoice(TEXT("Добро пожаловать в Покецентр! Вылечить ваших покемонов?"), {Yes, No}, [this, GI, Speaker](int32 Pick)
+	ShowChoice(TEXT("Добро пожаловать в Покецентр! Вылечить ваших покемонов?"), {Yes, No}, [this, GI, Who](int32 Pick)
 	{
 		if (Pick != 0)
 		{
-			ShowDialogue(Speaker, {TEXT("Приходите ещё!")});
+			ShowDialogue(Who, {TEXT("Приходите ещё!")});
 			return;
 		}
 		GI->HealTeam();
 		LigaQuests::AddCounter(GI->Data, TEXT("heal_center"));
 		RememberPosition();
 		GI->SaveGame();
-		ShowDialogue(Speaker, {TEXT("Минутку..."), TEXT("Ваши покемоны полностью здоровы! Игра сохранена."), TEXT("Приходите ещё!")}, [this]() { CheckQuests(); });
+		ShowDialogue(Who, {TEXT("Минутку..."), TEXT("Ваши покемоны полностью здоровы! Игра сохранена."), TEXT("Приходите ещё!")}, [this]() { CheckQuests(); });
 	}, true);
 }
 
-void ALigaPlayerController::OpenShop(const FString& Speaker)
+void ALigaPlayerController::OpenShop(const FString& Who)
 {
 	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
 	if (!GI) return;
@@ -470,18 +470,18 @@ void ALigaPlayerController::OpenShop(const FString& Speaker)
 	FLigaChoice Leave;
 	Leave.Label = TEXT("Уйти");
 	Opts.Add(Leave);
-	ShowChoice(FString::Printf(TEXT("Магазин · у вас %d монет"), GI->Data.Money), Opts, [this, Ids, Speaker](int32 Pick)
+	ShowChoice(FString::Printf(TEXT("Магазин · у вас %d монет"), GI->Data.Money), Opts, [this, Ids, Who](int32 Pick)
 	{
 		if (!Ids.IsValidIndex(Pick))
 		{
-			ShowDialogue(Speaker, {TEXT("Спасибо за покупки! Приходите ещё.")});
+			ShowDialogue(Who, {TEXT("Спасибо за покупки! Приходите ещё.")});
 			return;
 		}
-		BuyAmount(Speaker, Ids[Pick]);
+		BuyAmount(Who, Ids[Pick]);
 	}, true);
 }
 
-void ALigaPlayerController::BuyAmount(const FString& Speaker, const FString& ItemId)
+void ALigaPlayerController::BuyAmount(const FString& Who, const FString& ItemId)
 {
 	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
 	const FLigaItem* It = FLigaDatabase::Get().Item(ItemId);
@@ -498,7 +498,7 @@ void ALigaPlayerController::BuyAmount(const FString& Speaker, const FString& Ite
 	FLigaChoice Back;
 	Back.Label = TEXT("Назад");
 	Opts.Add(Back);
-	ShowChoice(FString::Printf(TEXT("%s · у вас %d монет. Сколько купить?"), *It->Name, GI->Data.Money), Opts, [this, Speaker, ItemId](int32 Pick)
+	ShowChoice(FString::Printf(TEXT("%s · у вас %d монет. Сколько купить?"), *It->Name, GI->Data.Money), Opts, [this, Who, ItemId](int32 Pick)
 	{
 		ULigaGameInstance* G = ULigaGameInstance::Get(this);
 		const FLigaItem* I = FLigaDatabase::Get().Item(ItemId);
@@ -511,7 +511,7 @@ void ALigaPlayerController::BuyAmount(const FString& Speaker, const FString& Ite
 			ShowToast(FString::Printf(TEXT("Куплено: %s ×%d (−%d монет)"), *I->Name, N, N * I->Price));
 			CheckQuests();
 		}
-		OpenShop(Speaker);
+		OpenShop(Who);
 	}, true);
 }
 

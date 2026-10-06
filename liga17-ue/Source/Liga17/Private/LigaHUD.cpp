@@ -11,6 +11,7 @@
 #include "LigaData.h"
 #include "LigaGameInstance.h"
 #include "LigaPlayerController.h"
+#include "LigaQuests.h"
 #include "Styling/CoreStyle.h"
 #include "Styling/SlateTypes.h"
 #include "Widgets/Images/SImage.h"
@@ -74,7 +75,9 @@ private:
 	FSlateRoundedBoxBrush BarFill{FLinearColor::White, 6.f};
 	FSlateRoundedBoxBrush ExpFill{Hex(TEXT("2FA8FF")), 3.f};
 	FSlateRoundedBoxBrush CardBrush{FLinearColor(1.f, 1.f, 1.f, 0.97f), 20.f};
+	FSlateRoundedBoxBrush QuestPill{Hex(TEXT("F29A1A")), 8.f};
 	FSlateBrush NoBrush;
+	FSlateBrush FadeBrush;
 	FProgressBarStyle HpStyle;
 	FProgressBarStyle ExpStyle;
 	FButtonStyle DarkButton;
@@ -84,6 +87,8 @@ private:
 	TMap<FString, TSharedPtr<FSlateBrush>> MonBrushes;
 
 	TSharedPtr<SBox> TeamBox;
+	TSharedPtr<SBox> QuestBox;
+	FString QuestSignature;
 	TSharedPtr<SBox> ChoiceBox;
 	TSharedPtr<SBox> CommandBox;
 	TSharedPtr<SBox> MenuBox;
@@ -105,6 +110,8 @@ private:
 	TSharedRef<SWidget> BuildBattle();
 	TSharedRef<SWidget> BuildPlate(int32 Side);
 	TSharedRef<SWidget> BuildTeamStrip();
+	TSharedRef<SWidget> BuildQuestTracker();
+	TSharedRef<SWidget> BuildQuestLog();
 	TSharedRef<SWidget> BuildChoice();
 	TSharedRef<SWidget> BuildCommands();
 	TSharedRef<SWidget> BuildMenu();
@@ -115,6 +122,7 @@ void SLigaHUDWidget::Construct(const FArguments& Args)
 {
 	PC = Args._Owner;
 	NoBrush.DrawAs = ESlateBrushDrawType::NoDrawType;
+	FadeBrush = *FCoreStyle::Get().GetBrush("WhiteBrush");
 	HpStyle = FProgressBarStyle().SetBackgroundImage(BarBack).SetFillImage(BarFill).SetMarqueeImage(BarFill);
 	ExpStyle = FProgressBarStyle().SetBackgroundImage(BarBack).SetFillImage(ExpFill).SetMarqueeImage(ExpFill);
 	auto MakeStyle = [this](const FLinearColor& Normal, const FLinearColor& Hover, const FLinearColor& Press)
@@ -145,9 +153,17 @@ void SLigaHUDWidget::Construct(const FArguments& Args)
 			.BorderImage(&PanelBrush)
 			.Padding(FMargin(22, 10))
 			[
-				SNew(STextBlock).Font(Font(16)).ColorAndOpacity(FLinearColor::White)
+				SNew(STextBlock).Font(Font(16)).ColorAndOpacity(FLinearColor::White).Justification(ETextJustify::Center)
 				.Text_Lambda([this] { return FText::FromString(PC.IsValid() ? PC->Toast : FString()); })
 			]
+		]
+		// black fade when going through a door
+		+ SOverlay::Slot()
+		[
+			SNew(SBorder)
+			.BorderImage(&FadeBrush)
+			.BorderBackgroundColor_Lambda([this] { return FSlateColor(FLinearColor(0.f, 0.f, 0.f, PC.IsValid() ? PC->Fade : 0.f)); })
+			.Visibility_Lambda([this] { return PC.IsValid() && PC->Fade > 0.f ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
 		]
 	];
 }
@@ -229,18 +245,27 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildExplore()
 {
 	return SNew(SOverlay)
 		.Visibility_Lambda([this] { return InMode(ELigaMode::Explore) || InMode(ELigaMode::Dialogue) || InMode(ELigaMode::Menu) ? EVisibility::SelfHitTestInvisible : EVisibility::Collapsed; })
-		// location banner
+		// location banner and the quest tracker under it
 		+ SOverlay::Slot().HAlign(HAlign_Left).VAlign(VAlign_Top).Padding(28, 24)
 		[
-			SNew(SBorder).BorderImage(&PlateBrush).Padding(FMargin(22, 10, 30, 12))
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Left)
 			[
-				SNew(SVerticalBox)
-				+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(TEXT("КАНТО"))).Font(Font(10)).ColorAndOpacity(Accent)]
-				+ SVerticalBox::Slot().AutoHeight()
+				SNew(SBorder).BorderImage(&PlateBrush).Padding(FMargin(22, 10, 30, 12))
 				[
-					SNew(STextBlock).Font(Font(22)).ColorAndOpacity(Ink)
-					.Text_Lambda([this] { return FText::FromString(PC.IsValid() ? PC->CurrentPlaceName() : FString()); })
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(TEXT("КАНТО"))).Font(Font(10)).ColorAndOpacity(Accent)]
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock).Font(Font(22)).ColorAndOpacity(Ink)
+						.Text_Lambda([this] { return FText::FromString(PC.IsValid() ? PC->CurrentPlaceName() : FString()); })
+					]
 				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Left).Padding(0, 12, 0, 0)
+			[
+				SAssignNew(QuestBox, SBox)
+				.Visibility_Lambda([this] { return InMode(ELigaMode::Explore) ? EVisibility::SelfHitTestInvisible : EVisibility::Collapsed; })
 			]
 		]
 		// controls help
@@ -391,14 +416,31 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildChoice()
 	}
 	else
 	{
-		for (int32 i = 0; i < PC->Choices.Num(); ++i)
+		// Long lists (the shop) go in two columns so they fit on the screen.
+		const int32 N = PC->Choices.Num();
+		const bool bTwo = N > 7;
+		const int32 PerColumn = bTwo ? (N + 1) / 2 : N;
+		TSharedRef<SHorizontalBox> Columns = SNew(SHorizontalBox);
+		for (int32 c = 0; c < (bTwo ? 2 : 1); ++c)
 		{
-			const FLigaChoice& C = PC->Choices[i];
-			Col->AddSlot().AutoHeight()
-			[
-				Button(FString::Printf(TEXT("%d. %s"), i + 1, *C.Label), C.Detail, ColorButton(C.Color), FLinearColor::White,
-					[W, i] { if (W.IsValid()) W->PickChoice(i); }, C.bEnabled, 520.f)
-			];
+			TSharedRef<SVerticalBox> Part = SNew(SVerticalBox);
+			for (int32 i = c * PerColumn; i < FMath::Min(N, (c + 1) * PerColumn); ++i)
+			{
+				const FLigaChoice& C = PC->Choices[i];
+				const FString Label = i < 9 ? FString::Printf(TEXT("%d. %s"), i + 1, *C.Label) : C.Label;
+				Part->AddSlot().AutoHeight()
+				[
+					Button(Label, C.Detail, ColorButton(C.Color), FLinearColor::White,
+						[W, i] { if (W.IsValid()) W->PickChoice(i); }, C.bEnabled, bTwo ? 470.f : 520.f)
+				];
+			}
+			Columns->AddSlot().AutoWidth().Padding(c > 0 ? 14 : 0, 0, 0, 0)[Part];
+		}
+		Col->AddSlot().AutoHeight()[Columns];
+		if (PC->bChoiceCancelable)
+		{
+			Col->AddSlot().AutoHeight().HAlign(HAlign_Right).Padding(0, 6, 0, 0)
+			[SNew(STextBlock).Text(FText::FromString(TEXT("Backspace — назад"))).Font(Font(11, false)).ColorAndOpacity(Muted)]
 		}
 	}
 	return SNew(SBorder).BorderImage(&CardBrush).Padding(FMargin(30, 24))[Col];
@@ -606,7 +648,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildCommands()
 			const int32 N = G->Data.ItemCount(It.Id);
 			if (N <= 0) continue;
 			if (It.Kind == TEXT("ball") && !B.bWild) continue;
-			if (It.Kind == TEXT("revive")) continue;
+			if (It.Kind == TEXT("revive") || It.Kind == TEXT("key")) continue;
 			const FString Id = It.Id;
 			Col->AddSlot().AutoHeight().HAlign(HAlign_Right)
 			[
@@ -755,8 +797,85 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildMenu()
 	[
 		SNew(SHorizontalBox)
 		+ SHorizontalBox::Slot().AutoWidth()[Team]
-		+ SHorizontalBox::Slot().AutoWidth().Padding(36, 0, 0, 0)[SNew(SBox).WidthOverride(320).MinDesiredHeight(460)[Side]]
+		+ SHorizontalBox::Slot().AutoWidth().Padding(36, 0, 0, 0)[SNew(SBox).WidthOverride(300)[BuildQuestLog()]]
+		+ SHorizontalBox::Slot().AutoWidth().Padding(36, 0, 0, 0)[SNew(SBox).WidthOverride(300).MinDesiredHeight(460)[Side]]
 	];
+}
+
+TSharedRef<SWidget> SLigaHUDWidget::BuildQuestTracker()
+{
+	const ULigaGameInstance* G = GI();
+	TSharedRef<SVerticalBox> Box = SNew(SVerticalBox);
+	if (!G) return Box;
+	int32 Shown = 0;
+	for (const FLigaQuestDef& Q : LigaQuests::All())
+	{
+		if (LigaQuests::State(G->Data, Q.Id) != 1 || Shown >= 3) continue;
+		++Shown;
+		const bool bReady = Q.Kind == ELigaQuestGoal::Talk || LigaQuests::IsComplete(G->Data, Q);
+		const FString P = LigaQuests::ProgressText(G->Data, Q);
+		FString Line = Q.Goal;
+		if (bReady && !Q.TurnIn.IsEmpty() && Q.Kind != ELigaQuestGoal::Talk) Line = TEXT("Готово! Возвращайтесь за наградой.");
+		else if (!P.IsEmpty()) Line += FString::Printf(TEXT("  (%s)"), *P);
+		Box->AddSlot().AutoHeight().Padding(0, 0, 0, 6)
+		[
+			SNew(SBox).WidthOverride(360)
+			[
+				SNew(SBorder).BorderImage(&PanelBrush).Padding(FMargin(14, 8, 16, 9))
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+						[SNew(SBorder).BorderImage(&QuestPill).Padding(FMargin(6, 0))[SNew(STextBlock).Text(FText::FromString(bReady ? TEXT("?") : TEXT("!"))).Font(Font(12)).ColorAndOpacity(FLinearColor::White)]]
+						+ SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+						[SNew(STextBlock).Text(FText::FromString(Q.Title)).Font(Font(13)).ColorAndOpacity(Yellow)]
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 3, 0, 0)
+					[SNew(STextBlock).Text(FText::FromString(Line)).Font(Font(11, false)).ColorAndOpacity(FLinearColor(1, 1, 1, 0.9f)).AutoWrapText(true)]
+				]
+			]
+		];
+	}
+	return Box;
+}
+
+TSharedRef<SWidget> SLigaHUDWidget::BuildQuestLog()
+{
+	const ULigaGameInstance* G = GI();
+	TSharedRef<SVerticalBox> Box = SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)[SNew(STextBlock).Text(FText::FromString(TEXT("Задания"))).Font(Font(20)).ColorAndOpacity(Ink)];
+	if (!G) return Box;
+	int32 Active = 0;
+	for (const FLigaQuestDef& Q : LigaQuests::All())
+	{
+		if (LigaQuests::State(G->Data, Q.Id) != 1) continue;
+		++Active;
+		const FString P = LigaQuests::ProgressText(G->Data, Q);
+		const bool bReady = Q.Kind != ELigaQuestGoal::Talk && LigaQuests::IsComplete(G->Data, Q);
+		Box->AddSlot().AutoHeight().Padding(0, 0, 0, 10)
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(Q.Title)).Font(Font(14)).ColorAndOpacity(Accent)]
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(STextBlock).Font(Font(12, false)).ColorAndOpacity(Ink).AutoWrapText(true)
+				.Text(FText::FromString(Q.Goal + (P.IsEmpty() ? FString() : FString::Printf(TEXT(" — %s"), *P)) + (bReady ? TEXT(" (готово)") : TEXT(""))))
+			]
+		];
+	}
+	if (Active == 0)
+	{
+		Box->AddSlot().AutoHeight().Padding(0, 0, 0, 10)
+		[SNew(STextBlock).Font(Font(12, false)).ColorAndOpacity(Muted).AutoWrapText(true).Text(FText::FromString(TEXT("Сейчас заданий нет. Поговорите с жителями — у кого есть задание, над головой «!».")))];
+	}
+	Box->AddSlot().AutoHeight()
+	[
+		SNew(STextBlock).Font(Font(12)).ColorAndOpacity(Muted)
+		.Text(FText::FromString(FString::Printf(TEXT("Выполнено: %d из %d"), LigaQuests::NumDone(G->Data), LigaQuests::All().Num())))
+	];
+	return Box;
 }
 
 void SLigaHUDWidget::Refresh()
@@ -773,6 +892,20 @@ void SLigaHUDWidget::Refresh()
 		{
 			TeamSignature = Sig;
 			TeamBox->SetContent(BuildTeamStrip());
+		}
+	}
+	if (const ULigaGameInstance* G = GI(); G && QuestBox.IsValid())
+	{
+		FString Sig;
+		for (const FLigaQuestDef& Q : LigaQuests::All())
+		{
+			const int32 St = LigaQuests::State(G->Data, Q.Id);
+			if (St == 1) Sig += FString::Printf(TEXT("%s:%d;"), *Q.Id, LigaQuests::Progress(G->Data, Q));
+		}
+		if (Sig != QuestSignature)
+		{
+			QuestSignature = Sig;
+			QuestBox->SetContent(BuildQuestTracker());
 		}
 	}
 	if (PC->UiSerial != LastSerial)

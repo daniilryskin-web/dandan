@@ -21,4 +21,8 @@ public:
 	/** Encounter table id (FLigaDatabase::Encounters). */
 	UPROPERTY(EditAnywhere)
 	FString Route = TEXT("route1");
+
+	/** Where the battle takes place, for the battle log ("Берег Паллет-тауна"). */
+	UPROPERTY(EditAnywhere)
+	FString Place = TEXT("Маршрут 1");
 };

@@ -1,8 +1,10 @@
-﻿// Лига 17 — the lead Pokémon walking next to the trainer: R releases it from its Poké Ball and calls it back.
+﻿// Лига 17 — a Pokémon walking in the overworld: the lead Pokémon next to the trainer (R releases it from its Poké Ball
+// and calls it back), or one of the Pokémon living in town, strolling around its spot (SetupAmbient).
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "LigaInteractable.h"
 #include "LigaFollower.generated.h"
 
 class APawn;
@@ -12,7 +14,7 @@ class USkeletalMeshComponent;
 class UStaticMeshComponent;
 
 UCLASS()
-class LIGA17_API ALigaFollower : public AActor
+class LIGA17_API ALigaFollower : public AActor, public ILigaInteractable
 {
 	GENERATED_BODY()
 
@@ -23,8 +25,16 @@ public:
 
 	/** Shows the Pokémon's 3D model next to the trainer; false when the species has no model. */
 	bool Setup(APawn* InTrainer, int32 InSpecies, bool bInShiny);
+	/** A Pokémon living in town: wanders within Radius (cm) of Home. With a quest it shows only while that quest needs
+	 *  it (and, without a 3D model, as a glowing ball so the quest can still be done). */
+	bool SetupAmbient(int32 InSpecies, const FVector& InHome, float InRadius, const FString& InQuest);
 	/** Back into the ball: shrinks with a flash, then the actor is destroyed. */
 	void Recall();
+
+	virtual FString GetPromptText() const override;
+	virtual FString GetDisplayName() const override;
+	virtual void Interact(ALigaPlayerController* PC) override;
+	virtual bool CanInteract() const override;
 
 	int32 Species = 0;
 	bool bShiny = false;
@@ -48,5 +58,20 @@ private:
 	bool bRecalling = false;
 	FVector Velocity = FVector::ZeroVector;
 
+	// ——— town Pokémon ———
+	bool bAmbient = false;
+	FVector Home = FVector::ZeroVector;
+	float Radius = 300.f;
+	FVector WanderGoal = FVector::ZeroVector;
+	float WanderWait = 0.f;
+	FString Quest;
+	bool bQuestShown = false;
+	float QuestCheck = 0.f;
+	float PetTimer = 0.f;
+
 	void PlayClip(bool bWalk);
+	bool LoadModel(bool bAllowPlaceholder);
+	void TickAmbient(float Dt);
+	bool QuestWantsMe() const;
+	float GroundZ(const FVector& At, float From) const;
 };

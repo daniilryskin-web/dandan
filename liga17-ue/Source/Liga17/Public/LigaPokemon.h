@@ -72,6 +72,12 @@ struct FLigaGameData
 	UPROPERTY() int32 Caught = 0;
 	UPROPERTY() int32 WildDefeated = 0;
 	UPROPERTY() double PlaySeconds = 0.0;
+	/** Event counters for quests ("heal_center", "buy:poke-ball", "catch_type:water"...). */
+	UPROPERTY() TMap<FString, int32> Counters;
+	/** Quest id -> 1 active, 2 done. */
+	UPROPERTY() TMap<FString, int32> QuestStage;
+	/** Quest id -> the counter value when the quest was taken (progress counts from there). */
+	UPROPERTY() TMap<FString, int32> QuestBase;
 
 	bool HasFlag(const FString& F) const { return Flags.Contains(F); }
 	void SetFlag(const FString& F) { Flags.AddUnique(F); }

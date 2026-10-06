@@ -42,6 +42,51 @@
       "source": "Darkness_Shibu",
       "url": "https://raw.githubusercontent.com/madjin/vrm-samples/e16eb187100149a315ad92c3c9968f1d5baa6c7d/vroid/beta/Darkness_Shibu.vrm",
       "sha256": "0b50573d2d054d98c0a6fc5a5ce872e1b2c8bff8718476ff72a9a68c48674fd8"
+    },
+    "nurse": {
+      "file": "Nurse.vrm",
+      "source": "Sendagaya_Shino",
+      "url": "https://raw.githubusercontent.com/madjin/vrm-samples/e16eb187100149a315ad92c3c9968f1d5baa6c7d/vroid/beta/Sendagaya_Shino.vrm",
+      "sha256": "1e177c1a7b14f783a9c48395831db8616260d3bddd4154cb2784b779adca49b5",
+      "hair": [
+        1.0,
+        0.56,
+        0.74
+      ]
+    },
+    "clerk": {
+      "file": "Clerk.vrm",
+      "source": "Sendagaya_Shibu",
+      "url": "https://raw.githubusercontent.com/madjin/vrm-samples/e16eb187100149a315ad92c3c9968f1d5baa6c7d/vroid/beta/Sendagaya_Shibu.vrm",
+      "sha256": "b7bcad5e5890abc4d7c65f9afc31da2445db03197d44f1ec10447f9db5abeaff"
+    },
+    "student": {
+      "file": "Student.vrm",
+      "source": "HairSample_Female",
+      "url": "https://raw.githubusercontent.com/madjin/vrm-samples/e16eb187100149a315ad92c3c9968f1d5baa6c7d/vroid/beta/HairSample_Female.vrm",
+      "sha256": "adfd242317aaabc773f31f7fff7b013979fbb5baa47e97427a78913d9cb4e979"
+    },
+    "walker": {
+      "file": "Walker.vrm",
+      "source": "Sendagaya_Shibu",
+      "url": "https://raw.githubusercontent.com/madjin/vrm-samples/e16eb187100149a315ad92c3c9968f1d5baa6c7d/vroid/beta/Sendagaya_Shibu.vrm",
+      "sha256": "b7bcad5e5890abc4d7c65f9afc31da2445db03197d44f1ec10447f9db5abeaff",
+      "hair": [
+        0.56,
+        0.32,
+        0.18
+      ]
+    },
+    "bugkid": {
+      "file": "Bugkid.vrm",
+      "source": "Sendagaya_Shino",
+      "url": "https://raw.githubusercontent.com/madjin/vrm-samples/e16eb187100149a315ad92c3c9968f1d5baa6c7d/vroid/beta/Sendagaya_Shino.vrm",
+      "sha256": "1e177c1a7b14f783a9c48395831db8616260d3bddd4154cb2784b779adca49b5",
+      "hair": [
+        0.4,
+        0.68,
+        0.32
+      ]
     }
   }
 }

@@ -47,6 +47,9 @@ public:
 	/** Distance walked in tall grass since the last encounter roll (cm). */
 	float GrassWalk = 0.f;
 
+	/** After a teleport: the camera jumps to the new place instead of flying there. */
+	void SnapCamera();
+
 private:
 	UPROPERTY() TObjectPtr<UInputMappingContext> Mapping;
 	UPROPERTY() TObjectPtr<UInputAction> MoveAction;
@@ -67,6 +70,7 @@ private:
 
 	float FocusTimer = 0.f;
 	float ZoomGoal = 430.f;
+	float LagOffTime = 0.f;
 	FVector LastPos = FVector::ZeroVector;
 
 	void BuildInput();
@@ -84,6 +88,7 @@ private:
 	bool SpawnFollower();
 	void UpdateFollower(float Dt);
 	void UpdateFocus();
+	void UpdateDoors();
 	void UpdateEncounters(float Dt);
 	class ALigaPlayerController* LigaPC() const;
 };

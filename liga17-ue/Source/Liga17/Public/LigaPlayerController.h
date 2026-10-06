@@ -6,6 +6,8 @@
 #include "LigaPlayerController.generated.h"
 
 class ALigaBattleStage;
+class ALigaNPC;
+struct FLigaQuestDef;
 
 enum class ELigaMode : uint8 { Explore, Dialogue, Choice, Battle, Menu };
 enum class ELigaBattleMenu : uint8 { None, Main, Fight, Bag, Team, ForceSwitch, Result };
@@ -33,8 +35,9 @@ public:
 	ELigaMode Mode = ELigaMode::Explore;
 	/** Bumped whenever the HUD needs to rebuild a dynamic panel. */
 	int32 UiSerial = 0;
-	FString CurrentPlaceName() const;
-	bool IsExploring() const { return Mode == ELigaMode::Explore; }
+	FString CurrentPlaceName() const { return PlaceName; }
+	bool IsIndoors() const { return bIndoors; }
+	bool IsExploring() const { return Mode == ELigaMode::Explore && !bTraveling; }
 
 	// ——— dialogue ———
 	FString Speaker;
@@ -51,14 +54,28 @@ public:
 	void ShowChoice(const FString& Title, const TArray<FLigaChoice>& InChoices, TFunction<void(int32)> OnPick, bool bCancelable = false, bool bPictures = false);
 	void PickChoice(int32 Index);
 
-	// ——— story ———
+	// ——— story, people and services ———
 	void TalkToOak();
 	void TalkToMom();
+	/** Quests first (reports, new quests, reminders), then what this person does: heal, shop, chat. */
+	void TalkToNpc(ALigaNPC* Npc);
+	void NurseHeal(const FString& Speaker);
+	void OpenShop(const FString& Speaker);
+	void OpenStorage();
+	/** Finishes quests that complete by themselves and announces the ones ready to report. */
+	void CheckQuests();
+
+	// ——— doors ———
+	/** Fades to black, moves the player (and the walking Pokémon) there, fades back in. */
+	void TravelTo(const FVector& Where, float Yaw);
+	bool IsTraveling() const { return bTraveling; }
+	/** Seconds until walking into a door works again (no bouncing between two doors). */
+	float DoorCooldown = 0.f;
 
 	// ——— battle ———
 	TWeakObjectPtr<ALigaBattleStage> Stage;
 	ELigaBattleMenu BattleMenu = ELigaBattleMenu::None;
-	void TryWildEncounter(const FString& Route);
+	void TryWildEncounter(const FString& Route, const FString& Place = FString());
 	void SetBattleMenu(ELigaBattleMenu M);
 	void BattleMove(int32 Index);
 	void BattleItem(const FString& ItemId);
@@ -85,6 +102,15 @@ public:
 	float Fade = 0.f;
 
 private:
+	FString PlaceName = TEXT("Паллет-таун");
+	bool bIndoors = false;
+	float PlaceCheck = 0.f;
+	bool bTraveling = false;
+	bool bTravelArrived = false;
+	FVector TravelWhere = FVector::ZeroVector;
+	float TravelYaw = 0.f;
+	TSet<FString> AnnouncedQuests;
+
 	TFunction<void()> AfterDialogue;
 	TFunction<void(int32)> OnChoicePicked;
 	TArray<TFunction<void()>> PostBattleSteps;
@@ -96,4 +122,10 @@ private:
 	void FinishBattle();
 	void RememberPosition();
 	void AfterTurn();
+	void UpdatePlace(float Dt);
+	void UpdateTravel(float Dt);
+	void BuyAmount(const FString& Speaker, const FString& ItemId);
+	void StorageList(bool bWithdraw);
+	FString NpcName(const FString& Id) const;
+	void QuestStarted(const FLigaQuestDef& Q);
 };

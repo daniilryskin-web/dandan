@@ -17,6 +17,7 @@ import json
 import math
 import os
 import shutil
+import struct
 import urllib.request
 
 import unreal
@@ -481,6 +482,93 @@ def make_billboard_material():
     return m
 
 
+@step('материал эффектов боя')
+def make_fx_material():
+    """Translucent unlit material for battle effects (LigaBattleFx). Parameters: Color, Glow, Alpha and Shape:
+    0 — solid shape, 1 — soft round puff, 2 — ring (both drawn on a camera-facing quad), 3 — sphere with soft edges."""
+    m = new_material('M_LigaFx')
+    m.set_editor_property('blend_mode', unreal.BlendMode.BLEND_TRANSLUCENT)
+    m.set_editor_property('shading_model', unreal.MaterialShadingModel.MSM_UNLIT)
+    m.set_editor_property('two_sided', True)
+    color = expr(m, unreal.MaterialExpressionVectorParameter, -1200, -300, parameter_name='Color', default_value=unreal.LinearColor(1, 1, 1, 1))
+    rgb = expr(m, unreal.MaterialExpressionComponentMask, -980, -300, r=True, g=True, b=True, a=False)
+    link(color, '', rgb, '')
+    glow = scalar(m, 'Glow', 3.0, -980, -180)
+    em = expr(m, unreal.MaterialExpressionMultiply, -760, -260)
+    link(rgb, '', em, 'A')
+    link(glow, '', em, 'B')
+    mel.connect_material_property(em, '', unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    # d = distance from the middle of the quad, 0 in the centre and 1 at the edge
+    uv = expr(m, unreal.MaterialExpressionTextureCoordinate, -1400, 100)
+    mid = expr(m, unreal.MaterialExpressionConstant2Vector, -1400, 220, r=0.5, g=0.5)
+    dist = expr(m, unreal.MaterialExpressionDistance, -1200, 140)
+    link(uv, '', dist, 'A')
+    link(mid, '', dist, 'B')
+    d = expr(m, unreal.MaterialExpressionMultiply, -1040, 140)
+    link(dist, '', d, 'A')
+    link(const(m, 2.0, -1200, 260), '', d, 'B')
+    # soft puff: (1 - d)^2
+    inv = expr(m, unreal.MaterialExpressionOneMinus, -880, 60)
+    link(d, '', inv, '')
+    sat1 = expr(m, unreal.MaterialExpressionSaturate, -740, 60)
+    link(inv, '', sat1, '')
+    disc = expr(m, unreal.MaterialExpressionMultiply, -600, 60)
+    link(sat1, '', disc, 'A')
+    link(sat1, '', disc, 'B')
+    # ring: 1 - |d - 0.72| * 7
+    sub = expr(m, unreal.MaterialExpressionSubtract, -880, 240)
+    link(d, '', sub, 'A')
+    link(const(m, 0.72, -1040, 300), '', sub, 'B')
+    ab = expr(m, unreal.MaterialExpressionAbs, -740, 240)
+    link(sub, '', ab, '')
+    mul7 = expr(m, unreal.MaterialExpressionMultiply, -600, 240)
+    link(ab, '', mul7, 'A')
+    link(const(m, 7.0, -740, 320), '', mul7, 'B')
+    inv2 = expr(m, unreal.MaterialExpressionOneMinus, -470, 240)
+    link(mul7, '', inv2, '')
+    ring = expr(m, unreal.MaterialExpressionSaturate, -340, 240)
+    link(inv2, '', ring, '')
+    # sphere: bright in the middle, fading to its outline
+    fres = expr(m, unreal.MaterialExpressionFresnel, -740, 420, exponent=1.5)
+    orb = expr(m, unreal.MaterialExpressionOneMinus, -600, 420)
+    link(fres, '', orb, '')
+    # pick the mask by Shape
+    shape = scalar(m, 'Shape', 1.0, -1040, 560)
+    s1 = expr(m, unreal.MaterialExpressionSaturate, -880, 560)
+    link(shape, '', s1, '')
+    shp2 = expr(m, unreal.MaterialExpressionSubtract, -880, 640)
+    link(shape, '', shp2, 'A')
+    link(const(m, 1.0, -1040, 680), '', shp2, 'B')
+    s2 = expr(m, unreal.MaterialExpressionSaturate, -740, 640)
+    link(shp2, '', s2, '')
+    shp3 = expr(m, unreal.MaterialExpressionSubtract, -880, 740)
+    link(shape, '', shp3, 'A')
+    link(const(m, 2.0, -1040, 780), '', shp3, 'B')
+    s3 = expr(m, unreal.MaterialExpressionSaturate, -740, 740)
+    link(shp3, '', s3, '')
+    l1 = expr(m, unreal.MaterialExpressionLinearInterpolate, -340, 60)
+    link(const(m, 1.0, -470, 0), '', l1, 'A')
+    link(disc, '', l1, 'B')
+    link(s1, '', l1, 'Alpha')
+    l2 = expr(m, unreal.MaterialExpressionLinearInterpolate, -200, 200)
+    link(l1, '', l2, 'A')
+    link(ring, '', l2, 'B')
+    link(s2, '', l2, 'Alpha')
+    l3 = expr(m, unreal.MaterialExpressionLinearInterpolate, -60, 340)
+    link(l2, '', l3, 'A')
+    link(orb, '', l3, 'B')
+    link(s3, '', l3, 'Alpha')
+    alpha = scalar(m, 'Alpha', 1.0, -200, 480)
+    op = expr(m, unreal.MaterialExpressionMultiply, 80, 400)
+    link(l3, '', op, 'A')
+    link(alpha, '', op, 'B')
+    mel.connect_material_property(op, '', unreal.MaterialProperty.MP_OPACITY)
+    mel.recompile_material(m)
+    check_compiled(m, 'эффекты боя')
+    eal.save_loaded_asset(m)
+    return m
+
+
 @step('материалы набора')
 def apply_kit_materials(meshes, foliage, textures, kit=None):
     if foliage is None:
@@ -595,6 +683,51 @@ def vrm4u_too_old():
         return False  # plugin without sources: cannot tell, try anyway
 
 
+def srgb_to_linear(c):
+    return [((x + 0.055) / 1.055) ** 2.4 if x > 0.04045 else x / 12.92 for x in c]
+
+
+def recolor_vrm_hair(path, hair):
+    """Makes a variant of a downloaded sample model with another hair colour (cast.json "hair"). Only the MToon colours
+    of the hair and the brows change: the Sendagaya hair textures are greyscale and take their colour from the material."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    magic, ver, _total = struct.unpack('<III', data[:12])
+    clen, ctype = struct.unpack('<II', data[12:20])
+    if magic != 0x46546C67 or ctype != 0x4E4F534A:
+        raise RuntimeError('не похоже на файл VRM')
+    gltf = json.loads(data[20:20 + clen].decode('utf-8'))
+    rest = data[20 + clen:]  # the binary chunk stays as it is
+    hair = [float(c) for c in hair][:3]
+    shade = [c * 0.72 for c in hair]
+    brow = [c * 0.5 for c in hair]
+
+    def is_hair(name):
+        return '_HAIR' in name and not name.endswith('_02')  # *_HAIR_02 is the inner layer with its own coloured texture
+
+    for mp in gltf['extensions']['VRM']['materialProperties']:
+        vp = mp.setdefault('vectorProperties', {})
+        name = mp.get('name', '')
+        if is_hair(name):
+            vp['_Color'], vp['_ShadeColor'] = hair + [1.0], shade + [1.0]
+        elif 'FaceBrow' in name:
+            vp['_Color'], vp['_ShadeColor'] = brow + [1.0], brow + [1.0]
+    for m in gltf.get('materials', []):
+        name = m.get('name', '')
+        pbr = m.setdefault('pbrMetallicRoughness', {})
+        if is_hair(name):
+            pbr['baseColorFactor'] = srgb_to_linear(hair) + [1.0]
+        elif 'FaceBrow' in name:
+            pbr['baseColorFactor'] = srgb_to_linear(brow) + [1.0]
+    js = json.dumps(gltf, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    js += b' ' * ((4 - len(js) % 4) % 4)
+    out = struct.pack('<III', magic, ver, 12 + 8 + len(js) + len(rest)) + struct.pack('<II', len(js), ctype) + js + rest
+    tmp = path + '.part'
+    with open(tmp, 'wb') as f:
+        f.write(out)
+    os.replace(tmp, path)
+
+
 def save_char_state(state):
     os.makedirs(os.path.dirname(CHAR_STATE), exist_ok=True)
     with open(CHAR_STATE, 'w', encoding='utf-8') as f:
@@ -660,6 +793,11 @@ def import_characters():
                     except Exception as e:
                         warn(f'{file}: не удалось скачать ({e}). Скачайте вручную {info["url"]} и сохраните как ArtSource/Characters/{file}')
                         continue
+                    if info.get('hair'):
+                        try:
+                            recolor_vrm_hair(path, info['hair'])
+                        except Exception as e:
+                            warn(f'{file}: не удалось перекрасить волосы ({e}) — будет исходная модель')
                 sha = file_sha256(path)
                 lists = assets_matching(folder, lambda c, n: 'VrmAssetList' in c)
                 if state.get(role) == 'crashed:' + sha:
@@ -900,14 +1038,14 @@ def finish_level(terrain_mat, sea_mat):
     with open(os.path.join(DATA, 'layout.json'), encoding='utf-8') as f:
         layout = json.load(f)
     start = layout['markers']['player_start']
-    spawn(unreal.PlayerStart, blender_to_ue((start['x'], start['y'], 1.5)))
+    spawn(unreal.PlayerStart, blender_to_ue((start['x'], start['y'], start.get('z', 0.0) + 1.5)))  # the game starts at home
     add_lighting()
     level_sub.save_current_level()
     eal.save_directory(ROOT, only_if_is_dirty=True, recursive=True)
     log('уровень сохранён')
 
 
-def write_assets_json(meshes, chars, billboard, models3d=None):
+def write_assets_json(meshes, chars, billboard, models3d=None, fx=None):
     old = {}
     path = os.path.join(DATA, 'assets.json')
     if os.path.exists(path):
@@ -921,6 +1059,7 @@ def write_assets_json(meshes, chars, billboard, models3d=None):
     data['pokemon3d'] = dict(kept, **(models3d or {}))
     data['kit'] = {k: sm.get_path_name() for k, sm in (meshes or {}).items()}
     data['billboard_material'] = billboard.get_path_name() if billboard else ''
+    data['fx_material'] = fx.get_path_name() if fx else ''
     os.makedirs(DATA, exist_ok=True)
     with open(os.path.join(DATA, 'assets.json'), 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -972,16 +1111,17 @@ def main():
         terrain = make_terrain_material(textures)
         sea = make_water_material(textures)
         billboard = make_billboard_material()
+        fx = make_fx_material()
         kit = make_kit_material(textures)
         apply_kit_materials(meshes, foliage, textures, kit)
         task.enter_progress_frame(1, 'Персонажи')
         chars = find_characters() or {}
         task.enter_progress_frame(1, 'Аниме-персонажи (первый раз — несколько минут)')
         chars.update(import_characters() or {})
-        write_assets_json(meshes, chars, billboard)  # saved first: the 3D step below can be the slowest and riskiest
+        write_assets_json(meshes, chars, billboard, fx=fx)  # saved first: the 3D step below can be the slowest and riskiest
         task.enter_progress_frame(1, '3D-покемоны')
         models3d = import_pokemon3d() or {}
-        write_assets_json(meshes, chars, billboard, models3d)
+        write_assets_json(meshes, chars, billboard, models3d, fx=fx)
         task.enter_progress_frame(1, 'Уровень')
         open_fresh_level()
 

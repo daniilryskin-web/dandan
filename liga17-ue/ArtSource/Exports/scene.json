@@ -90,6 +90,36 @@
 ]
 },
 {
+"name": "PokeCenter",
+"mesh": "pokecenter",
+"loc": [
+-29.0,
+-4.0,
+0.0
+],
+"rot_z": 1.5708,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "PokeMart",
+"mesh": "mart",
+"loc": [
+28.5,
+-4.0,
+0.0176
+],
+"rot_z": -1.5708,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
 "name": "Fence_-13_0",
 "mesh": "fence",
 "loc": [
@@ -780,12 +810,12 @@
 ]
 },
 {
-"name": "Hedge_Lab_4",
-"mesh": "hedge",
+"name": "Lamp_PokeCenter_-1",
+"mesh": "lamp_post",
 "loc": [
-22.5,
--8.6,
-0.0145
+-19.2,
+-7.6,
+0.0289
 ],
 "rot_z": 0.0,
 "scale": [
@@ -795,12 +825,177 @@
 ]
 },
 {
-"name": "Hedge_Lab_5",
-"mesh": "hedge",
+"name": "Lamp_PokeCenter_1",
+"mesh": "lamp_post",
 "loc": [
-24.5,
+-19.2,
+-0.4,
+-0.0116
+],
+"rot_z": 0.0,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Lamp_PokeMart_-1",
+"mesh": "lamp_post",
+"loc": [
+19.7,
+-7.6,
+0.0119
+],
+"rot_z": 0.0,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Lamp_PokeMart_1",
+"mesh": "lamp_post",
+"loc": [
+19.7,
+-0.4,
+0.0122
+],
+"rot_z": 0.0,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "FlowerBed_Center",
+"mesh": "flower_bed",
+"loc": [
+-22.4,
+1.0,
+-0.0227
+],
+"rot_z": 1.5708,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "FlowerBed_Mart",
+"mesh": "flower_bed",
+"loc": [
+22.9,
+-9.0,
+0.0136
+],
+"rot_z": 1.5708,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Bench_Center",
+"mesh": "bench",
+"loc": [
+-20.8,
 -8.6,
-0.0223
+0.0227
+],
+"rot_z": 3.14159,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Pier",
+"mesh": "pier",
+"loc": [
+-6.0,
+-37.0,
+-0.15
+],
+"rot_z": 0.0,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Bench_Beach",
+"mesh": "bench",
+"loc": [
+6.0,
+-35.0,
+-0.0014
+],
+"rot_z": 3.14159,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Interior_home",
+"mesh": "int_home",
+"loc": [
+200.0,
+0.0,
+-30.0
+],
+"rot_z": 0.0,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Interior_lab",
+"mesh": "int_lab",
+"loc": [
+240.0,
+0.0,
+-30.0
+],
+"rot_z": 0.0,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Interior_center",
+"mesh": "int_center",
+"loc": [
+280.0,
+0.0,
+-30.0
+],
+"rot_z": 0.0,
+"scale": [
+1.0,
+1.0,
+1.0
+]
+},
+{
+"name": "Interior_mart",
+"mesh": "int_mart",
+"loc": [
+320.0,
+0.0,
+-30.0
 ],
 "rot_z": 0.0,
 "scale": [

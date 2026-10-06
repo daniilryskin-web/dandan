@@ -28,8 +28,11 @@ import unreal
 COMMIT = '429de1288cea0d43f5b4f56305d2276e94239d65'
 BASE = f'https://raw.githubusercontent.com/Pokemon-3D-api/assets/{COMMIT}/models/opt'
 
-# Starters with evolutions, Route 1, and Pikachu/Eevee lines.
-GAME_SPECIES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 133, 134, 135, 136]
+# Pokémon the game can show: starters, every wild Pokémon of Route 1, the forest edge and the shore, and what they
+# evolve into early on.
+GAME_SPECIES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+                28, 29, 30, 32, 33, 39, 43, 44, 46, 47, 48, 49, 52, 53, 54, 55, 56, 57, 60, 61, 69, 70, 72, 73, 79,
+                80, 86, 87, 90, 98, 99, 116, 117, 118, 119, 120, 131, 133, 134, 135, 136]
 
 PROJECT = os.path.abspath(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir()))
 CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')

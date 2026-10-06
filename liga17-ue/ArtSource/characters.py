@@ -31,9 +31,14 @@ SOURCES = {
     'Vivi': 'eaf902e041a7a810f1423599ae75682f61184ab6ef0206da9a8ed9caa8ec3a9d',
     'Vita': 'f2bf78f28a24e2f75f5ca0b6c3b646654c394e4b03592dfaa0d0633ef0972b4d',
     'Darkness_Shibu': '0b50573d2d054d98c0a6fc5a5ce872e1b2c8bff8718476ff72a9a68c48674fd8',
+    'HairSample_Female': 'adfd242317aaabc773f31f7fff7b013979fbb5baa47e97427a78913d9cb4e979',
+    'Sendagaya_Shibu': 'b7bcad5e5890abc4d7c65f9afc31da2445db03197d44f1ec10447f9db5abeaff',
+    'Sendagaya_Shino': '1e177c1a7b14f783a9c48395831db8616260d3bddd4154cb2784b779adca49b5',
 }
 
-# role -> (file in Characters/, source model). The role keys match the NPC ids in town.py, plus 'player'.
+# role -> (file in Characters/, source model[, hair colour]). The role keys match the NPC ids or looks in town.py, plus
+# 'player'. With a hair colour the setup script makes a variant of the source model after downloading it: only the
+# MToon colours of the hair and the brows change (Sendagaya hair textures are greyscale, the colour is in the material).
 CAST = {
     'player': ('Player.vrm', 'HairSample_Male'),
     'rival': ('Rival.vrm', 'Sakurada_Fumiriya'),
@@ -42,6 +47,11 @@ CAST = {
     'girl': ('Girl.vrm', 'Vivi'),
     'tech': ('Tech.vrm', 'Vita'),
     'sailor': ('Sailor.vrm', 'Darkness_Shibu'),
+    'nurse': ('Nurse.vrm', 'Sendagaya_Shino', [1.0, 0.56, 0.74]),
+    'clerk': ('Clerk.vrm', 'Sendagaya_Shibu'),
+    'student': ('Student.vrm', 'HairSample_Female'),
+    'walker': ('Walker.vrm', 'Sendagaya_Shibu', [0.56, 0.32, 0.18]),
+    'bugkid': ('Bugkid.vrm', 'Sendagaya_Shino', [0.4, 0.68, 0.32]),
 }
 
 
@@ -176,9 +186,11 @@ def main():
     oak = make_oak(fetch('Sakurada_Fumiriya'))
     open(os.path.join(OUT, 'Oak.vrm'), 'wb').write(oak)
     roles = {}
-    for role, (file, src) in CAST.items():
+    for role, (file, src, *hair) in CAST.items():
         if src:
             roles[role] = {'file': file, 'source': src, 'url': BASE + src + '.vrm', 'sha256': SOURCES[src]}
+            if hair:
+                roles[role]['hair'] = hair[0]
         else:
             roles[role] = {'file': file, 'source': 'Sakurada_Fumiriya (recoloured by characters.py)', 'sha256': sha256(oak)}
     cast = {

@@ -7,6 +7,7 @@
 #include "LigaBattle.h"
 #include "LigaBattleStage.generated.h"
 
+class ALigaBattleFx;
 class UAnimSequence;
 class UCameraComponent;
 class UMaterialInstanceDynamic;
@@ -72,6 +73,7 @@ public:
 	void Finish();
 
 	virtual void Tick(float DeltaSeconds) override;
+	virtual void Destroyed() override;
 
 	// ——— state for the HUD (what is currently shown, not the engine's state) ———
 	FString Message;
@@ -92,6 +94,8 @@ private:
 	UPROPERTY() TObjectPtr<UStaticMeshComponent> Ball;
 	UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> BallMat;
 	UPROPERTY() TObjectPtr<APawn> Trainer;
+	/** Move and status effects. */
+	UPROPERTY() TObjectPtr<ALigaBattleFx> Fx;
 
 	TArray<FLigaBattleEvent> Queue;
 	float Wait = 0.f;
@@ -108,6 +112,11 @@ private:
 	float Shake = 0.f;
 	float Time = 0.f;
 
+	/** Seconds until the next "Z" over a sleeping Pokémon. */
+	float SleepTimer[2] = {0.f, 0.f};
+	/** Sea surface height (world): battles at the shore keep water Pokémon on the water. */
+	float SeaZ = -1.0e9f;
+
 	bool bBallActive = false;
 	float BallTime = 0.f;
 	int32 BallShakes = 0;
@@ -123,5 +132,8 @@ private:
 	void UpdateBall(float Dt);
 	void NextEvent();
 	void AddPopup(int32 Side, const FString& Text, const FLinearColor& Color);
+	/** Height of what is drawn for a side (the model is 80% of the picture size). */
+	float FxHeight(int32 Side) const;
+	void UpdateAura(int32 Side);
 	float Speed() const { return bFast ? 4.f : 1.f; }
 };

@@ -2,6 +2,7 @@
 
 #include "Animation/AnimSequence.h"
 #include "Camera/CameraComponent.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/SkeletalMesh.h"
@@ -10,9 +11,12 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
+#include "EngineUtils.h"
 #include "LigaAssets.h"
+#include "LigaBattleFx.h"
 #include "LigaData.h"
 #include "LigaGameInstance.h"
+#include "LigaWorldBuilder.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ProceduralMeshComponent.h"
 
@@ -75,11 +79,33 @@ FVector ALigaBattleStage::GroundAt(const FVector& P) const
 	FHitResult Hit;
 	FCollisionQueryParams Q(SCENE_QUERY_STAT(LigaGround), false, this);
 	if (Trainer) Q.AddIgnoredActor(Trainer);
+	FVector G = P;
 	if (GetWorld()->LineTraceSingleByChannel(Hit, P + FVector(0, 0, 600), P - FVector(0, 0, 1500), ECC_Visibility, Q))
 	{
-		return Hit.ImpactPoint;
+		G = Hit.ImpactPoint;
 	}
-	return P;
+	// The sea has no collision: a Pokémon in the water floats on the surface instead of standing on the sea floor.
+	G.Z = FMath::Max(G.Z, (double)SeaZ);
+	return G;
+}
+
+float ALigaBattleStage::FxHeight(int32 Side) const
+{
+	return Mons[Side].Height * (Mons[Side].bModel ? 0.8f : 0.9f);
+}
+
+void ALigaBattleStage::UpdateAura(int32 Side)
+{
+	if (!Fx) return;
+	const bool bShown = Mons[Side].Anim != TEXT("hidden") && Mons[Side].Anim != TEXT("faint") && Mons[Side].Anim != TEXT("capture");
+	Fx->SetAura(Side, bShown ? ShownStatus[Side] : EStatus::None, Mons[Side].Home, FxHeight(Side));
+}
+
+void ALigaBattleStage::Destroyed()
+{
+	if (Fx) Fx->Destroy();
+	Fx = nullptr;
+	Super::Destroyed();
 }
 
 void ALigaBattleStage::Begin(APawn* PlayerPawn)
@@ -89,6 +115,14 @@ void ALigaBattleStage::Begin(APawn* PlayerPawn)
 	if (!GI || !GI->Battle || !PlayerPawn) return;
 	FLigaBattle& B = *GI->Battle;
 
+	for (TActorIterator<ALigaWorldBuilder> It(GetWorld()); It; ++It)
+	{
+		SeaZ = It->SeaLevelZ();
+		break;
+	}
+	FActorSpawnParameters FxParams;
+	FxParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	Fx = GetWorld()->SpawnActor<ALigaBattleFx>(PlayerPawn->GetActorLocation(), FRotator::ZeroRotator, FxParams);
 	Forward = PlayerPawn->GetActorForwardVector().GetSafeNormal2D();
 	if (Forward.IsNearlyZero()) Forward = FVector::ForwardVector;
 	Right = FVector::CrossProduct(FVector::UpVector, Forward).GetSafeNormal();
@@ -102,6 +136,9 @@ void ALigaBattleStage::Begin(APawn* PlayerPawn)
 	SetupMon(1, B.EnemyMon(), Foe);
 	Mons[0].Anim = TEXT("hidden");
 	Animate(1, TEXT("appear"));
+	UpdateAura(0);
+	UpdateAura(1);
+	if (Fx) Fx->BallOpen(Foe + FVector(0, 0, FxHeight(1) * 0.4f), FxHeight(1));
 
 	// Camera starts close to the wild Pokémon and pulls back (intro).
 	CamPos = Foe - Forward * 350.f + Right * 260.f + FVector(0, 0, 160.f);
@@ -277,6 +314,8 @@ void ALigaBattleStage::NextEvent()
 		{
 			bIntro = false;
 			Animate(0, TEXT("appear"));
+			UpdateAura(0);
+			if (Fx) Fx->BallOpen(Mons[0].Home + FVector(0, 0, FxHeight(0) * 0.4f), FxHeight(0));
 		}
 		Message = E.Text;
 		Wait = FMath::Min(1.8f, 0.75f + E.Text.Len() * 0.018f);
@@ -285,13 +324,26 @@ void ALigaBattleStage::NextEvent()
 	{
 		const FLigaMove* Mv = FLigaDatabase::Get().Move(E.MoveId);
 		Focus = S == 0 ? 1 : 2;
-		if (Mv && Mv->Category != EMoveCategory::Status) Animate(S, TEXT("attack"));
+		// Physical moves lunge at the foe; special and status moves are cast from where the Pokémon stands.
+		if (Mv && Mv->Category == EMoveCategory::Physical) Animate(S, TEXT("attack"));
+		else if (Mv) Animate(S, TEXT("cast"));
 		Wait = 0.45f;
+		if (Fx && Mv) Wait = Fx->PlayMove(*Mv, Mons[S].Home, FxHeight(S), Mons[1 - S].Home, FxHeight(1 - S));
+		if (Mv && Mv->Type == EPokeType::Ground && Mv->Category != EMoveCategory::Status) Shake = FMath::Max(Shake, 0.3f);
 		break;
 	}
 	case ELigaEvent::Damage:
 	{
 		Animate(S, TEXT("hit"));
+		if (Fx)
+		{
+			if (E.MoveId.StartsWith(TEXT("status:")) || E.MoveId == TEXT("recoil")) Fx->StatusDamage(E.MoveId, Mons[S].Home, FxHeight(S));
+			else
+			{
+				const FLigaMove* Mv = FLigaDatabase::Get().Move(E.MoveId);
+				Fx->Impact(Mv ? Mv->Type : EPokeType::Normal, E.MoveId, Mons[S].Home, FxHeight(S), E.bCrit || E.Eff >= 2.f);
+			}
+		}
 		TargetHp[S] = E.Hp;
 		const FLinearColor C = E.bCrit ? StageHex(TEXT("FFD84A")) : E.Eff >= 2.f ? StageHex(TEXT("FF8A3A")) : E.Eff < 1.f ? StageHex(TEXT("B8C0D8")) : FLinearColor::White;
 		AddPopup(S, FString::Printf(TEXT("-%d"), E.Amount), C);
@@ -300,20 +352,39 @@ void ALigaBattleStage::NextEvent()
 		break;
 	}
 	case ELigaEvent::Heal:
+		if (Fx) Fx->Heal(Mons[S].Home, FxHeight(S));
 		TargetHp[S] = E.Hp;
 		AddPopup(S, FString::Printf(TEXT("+%d"), E.Amount), StageHex(TEXT("6DFFA0")));
 		Wait = 0.5f;
 		break;
 	case ELigaEvent::Status:
 		ShownStatus[S] = E.Status;
-		Wait = 0.35f;
+		if (Fx) Fx->StatusBurst(E.Status, Mons[S].Home, FxHeight(S));
+		UpdateAura(S);
+		SleepTimer[S] = 0.4f;
+		Wait = E.Status == EStatus::None ? 0.35f : 0.6f;
+		break;
+	case ELigaEvent::Confuse:
+		if (Fx) Fx->Confused(Mons[S].Home, FxHeight(S));
+		Wait = 0.5f;
+		break;
+	case ELigaEvent::Protect:
+		if (Fx) Fx->Shield(Mons[S].Home, FxHeight(S));
+		Wait = 0.4f;
+		break;
+	case ELigaEvent::Miss:
+		if (Fx) Fx->Miss(Mons[1 - S].Home, FxHeight(1 - S));
+		Wait = 0.2f;
 		break;
 	case ELigaEvent::Stat:
 		AddPopup(S, E.Delta > 0 ? TEXT("+") : TEXT("-"), E.Delta > 0 ? StageHex(TEXT("5EC8FF")) : StageHex(TEXT("FF6A6A")));
-		Wait = 0.3f;
+		if (Fx) Fx->StatChange(Mons[S].Home, FxHeight(S), E.Delta > 0);
+		Wait = 0.5f;
 		break;
 	case ELigaEvent::Faint:
 		Animate(S, TEXT("faint"));
+		if (Fx) Fx->Faint(Mons[S].Home, FxHeight(S));
+		UpdateAura(S);
 		Wait = 0.9f;
 		break;
 	case ELigaEvent::Switch:
@@ -342,6 +413,8 @@ void ALigaBattleStage::NextEvent()
 				ShownHp[S] = TargetHp[S] = Hp + Back;
 				if (UTexture2D* T = GI->GetCachedTexture(P->Species, P->bShiny)) SetMonTexture(S, T);
 				Animate(S, TEXT("appear"));
+				UpdateAura(S);
+				if (Fx) Fx->BallOpen(Mons[S].Home + FVector(0, 0, FxHeight(S) * 0.4f), FxHeight(S));
 			}
 		}
 		bIntro = false;
@@ -402,6 +475,25 @@ void ALigaBattleStage::Tick(float Dt)
 		Popups[i].Age += Dt;
 		if (Popups[i].Age > 1.4f) Popups.RemoveAt(i);
 	}
+	if (Fx)
+	{
+		Fx->ViewPos = Camera->GetComponentLocation();
+		if (APlayerController* PC = UGameplayStatics::GetPlayerController(this, 0))
+		{
+			if (PC->PlayerCameraManager) Fx->ViewPos = PC->PlayerCameraManager->GetCameraLocation();
+		}
+	}
+	for (int32 i = 0; i < 2; ++i)
+	{
+		// "Z" floating up from a sleeping Pokémon.
+		if (ShownStatus[i] != EStatus::Sleep || Mons[i].Anim == TEXT("hidden") || Mons[i].Anim == TEXT("faint")) continue;
+		SleepTimer[i] -= Dt;
+		if (SleepTimer[i] <= 0.f)
+		{
+			SleepTimer[i] = 1.1f;
+			AddPopup(i, TEXT("Z"), StageHex(TEXT("BFD6FF")));
+		}
+	}
 	if (bBallActive) UpdateBall(Dt * Speed());
 	else if (Wait > 0.f) Wait -= Dt * Speed();
 	else if (Queue.Num() > 0) NextEvent();
@@ -423,6 +515,11 @@ void ALigaBattleStage::UpdateMon(int32 Side, float Dt)
 	{
 		const float P = FMath::Clamp(T / 0.45f, 0.f, 1.f);
 		Offset += Toward * FMath::Sin(P * PI) * 140.f + FVector(0, 0, FMath::Sin(P * PI) * 30.f);
+	}
+	else if (M.Anim == TEXT("cast"))
+	{
+		const float P = FMath::Clamp(T / 0.4f, 0.f, 1.f);
+		Offset += Toward * FMath::Sin(P * PI) * 25.f + FVector(0, 0, FMath::Sin(P * PI) * 22.f);
 	}
 	else if (M.Anim == TEXT("hit"))
 	{
@@ -498,7 +595,12 @@ void ALigaBattleStage::UpdateBall(float Dt)
 	}
 	else if (BallTime < LandAt)
 	{
-		if (Mons[1].Anim != TEXT("capture")) Animate(1, TEXT("capture"));
+		if (Mons[1].Anim != TEXT("capture"))
+		{
+			Animate(1, TEXT("capture"));
+			UpdateAura(1);
+			if (Fx) Fx->BallOpen(Top, FxHeight(1) * 0.6f);
+		}
 		const float P = (BallTime - CaptureAt) / (LandAt - CaptureAt);
 		Ball->SetWorldLocation(FMath::Lerp(Top, Ground, P * P));
 	}
@@ -516,6 +618,12 @@ void ALigaBattleStage::UpdateBall(float Dt)
 		{
 			Ball->SetVisibility(false);
 			Animate(1, TEXT("appear"));
+			UpdateAura(1);
+			if (Fx) Fx->BallOpen(Ground, FxHeight(1));
+		}
+		else if (Fx)
+		{
+			Fx->CaptureSparkles(Ground + FVector(0, 0, 20.f));
 		}
 		Wait = 0.5f;
 	}
@@ -564,5 +672,6 @@ void ALigaBattleStage::Finish()
 	{
 		if (Trainer) PC->SetViewTargetWithBlend(Trainer, 0.6f, VTBlend_Cubic);
 	}
+	if (Fx) Fx->SetLifeSpan(0.8f);
 	SetLifeSpan(0.8f);
 }

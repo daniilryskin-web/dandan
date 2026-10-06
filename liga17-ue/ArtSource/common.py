@@ -42,6 +42,25 @@ MATDEF = {
     'sign_pallet': ('sign_pallet', None, False, {}),
     'sign_lab': ('sign_lab', None, False, {}),
     'sign_route1': ('sign_route1', None, False, {}),
+    'sign_center': ('sign_center', None, False, {}),
+    'sign_mart': ('sign_mart', None, False, {}),
+    'poster_kanto': ('poster_kanto', None, False, {}),
+    'rug_ball': ('rug_ball', None, False, {}),
+    'floor_wood': ('floor_wood', 2.4, False, {}),
+    'floor_tile': ('floor_tile', 4.0, False, {}),
+    'floor_lab': ('floor_lab', 4.0, False, {}),
+    'wall_inner': ('wall_inner', 3.0, False, {}),
+    'wall_lab': ('wall_lab', 3.0, False, {}),
+    'wall_pink': ('wall_pink', 3.0, False, {}),
+    'carpet_red': ('carpet_red', 1.0, False, {}),
+    'carpet_green': ('carpet_green', 1.0, False, {}),
+    'counter_pink': ('counter_pink', 1.0, False, {}),
+    'cushion_blue': ('cushion_blue', 1.0, False, {}),
+    'books': ('books', 1.2, False, {}),
+    'goods': ('goods', 1.6, False, {}),
+    'pokeball_red': ('pokeball_red', 1.0, False, {}),
+    'screen': ('screen', 1.0, False, {'emit': 1.6, 'emit_color': (0.55, 0.85, 1.0)}),
+    'window_day': ('window_day', 1.0, False, {'emit': 2.5, 'emit_color': (0.82, 0.91, 1.0)}),
     'flower_red': (None, None, True, {'color': (0.85, 0.12, 0.12)}),
     'flower_yellow': (None, None, True, {'color': (0.98, 0.78, 0.12)}),
     'flower_white': (None, None, True, {'color': (0.95, 0.95, 0.92)}),
@@ -114,7 +133,7 @@ def get_mat(name):
     if 'spec' in extra:
         bsdf.inputs['Roughness'].default_value = 0.06
     if 'emit' in extra:
-        bsdf.inputs['Emission Color'].default_value = (1.0, 0.92, 0.7, 1)
+        bsdf.inputs['Emission Color'].default_value = (*extra.get('emit_color', (1.0, 0.92, 0.7)), 1)
         bsdf.inputs['Emission Strength'].default_value = extra['emit']
     if 'sss' in extra:
         # Soft light transmission for foliage in the preview renders.

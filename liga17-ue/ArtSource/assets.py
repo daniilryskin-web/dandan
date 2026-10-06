@@ -243,6 +243,74 @@ def oak_lab(name='oak_lab', W=17.0, D=10.0, H=5.0):
     return obj
 
 
+def service_building(name, W, D, H, roof, band, sign, door_mat='metal_white'):
+    """Poké Center / Poké Mart: white walls with a coloured band, low roof, glass double door, a big sign over the canopy.
+    The door is in the middle of the front facade; the door marker is 0.7 m in front of it."""
+    mb = MB()
+    Fh = 0.4
+    mb.box('stone', (0, 0, Fh / 2), (W + 0.3, D + 0.3, Fh))
+    mb.box('wall_white', (0, 0, Fh + H / 2), (W, D, H))
+    zt = Fh + H
+    mb.box(band, (0, 0, zt - 0.35), (W + 0.12, D + 0.12, 0.7))
+    mb.box(band, (0, 0, Fh + 0.15), (W + 0.08, D + 0.08, 0.3))
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            mb.box(band, (sx * W / 2, sy * D / 2, Fh + H / 2), (0.32, 0.32, H))
+    gable_roof(mb, W, D, zt, roof, 'wood_white', pitch_deg=18, o=0.6, attic='wall_white')
+    F = facade('front', W, D)
+    door(mb, F, 0, Fh, w=2.4, h=2.6, mat=door_mat, trim=band, canopy=None, steps=2, double=True)
+    # entrance canopy on two posts
+    mb.box(band, (0, -D / 2 - 0.95, Fh + 3.0), (4.6, 1.9, 0.22))
+    mb.box('metal_white', (0, -D / 2 - 1.9, Fh + 3.0), (4.7, 0.06, 0.3))
+    for sx in (-1, 1):
+        mb.cyl('metal_white', (sx * 2.05, -D / 2 - 1.75, 0), 0.09, Fh + 2.9, seg=12)
+    # sign board above the canopy
+    sw, sh = 3.6, 1.8
+    zs = Fh + 3.3
+    yb = -D / 2 - 0.1
+    mb.box(band, (0, yb, zs + sh / 2), (sw + 0.3, 0.16, sh + 0.3))
+    yf = yb - 0.085
+    mb.face(sign, [(-sw / 2, yf, zs), (sw / 2, yf, zs), (sw / 2, yf, zs + sh), (-sw / 2, yf, zs + sh)], fit=True)
+    for u in (-W * 0.33, W * 0.33):
+        window(mb, F, u, Fh + 0.9, w=min(2.2, W * 0.2), h=1.7, trim='metal_white', cross=False)
+    B = facade('back', W, D)
+    for u in (-W * 0.25, W * 0.25):
+        window(mb, B, u, Fh + 1.1, w=1.4, h=1.4, trim='metal_white', cross=False)
+    for side in ('left', 'right'):
+        S = facade(side, W, D)
+        for u in (-D * 0.22, D * 0.22):
+            window(mb, S, u, Fh + 1.0, w=1.4, h=1.6, trim='metal_white', cross=False)
+    return mb.build(name, bevel=0.025)
+
+
+def pier(name='pier', L=20.0, w=3.0):
+    """Wooden jetty: deck top at z = 0, starting at y = 0 and running towards -Y over the water."""
+    mb = MB()
+    mb.box('deck', (0, -L / 2, -0.1), (w, L, 0.2))
+    for sx in (-1, 1):
+        mb.box('wood_brown', (sx * (w / 2 - 0.05), -L / 2, -0.28), (0.12, L, 0.22))
+    n = int(L // 2.5)
+    for i in range(n + 1):
+        y = -0.6 - i * (L - 0.9) / n
+        for sx in (-1, 1):
+            top = 1.05 if i > 0 else 0.25
+            mb.cyl('wood_brown', (sx * (w / 2 - 0.12), y, -4.5), 0.13, 4.5 + top, seg=10)
+    # hand rails along both sides (open at the shore end) and across the far end
+    y0, y1 = -1.6, -L + 0.3
+    for sx in (-1, 1):
+        mb.box('wood_white', (sx * (w / 2 - 0.12), (y0 + y1) / 2, 1.0), (0.1, y0 - y1, 0.09))
+        mb.box('wood_white', (sx * (w / 2 - 0.12), (y0 + y1) / 2, 0.55), (0.06, y0 - y1, 0.07))
+    mb.box('wood_white', (0, y1, 1.0), (w - 0.2, 0.1, 0.09))
+    mb.box('wood_white', (0, y1, 0.55), (w - 0.2, 0.06, 0.07))
+    for sx in (-1, 1):
+        mb.cyl('metal_dark', (sx * 0.8, -L + 1.2, 0), 0.14, 0.45, seg=12, r2=0.11)
+    # lantern at the end
+    mb.cyl('metal_dark', (w / 2 - 0.12, -L + 0.6, 1.05), 0.05, 1.5, seg=8)
+    mb.box('lamp_glow', (w / 2 - 0.12, -L + 0.6, 2.75), (0.24, 0.24, 0.36))
+    mb.box('metal_dark', (w / 2 - 0.12, -L + 0.6, 2.97), (0.34, 0.34, 0.06))
+    return mb.build(name, bevel=0.01)
+
+
 def fence(name='fence', length=2.0, h=1.0, mat='wood_white'):
     mb = MB()
     for sx in (-1, 1):
@@ -472,6 +540,9 @@ def build_kit():
     kit['house_rival'] = house('house_rival', wall='wall_teal', roof='roof_pink', doormat='wood_blue', shutter=None, tower='wood_blue', chimney=False, seed=2)
     kit['house_small'] = house('house_small', W=7.0, D=6.0, H=3.4, wall='wall_peach', roof='roof_green', doormat='wood_brown', shutter='wood_brown', pitch=38, floors=1, seed=3)
     kit['oak_lab'] = oak_lab()
+    kit['pokecenter'] = service_building('pokecenter', 12.0, 10.0, 5.2, 'roof_red', 'red_paint', 'sign_center')
+    kit['mart'] = service_building('mart', 10.0, 8.0, 5.0, 'roof_blue', 'wood_blue', 'sign_mart')
+    kit['pier'] = pier()
     kit['fence'] = fence()
     kit['mailbox'] = mailbox()
     kit['sign_pallet'] = town_sign('sign_pallet', 'sign_pallet')

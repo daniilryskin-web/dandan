@@ -24,6 +24,8 @@ public:
 	virtual FString GetPromptText() const = 0;
 	virtual FString GetDisplayName() const = 0;
 	virtual void Interact(ALigaPlayerController* PC) = 0;
+	/** False while it should be ignored (hidden, busy). */
+	virtual bool CanInteract() const { return true; }
 };
 
 UENUM()
@@ -33,6 +35,10 @@ enum class ELigaDoorKind : uint8
 	Lab,
 	House,
 	Sign,
+	/** Leads into a room or back outside (Target). */
+	Portal,
+	/** The Poké Center computer with the Pokémon storage. */
+	Pc,
 };
 
 /** An invisible interaction point placed at a building's door. */
@@ -55,6 +61,21 @@ public:
 
 	UPROPERTY(EditAnywhere)
 	TArray<FString> Lines;
+
+	/** Portal: where the player appears (world) and which way they face. */
+	UPROPERTY(EditAnywhere)
+	FVector Target = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere)
+	float TargetYaw = 0.f;
+
+	/** Portal: used by simply walking into it. */
+	UPROPERTY(EditAnywhere)
+	bool bWalkIn = false;
+
+	/** Portal back outside (prompt "Выйти"). */
+	UPROPERTY(EditAnywhere)
+	bool bExit = false;
 
 	virtual FString GetPromptText() const override;
 	virtual FString GetDisplayName() const override { return Title; }

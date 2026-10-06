@@ -277,6 +277,7 @@ void FLigaBattle::UseMove(ELigaSide Side, int32 SlotIndex, bool bMovedFirst)
 				const float LevelPart = FMath::FloorToFloat(2.f * Attacker.Level / 5.f + 2.f);
 				const int32 Dmg = FMath::Max(1, (int32)(FMath::FloorToFloat(FMath::FloorToFloat(LevelPart * 40.f * A / D) / 50.f) + 2.f));
 				ApplyDamage(Side, Dmg, 1.f, false);
+				Events.Last().MoveId = TEXT("status:confusion");  // tells the battle stage which effect to show
 				Say(FString::Printf(TEXT("%s бьёт сам себя в замешательстве!"), *Name));
 				return;
 			}
@@ -341,6 +342,7 @@ void FLigaBattle::UseMove(ELigaSide Side, int32 SlotIndex, bool bMovedFirst)
 			return;
 		}
 		ApplyDamage(DefSide, Defender.HP, 1.f, false);
+		Events.Last().MoveId = Move.Id;
 		Say(TEXT("Сокрушительный удар — одним махом!"));
 		return;
 	}
@@ -381,6 +383,7 @@ void FLigaBattle::UseMove(ELigaSide Side, int32 SlotIndex, bool bMovedFirst)
 		float E = 1.f;
 		const int32 Dmg = ComputeDamage(Attacker, Defender, Move, Stages[Idx(Side)], Stages[Idx(DefSide)], bCrit, Rng.FRand(), E);
 		Total += ApplyDamage(DefSide, Dmg, Eff, bCrit);
+		Events.Last().MoveId = Move.Id;
 		++Landed;
 		bAnyCrit |= bCrit;
 	}
@@ -402,6 +405,7 @@ void FLigaBattle::UseMove(ELigaSide Side, int32 SlotIndex, bool bMovedFirst)
 	if (Fx.Recoil > 0.f && Total > 0)
 	{
 		ApplyDamage(Side, FMath::Max(1, (int32)(Total * Fx.Recoil)), 1.f, false);
+		Events.Last().MoveId = TEXT("recoil");
 		Say(FString::Printf(TEXT("%s получает урон от отдачи!"), *Name));
 	}
 	if (Fx.bPayDay && Side == ELigaSide::Player)
@@ -808,6 +812,7 @@ void FLigaBattle::EndOfTurn()
 		if (S == EStatus::Burn || S == EStatus::Poison)
 		{
 			ApplyDamage(Side, FMath::Max(1, LigaRules::MaxHp(P) / (S == EStatus::Burn ? 16 : 8)), 1.f, false);
+			Events.Last().MoveId = S == EStatus::Burn ? TEXT("status:burn") : TEXT("status:poison");
 			Say(FString::Printf(TEXT("%s %s!"), *Label(Side), S == EStatus::Burn ? TEXT("страдает от ожога") : TEXT("страдает от яда")));
 		}
 	}

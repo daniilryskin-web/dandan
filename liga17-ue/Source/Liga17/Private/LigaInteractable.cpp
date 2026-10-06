@@ -20,6 +20,8 @@ FString ALigaDoor::GetPromptText() const
 	case ELigaDoorKind::Home: return TEXT("Войти домой");
 	case ELigaDoorKind::Lab: return TEXT("Войти в лабораторию");
 	case ELigaDoorKind::Sign: return TEXT("Прочитать");
+	case ELigaDoorKind::Portal: return bExit ? TEXT("Выйти") : TEXT("Войти");
+	case ELigaDoorKind::Pc: return TEXT("Включить");
 	default: return TEXT("Постучать");
 	}
 }
@@ -44,6 +46,12 @@ void ALigaDoor::Interact(ALigaPlayerController* PC)
 		break;
 	case ELigaDoorKind::Lab:
 		PC->TalkToOak();
+		break;
+	case ELigaDoorKind::Portal:
+		PC->TravelTo(Target, TargetYaw);
+		break;
+	case ELigaDoorKind::Pc:
+		PC->OpenStorage();
 		break;
 	default:
 		PC->ShowDialogue(Title, Lines.Num() ? Lines : TArray<FString>{TEXT("Никто не отвечает...")});

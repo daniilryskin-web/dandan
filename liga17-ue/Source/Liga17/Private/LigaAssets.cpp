@@ -39,13 +39,27 @@ namespace
 		TEXT("/Game/Characters/Mannequins/Animations/ABP_Quinn.ABP_Quinn_C"),
 	};
 
-	FVector Vec3(const TSharedPtr<FJsonObject>& O)
+	FVector Vec3(const TSharedPtr<FJsonObject>& O, const TCHAR* Px = TEXT(""))
 	{
 		double X = 0, Y = 0, Z = 0;
-		O->TryGetNumberField(TEXT("x"), X);
-		O->TryGetNumberField(TEXT("y"), Y);
-		O->TryGetNumberField(TEXT("z"), Z);
+		if (!O) return FVector::ZeroVector;
+		O->TryGetNumberField(FString(Px) + TEXT("x"), X);
+		O->TryGetNumberField(FString(Px) + TEXT("y"), Y);
+		O->TryGetNumberField(FString(Px) + TEXT("z"), Z);
 		return FVector(X, Y, Z);
+	}
+
+	float Num(const TSharedPtr<FJsonObject>& O, const TCHAR* Field, float Default)
+	{
+		double V = Default;
+		return O && O->TryGetNumberField(Field, V) ? (float)V : Default;
+	}
+
+	FString Str(const TSharedPtr<FJsonObject>& O, const TCHAR* Field)
+	{
+		FString V;
+		if (O) O->TryGetStringField(Field, V);
+		return V;
 	}
 }
 
@@ -78,6 +92,7 @@ void FLigaAssets::Load()
 	Root->TryGetStringField(TEXT("character_mesh"), CharacterMesh);
 	Root->TryGetStringField(TEXT("character_anim"), CharacterAnimClass);
 	Root->TryGetStringField(TEXT("billboard_material"), BillboardMaterial);
+	Root->TryGetStringField(TEXT("fx_material"), FxMaterial);
 	Root->TryGetStringField(TEXT("player_vrm"), PlayerVrm);
 	Root->TryGetStringField(TEXT("player_rtg"), PlayerRtg);
 	const TSharedPtr<FJsonObject>* Obj;
@@ -158,9 +173,31 @@ UClass* FLigaAssets::LoadCharacterAnimClass() const
 
 const FLigaLayout& FLigaLayout::Get()
 {
+	// Like assets.json: re-read when the setup script copies a new layout.json while the editor stays open.
 	static FLigaLayout Instance;
-	if (!Instance.bLoaded) Instance.Load();
+	static FDateTime Stamp;
+	const FDateTime Now = IFileManager::Get().GetTimeStamp(*(FLigaDatabase::DataDir() / TEXT("layout.json")));
+	if (!Instance.bLoaded || Now != Stamp)
+	{
+		Stamp = Now;
+		Instance = FLigaLayout();
+		Instance.Load();
+	}
 	return Instance;
+}
+
+const FLigaPlaceDef* FLigaLayout::PlaceAt(const FVector& B) const
+{
+	for (const FLigaPlaceDef& P : Places)
+	{
+		if (P.Contains(B)) return &P;
+	}
+	return nullptr;
+}
+
+const FLigaPlaceDef* FLigaLayout::FindPlace(const FString& Id) const
+{
+	return Places.FindByPredicate([&Id](const FLigaPlaceDef& P) { return P.Id == Id; });
 }
 
 void FLigaLayout::Load()
@@ -181,9 +218,66 @@ void FLigaLayout::Load()
 		if ((*Markers)->TryGetObjectField(TEXT("player_start"), Start))
 		{
 			PlayerStart = Vec3(*Start);
-			double F = 0;
-			(*Start)->TryGetNumberField(TEXT("face"), F);
-			PlayerFace = (float)F;
+			PlayerFace = Num(*Start, TEXT("face"), 0.f);
+		}
+		const TArray<TSharedPtr<FJsonValue>>* Arr;
+		if ((*Markers)->TryGetArrayField(TEXT("portals"), Arr))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Arr)
+			{
+				const TSharedPtr<FJsonObject> O = V->AsObject();
+				if (!O) continue;
+				FLigaPortalDef P;
+				P.Id = Str(O, TEXT("id"));
+				P.Kind = Str(O, TEXT("kind"));
+				P.Title = Str(O, TEXT("title"));
+				P.Pos = Vec3(O);
+				P.To = Vec3(O, TEXT("t"));
+				P.ToFace = Num(O, TEXT("tface"), 0.f);
+				Portals.Add(P);
+			}
+		}
+		if ((*Markers)->TryGetArrayField(TEXT("places"), Arr))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Arr)
+			{
+				const TSharedPtr<FJsonObject> O = V->AsObject();
+				if (!O) continue;
+				FLigaPlaceDef P;
+				P.Id = Str(O, TEXT("id"));
+				P.Name = Str(O, TEXT("name"));
+				O->TryGetBoolField(TEXT("indoor"), P.bIndoor);
+				P.X0 = Num(O, TEXT("x0"), 0.f);
+				P.X1 = Num(O, TEXT("x1"), 0.f);
+				P.Y0 = Num(O, TEXT("y0"), 0.f);
+				P.Y1 = Num(O, TEXT("y1"), 0.f);
+				P.Z0 = Num(O, TEXT("z0"), -1.0e6f);
+				P.Z1 = Num(O, TEXT("z1"), 1.0e6f);
+				const TArray<TSharedPtr<FJsonValue>>* Lights;
+				if (O->TryGetArrayField(TEXT("lights"), Lights))
+				{
+					for (const TSharedPtr<FJsonValue>& L : *Lights)
+					{
+						const TArray<TSharedPtr<FJsonValue>>& A = L->AsArray();
+						if (A.Num() >= 4) P.Lights.Add(FVector4(A[0]->AsNumber(), A[1]->AsNumber(), A[2]->AsNumber(), A[3]->AsNumber()));
+					}
+				}
+				Places.Add(P);
+			}
+		}
+		if ((*Markers)->TryGetArrayField(TEXT("ambient"), Arr))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Arr)
+			{
+				const TSharedPtr<FJsonObject> O = V->AsObject();
+				if (!O) continue;
+				FLigaAmbientDef A;
+				A.Species = (int32)Num(O, TEXT("species"), 0.f);
+				A.Pos = Vec3(O);
+				A.Radius = Num(O, TEXT("radius"), 3.f);
+				A.Quest = Str(O, TEXT("quest"));
+				if (A.Species > 0) Ambient.Add(A);
+			}
 		}
 		const TSharedPtr<FJsonObject>* DoorsObj;
 		if ((*Markers)->TryGetObjectField(TEXT("doors"), DoorsObj))
@@ -205,14 +299,24 @@ void FLigaLayout::Load()
 				O->TryGetStringField(TEXT("name"), N.Name);
 				O->TryGetStringField(TEXT("look"), N.Look);
 				N.Pos = Vec3(O);
-				double F = 0;
-				O->TryGetNumberField(TEXT("face"), F);
-				N.Face = (float)F;
+				N.Face = Num(O, TEXT("face"), 0.f);
 				const TArray<TSharedPtr<FJsonValue>>* Lines;
 				if (O->TryGetArrayField(TEXT("lines"), Lines))
 				{
 					for (const TSharedPtr<FJsonValue>& L : *Lines) N.Lines.Add(L->AsString());
 				}
+				const TArray<TSharedPtr<FJsonValue>>* Route;
+				if (O->TryGetArrayField(TEXT("route"), Route))
+				{
+					for (const TSharedPtr<FJsonValue>& R : *Route)
+					{
+						const TArray<TSharedPtr<FJsonValue>>& A = R->AsArray();
+						if (A.Num() >= 2) N.Route.Add(FVector2D(A[0]->AsNumber(), A[1]->AsNumber()));
+					}
+				}
+				O->TryGetBoolField(TEXT("loop"), N.bLoop);
+				N.Speed = Num(O, TEXT("speed"), 1.2f);
+				N.Pause = Num(O, TEXT("pause"), 2.f);
 				Npcs.Add(N);
 			}
 		}
@@ -230,6 +334,9 @@ void FLigaLayout::Load()
 			if (O->TryGetNumberField(TEXT("y0"), D)) Z.Y0 = (float)D;
 			if (O->TryGetNumberField(TEXT("y1"), D)) Z.Y1 = (float)D;
 			O->TryGetStringField(TEXT("route"), Z.Route);
+			O->TryGetStringField(TEXT("kind"), Z.Kind);
+			O->TryGetStringField(TEXT("place"), Z.Place);
+			Z.Pad = Num(O, TEXT("pad"), 3.5f);
 			Zones.Add(Z);
 		}
 	}
@@ -251,5 +358,5 @@ void FLigaLayout::Load()
 			}
 		}
 	}
-	UE_LOG(LogLigaAssets, Log, TEXT("Layout: %d NPCs, %d zones, %d instance kinds"), Npcs.Num(), Zones.Num(), Instances.Num());
+	UE_LOG(LogLigaAssets, Log, TEXT("Layout: %d NPCs, %d zones, %d doors, %d places, %d instance kinds"), Npcs.Num(), Zones.Num(), Portals.Num(), Places.Num(), Instances.Num());
 }

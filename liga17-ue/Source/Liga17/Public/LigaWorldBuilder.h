@@ -7,6 +7,8 @@
 #include "LigaWorldBuilder.generated.h"
 
 class UHierarchicalInstancedStaticMeshComponent;
+class UPointLightComponent;
+struct FLigaPlaceDef;
 
 UCLASS()
 class LIGA17_API ALigaWorldBuilder : public AActor
@@ -25,12 +27,19 @@ public:
 	FVector ToBlender(const FVector& World) const;
 	/** Drops a point onto the ground (terrain / buildings). */
 	FVector Ground(const FVector& World, float Up = 2000.f) const;
+	/** Ground under a layout point. Rooms have ceilings, so indoor points are traced from just above their floor. */
+	FVector GroundAtLayout(const FVector& Blender) const;
+	/** Height of the sea surface (world units). */
+	float SeaLevelZ() const;
+	/** The named place (room or outdoor area) at a world position, or null. */
+	const FLigaPlaceDef* PlaceAtWorld(const FVector& World) const;
 
 	FVector PlayerStartWorld() const;
 	float PlayerStartYaw() const;
 
 private:
 	UPROPERTY() TArray<TObjectPtr<UHierarchicalInstancedStaticMeshComponent>> Foliage;
+	UPROPERTY() TArray<TObjectPtr<UPointLightComponent>> RoomLights;
 
 	FVector Origin = FVector::ZeroVector;
 	FVector AxisX = FVector(100.f, 0.f, 0.f);  // per Blender metre
@@ -43,5 +52,7 @@ private:
 	void SpawnNpcs();
 	void SpawnDoors();
 	void SpawnZones();
+	void SpawnRoomLights();
+	void SpawnAmbient();
 	void PlacePlayer();
 };

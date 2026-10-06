@@ -379,18 +379,55 @@ void ALigaCharacter::OnNumber(const FInputActionValue& V)
 	if (ALigaPlayerController* PC = LigaPC()) PC->OnNumberKey(FMath::RoundToInt(V.Get<float>()));
 }
 
+void ALigaCharacter::SnapCamera()
+{
+	CameraBoom->bEnableCameraLag = false;
+	LagOffTime = 0.1f;
+	GrassWalk = 0.f;
+	LastPos = GetActorLocation();
+}
+
 void ALigaCharacter::Tick(float Dt)
 {
 	Super::Tick(Dt);
-	CameraBoom->TargetArmLength = FMath::FInterpTo(CameraBoom->TargetArmLength, ZoomGoal, Dt, 8.f);
+	if (LagOffTime > 0.f)
+	{
+		LagOffTime -= Dt;
+		if (LagOffTime <= 0.f) CameraBoom->bEnableCameraLag = true;
+	}
+	// Rooms are small: the camera stays closer indoors.
+	const ALigaPlayerController* PC = LigaPC();
+	const float Arm = PC && PC->IsIndoors() ? FMath::Min(ZoomGoal, 320.f) : ZoomGoal;
+	CameraBoom->TargetArmLength = FMath::FInterpTo(CameraBoom->TargetArmLength, Arm, Dt, 8.f);
 	FocusTimer -= Dt;
 	if (FocusTimer <= 0.f)
 	{
 		FocusTimer = 0.12f;
 		UpdateFocus();
+		UpdateDoors();
 	}
 	UpdateEncounters(Dt);
 	UpdateFollower(Dt);
+}
+
+void ALigaCharacter::UpdateDoors()
+{
+	// Walking into a door goes through it, like in the classic games (E works too).
+	ALigaPlayerController* PC = LigaPC();
+	if (!PC || !PC->IsExploring() || PC->DoorCooldown > 0.f) return;
+	const FVector Vel = GetVelocity().GetSafeNormal2D();
+	if (GetVelocity().Size2D() < 60.f) return;
+	const FVector Me = GetActorLocation();
+	for (TActorIterator<ALigaDoor> It(GetWorld()); It; ++It)
+	{
+		ALigaDoor* D = *It;
+		if (!D->bWalkIn) continue;
+		const FVector To = D->GetActorLocation() - Me;
+		if (To.Size2D() > 80.f || FMath::Abs(To.Z) > 200.f) continue;
+		if (FVector::DotProduct(To.GetSafeNormal2D(), Vel) < 0.3f && To.Size2D() > 35.f) continue;
+		D->Interact(PC);
+		return;
+	}
 }
 
 void ALigaCharacter::OnFollower()
@@ -482,6 +519,8 @@ void ALigaCharacter::UpdateFocus()
 	{
 		AActor* A = *It;
 		if (A == this || !A->Implements<ULigaInteractable>()) continue;
+		const ILigaInteractable* I = Cast<ILigaInteractable>(A);
+		if (!I || !I->CanInteract()) continue;
 		const FVector D = A->GetActorLocation() - Me;
 		const float Dist = D.Size2D();
 		if (Dist > 260.f || FMath::Abs(D.Z) > 250.f) continue;
@@ -517,6 +556,6 @@ void ALigaCharacter::UpdateEncounters(float Dt)
 	if (FMath::FRand() < 0.13f)
 	{
 		const ALigaEncounterZone* Z = Cast<ALigaEncounterZone>(Zones[0]);
-		PC->TryWildEncounter(Z ? Z->Route : FString(TEXT("route1")));
+		PC->TryWildEncounter(Z ? Z->Route : FString(TEXT("route1")), Z ? Z->Place : FString());
 	}
 }

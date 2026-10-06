@@ -321,6 +321,93 @@ def sign(name, lines, bg='#7a5233', fg='#fff4dc', size=(1024, 512)):
     print('wrote', name)
 
 
+def tiles(name, a='#f3efe6', b='#d9d2c3', grout='#b9b1a1', seed=70, size=1024, across=8):
+    """Square floor tiles in a checker of two colours."""
+    ys, xs = np.mgrid[0:size, 0:size]
+    w = size / across
+    ix, iy = (xs // w).astype(int), (ys // w).astype(int)
+    lx, ly = (xs % w) / w, (ys % w) / w
+    col = np.where(((ix + iy) % 2 == 0)[..., None], hexcol(a), hexcol(b))
+    m = fbm(size, seed, base=60, octaves=4)
+    edge = np.clip(np.minimum(np.minimum(lx, 1 - lx), np.minimum(ly, 1 - ly)) * w / 3.0, 0, 1)
+    col = col * (0.95 + 0.07 * m)[..., None]
+    col = col * edge[..., None] + hexcol(grout) * (1 - edge[..., None])
+    save(name, col, edge * 0.8 + m * 0.2, strength=3.0, rough=0.35 + 0.4 * (1 - edge))
+
+
+def stripes(name, colors, seed, size=512, count=16, vertical=True, base='#3b2a1d'):
+    """Book spines / boxes on a shelf: random coloured strips with dark gaps."""
+    r = rng(seed)
+    ys, xs = np.mgrid[0:size, 0:size]
+    coord = xs if vertical else ys
+    edges = np.cumsum(r.uniform(0.6, 1.4, count * 2))
+    edges = edges / edges[count - 1] * size
+    idx = np.searchsorted(edges, coord)
+    pal = [hexcol(colors[r.integers(len(colors))]) for _ in range(count * 2 + 1)]
+    col = np.array(pal)[np.minimum(idx, len(pal) - 1)]
+    prev = np.concatenate([[0], edges])[np.minimum(idx, len(edges))]
+    local = (coord - prev)
+    gap = np.clip(local / 3.0, 0, 1)
+    col = col * gap[..., None] + hexcol(base) * (1 - gap[..., None])
+    band = ((ys if vertical else xs) % (size // 4)) < 6
+    col = np.where(band[..., None], col * 0.8, col)
+    save(name, col, gap, strength=2.0, rough=0.7)
+
+
+def emblem(name, bg, size=(1024, 512), lines=()):
+    """Sign with a Poké Ball emblem on the left and text on the right (Poké Center / Poké Mart)."""
+    img = Image.new('RGB', size, bg)
+    d = ImageDraw.Draw(img)
+    d.rectangle([10, 10, size[0] - 11, size[1] - 11], outline='#ffffff', width=14)
+    cx, cy, rr = 230, size[1] // 2, 150
+    d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill='#ffffff', outline='#20232b', width=14)
+    d.pieslice([cx - rr, cy - rr, cx + rr, cy + rr], 180, 360, fill='#e2403a', outline='#20232b', width=14)
+    d.rectangle([cx - rr, cy - 10, cx + rr, cy + 10], fill='#20232b')
+    d.ellipse([cx - 52, cy - 52, cx + 52, cy + 52], fill='#ffffff', outline='#20232b', width=14)
+    y = 140 if len(lines) > 1 else 190
+    for text, px in lines:
+        font = ImageFont.truetype(FONT, px)
+        w = d.textlength(text, font=font)
+        x = 420 + (size[0] - 420 - w) / 2
+        d.text((x + 3, y + 4), text, font=font, fill='#1d2030')
+        d.text((x, y), text, font=font, fill='#ffffff')
+        y += px + 34
+    img.save(os.path.join(OUT, f'{name}_albedo.png'), optimize=True)
+    print('wrote', name)
+
+
+def rug_ball(name, size=1024):
+    """Square rug with a big Poké Ball (the floor emblem of the Poké Center)."""
+    img = Image.new('RGB', (size, size), '#c8343a')
+    d = ImageDraw.Draw(img)
+    d.rectangle([24, 24, size - 25, size - 25], outline='#f4efe4', width=18)
+    c, r = size // 2, int(size * 0.36)
+    d.ellipse([c - r, c - r, c + r, c + r], fill='#f4efe4', outline='#22252d', width=22)
+    d.pieslice([c - r, c - r, c + r, c + r], 180, 360, fill='#e2403a', outline='#22252d', width=22)
+    d.rectangle([c - r, c - 16, c + r, c + 16], fill='#22252d')
+    d.ellipse([c - 90, c - 90, c + 90, c + 90], fill='#f4efe4', outline='#22252d', width=22)
+    img.save(os.path.join(OUT, f'{name}_albedo.png'), optimize=True)
+    print('wrote', name)
+
+
+def poster(name, size=(768, 1024)):
+    """A wall poster: a simple map of the region with Pallet Town and Route 1."""
+    img = Image.new('RGB', size, '#f3ead2')
+    d = ImageDraw.Draw(img)
+    d.rectangle([14, 14, size[0] - 15, size[1] - 15], outline='#6b4d2e', width=12)
+    d.rectangle([60, 640, size[0] - 60, size[1] - 70], fill='#7cc0e8')
+    d.rectangle([60, 140, size[0] - 60, 640], fill='#9fd38a')
+    d.rectangle([size[0] // 2 - 34, 140, size[0] // 2 + 34, 600], fill='#d8c08a')
+    d.rectangle([size[0] // 2 - 90, 520, size[0] // 2 + 90, 620], fill='#e9e1cf', outline='#6b4d2e', width=6)
+    font = ImageFont.truetype(FONT, 64)
+    small = ImageFont.truetype(FONT, 40)
+    for text, y, f in (('КАНТО', 40, font), ('Маршрут 1', 300, small), ('Паллет', 540, small)):
+        w = d.textlength(text, font=f)
+        d.text(((size[0] - w) / 2, y), text, font=f, fill='#3b2a1d')
+    img.save(os.path.join(OUT, f'{name}_albedo.png'), optimize=True)
+    print('wrote', name)
+
+
 def build_all():
     shingles('roof_red', '#c2453a', 1)
     shingles('roof_pink', '#b06a8c', 2)
@@ -354,6 +441,25 @@ def build_all():
     sign('sign_pallet', [('ПАЛЛЕТ-ТАУН', 96), ('Оттенки невинности', 54)])
     sign('sign_lab', [('ЛАБОРАТОРИЯ', 92), ('ПРОФЕССОРА ОУКА', 74)], bg='#3b5f8f')
     sign('sign_route1', [('МАРШРУТ 1', 100), ('↑ Виридиан-Сити', 58)])
+    emblem('sign_center', '#d93b3b', lines=[('ПОКЕЦЕНТР', 72), ('лечение покемонов', 44)])
+    emblem('sign_mart', '#2f63b8', lines=[('МАГАЗИН', 86), ('всё для тренера', 44)])
+    planks('floor_wood', '#b88a5c', 25, count=8, vertical=False, painted=False)
+    tiles('floor_tile')
+    tiles('floor_lab', a='#e8edf2', b='#cfd8e2', grout='#9aa7b6', seed=71)
+    plaster('wall_inner', '#f3ead8', 14)
+    plaster('wall_lab', '#e6edf3', 15)
+    plaster('wall_pink', '#f6d6dc', 16)
+    flat('carpet_red', '#b8433f', 0.95)
+    flat('carpet_green', '#4f8a5e', 0.95)
+    flat('counter_pink', '#f29fb5', 0.45)
+    flat('screen', '#8fe0ff', 0.15)
+    flat('cushion_blue', '#4f73c9', 0.9)
+    stripes('books', ('#8b2e2e', '#2e4f8b', '#2e7a4f', '#b38a2e', '#5e3b8b', '#d0c9b8'), 80)
+    stripes('goods', ('#e2403a', '#f2b33a', '#3a8ee2', '#4fbf6a', '#f2f2f2', '#b85ec2', '#8fd0ff'), 81, count=12)
+    rug_ball('rug_ball')
+    flat('window_day', '#cfe8ff', 0.2)
+    flat('pokeball_red', '#e2403a', 0.25)
+    poster('poster_kanto')
 
 
 if __name__ == '__main__':

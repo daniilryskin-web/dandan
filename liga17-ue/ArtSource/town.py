@@ -21,6 +21,7 @@ import numpy as np  # noqa: E402
 from mathutils import Vector  # noqa: E402
 
 import assets  # noqa: E402
+import interiors  # noqa: E402
 import render  # noqa: E402
 from common import HERE, MB, clear_scene, get_mat, instance, load_image, tex_path  # noqa: E402
 
@@ -81,15 +82,39 @@ BUILDINGS = [
     ('RivalHouse', 'house_rival', 13.0, 15.0, 0.0, (13, 11)),
     ('OakLab', 'oak_lab', 9.0, -17.0, math.pi, (24, 14)),
     ('NeighbourHouse', 'house_small', -15.0, -17.0, math.pi, (9, 8)),
+    ('PokeCenter', 'pokecenter', -29.0, -4.0, math.pi / 2, (13, 13)),
+    ('PokeMart', 'mart', 28.5, -4.0, -math.pi / 2, (11, 11)),
 ]
+
+
+def front_point(name, dist):
+    """A point `dist` metres in front of a building's facade centre."""
+    _, kit, x, y, rz, _ = next(b for b in BUILDINGS if b[0] == name)
+    depth = {'pokecenter': 10.0, 'mart': 8.0}[kit]
+    ly = -depth / 2 - dist
+    return (round(x - ly * math.sin(rz), 3), round(y + ly * math.cos(rz), 3))
+
+
 DOORS = {
     'PlayerHouse': (-14.62, 9.4),
     'RivalHouse': (11.38, 9.4),
     'RivalTower': (17.2, 8.9),
     'OakLab': (9.0, -9.6),
     'NeighbourHouse': (-13.74, -12.3),
+    'PokeCenter': front_point('PokeCenter', 2.2),
+    'PokeMart': front_point('PokeMart', 2.2),
 }
 ROAD_W = 2.6
+PIER = (-6.0, -37.0, 20.0)  # x, y of the shore end, length (it runs south over the water)
+
+# Rooms you can enter: far below the map, out of sight. door = the building door outside, out = where you appear outside.
+INTERIOR_Z = -30.0
+ROOMS = {
+    'home': {'name': 'Дом героя', 'at': (200.0, 0.0), 'door': 'PlayerHouse', 'out_face': -math.pi / 2},
+    'lab': {'name': 'Лаборатория Оука', 'at': (240.0, 0.0), 'door': 'OakLab', 'out_face': math.pi / 2},
+    'center': {'name': 'Покецентр', 'at': (280.0, 0.0), 'door': 'PokeCenter', 'out_face': 0.0},
+    'mart': {'name': 'Магазин', 'at': (320.0, 0.0), 'door': 'PokeMart', 'out_face': math.pi},
+}
 
 
 def path_segments():
@@ -99,6 +124,10 @@ def path_segments():
         segs.append(((x, y), (x, 3.0 if y > 0 else -4.0), 1.3))
         segs.append(((x, 3.0 if y > 0 else -4.0), (0.0, 3.0 if y > 0 else -4.0), 1.3))
     segs.append((DOORS['RivalTower'], (DOORS['RivalTower'][0], 3.0), 1.0))
+    for k in ('PokeCenter', 'PokeMart'):  # wide streets to the two shops
+        segs.append((DOORS[k], (0.0, DOORS[k][1]), 1.8))
+    segs.append(((PIER[0], PIER[1] + 1.0), (PIER[0], -33.0), 1.2))
+    segs.append(((PIER[0], -33.0), (0.0, -33.0), 1.2))
     return segs
 
 
@@ -138,6 +167,23 @@ def in_building(x, y, pad=0.0):
         if abs(x - bx) < w / 2 + pad and abs(y - by) < d / 2 + pad:
             return True
     return False
+
+
+# Wild Pokémon areas: tall grass on Route 1 and at the forest edge, the surf along the beach and the pier.
+ZONES = [
+    {'x0': -12.0, 'x1': -4.5, 'y0': 54.0, 'y1': 78.0, 'kind': 'tall_grass', 'route': 'route1', 'place': 'Маршрут 1', 'pad': 3.5, 'wiggle': True},
+    {'x0': 4.5, 'x1': 12.5, 'y0': 62.0, 'y1': 92.0, 'kind': 'tall_grass', 'route': 'route1', 'place': 'Маршрут 1', 'pad': 3.5, 'wiggle': True},
+    {'x0': -11.0, 'x1': -3.5, 'y0': 98.0, 'y1': 128.0, 'kind': 'tall_grass', 'route': 'route1_north', 'place': 'Маршрут 1', 'pad': 3.5, 'wiggle': True},
+    {'x0': 5.0, 'x1': 12.0, 'y0': 112.0, 'y1': 140.0, 'kind': 'tall_grass', 'route': 'route1_north', 'place': 'Маршрут 1', 'pad': 3.5, 'wiggle': True},
+    {'x0': -35.0, 'x1': -25.5, 'y0': 27.0, 'y1': 41.0, 'kind': 'tall_grass', 'route': 'forest', 'place': 'Опушка леса', 'pad': 0.6},
+    {'x0': -46.0, 'x1': 46.0, 'y0': -48.0, 'y1': -40.5, 'kind': 'shore', 'route': 'shore', 'place': 'Берег Паллет-тауна', 'pad': 0.3},
+    {'x0': PIER[0] - 1.6, 'x1': PIER[0] + 1.6, 'y0': PIER[1] - PIER[2], 'y1': -40.5, 'kind': 'shore', 'route': 'shore', 'place': 'Пристань', 'pad': 0.3},
+]
+
+
+def in_grass_zone(x, y, pad=0.0):
+    return any(z['kind'] == 'tall_grass' and not z.get('wiggle') and z['x0'] - pad < x < z['x1'] + pad and z['y0'] - pad < y < z['y1'] + pad
+               for z in ZONES)
 
 
 # ——— terrain ———
@@ -319,9 +365,35 @@ def place_town(kit, coll):
     put('FlowerBed_Player', 'flower_bed', -9.0, 8.4)
     put('FlowerBed_Rival', 'flower_bed', 7.0, 8.4)
     put('FlowerBed_Lab', 'flower_bed', 3.6, -9.5)
-    for i in range(6):
+    for i in range(4):
         put(f'Hedge_Lab_{i}', 'hedge', 14.5 + i * 2.0, -8.6)
+    for k in ('PokeCenter', 'PokeMart'):
+        x, y = DOORS[k]
+        for side in (-1, 1):
+            put(f'Lamp_{k}_{side}', 'lamp_post', x + (2.6 if k == 'PokeCenter' else -2.6), y + side * 3.6)
+    put('FlowerBed_Center', 'flower_bed', DOORS['PokeCenter'][0] - 0.6, DOORS['PokeCenter'][1] + 5.0, math.pi / 2)
+    put('FlowerBed_Mart', 'flower_bed', DOORS['PokeMart'][0] + 0.6, DOORS['PokeMart'][1] - 5.0, math.pi / 2)
+    put('Bench_Center', 'bench', DOORS['PokeCenter'][0] + 1.0, DOORS['PokeCenter'][1] - 4.6, math.pi)
+    o = put('Pier', 'pier', PIER[0], PIER[1])
+    o.location.z = -0.15
+    put('Bench_Beach', 'bench', 6.0, -35.0, math.pi)
     return placed
+
+
+def place_interiors(coll):
+    """Builds the rooms, moves them to their spots and returns their markers in town coordinates."""
+    rooms = interiors.build_interiors()
+    out = {}
+    for rid, (obj, meta) in rooms.items():
+        ox, oy = ROOMS[rid]['at']
+        oz = INTERIOR_Z
+        obj.name = 'Interior_' + rid
+        obj.location = (ox, oy, oz)
+        bpy.context.scene.collection.objects.unlink(obj)
+        coll.objects.link(obj)
+        dims = obj.dimensions
+        out[rid] = {'origin': (ox, oy, oz), 'meta': meta, 'half': (dims.x / 2, dims.y / 2)}
+    return out
 
 
 def scatter(kit, coll):
@@ -374,14 +446,14 @@ def scatter(kit, coll):
             continue
         add(rnd.choice(['tree_a', 'tree_b', 'pine', 'pine']), x, y, s=rnd.uniform(0.9, 1.5))
     # a few trees inside the town for shade
-    for x, y in ((-24, 2), (24, 2), (-25, -24), (27, -26), (-22, 24), (22, 25), (-30, 30), (31, -6)):
+    for x, y in ((-25, -24), (27, -26), (-22, 24), (22, 25), (-21, -30), (33, 30)):
         add(rnd.choice(['tree_a', 'tree_c']), x, y, s=rnd.uniform(0.95, 1.15))
     # bushes & flowers on lawns
     for _ in range(140 if QUICK else 260):
         x, y = rnd.uniform(PLATEAU[0] + 2, PLATEAU[1] - 2), rnd.uniform(PLATEAU[2] + 2, Y1 - 6)
         if abs(x) > ROUTE[1] + 6 and y > PLATEAU[3]:
             continue
-        if not ok(x, y, 1.2, 0.05):
+        if not ok(x, y, 1.2, 0.05) or in_grass_zone(x, y, 1.0):
             continue
         r = rnd.random()
         if r < 0.3:
@@ -403,17 +475,20 @@ def scatter(kit, coll):
             continue
         add('grass_short', x, y, s=rnd.uniform(0.7, 1.35))
         got += 1
-    # tall grass: encounter zones on Route 1 (and two patches at the town's north edge)
-    zones = [(-12.0, -4.5, 54.0, 78.0), (4.5, 12.5, 62.0, 92.0), (-11.0, -3.5, 98.0, 128.0), (5.0, 12.0, 112.0, 140.0)]
-    for (x0, x1, y0, y1) in zones:
+    # tall grass in the encounter zones on Route 1 and at the forest edge
+    for z in ZONES:
+        if z['kind'] != 'tall_grass':
+            continue
+        x0, x1, y0, y1 = z['x0'], z['x1'], z['y0'], z['y1']
         area = (x1 - x0) * (y1 - y0)
         for _ in range(int(area * (0.9 if QUICK else 1.8))):
             x, y = rnd.uniform(x0, x1), rnd.uniform(y0, y1)
-            x += float(route_wiggle(np.array(y)))
-            if float(path_mask(x, y)) > 0.3:
+            if z.get('wiggle'):
+                x += float(route_wiggle(np.array(y)))
+            if float(path_mask(x, y)) > 0.3 or in_building(x, y, 0.5):
                 continue
             add(rnd.choice(['grass_tall', 'grass_tall_b']), x, y, s=rnd.uniform(0.8, 1.2))
-    zones_world = [{'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1} for (x0, x1, y0, y1) in zones]
+    zones_world = [{k: v for k, v in z.items() if k != 'wiggle'} for z in ZONES]
 
     # Blender preview instances: trees/bushes/rocks/flowers as linked duplicates, grass via geometry nodes.
     for kind, items in inst.items():
@@ -466,22 +541,108 @@ def point_instancer(src, name, items, coll):
 
 
 # ——— markers for the game (NPCs, doors, exits, player start) ———
+def plaza_loop(r=4.2, n=6):
+    return [[round(math.cos(a) * r, 2), round(-0.5 + math.sin(a) * r, 2)] for a in (i / n * math.tau for i in range(n))]
+
+
+# NPCs in town. place: 'town' or a room id (then x, y come from the room). route: waypoints they walk along
+# (loop=True: round and round, otherwise back and forth), speed in m/s, pause: seconds standing at each waypoint.
 NPCS = [
-    {'id': 'mom', 'name': 'Мама', 'x': -11.6, 'y': 7.9, 'face': -1.4, 'look': 'mom', 'lines': ['Профессор Оук искал тебя!', 'Не забудь заглянуть домой, если покемоны устанут.']},
-    {'id': 'oak', 'name': 'Профессор Оук', 'x': 7.0, 'y': -7.6, 'face': 0.3, 'look': 'oak', 'lines': ['А, вот и ты! Мир полон покемонов.', 'В высокой траве на Маршруте 1 водятся дикие покемоны — будь осторожен!']},
-    {'id': 'girl', 'name': 'Девочка', 'x': -2.4, 'y': -3.2, 'face': 2.2, 'look': 'girl', 'lines': ['Я выращиваю цветы! Покемоны их очень любят.']},
-    {'id': 'tech', 'name': 'Изобретательница', 'x': 5.6, 'y': 0.4, 'face': -2.0, 'look': 'woman', 'lines': ['Технологии невероятны!', 'Теперь покемонов можно хранить в компьютере как данные!']},
-    {'id': 'rival', 'name': 'Гэри', 'x': 15.4, 'y': 6.6, 'face': -0.8, 'look': 'rival', 'lines': ['Хе, наконец-то! Я выберу покемона сильнее твоего.']},
-    {'id': 'sailor', 'name': 'Путешественница', 'x': -6.0, 'y': -33.0, 'face': 3.0, 'look': 'woman', 'lines': ['Говорят, за морем лежит остров Синнабар.']},
+    {'id': 'girl', 'name': 'Лиза', 'x': -2.4, 'y': -3.2, 'face': 2.2, 'look': 'girl',
+     'lines': ['Я выращиваю цветы! Покемоны их очень любят.'], 'route': plaza_loop(), 'loop': True, 'speed': 0.9, 'pause': 2.5},
+    {'id': 'rival', 'name': 'Гэри', 'x': 15.4, 'y': 6.6, 'face': -0.8, 'look': 'rival',
+     'lines': ['Хе, наконец-то! Я выберу покемона сильнее твоего.', 'Мой дедушка — профессор Оук. Так что я всегда буду на шаг впереди!']},
+    {'id': 'jogger', 'name': 'Спортсменка Аня', 'x': 1.3, 'y': -30.0, 'face': math.pi / 2, 'look': 'student',
+     'lines': ['Бег по утрам — лучшая тренировка! Для покемонов тоже.'],
+     'route': [[1.3, -30.0], [1.3, 40.0], [-1.3, 40.0], [-1.3, -30.0]], 'loop': True, 'speed': 3.2, 'pause': 0.5},
+    {'id': 'walker', 'name': 'Горожанка Нина', 'x': -19.8, 'y': -4.0, 'face': 0.0, 'look': 'walker',
+     'lines': ['Покецентр — на западе, магазин — на востоке. Очень удобно!', 'Сегодня отличная погода для прогулки.'],
+     'route': [[-19.6, -4.0], [-6.0, -4.0], [6.0, -4.0], [20.0, -4.0]], 'loop': False, 'speed': 1.3, 'pause': 3.0},
+    {'id': 'bugkid', 'name': 'Натуралистка Мила', 'x': -24.0, 'y': 30.0, 'face': math.pi, 'look': 'bugkid',
+     'lines': ['В траве у леса живут покемоны-жуки: Катерпи, Видл, а иногда даже Парас!'],
+     'route': [[-24.0, 30.0], [-24.0, 38.5]], 'loop': False, 'speed': 0.8, 'pause': 4.0},
+    {'id': 'sailor', 'name': 'Морячка Рина', 'x': PIER[0], 'y': PIER[1] - PIER[2] + 2.0, 'face': -math.pi / 2, 'look': 'sailor',
+     'lines': ['Говорят, за морем лежит остров Синнабар.', 'У берега водятся Тентакулы, Крабби и даже Старью!']},
+    # inside
+    {'id': 'mom', 'name': 'Мама', 'place': 'home', 'look': 'mom',
+     'lines': ['Ты так вырос! Береги своих покемонов.', 'Если покемоны устанут, загляни домой или в Покецентр.']},
+    {'id': 'oak', 'name': 'Профессор Оук', 'place': 'lab', 'look': 'oak',
+     'lines': ['Мир полон покемонов. Изучай их!']},
+    {'id': 'aide', 'name': 'Ассистентка Вита', 'place': 'lab', 'look': 'tech',
+     'lines': ['Я помогаю профессору с исследованиями.', 'Покемонов, которым не хватило места в команде, хранят в компьютере. Он есть в Покецентре!']},
+    {'id': 'nurse', 'name': 'Медсестра Джой', 'place': 'center', 'look': 'nurse',
+     'lines': ['Добро пожаловать в Покецентр!']},
+    {'id': 'visitor', 'name': 'Тренер Кай', 'place': 'center', 'look': 'sailor',
+     'lines': ['Покецентр лечит покемонов бесплатно. Удобно, правда?', 'Компьютер в углу хранит покемонов, которые не поместились в команду.']},
+    {'id': 'clerk', 'name': 'Продавщица Юки', 'place': 'mart', 'look': 'clerk',
+     'lines': ['Добро пожаловать в магазин!']},
+    {'id': 'shopper', 'name': 'Покупательница', 'place': 'mart', 'look': 'girl',
+     'lines': ['Покеболы заканчиваются так быстро...', 'Суперболы ловят лучше обычных, но и стоят дороже.']},
+]
+
+# Pokémon living in town (shown when their 3D model is installed). quest: only while that quest needs them.
+AMBIENT = [
+    {'species': 16, 'x': 3.0, 'y': -2.5, 'radius': 3.5},
+    {'species': 16, 'x': -3.5, 'y': 2.0, 'radius': 3.0},
+    {'species': 19, 'x': 21.0, 'y': 29.0, 'radius': 4.0},
+    {'species': 10, 'x': -29.0, 'y': 33.0, 'radius': 3.0},
+    {'species': 54, 'x': 14.0, 'y': -41.5, 'radius': 3.0},
+    {'species': 133, 'x': 35.0, 'y': -38.5, 'radius': 1.0, 'quest': 'lost_eevee'},
 ]
 
 
-def markers():
+def markers(rooms):
+    def room_pt(rid, x, y):
+        ox, oy, oz = rooms[rid]['origin']
+        return round(ox + x, 3), round(oy + y, 3), oz
+
+    sx, sy, sf = rooms['home']['meta']['start']
+    px, py, pz = room_pt('home', sx, sy)
+    portals, places = [], []
+    for rid, info in ROOMS.items():
+        r = rooms[rid]
+        m = r['meta']
+        ox, oy, oz = r['origin']
+        dx, dy = DOORS[info['door']]
+        tx, ty, tz = room_pt(rid, m['spawn'][0], m['spawn'][1])
+        portals.append({'id': info['door'], 'kind': 'enter', 'x': dx, 'y': dy, 'z': 0.0, 'title': info['name'],
+                        'tx': tx, 'ty': ty, 'tz': tz, 'tface': m['spawn'][2]})
+        ex, ey, ez = room_pt(rid, m['exit'][0], m['exit'][1])
+        of = info['out_face']
+        portals.append({'id': rid + '_exit', 'kind': 'exit', 'x': ex, 'y': ey, 'z': ez, 'title': 'Паллет-таун',
+                        'tx': round(dx + math.cos(of) * 1.3, 3), 'ty': round(dy + math.sin(of) * 1.3, 3), 'tz': 0.0, 'tface': of})
+        hx, hy = r['half']
+        places.append({'id': rid, 'name': info['name'], 'indoor': True, 'x0': ox - hx, 'x1': ox + hx, 'y0': oy - hy, 'y1': oy + hy,
+                       'z0': oz - 3.0, 'z1': oz + 8.0,
+                       'lights': [[round(ox + x, 3), round(oy + y, 3), round(oz + z, 3), i] for (x, y, z, i) in m['lights']]})
+        for key, (x, y) in m['spots'].items():
+            qx, qy, qz = room_pt(rid, x, y)
+            portals.append({'id': key, 'kind': key, 'x': qx, 'y': qy, 'z': qz, 'title': 'Компьютер'})
+    fz = next(z for z in ZONES if z['route'] == 'forest')
+    places += [
+        {'id': 'pier', 'name': 'Пристань', 'x0': PIER[0] - 2.5, 'x1': PIER[0] + 2.5, 'y0': PIER[1] - PIER[2] - 1.0, 'y1': PIER[1] - 1.0},
+        {'id': 'forest_edge', 'name': 'Опушка леса', 'x0': fz['x0'] - 4.0, 'x1': fz['x1'] + 2.0, 'y0': fz['y0'] - 3.0, 'y1': fz['y1'] + 4.0},
+        {'id': 'shore', 'name': 'Берег Паллет-тауна', 'x0': X0, 'x1': X1, 'y0': Y0 - 50.0, 'y1': PLATEAU[2]},
+        {'id': 'route1', 'name': 'Маршрут 1', 'x0': X0, 'x1': X1, 'y0': PLATEAU[3] + 1.0, 'y1': Y1 + 50.0},
+    ]
+    npcs = []
+    for n in NPCS:
+        n = dict(n)
+        rid = n.pop('place', None)
+        if rid:
+            x, y, face = rooms[rid]['meta']['npcs'][n['id']]
+            n['x'], n['y'], n['z'] = room_pt(rid, x, y)
+            n['face'] = face
+        else:
+            n['z'] = float(height(n['x'], n['y']))
+        npcs.append(n)
     out = {
-        'player_start': {'x': DOORS['PlayerHouse'][0], 'y': DOORS['PlayerHouse'][1] - 2.0, 'z': 0.0, 'face': -math.pi / 2},
+        'player_start': {'x': px, 'y': py, 'z': pz, 'face': sf},
         'doors': {k: {'x': v[0], 'y': v[1]} for k, v in DOORS.items()},
-        'exits': {'route1_north': {'x': 0.0, 'y': Y1 - 6}},
-        'npcs': [dict(n, z=float(height(n['x'], n['y']))) for n in NPCS],
+        'portals': portals,
+        'places': places,
+        'npcs': npcs,
+        'ambient': [dict(a, z=float(height(a['x'], a['y']))) for a in AMBIENT],
     }
     return out
 
@@ -538,7 +699,7 @@ def export_all(kit, town_coll, inst, zones, marks):
         'units': 'metres, Blender axes (X east, Y north, Z up)',
         'sea_level': SEA_LEVEL,
         'markers': marks,
-        'encounter_zones': [dict(z, kind='tall_grass', route='route1') for z in zones],
+        'encounter_zones': zones,
         'instances': {k: [[round(v, 3) for v in it] for it in items] for k, items in inst.items()},
     }
     with open(os.path.join(OUTDIR, 'layout.json'), 'w', encoding='utf-8') as f:
@@ -563,9 +724,10 @@ def main():
     bpy.context.scene.collection.objects.unlink(w)
     town.objects.link(w)
     place_town(kit, town)
+    rooms = place_interiors(town)
     inst, zones = scatter(kit, scat)
     axis_markers(town)
-    marks = markers()
+    marks = markers(rooms)
     if '--export' in ARGS:
         export_all(kit, town, inst, zones, marks)
     if '--render' in ARGS:
@@ -576,7 +738,25 @@ def main():
             ('town_overview', (34.0, -52.0, 26.0), (0.0, 4.0, 0.0), 24),
             ('route1', (0.5, 46.0, 2.0), (-2.0, 80.0, 1.0), 26),
             ('lab', (-2.0, -0.5, 2.2), (9.0, -16.0, 3.0), 26),
+            ('pokecenter', (-11.0, -9.0, 2.4), (-27.0, -3.0, 3.2), 26),
+            ('mart', (11.0, 0.5, 2.4), (27.0, -4.5, 3.0), 26),
+            ('beach', (6.0, -31.0, 3.2), (-6.0, -52.0, 0.0), 24),
         ]
+        # interiors: cameras near the entrance, plus Blender lights where the game puts its lamps
+        for rid in ROOMS:
+            ox, oy, oz = rooms[rid]['origin']
+            m = rooms[rid]['meta']
+            ex, ey = m['exit']
+            for (x, y, z, i) in m['lights']:
+                ld = bpy.data.lights.new(f'L_{rid}_{x}_{y}', 'POINT')
+                ld.energy = i * 2.5
+                ld.color = (1.0, 0.95, 0.88)
+                ld.shadow_soft_size = 0.3
+                lo = bpy.data.objects.new(ld.name, ld)
+                lo.location = (ox + x, oy + y, oz + z)
+                bpy.context.scene.collection.objects.link(lo)
+            hx, hy = rooms[rid]['half']
+            shots.append((f'int_{rid}', (ox + ex + (1.2 if ex < 0 else -1.2), oy + ey + 0.5, oz + 2.4), (ox, oy + hy * 0.45, oz + 0.9), 18))
         only = os.environ.get('SHOT')
         for name, loc, look, lens in shots:
             if only and only != name:

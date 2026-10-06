@@ -4,6 +4,7 @@
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/PointLightComponent.h"
 #include "Materials/Material.h"
 #include "Components/PostProcessComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
@@ -20,6 +21,7 @@
 #include "Components/SphereComponent.h"
 #include "LigaAssets.h"
 #include "LigaEncounterZone.h"
+#include "LigaFollower.h"
 #include "LigaInteractable.h"
 #include "LigaGameInstance.h"
 #include "GameFramework/PlayerController.h"
@@ -43,6 +45,8 @@ void ALigaWorldBuilder::BeginPlay()
 	SpawnZones();
 	SpawnDoors();
 	SpawnNpcs();
+	SpawnRoomLights();
+	SpawnAmbient();
 	PlacePlayer();
 	SpawnFoliage();
 }
@@ -126,9 +130,25 @@ FVector ALigaWorldBuilder::Ground(const FVector& W, float Up) const
 	return W;
 }
 
+FVector ALigaWorldBuilder::GroundAtLayout(const FVector& B) const
+{
+	if (FLigaLayout::IsIndoorPoint(B)) return Ground(ToWorld(B + FVector(0.f, 0.f, 1.2f)), 0.f);
+	return Ground(ToWorld(FVector(B.X, B.Y, 0.f)));
+}
+
+float ALigaWorldBuilder::SeaLevelZ() const
+{
+	return ToWorld(FVector(0.f, 0.f, FLigaLayout::Get().SeaLevel)).Z;
+}
+
+const FLigaPlaceDef* ALigaWorldBuilder::PlaceAtWorld(const FVector& W) const
+{
+	return FLigaLayout::Get().PlaceAt(ToBlender(W));
+}
+
 FVector ALigaWorldBuilder::PlayerStartWorld() const
 {
-	return Ground(ToWorld(FLigaLayout::Get().PlayerStart)) + FVector(0, 0, 100.f);
+	return GroundAtLayout(FLigaLayout::Get().PlayerStart) + FVector(0, 0, 100.f);
 }
 
 float ALigaWorldBuilder::PlayerStartYaw() const
@@ -296,32 +316,59 @@ void ALigaWorldBuilder::SpawnZones()
 		P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 		ALigaEncounterZone* Zone = GetWorld()->SpawnActor<ALigaEncounterZone>(C, FRotator::ZeroRotator, P);
 		const FVector Ext = (B - A).GetAbs() * 0.5f;
-		// Route 1 wiggles: widen a bit so the grass patches are covered.
-		Zone->Box->SetBoxExtent(FVector(Ext.X + 350.f, Ext.Y + 350.f, 400.f));
+		// The margin covers the wiggle of Route 1 (its grass follows the winding road).
+		const float Pad = Z.Pad * (float)AxisX.Size();
+		Zone->Box->SetBoxExtent(FVector(Ext.X + Pad, Ext.Y + Pad, 400.f));
 		Zone->Route = Z.Route.IsEmpty() ? TEXT("route1") : Z.Route;
+		Zone->Place = Z.Place.IsEmpty() ? TEXT("Маршрут 1") : Z.Place;
 	}
 }
 
 void ALigaWorldBuilder::SpawnDoors()
 {
-	struct FDoorInfo { const TCHAR* Key; ELigaDoorKind Kind; const TCHAR* Title; TArray<FString> Lines; };
-	const TArray<FDoorInfo> Infos = {
-		{TEXT("PlayerHouse"), ELigaDoorKind::Home, TEXT("Ваш дом"), {}},
-		{TEXT("OakLab"), ELigaDoorKind::Lab, TEXT("Лаборатория Оука"), {}},
-		{TEXT("RivalHouse"), ELigaDoorKind::House, TEXT("Дом Гэри"), {TEXT("Дейзи: Гэри? Он где-то на улице, хвастается перед всеми."), TEXT("Хочешь, я расскажу тебе о покемонах? В высокой траве живут дикие покемоны!")}},
-		{TEXT("RivalTower"), ELigaDoorKind::House, TEXT("Башня"), {TEXT("Заперто. На двери табличка: «Обсерватория. Не беспокоить»."), }},
-		{TEXT("NeighbourHouse"), ELigaDoorKind::House, TEXT("Дом соседей"), {TEXT("Изнутри доносится: «Покемоны — лучшие друзья человека!»")}},
-	};
 	const FLigaLayout& L = FLigaLayout::Get();
+	FActorSpawnParameters P;
+	P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	// Doors into the rooms and back out, and service spots such as the Poké Center computer.
+	TSet<FString> WithRooms;
+	for (const FLigaPortalDef& Def : L.Portals)
+	{
+		const FVector W = GroundAtLayout(Def.Pos) + FVector(0, 0, 80.f);
+		ALigaDoor* Door = GetWorld()->SpawnActor<ALigaDoor>(W, FRotator::ZeroRotator, P);
+		if (!Door) continue;
+		Door->Title = Def.Title;
+		if (Def.Kind == TEXT("enter") || Def.Kind == TEXT("exit"))
+		{
+			Door->Kind = ELigaDoorKind::Portal;
+			Door->bExit = Def.Kind == TEXT("exit");
+			Door->bWalkIn = true;
+			Door->Target = GroundAtLayout(Def.To) + FVector(0, 0, 95.f);
+			Door->TargetYaw = ToWorldYaw(Def.ToFace);
+			WithRooms.Add(Def.Id);
+		}
+		else
+		{
+			Door->Kind = ELigaDoorKind::Pc;
+		}
+	}
+	// Houses you cannot enter: knocking gets an answer through the door.
+	struct FDoorInfo { const TCHAR* Key; const TCHAR* Title; TArray<FString> Lines; };
+	const TArray<FDoorInfo> Infos = {
+		{TEXT("RivalHouse"), TEXT("Дом Гэри"), {TEXT("Дейзи: Гэри? Он где-то на улице, хвастается перед всеми."), TEXT("Хочешь, я расскажу тебе о покемонах? В высокой траве живут дикие покемоны!")}},
+		{TEXT("RivalTower"), TEXT("Башня"), {TEXT("Заперто. На двери табличка: «Обсерватория. Не беспокоить».")}},
+		{TEXT("NeighbourHouse"), TEXT("Дом соседей"), {TEXT("Изнутри доносится: «Покемоны — лучшие друзья человека!»")}},
+		{TEXT("PlayerHouse"), TEXT("Ваш дом"), {}},
+		{TEXT("OakLab"), TEXT("Лаборатория Оука"), {}},
+	};
 	for (const FDoorInfo& Info : Infos)
 	{
 		const FVector2D* D = L.Doors.Find(Info.Key);
-		if (!D) continue;
+		if (!D || WithRooms.Contains(Info.Key)) continue;
 		const FVector W = Ground(ToWorld(FVector(D->X, D->Y, 0.f))) + FVector(0, 0, 80.f);
-		FActorSpawnParameters P;
-		P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 		ALigaDoor* Door = GetWorld()->SpawnActor<ALigaDoor>(W, FRotator::ZeroRotator, P);
-		Door->Kind = Info.Kind;
+		if (!Door) continue;
+		// An old layout.json without rooms: the house and the lab work from their doors as before.
+		Door->Kind = FString(Info.Key) == TEXT("PlayerHouse") ? ELigaDoorKind::Home : FString(Info.Key) == TEXT("OakLab") ? ELigaDoorKind::Lab : ELigaDoorKind::House;
 		Door->Title = Info.Title;
 		Door->Lines = Info.Lines;
 	}
@@ -331,13 +378,53 @@ void ALigaWorldBuilder::SpawnNpcs()
 {
 	for (const FLigaNpcDef& N : FLigaLayout::Get().Npcs)
 	{
-		const FVector W = Ground(ToWorld(FVector(N.Pos.X, N.Pos.Y, 0.f))) + FVector(0, 0, 92.f);
+		const FVector W = GroundAtLayout(N.Pos) + FVector(0, 0, 92.f);
 		FActorSpawnParameters P;
 		P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
 		P.bDeferConstruction = true;
 		ALigaNPC* Npc = GetWorld()->SpawnActor<ALigaNPC>(ALigaNPC::StaticClass(), W, FRotator(0.f, ToWorldYaw(N.Face), 0.f), P);
 		if (!Npc) continue;
 		Npc->Configure(N.Id, N.Name, N.Look, N.Lines);
+		if (N.Route.Num() >= 2)
+		{
+			TArray<FVector> Points;
+			for (const FVector2D& R : N.Route) Points.Add(GroundAtLayout(FVector(R.X, R.Y, N.Pos.Z)) + FVector(0, 0, 92.f));
+			Npc->SetRoute(Points, N.bLoop, N.Speed * (float)AxisX.Size(), N.Pause);
+		}
 		Npc->FinishSpawning(FTransform(FRotator(0.f, ToWorldYaw(N.Face), 0.f), W));
+	}
+}
+
+void ALigaWorldBuilder::SpawnRoomLights()
+{
+	for (const FLigaPlaceDef& Place : FLigaLayout::Get().Places)
+	{
+		for (const FVector4& L : Place.Lights)
+		{
+			UPointLightComponent* C = NewObject<UPointLightComponent>(this);
+			C->SetupAttachment(RootComponent);
+			C->SetMobility(EComponentMobility::Movable);
+			C->SetWorldLocation(ToWorld(FVector(L.X, L.Y, L.Z)));
+			C->SetIntensityUnits(ELightUnits::Candelas);
+			C->SetIntensity((float)L.W);
+			C->SetAttenuationRadius(1100.f);
+			C->SetSourceRadius(25.f);
+			C->SetLightColor(FLinearColor(1.f, 0.93f, 0.84f));
+			C->SetCastShadows(true);
+			C->RegisterComponent();
+			RoomLights.Add(C);
+		}
+	}
+}
+
+void ALigaWorldBuilder::SpawnAmbient()
+{
+	for (const FLigaAmbientDef& A : FLigaLayout::Get().Ambient)
+	{
+		const FVector W = GroundAtLayout(A.Pos);
+		FActorSpawnParameters P;
+		P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		ALigaFollower* Mon = GetWorld()->SpawnActor<ALigaFollower>(W, FRotator(0.f, FMath::FRandRange(0.f, 360.f), 0.f), P);
+		if (Mon && !Mon->SetupAmbient(A.Species, W, A.Radius * (float)AxisX.Size(), A.Quest)) Mon->Destroy();
 	}
 }

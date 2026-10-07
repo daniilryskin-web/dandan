@@ -69,6 +69,8 @@ private:
 	bool bQuestShown = false;
 	float QuestCheck = 0.f;
 	float PetTimer = 0.f;
+	/** Petting your own Pokémon raises its friendship at most once in a while. */
+	float FriendCooldown = 0.f;
 	/** Swims at SwimZ (world) instead of walking on the ground. */
 	bool bSwim = false;
 	float SwimZ = 0.f;

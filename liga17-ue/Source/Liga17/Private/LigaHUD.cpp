@@ -685,7 +685,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildCommands()
 			const int32 N = G->Data.ItemCount(It.Id);
 			if (N <= 0) continue;
 			if (It.Kind == TEXT("ball") && !B.bWild) continue;
-			if (It.Kind == TEXT("revive") || It.Kind == TEXT("key")) continue;
+			if (It.Kind == TEXT("revive") || It.Kind == TEXT("key") || It.Kind == TEXT("evo") || It.Kind == TEXT("trade") || It.Kind == TEXT("friend")) continue;
 			const FString Id = It.Id;
 			Col->AddSlot().AutoHeight().HAlign(HAlign_Right)
 			[
@@ -798,6 +798,9 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildMenu()
 					+ SVerticalBox::Slot().AutoHeight()
 					[SNew(STextBlock).Font(Font(11, false)).ColorAndOpacity(Muted).AutoWrapText(true)
 						.Text(FText::FromString(FString::Printf(TEXT("Характер: %s · %s"), Nat ? Nat->Name : TEXT("?"), *Moves)))]
+					+ SVerticalBox::Slot().AutoHeight()
+					[SNew(STextBlock).Font(Font(11, false)).ColorAndOpacity(P.Friendship >= LigaRules::FriendshipToEvolve ? Hex(TEXT("D9487A")) : Muted)
+						.Text(FText::FromString(FString::Printf(TEXT("Дружба: %d из 255 — %s"), P.Friendship, *LigaRules::FriendshipText(P))))]
 				]
 			]
 		];
@@ -828,7 +831,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildMenu()
 		+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(BagText.IsEmpty() ? TEXT("Пусто") : BagText)).Font(Font(13, false)).ColorAndOpacity(Muted)]
 		+ SVerticalBox::Slot().FillHeight(1)[SNew(SSpacer)]
 		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Продолжить"), FString(), ColorButton(Accent), FLinearColor::White, [W] { if (W.IsValid()) W->ToggleMenu(); }, true, 300.f)]
-		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Сумка"), TEXT("Лечить покемонов зельями"), ColorButton(Hex(TEXT("F29A1A"))), FLinearColor::White, [W] { if (W.IsValid()) W->OpenBag(); }, true, 300.f)]
+		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Сумка"), TEXT("Зелья, лекарства, камни эволюции"), ColorButton(Hex(TEXT("F29A1A"))), FLinearColor::White, [W] { if (W.IsValid()) W->OpenBag(); }, true, 300.f)]
 		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Покедекс"), TEXT("Покемоны Канто и Джото"), ColorButton(Hex(TEXT("D94A3D"))), FLinearColor::White, [W] { if (W.IsValid()) W->OpenPokedex(); }, true, 300.f)]
 		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Сохранить игру"), FString(), ColorButton(Hex(TEXT("22A35A"))), FLinearColor::White, [W] { if (W.IsValid()) W->SaveFromMenu(); }, true, 300.f)]
 		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Выйти из игры"), TEXT("Игра сохранится"), &DarkButton, FLinearColor::White, [W] { if (W.IsValid()) W->QuitGame(); }, true, 300.f)];
@@ -914,7 +917,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildDex()
 		{
 			const FLigaSpecies* To = Db.Species(E.To);
 			if (!To) continue;
-			Evo += (Evo.IsEmpty() ? FString() : FString(TEXT(", "))) + To->Name + (E.Level > 0 ? FString::Printf(TEXT(" (ур. %d)"), E.Level) : FString(TEXT(" (особым способом)")));
+			Evo += (Evo.IsEmpty() ? FString() : FString(TEXT(", "))) + To->Name + TEXT(" (") + LigaRules::EvolutionMethodText(E) + TEXT(")");
 		}
 		Info->AddSlot().AutoHeight().HAlign(HAlign_Center)[MonImage(Sel, false, 200)];
 		Info->AddSlot().AutoHeight()[SNew(STextBlock).Font(Font(22)).ColorAndOpacity(Ink).Text(FText::FromString(FString::Printf(TEXT("№%03d %s"), Sel, *SelSp->Name)))];

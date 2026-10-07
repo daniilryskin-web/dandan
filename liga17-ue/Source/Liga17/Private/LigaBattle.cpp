@@ -881,6 +881,7 @@ void FLigaBattle::ResolveFaints()
 	{
 		Push(ELigaEvent::Faint, ELigaSide::Player);
 		Say(FString::Printf(TEXT("%s теряет сознание!"), *LigaRules::DisplayName(Player)));
+		LigaRules::AddFriendship(Player, -1);
 		Participants.Remove(Player.Uid);
 		if (Game->FirstAliveIndex() == INDEX_NONE)
 		{
@@ -920,6 +921,8 @@ void FLigaBattle::AwardExp(const FLigaPokemon& Defeated)
 			L.Uid = P->Uid;
 			L.Level = Lvl;
 			Say(FString::Printf(TEXT("%s достигает уровня %d!"), *LigaRules::DisplayName(*P), Lvl));
+			// Growing up together makes friends (less so for a Pokémon that already loves its trainer).
+			LigaRules::AddFriendship(*P, P->Friendship < 100 ? 5 : P->Friendship < 200 ? 3 : 2);
 		}
 		for (const FString& Mv : Res.Learned)
 		{
@@ -997,7 +1000,9 @@ void FLigaBattle::Close()
 	{
 		const FLigaPokemon* P = Game->FindByUid(Uid);
 		if (!P || P->HP <= 0) continue;
-		const int32 To = LigaRules::LevelEvolution(*P);
+		// By level, or on a level-up with friendship high enough (Pichu, Golbat, Eevee into Espeon by day / Umbreon by night).
+		int32 To = LigaRules::LevelEvolution(*P);
+		if (To == 0) To = LigaRules::FriendshipEvolution(*P);
 		if (To > 0) PendingEvolutions.Add({Uid, To});
 	}
 }

@@ -581,6 +581,19 @@ void ALigaCharacter::UpdateEncounters(float Dt)
 	LastPos = Pos;
 	ALigaPlayerController* PC = LigaPC();
 	if (!PC || !PC->IsExploring() || Moved <= 0.f || Moved > 200.f) return;
+	// Walking together makes friends: every 25 m each Pokémon of the team that can still walk likes you a bit more.
+	FriendWalk += Moved;
+	if (FriendWalk >= 2500.f)
+	{
+		FriendWalk -= 2500.f;
+		if (ULigaGameInstance* GI = ULigaGameInstance::Get(this))
+		{
+			for (FLigaPokemon& P : GI->Data.Team)
+			{
+				if (!P.IsFainted()) LigaRules::AddFriendship(P, 1);
+			}
+		}
+	}
 	TArray<AActor*> Zones;
 	GetOverlappingActors(Zones, ALigaEncounterZone::StaticClass());
 	if (Zones.Num() == 0)

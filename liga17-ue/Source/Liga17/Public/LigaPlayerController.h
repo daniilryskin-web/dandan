@@ -63,6 +63,10 @@ public:
 	void TalkToNpc(ALigaNPC* Npc);
 	void NurseHeal(const FString& Who);
 	void OpenShop(const FString& Who);
+	/** The market stall: evolution stones, items for trades, rare items. */
+	void OpenMarket(const FString& Who);
+	/** The Trainers' Club: trade Pokémon that evolve by trade (some must hold an item). */
+	void OpenTradeClub(const FString& Who);
 	void OpenStorage();
 	/** Finishes quests that complete by themselves and announces the ones ready to report. */
 	void CheckQuests();
@@ -124,6 +128,8 @@ public:
 
 private:
 	FString PlaceName = TEXT("Паллет-таун");
+	/** What the shop shows: 0 the Mart, 1 stones, 2 items for trades, 3 rare items (the market stall). */
+	int32 ShopCategory = 0;
 	FString Region = TEXT("КАНТО");
 	/** The trainer being fought (layout NPC id), empty in wild battles. */
 	FString TrainerNpcId;

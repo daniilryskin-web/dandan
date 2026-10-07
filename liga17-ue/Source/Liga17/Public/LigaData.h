@@ -123,6 +123,8 @@ private:
 	TMap<FString, TArray<FLigaEncounter>> EncounterTables;
 
 	bool LoadSpecies(const FString& Path);
+	/** Puts back the Kanto and Johto evolutions where the data lists a regional form's instead (Alolan Sandshrew…). */
+	void FixClassicEvolutions();
 	bool LoadMoves(const FString& Path);
 	void BuildItems();
 	void BuildEncounters();

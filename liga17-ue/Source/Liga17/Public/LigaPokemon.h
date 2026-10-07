@@ -7,6 +7,7 @@
 #include "LigaPokemon.generated.h"
 
 struct FLigaSpecies;
+struct FLigaEvolution;
 
 USTRUCT(BlueprintType)
 struct FLigaMoveSlot
@@ -42,6 +43,8 @@ struct FLigaPokemon
 	UPROPERTY() int32 SleepTurns = 0;
 	UPROPERTY() TArray<FLigaMoveSlot> Moves;
 	UPROPERTY() FString Ball;
+	/** 0..255: grows with level-ups, walks together, petting and the Soothe Bell; 220+ lets some species evolve. */
+	UPROPERTY() int32 Friendship = 70;
 	UPROPERTY() FString MetAt;
 	UPROPERTY() int32 MetLevel = 1;
 
@@ -133,6 +136,25 @@ namespace LigaRules
 	LIGA17_API void AddEvYield(FLigaPokemon& P, int32 DefeatedSpecies);
 	/** Species the Pokémon evolves into at its current level (0 if none). */
 	LIGA17_API int32 LevelEvolution(const FLigaPokemon& P);
+
+	/** How an evolution happens: by level, by using an item (stones), by a trade (with a held item or without),
+	 *  or by friendship (the data marks those with "soothe-bell"). */
+	enum class EEvoMethod : uint8 { Level, Item, Trade, TradeItem, Friendship, Other };
+	constexpr int32 FriendshipToEvolve = 220;
+	LIGA17_API EEvoMethod MethodOf(const FLigaEvolution& E);
+	/** Species this Pokémon becomes when the item (a stone…) is used on it, 0 if it does not react. */
+	LIGA17_API int32 ItemEvolution(const FLigaPokemon& P, const FString& ItemId);
+	/** Species it becomes when traded (OutItem: the item it must hold, empty if none), 0 if it does not evolve by trade. */
+	LIGA17_API int32 TradeEvolution(const FLigaPokemon& P, FString& OutItem);
+	/** Species it becomes on a level-up thanks to its friendship (and the time of day, if that matters), 0 if none. */
+	LIGA17_API int32 FriendshipEvolution(const FLigaPokemon& P);
+	/** "ур. 16", "Огненный камень", "обмен", "дружба, днём"… for the Pokédex. */
+	LIGA17_API FString EvolutionMethodText(const FLigaEvolution& E);
+	LIGA17_API void AddFriendship(FLigaPokemon& P, int32 N);
+	/** "обожает вас", "очень любит вас"… */
+	LIGA17_API FString FriendshipText(const FLigaPokemon& P);
+	/** Day (06:00–18:00 on this computer's clock) or night: Eevee becomes Espeon by day and Umbreon by night. */
+	LIGA17_API bool IsDaytime();
 	LIGA17_API void Evolve(FLigaPokemon& P, int32 To);
 	/** Teaches a move, replacing slot ReplaceIndex (or appending when < 4 moves). */
 	LIGA17_API void LearnMove(FLigaPokemon& P, const FString& MoveId, int32 ReplaceIndex);

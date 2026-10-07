@@ -25,6 +25,7 @@ bool FLigaDatabase::Load()
 {
 	if (bLoaded) return true;
 	const bool bOk = LoadSpecies(DataDir() / TEXT("species.json")) && LoadMoves(DataDir() / TEXT("moves.json"));
+	FixClassicEvolutions();
 	BuildItems();
 	BuildEncounters();
 	bLoaded = bOk;
@@ -100,6 +101,41 @@ bool FLigaDatabase::LoadSpecies(const FString& Path)
 		if (S.Id >= 1 && S.Id <= SpeciesList.Num()) SpeciesList[S.Id - 1] = MoveTemp(S);
 	}
 	return SpeciesList.Num() > 0;
+}
+
+void FLigaDatabase::FixClassicEvolutions()
+{
+	// PokeAPI keeps one evolution list per species, and for some of them it is the list of a regional form: Alolan
+	// Sandshrew (Ice Stone), Hisuian Voltorb (Leaf Stone), Galarian Slowpoke, Farfetch'd, Mr. Mime, Corsola, Hisuian
+	// Qwilfish and Sneasel. The Pokémon of this game are the Kanto and Johto ones, so they evolve as in those games.
+	auto Set = [this](int32 Id, TArray<FLigaEvolution> Evos)
+	{
+		if (SpeciesList.IsValidIndex(Id - 1) && SpeciesList[Id - 1].Id == Id) SpeciesList[Id - 1].Evolutions = MoveTemp(Evos);
+	};
+	auto Lv = [](int32 To, int32 Level)
+	{
+		FLigaEvolution E;
+		E.To = To;
+		E.Level = Level;
+		return E;
+	};
+	auto ByItem = [](int32 To, const TCHAR* ItemId)
+	{
+		FLigaEvolution E;
+		E.To = To;
+		E.Item = ItemId;
+		return E;
+	};
+	Set(27, {Lv(28, 22)});                                     // Sandshrew → Sandslash at 22
+	Set(52, {Lv(53, 28)});                                     // Meowth → Persian (not Perrserker)
+	Set(79, {Lv(80, 37), ByItem(199, TEXT("kings-rock"))});    // Slowpoke → Slowbro at 37, Slowking by trade holding a King's Rock
+	Set(83, {});                                               // Farfetch'd does not evolve
+	Set(100, {Lv(101, 30)});                                   // Voltorb → Electrode at 30
+	Set(122, {});                                              // Mr. Mime does not evolve
+	Set(194, {Lv(195, 20)});                                   // Wooper → Quagsire (not Clodsire)
+	Set(211, {});                                              // Qwilfish does not evolve
+	Set(215, {ByItem(461, TEXT("razor-claw"))});               // Sneasel → Weavile (not Sneasler)
+	Set(222, {});                                              // Corsola does not evolve
 }
 
 bool FLigaDatabase::LoadMoves(const FString& Path)
@@ -218,6 +254,30 @@ void FLigaDatabase::BuildItems()
 	Add(TEXT("ether"), TEXT("Эфир"), TEXT("pp"), 1200, TEXT("Восстанавливает 10 PP всем атакам.")).PP = 10;
 	Add(TEXT("oaks-parcel"), TEXT("Посылка Оука"), TEXT("key"), 0, TEXT("Посылка из магазина для профессора Оука."));
 	Add(TEXT("old-rod"), TEXT("Старая удочка"), TEXT("key"), 0, TEXT("Встаньте на краю мостков или пристани и закиньте удочку."));
+	// Evolution: stones and other items used from the bag ("evo"), items held during a trade at the Trainers' Club ("trade"),
+	// and the Soothe Bell that makes a Pokémon friendlier ("friend"). The species data names these items in its evolutions.
+	Add(TEXT("fire-stone"), TEXT("Огненный камень"), TEXT("evo"), 1500, TEXT("Эволюция: Вульпикс, Гроулит, Иви."));
+	Add(TEXT("water-stone"), TEXT("Водный камень"), TEXT("evo"), 1500, TEXT("Эволюция: Поливирл, Шеллдер, Старью, Иви."));
+	Add(TEXT("thunder-stone"), TEXT("Громовой камень"), TEXT("evo"), 1500, TEXT("Эволюция: Пикачу, Иви, Магнетон."));
+	Add(TEXT("leaf-stone"), TEXT("Листовой камень"), TEXT("evo"), 1500, TEXT("Эволюция: Глум, Випинбелл, Экзеггут, Иви."));
+	Add(TEXT("moon-stone"), TEXT("Лунный камень"), TEXT("evo"), 1500, TEXT("Эволюция: Нидорина, Нидорино, Клефейри, Джиглипафф."));
+	Add(TEXT("sun-stone"), TEXT("Солнечный камень"), TEXT("evo"), 1500, TEXT("Эволюция: Глум (в Беллоссома), Санкерн."));
+	Add(TEXT("ice-stone"), TEXT("Ледяной камень"), TEXT("evo"), 1500, TEXT("Эволюция: Иви (в Гласеона)."));
+	Add(TEXT("shiny-stone"), TEXT("Сияющий камень"), TEXT("evo"), 2000, TEXT("Эволюция: Иви (в Сильвеона), Тогетик."));
+	Add(TEXT("dusk-stone"), TEXT("Камень сумерек"), TEXT("evo"), 2000, TEXT("Эволюция: Маркроу, Мисдривус."));
+	Add(TEXT("razor-claw"), TEXT("Острый коготь"), TEXT("evo"), 2000, TEXT("Эволюция: Снизел."));
+	Add(TEXT("razor-fang"), TEXT("Острый клык"), TEXT("evo"), 2000, TEXT("Эволюция: Глайгер."));
+	Add(TEXT("black-augurite"), TEXT("Чёрный авгурит"), TEXT("evo"), 2000, TEXT("Эволюция: Скайтер (в Кливора)."));
+	Add(TEXT("peat-block"), TEXT("Торфяной брикет"), TEXT("evo"), 2000, TEXT("Эволюция: Урсаринг."));
+	Add(TEXT("kings-rock"), TEXT("Королевский камень"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Поливирл станет Политодом, Слоупок — Слоукингом."));
+	Add(TEXT("metal-coat"), TEXT("Металлическое покрытие"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Оникс — Стиликсом, Скайтер — Сизором."));
+	Add(TEXT("dragon-scale"), TEXT("Драконья чешуя"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Сидра станет Кингдрой."));
+	Add(TEXT("up-grade"), TEXT("Апгрейд"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Поригон станет Поригоном 2."));
+	Add(TEXT("dubious-disc"), TEXT("Сомнительный диск"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Поригон 2 станет Поригоном-Z."));
+	Add(TEXT("protector"), TEXT("Протектор"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Райдон станет Райпериором."));
+	Add(TEXT("electirizer"), TEXT("Электрайзер"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Электабазз станет Элективайром."));
+	Add(TEXT("magmarizer"), TEXT("Магмарайзер"), TEXT("trade"), 2500, TEXT("Обмен в Клубе тренеров: Магмар станет Магмортаром."));
+	Add(TEXT("soothe-bell"), TEXT("Успокаивающий колокольчик"), TEXT("friend"), 2000, TEXT("Покемон слышит его звон и становится дружелюбнее (+50 к дружбе)."));
 }
 
 void FLigaDatabase::BuildEncounters()

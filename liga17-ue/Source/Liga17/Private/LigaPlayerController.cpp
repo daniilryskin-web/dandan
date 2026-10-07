@@ -421,9 +421,20 @@ void ALigaPlayerController::TalkToNpc(ALigaNPC* Npc)
 		NurseHeal(Name);
 		return;
 	}
+	if (Id == TEXT("clerk_market"))
+	{
+		OpenMarket(Name);
+		return;
+	}
 	if (Id.StartsWith(TEXT("clerk")))
 	{
+		ShopCategory = 0;
 		OpenShop(Name);
+		return;
+	}
+	if (Id.StartsWith(TEXT("clubgirl")))
+	{
+		OpenTradeClub(Name);
 		return;
 	}
 	// 5. A reminder about a quest in progress.
@@ -477,13 +488,29 @@ void ALigaPlayerController::OpenShop(const FString& Who)
 {
 	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
 	if (!GI) return;
-	static const TCHAR* Stock[] = {
-		TEXT("poke-ball"), TEXT("great-ball"), TEXT("ultra-ball"), TEXT("potion"), TEXT("super-potion"), TEXT("hyper-potion"), TEXT("antidote"),
-		TEXT("paralyze-heal"), TEXT("awakening"), TEXT("burn-heal"), TEXT("ice-heal"), TEXT("full-heal"), TEXT("revive"), TEXT("ether"),
-	};
+	// 0 the Mart; the market stall: 1 evolution stones, 2 items for trades, 3 rare items and the Soothe Bell.
+	TArray<FString> Stock;
+	switch (ShopCategory)
+	{
+	case 1:
+		Stock = {TEXT("fire-stone"), TEXT("water-stone"), TEXT("thunder-stone"), TEXT("leaf-stone"), TEXT("moon-stone"), TEXT("sun-stone"),
+			TEXT("ice-stone"), TEXT("shiny-stone"), TEXT("dusk-stone")};
+		break;
+	case 2:
+		Stock = {TEXT("kings-rock"), TEXT("metal-coat"), TEXT("dragon-scale"), TEXT("up-grade"), TEXT("dubious-disc"), TEXT("protector"),
+			TEXT("electirizer"), TEXT("magmarizer")};
+		break;
+	case 3:
+		Stock = {TEXT("soothe-bell"), TEXT("razor-claw"), TEXT("razor-fang"), TEXT("black-augurite"), TEXT("peat-block")};
+		break;
+	default:
+		Stock = {TEXT("poke-ball"), TEXT("great-ball"), TEXT("ultra-ball"), TEXT("potion"), TEXT("super-potion"), TEXT("hyper-potion"), TEXT("antidote"),
+			TEXT("paralyze-heal"), TEXT("awakening"), TEXT("burn-heal"), TEXT("ice-heal"), TEXT("full-heal"), TEXT("revive"), TEXT("ether")};
+		break;
+	}
 	TArray<FLigaChoice> Opts;
 	TArray<FString> Ids;
-	for (const TCHAR* Id : Stock)
+	for (const FString& Id : Stock)
 	{
 		const FLigaItem* It = FLigaDatabase::Get().Item(Id);
 		if (!It) continue;
@@ -491,22 +518,124 @@ void ALigaPlayerController::OpenShop(const FString& Who)
 		C.Label = FString::Printf(TEXT("%s — %d"), *It->Name, It->Price);
 		C.Detail = FString::Printf(TEXT("В сумке: %d · %s"), GI->Data.ItemCount(It->Id), *It->Desc);
 		C.Color = It->Kind == TEXT("ball") ? PcHex(TEXT("D94A3D")) : It->Kind == TEXT("heal") ? PcHex(TEXT("2F9E5B"))
-			: It->Kind == TEXT("status") ? PcHex(TEXT("C98A1E")) : PcHex(TEXT("7A55C9"));
+			: It->Kind == TEXT("status") ? PcHex(TEXT("C98A1E")) : It->Kind == TEXT("evo") ? PcHex(TEXT("2F8FB0"))
+			: It->Kind == TEXT("trade") ? PcHex(TEXT("3E6FD9")) : It->Kind == TEXT("friend") ? PcHex(TEXT("D9487A")) : PcHex(TEXT("7A55C9"));
 		C.bEnabled = GI->Data.Money >= It->Price;
 		Opts.Add(C);
 		Ids.Add(It->Id);
 	}
 	FLigaChoice Leave;
-	Leave.Label = TEXT("Уйти");
+	Leave.Label = ShopCategory == 0 ? TEXT("Уйти") : TEXT("Назад к прилавку");
 	Opts.Add(Leave);
-	ShowChoice(FString::Printf(TEXT("Магазин · у вас %d монет"), GI->Data.Money), Opts, [this, Ids, Who](int32 Pick)
+	const FString Title = ShopCategory == 0 ? FString(TEXT("Магазин")) : FString(TEXT("Рынок"));
+	ShowChoice(FString::Printf(TEXT("%s · у вас %d монет"), *Title, GI->Data.Money), Opts, [this, Ids, Who](int32 Pick)
 	{
 		if (!Ids.IsValidIndex(Pick))
 		{
-			ShowDialogue(Who, {TEXT("Спасибо за покупки! Приходите ещё.")});
+			if (ShopCategory != 0) OpenMarket(Who);
+			else ShowDialogue(Who, {TEXT("Спасибо за покупки! Приходите ещё.")});
 			return;
 		}
 		BuyAmount(Who, Ids[Pick]);
+	}, true);
+}
+
+void ALigaPlayerController::OpenMarket(const FString& Who)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!GI) return;
+	struct FStall { const TCHAR* Label; const TCHAR* Detail; const TCHAR* Color; };
+	const FStall Stalls[] = {
+		{TEXT("Камни эволюции"), TEXT("Огненный, водный, громовой, листовой, лунный…"), TEXT("2F8FB0")},
+		{TEXT("Предметы для обмена"), TEXT("Покемон держит их при обмене в Клубе тренеров"), TEXT("3E6FD9")},
+		{TEXT("Редкие предметы"), TEXT("Успокаивающий колокольчик, острый коготь…"), TEXT("D9487A")},
+	};
+	TArray<FLigaChoice> Opts;
+	for (const FStall& St : Stalls)
+	{
+		FLigaChoice C;
+		C.Label = St.Label;
+		C.Detail = St.Detail;
+		C.Color = PcHex(St.Color);
+		Opts.Add(C);
+	}
+	FLigaChoice Leave;
+	Leave.Label = TEXT("Уйти");
+	Opts.Add(Leave);
+	ShowChoice(FString::Printf(TEXT("Рынок · у вас %d монет. Что посмотреть?"), GI->Data.Money), Opts, [this, Who](int32 Pick)
+	{
+		if (Pick < 0 || Pick > 2)
+		{
+			ShopCategory = 0;
+			ShowDialogue(Who, {TEXT("Заходите ещё! Каждый день — новые находки.")});
+			return;
+		}
+		ShopCategory = Pick + 1;
+		OpenShop(Who);
+	}, true);
+}
+
+// ——— trades at the Trainers' Club ———
+
+void ALigaPlayerController::OpenTradeClub(const FString& Who)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!GI) return;
+	TArray<FLigaChoice> Opts;
+	TArray<int32> Uids;
+	for (const FLigaPokemon& Pk : GI->Data.Team)
+	{
+		FString Held;
+		const int32 To = LigaRules::TradeEvolution(Pk, Held);
+		const FLigaSpecies* Target = FLigaDatabase::Get().Species(To);
+		if (!Target) continue;
+		const FLigaItem* Item = Held.IsEmpty() ? nullptr : FLigaDatabase::Get().Item(Held);
+		const int32 Have = Held.IsEmpty() ? 1 : GI->Data.ItemCount(Held);
+		FLigaChoice C;
+		C.Label = FString::Printf(TEXT("%s  ур. %d  →  %s"), *LigaRules::DisplayName(Pk), Pk.Level, *Target->Name);
+		C.Detail = Held.IsEmpty() ? FString(TEXT("Эволюционирует при обмене"))
+			: FString::Printf(TEXT("Нужен предмет «%s» (в сумке: %d). Продаётся на рынке"), Item ? *Item->Name : *Held, Have);
+		C.Color = PcHex(TEXT("3E6FD9"));
+		C.bEnabled = Have > 0;
+		Opts.Add(C);
+		Uids.Add(Pk.Uid);
+	}
+	if (Uids.Num() == 0)
+	{
+		ShowDialogue(Who, {
+			TEXT("Добро пожаловать в Клуб тренеров! Здесь тренеры меняются покемонами."),
+			TEXT("Некоторые покемоны эволюционируют, когда их обменивают: Кадабра, Мачок, Гравелер, Хонтер."),
+			TEXT("А Поливирл, Слоупок, Оникс, Скайтер, Сидра и Поригон — только если держат особый предмет. Такие предметы продаёт торговка на рынке."),
+			TEXT("Сейчас в вашей команде таких покемонов нет. Приходите, когда появятся!"),
+		});
+		return;
+	}
+	FLigaChoice Back;
+	Back.Label = TEXT("Не сейчас");
+	Opts.Add(Back);
+	ShowChoice(TEXT("Клуб тренеров · обмен с партнёром. Кого отправить? Он вернётся к вам уже эволюционировавшим."), Opts, [this, Uids, Who](int32 Pick)
+	{
+		ULigaGameInstance* G = ULigaGameInstance::Get(this);
+		if (!G || !Uids.IsValidIndex(Pick)) return;
+		FLigaPokemon* P = G->Data.FindByUid(Uids[Pick]);
+		if (!P) return;
+		FString Held;
+		const int32 To = LigaRules::TradeEvolution(*P, Held);
+		const FLigaSpecies* Target = FLigaDatabase::Get().Species(To);
+		if (!Target || (!Held.IsEmpty() && G->Data.ItemCount(Held) <= 0)) return;
+		if (!Held.IsEmpty()) G->Data.Bag.FindOrAdd(Held) -= 1;
+		const FString Before = LigaRules::DisplayName(*P);
+		LigaRules::Evolve(*P, To);
+		G->Data.MarkCaught(To);
+		LigaQuests::AddCounter(G->Data, TEXT("trade_evolve"));
+		RememberPosition();
+		G->SaveGame();
+		ShowDialogue(Who, {
+			FString::Printf(TEXT("Отправляем %s партнёру по обмену…"), *Before),
+			TEXT("Партнёр бережно возвращает покемона обратно — с благодарственной открыткой!"),
+			FString::Printf(TEXT("Что? %s эволюционирует!"), *Before),
+			FString::Printf(TEXT("Поздравляем! %s превратился в %s!"), *Before, *Target->Name),
+		}, [this]() { CheckQuests(); });
 	}, true);
 }
 
@@ -855,19 +984,21 @@ void ALigaPlayerController::OpenBag()
 	for (const FLigaItem& It : FLigaDatabase::Get().Items())
 	{
 		const int32 N = GI->Data.ItemCount(It.Id);
-		const bool bUsable = It.Kind == TEXT("heal") || It.Kind == TEXT("status") || It.Kind == TEXT("revive") || It.Kind == TEXT("pp");
+		const bool bUsable = It.Kind == TEXT("heal") || It.Kind == TEXT("status") || It.Kind == TEXT("revive") || It.Kind == TEXT("pp")
+			|| It.Kind == TEXT("evo") || It.Kind == TEXT("friend");
 		if (N <= 0 || !bUsable) continue;
 		FLigaChoice C;
 		C.Label = FString::Printf(TEXT("%s ×%d"), *It.Name, N);
 		C.Detail = It.Desc;
-		C.Color = It.Kind == TEXT("heal") ? PcHex(TEXT("2F9E5B")) : It.Kind == TEXT("status") ? PcHex(TEXT("C98A1E")) : PcHex(TEXT("7A55C9"));
+		C.Color = It.Kind == TEXT("heal") ? PcHex(TEXT("2F9E5B")) : It.Kind == TEXT("status") ? PcHex(TEXT("C98A1E"))
+			: It.Kind == TEXT("evo") ? PcHex(TEXT("2F8FB0")) : It.Kind == TEXT("friend") ? PcHex(TEXT("D9487A")) : PcHex(TEXT("7A55C9"));
 		Opts.Add(C);
 		Ids.Add(It.Id);
 	}
 	FLigaChoice Back;
 	Back.Label = TEXT("Назад в меню");
 	Opts.Add(Back);
-	const FString Title = Ids.Num() ? TEXT("Сумка · что использовать?") : TEXT("Сумка · лечебных предметов нет. Их продают в магазине.");
+	const FString Title = Ids.Num() ? TEXT("Сумка · что использовать?") : TEXT("Сумка · пусто. Зелья продают в магазине, камни эволюции — на рынке.");
 	ShowChoice(Title, Opts, [this, Ids](int32 Pick)
 	{
 		if (!Ids.IsValidIndex(Pick))
@@ -884,6 +1015,8 @@ void ALigaPlayerController::UseItemOn(const FString& ItemId)
 	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
 	const FLigaItem* Item = FLigaDatabase::Get().Item(ItemId);
 	if (!GI || !Item) return;
+	const bool bEvoItem = Item->Kind == TEXT("evo");
+	const bool bBell = Item->Kind == TEXT("friend");
 	TArray<FLigaChoice> Opts;
 	for (const FLigaPokemon& Pk : GI->Data.Team)
 	{
@@ -891,6 +1024,18 @@ void ALigaPlayerController::UseItemOn(const FString& ItemId)
 		C.Label = FString::Printf(TEXT("%s  ур. %d"), *LigaRules::DisplayName(Pk), Pk.Level);
 		FString Detail = FString::Printf(TEXT("HP %d/%d"), Pk.HP, LigaRules::MaxHp(Pk));
 		if (Pk.GetStatus() != EStatus::None) Detail += TEXT(" · ") + LigaTypes::StatusName(Pk.GetStatus());
+		if (bEvoItem)
+		{
+			// A stone only works on the Pokémon it evolves; the others are greyed out.
+			const FLigaSpecies* To = FLigaDatabase::Get().Species(LigaRules::ItemEvolution(Pk, ItemId));
+			Detail = To ? FString::Printf(TEXT("Может эволюционировать в %s!"), *To->Name) : FString(TEXT("Не подействует"));
+			C.bEnabled = To != nullptr;
+		}
+		else if (bBell)
+		{
+			Detail = FString::Printf(TEXT("Дружба: %d из 255 — %s"), Pk.Friendship, *LigaRules::FriendshipText(Pk));
+			C.bEnabled = Pk.Friendship < 255;
+		}
 		C.Detail = Detail;
 		C.Color = PcHex(TEXT("3B4A7A"));
 		Opts.Add(C);
@@ -901,11 +1046,45 @@ void ALigaPlayerController::UseItemOn(const FString& ItemId)
 	ShowChoice(FString::Printf(TEXT("%s · на кого использовать?"), *Item->Name), Opts, [this, ItemId](int32 Pick)
 	{
 		ULigaGameInstance* G = ULigaGameInstance::Get(this);
-		if (G && G->Data.Team.IsValidIndex(Pick) && G->Data.ItemCount(ItemId) > 0)
+		const FLigaItem* Used = FLigaDatabase::Get().Item(ItemId);
+		if (G && Used && G->Data.Team.IsValidIndex(Pick) && G->Data.ItemCount(ItemId) > 0)
 		{
-			FString Msg;
-			if (LigaApplyItem(G->Data.Team[Pick], ItemId, Msg)) G->Data.Bag.FindOrAdd(ItemId) -= 1;
-			ShowToast(Msg, 3.f);
+			FLigaPokemon& Pk = G->Data.Team[Pick];
+			if (Used->Kind == TEXT("evo"))
+			{
+				const int32 To = LigaRules::ItemEvolution(Pk, ItemId);
+				const FLigaSpecies* Target = FLigaDatabase::Get().Species(To);
+				if (Target)
+				{
+					G->Data.Bag.FindOrAdd(ItemId) -= 1;
+					const FString Before = LigaRules::DisplayName(Pk);
+					LigaRules::Evolve(Pk, To);
+					G->Data.MarkCaught(To);
+					RememberPosition();
+					G->SaveGame();
+					ShowDialogue(TEXT(""), {
+						FString::Printf(TEXT("%s касается предмета «%s»…"), *Before, *Used->Name),
+						FString::Printf(TEXT("Что? %s эволюционирует!"), *Before),
+						FString::Printf(TEXT("Поздравляем! %s превратился в %s!"), *Before, *Target->Name),
+					}, [this]() { CheckQuests(); });
+					return;
+				}
+				ShowToast(TEXT("Это не подействует."), 3.f);
+			}
+			else if (Used->Kind == TEXT("friend"))
+			{
+				LigaRules::AddFriendship(Pk, 50);
+				G->Data.Bag.FindOrAdd(ItemId) -= 1;
+				const bool bReady = Pk.Friendship >= LigaRules::FriendshipToEvolve;
+				ShowToast(FString::Printf(TEXT("%s слушает звон колокольчика. Дружба: %d из 255 — %s.%s"), *LigaRules::DisplayName(Pk), Pk.Friendship,
+					*LigaRules::FriendshipText(Pk), bReady ? TEXT(" Некоторые покемоны с такой дружбой эволюционируют при повышении уровня!") : TEXT("")), 5.f);
+			}
+			else
+			{
+				FString Msg;
+				if (LigaApplyItem(Pk, ItemId, Msg)) G->Data.Bag.FindOrAdd(ItemId) -= 1;
+				ShowToast(Msg, 3.f);
+			}
 		}
 		OpenBag();
 	}, true);

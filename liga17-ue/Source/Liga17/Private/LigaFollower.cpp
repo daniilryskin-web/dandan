@@ -162,12 +162,12 @@ void ALigaFollower::Interact(ALigaPlayerController* PC)
 	PetTimer = 1.2f;
 	if (!bAmbient)
 	{
-		// Your own Pokémon: how it feels depends on its health.
-		const ULigaGameInstance* GI = ULigaGameInstance::Get(this);
-		const FLigaPokemon* Lead = nullptr;
+		// Your own Pokémon: how it feels depends on its health; petting it now and then makes it friendlier.
+		ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+		FLigaPokemon* Lead = nullptr;
 		if (GI)
 		{
-			for (const FLigaPokemon& P : GI->Data.Team)
+			for (FLigaPokemon& P : GI->Data.Team)
 			{
 				if (!P.IsFainted())
 				{
@@ -176,13 +176,22 @@ void ALigaFollower::Interact(ALigaPlayerController* PC)
 				}
 			}
 		}
-		if (Lead) Name = LigaRules::DisplayName(*Lead);
+		if (Lead)
+		{
+			Name = LigaRules::DisplayName(*Lead);
+			if (FriendCooldown <= 0.f)
+			{
+				FriendCooldown = 20.f;
+				LigaRules::AddFriendship(*Lead, 1);
+			}
+		}
 		static const TCHAR* Happy[] = {
 			TEXT("радостно прыгает вокруг вас!"), TEXT("трётся о вашу ногу."), TEXT("гордо смотрит вперёд — готов к новым битвам!"),
 			TEXT("внимательно принюхивается к чему-то в траве."), TEXT("довольно урчит."),
 		};
 		const bool bTired = Lead && (Lead->HP * 3 < LigaRules::MaxHp(*Lead) || Lead->GetStatus() != EStatus::None);
-		PC->ShowToast(Name + TEXT(" ") + (bTired ? TEXT("выглядит уставшим. Может, заглянуть в покецентр?") : Happy[FMath::RandRange(0, 4)]), 2.5f);
+		const FString Mood = Lead ? FString::Printf(TEXT("\nДружба: %d из 255 — %s."), Lead->Friendship, *LigaRules::FriendshipText(*Lead)) : FString();
+		PC->ShowToast(Name + TEXT(" ") + (bTired ? TEXT("выглядит уставшим. Может, заглянуть в покецентр?") : Happy[FMath::RandRange(0, 4)]) + Mood, 3.f);
 		return;
 	}
 	if (!Quest.IsEmpty())
@@ -476,6 +485,7 @@ void ALigaFollower::Tick(float Dt)
 
 	// Waiting for the trainer: now and then a little hop or a stretch.
 	PetTimer = FMath::Max(0.f, PetTimer - Dt);
+	FriendCooldown = FMath::Max(0.f, FriendCooldown - Dt);
 	if (Speed < 10.f)
 	{
 		FidgetTimer -= Dt;

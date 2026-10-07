@@ -224,6 +224,91 @@ namespace LigaRules
 		return 0;
 	}
 
+	EEvoMethod MethodOf(const FLigaEvolution& E)
+	{
+		if (E.Item.IsEmpty()) return E.Level > 0 ? EEvoMethod::Level : EEvoMethod::Other;
+		if (E.Item == TEXT("soothe-bell")) return EEvoMethod::Friendship;
+		if (E.Item == TEXT("linking-cord")) return EEvoMethod::Trade;
+		const FLigaItem* It = FLigaDatabase::Get().Item(E.Item);
+		return It && It->Kind == TEXT("trade") ? EEvoMethod::TradeItem : EEvoMethod::Item;
+	}
+
+	int32 ItemEvolution(const FLigaPokemon& P, const FString& ItemId)
+	{
+		const FLigaSpecies* S = SpeciesOf(P);
+		if (!S || ItemId.IsEmpty()) return 0;
+		for (const FLigaEvolution& E : S->Evolutions)
+		{
+			if (E.Item == ItemId && MethodOf(E) == EEvoMethod::Item && FLigaDatabase::Get().Species(E.To)) return E.To;
+		}
+		return 0;
+	}
+
+	int32 TradeEvolution(const FLigaPokemon& P, FString& OutItem)
+	{
+		OutItem.Reset();
+		const FLigaSpecies* S = SpeciesOf(P);
+		if (!S) return 0;
+		for (const FLigaEvolution& E : S->Evolutions)
+		{
+			const EEvoMethod M = MethodOf(E);
+			if ((M != EEvoMethod::Trade && M != EEvoMethod::TradeItem) || !FLigaDatabase::Get().Species(E.To)) continue;
+			if (M == EEvoMethod::TradeItem) OutItem = E.Item;
+			return E.To;
+		}
+		return 0;
+	}
+
+	bool IsDaytime()
+	{
+		const int32 Hour = FDateTime::Now().GetHour();
+		return Hour >= 6 && Hour < 18;
+	}
+
+	int32 FriendshipEvolution(const FLigaPokemon& P)
+	{
+		const FLigaSpecies* S = SpeciesOf(P);
+		if (!S || P.Friendship < FriendshipToEvolve) return 0;
+		const bool bDay = IsDaytime();
+		for (const FLigaEvolution& E : S->Evolutions)
+		{
+			if (MethodOf(E) != EEvoMethod::Friendship || !FLigaDatabase::Get().Species(E.To)) continue;
+			if ((E.Time == TEXT("day") && !bDay) || (E.Time == TEXT("night") && bDay)) continue;
+			return E.To;
+		}
+		return 0;
+	}
+
+	FString EvolutionMethodText(const FLigaEvolution& E)
+	{
+		const FLigaItem* It = FLigaDatabase::Get().Item(E.Item);
+		const FString ItemName = It ? It->Name : E.Item;
+		switch (MethodOf(E))
+		{
+		case EEvoMethod::Level: return FString::Printf(TEXT("ур. %d"), E.Level);
+		case EEvoMethod::Item: return ItemName;
+		case EEvoMethod::Trade: return TEXT("обмен");
+		case EEvoMethod::TradeItem: return FString::Printf(TEXT("обмен с предметом «%s»"), *ItemName);
+		case EEvoMethod::Friendship:
+			return E.Time == TEXT("day") ? TEXT("дружба, днём") : E.Time == TEXT("night") ? TEXT("дружба, ночью") : TEXT("дружба");
+		default: return TEXT("особым способом");
+		}
+	}
+
+	void AddFriendship(FLigaPokemon& P, int32 N)
+	{
+		P.Friendship = FMath::Clamp(P.Friendship + N, 0, 255);
+	}
+
+	FString FriendshipText(const FLigaPokemon& P)
+	{
+		if (P.Friendship >= FriendshipToEvolve) return TEXT("обожает вас");
+		if (P.Friendship >= 150) return TEXT("очень любит вас");
+		if (P.Friendship >= 100) return TEXT("дружелюбен к вам");
+		if (P.Friendship >= 70) return TEXT("привыкает к вам");
+		return TEXT("держится настороженно");
+	}
+
 	void Evolve(FLigaPokemon& P, int32 To)
 	{
 		const float Ratio = P.HP > 0 ? float(P.HP) / float(FMath::Max(1, MaxHp(P))) : 0.f;

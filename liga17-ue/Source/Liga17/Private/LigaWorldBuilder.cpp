@@ -130,9 +130,11 @@ FVector ALigaWorldBuilder::Ground(const FVector& W, float Up) const
 	return W;
 }
 
-FVector ALigaWorldBuilder::GroundAtLayout(const FVector& B) const
+FVector ALigaWorldBuilder::GroundAtLayout(const FVector& B, bool bLow) const
 {
 	if (FLigaLayout::IsIndoorPoint(B)) return Ground(ToWorld(B + FVector(0.f, 0.f, 1.2f)), 0.f);
+	// Doors: start just above the ground, or the trace lands on the porch roof over the entrance.
+	if (bLow) return Ground(ToWorld(FVector(B.X, B.Y, B.Z + 1.5f)), 0.f);
 	return Ground(ToWorld(FVector(B.X, B.Y, 0.f)));
 }
 
@@ -333,7 +335,7 @@ void ALigaWorldBuilder::SpawnDoors()
 	TSet<FString> WithRooms;
 	for (const FLigaPortalDef& Def : L.Portals)
 	{
-		const FVector W = GroundAtLayout(Def.Pos) + FVector(0, 0, 80.f);
+		const FVector W = GroundAtLayout(Def.Pos, true) + FVector(0, 0, 80.f);
 		ALigaDoor* Door = GetWorld()->SpawnActor<ALigaDoor>(W, FRotator::ZeroRotator, P);
 		if (!Door) continue;
 		Door->Title = Def.Title;
@@ -342,7 +344,7 @@ void ALigaWorldBuilder::SpawnDoors()
 			Door->Kind = ELigaDoorKind::Portal;
 			Door->bExit = Def.Kind == TEXT("exit");
 			Door->bWalkIn = true;
-			Door->Target = GroundAtLayout(Def.To) + FVector(0, 0, 95.f);
+			Door->Target = GroundAtLayout(Def.To, true) + FVector(0, 0, 95.f);
 			Door->TargetYaw = ToWorldYaw(Def.ToFace);
 			WithRooms.Add(Def.Id);
 		}

@@ -39,7 +39,7 @@ CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')
 SITE = os.path.join(PROJECT, 'Content', 'Python', 'Lib', 'site-packages')
 
 # Bump when convert() changes: models are imported again into a new folder, and the old folders are deleted.
-CONVERTER_VERSION = 5
+CONVERTER_VERSION = 6
 DEST_ROOT = '/Game/Liga/Pokemon3D'
 DEST = f'{DEST_ROOT}/V{CONVERTER_VERSION}'
 OLD_DESTS = ['/Game/Liga/Pokemon']  # converter versions 1–3
@@ -883,8 +883,13 @@ def _procedural_clips(gltf, views, add_view):
         x = np.clip((t - a) / (b - a), 0.0, 1.0)
         return x * x * (3 - 2 * x)
 
+    wings = [j for j in joints if kind(j) == 'wing' and info[j][0] != 0 and not (parent.get(j) in jset and kind(parent[j]) == 'wing')]
+    feet = {info[j][0]: j for j in joints if kind(j) == 'foot' and info[j][0] != 0}
+
     def pose_at(role, t, T):
-        """{joint: [(axis, degrees), ...]} world rotations and a root offset for one moment of a clip."""
+        """{joint: [(axis, degrees), ...]} world rotations and a root offset for one moment of a clip.
+        Every motion uses whole multiples of the clip's own frequency, so the loops are seamless; several frequencies
+        on top of each other keep the idle from looking mechanical."""
         rot, off = {}, np.zeros(3)
         wv = 2 * np.pi * t / T
 
@@ -896,67 +901,103 @@ def _procedural_clips(gltf, views, add_view):
             if low is not None:
                 add(j, low[0], low[1])
         if role == 'idle':
+            breath = np.sin(2 * wv)                      # two breaths per loop
             for k, j in enumerate(spines):
-                add(j, X, 1.2 * np.sin(wv - 0.3 * k))
+                add(j, X, 3.0 * np.sin(2 * wv - 0.4 * k))
+                add(j, Y, 2.0 * np.sin(wv + 0.3 * k))
             for j in necks:
-                add(j, X, 1.5 * np.sin(wv - 0.8))
-            for j in heads:
-                add(j, X, 2.5 * np.sin(wv - 1.0))
-                add(j, Y, 2.0 * np.sin(wv + 0.5))
+                add(j, X, 2.5 * np.sin(2 * wv - 0.8))
+                add(j, Y, 5.0 * np.sin(wv))
+            for j in heads:                               # looks around now and then
+                add(j, Y, 12.0 * np.sin(wv) + 4.0 * np.sin(3 * wv + 0.6))
+                add(j, X, 4.0 * np.sin(2 * wv - 1.0) - 3.0 * max(0.0, np.sin(wv + 2.0)) ** 3)
+                add(j, Z, 5.0 * np.sin(wv + 1.0))
+            for j in jaws:
+                add(j, X, 8.0 * max(0.0, np.sin(wv - 1.2)) ** 4)
             for j in hands_up:
-                add(j, X, 2.5 * np.sin(wv + info[j][0]))
+                add(j, X, 6.0 * np.sin(2 * wv + info[j][0]))
+                add(j, Z, 4.0 * info[j][0] * np.sin(2 * wv))
+            for j in wings:
+                add(j, Z, info[j][0] * (5.0 * np.sin(2 * wv) + 14.0 * max(0.0, np.sin(4 * wv)) ** 6))
             for k, j in enumerate(tails):
-                add(j, Y, 4.0 * np.sin(wv + 0.7 * k))
-            for j in ears:
-                add(j, Z, 3.0 * info[j][0] * np.sin(2 * wv))
+                add(j, Y, 14.0 * np.sin(2 * wv + 0.7 * k))
+                add(j, X, 4.0 * np.sin(2 * wv + 0.5 * k + 1.0))
+            for j in ears:                                # slow sway with quick twitches
+                add(j, Z, info[j][0] * (4.0 * np.sin(2 * wv) + 10.0 * max(0.0, np.sin(6 * wv + info[j][0])) ** 8))
+            add(root, Z, 1.8 * np.sin(wv))                # weight shifting from foot to foot
+            off = off + Y * (0.012 * height * 0.5 * (1 + breath)) + X * (0.012 * height * np.sin(wv))
+            if legless:                                   # blobs and floaters bob up and down
+                off = off + Y * (0.04 * height * 0.5 * (1 + np.sin(2 * wv)))
         elif role == 'walk':
             for j in thighs:
                 ph = 0.0 if info[j][0] > 0 else np.pi
-                add(j, X, 24.0 * np.sin(wv + ph))
+                add(j, X, 32.0 * np.sin(wv + ph))
                 shin = shins.get(info[j][0])
-                if shin is not None:
-                    add(shin, X, -18.0 * max(0.0, np.sin(wv + ph + np.pi / 2)))
-            for j in front_legs:  # diagonal pairs, like a trot
+                if shin is not None:                      # knee bends while the leg swings forward
+                    add(shin, X, -34.0 * max(0.0, np.sin(wv + ph + np.pi / 2)))
+                foot = feet.get(info[j][0])
+                if foot is not None:
+                    add(foot, X, 14.0 * np.sin(wv + ph - 0.6))
+            for j in front_legs:                          # diagonal pairs, like a trot
                 ph = 0.0 if info[j][0] < 0 else np.pi
-                add(j, X, 22.0 * np.sin(wv + ph))
-            for j in hands_up:
+                add(j, X, 28.0 * np.sin(wv + ph))
+            for j in hands_up:                            # arms swing against the legs
                 ph = np.pi if info[j][0] > 0 else 0.0
-                add(j, X, 12.0 * np.sin(wv + ph))
+                add(j, X, 22.0 * np.sin(wv + ph))
+            for j in wings:
+                add(j, Z, info[j][0] * 10.0 * np.sin(2 * wv))
             for k, j in enumerate(spines):
-                add(j, Y, (7.0 * np.sin(wv + 0.9 * k)) if legless else 3.0 * np.sin(wv))
-            for j in heads:
-                add(j, X, 2.0 * np.sin(2 * wv))
+                if legless:
+                    add(j, Y, 10.0 * np.sin(wv + 0.9 * k))   # slither
+                else:
+                    add(j, Y, 4.0 * np.sin(wv))
+                    add(j, X, 2.5 * np.sin(2 * wv))
+            for j in heads + necks:                       # keeps the head steady against the body's bob
+                add(j, X, -3.0 * np.sin(2 * wv))
+                add(j, Y, -3.0 * np.sin(wv))
             for k, j in enumerate(tails):
-                add(j, Y, (9.0 if legless else 8.0) * np.sin(wv + 0.7 * k + (0.9 * len(spines) if legless else 0)))
-            off = off + Y * (0.025 * height * 0.5 * (1 - np.cos(2 * wv)))
+                add(j, Y, (12.0 if legless else 14.0) * np.sin(wv + 0.7 * k + (0.9 * len(spines) if legless else 0)))
+                add(j, X, 4.0 * np.sin(2 * wv + 0.5 * k))
+            for j in ears:
+                add(j, X, 6.0 * np.sin(2 * wv + 0.5))
+            if legless and not spines and not tails:      # no legs and no body to wiggle: little hops
+                off = off + Y * (0.14 * height * abs(np.sin(wv)))
+                add(root, X, 6.0 * np.sin(2 * wv))
+            else:
+                add(root, Z, 3.5 * np.sin(wv))            # side to side with every step
+                off = off + Y * (0.045 * height * 0.5 * (1 - np.cos(2 * wv)))
         elif role == 'attack':
             a = smooth(0.0, 0.35, t) - smooth(0.35, 0.5, t)    # wind-up
             s = smooth(0.35, 0.5, t) - smooth(0.6, 1.0, t)     # strike
             for j in spines:
-                add(j, X, -8.0 * a + 14.0 * s)
+                add(j, X, -12.0 * a + 20.0 * s)
             for j in necks + heads:
-                add(j, X, -6.0 * a + 10.0 * s)
+                add(j, X, -8.0 * a + 14.0 * s)
             for j in jaws:
-                add(j, X, 18.0 * s)
+                add(j, X, 25.0 * s)
             for j in hands_up:
-                add(j, X, 20.0 * a - 45.0 * s)
+                add(j, X, 30.0 * a - 60.0 * s)
             for j in front_legs:
-                add(j, X, -20.0 * s)
+                add(j, X, -25.0 * s)
+            for j in wings:
+                add(j, Z, info[j][0] * (25.0 * a - 30.0 * s))
+            for j in thighs:
+                add(j, X, -10.0 * a + 12.0 * s)
             for k, j in enumerate(tails):
-                add(j, Y, 12.0 * (a + s) * np.sin(np.pi * t / T * 3 + 0.6 * k))
-            off = off + Z * (0.15 * height * s) + Y * (0.05 * height * a)
+                add(j, Y, 16.0 * (a + s) * np.sin(np.pi * t / T * 3 + 0.6 * k))
+            off = off + Z * (0.2 * height * s) + Y * (0.06 * height * a + 0.04 * height * s)
         elif role == 'faint':
             f = smooth(0.0, 0.6, t)
-            add(root, Z, 75.0 * f)
+            add(root, Z, 80.0 * f)
             for j in necks + heads:
-                add(j, X, 20.0 * f)
+                add(j, X, 25.0 * f)
+            for k, j in enumerate(tails):
+                add(j, X, 15.0 * f)
             off = off - Y * (0.15 * height * f)
         return rot, off
 
-    specs = {'idle': (2.4, 24, True), 'walk': (0.8, 16, True), 'attack': (1.0, 25, False), 'faint': (0.7, 14, False)}
+    specs = {'idle': (4.0, 64, True), 'walk': (0.8, 24, True), 'attack': (1.0, 30, False), 'faint': (0.7, 16, False)}
     for role in missing:
-        if role == 'walk' and legless and not spines and not tails:
-            continue
         T, n, loop = specs[role]
         times = np.linspace(0.0, T, n + 1)
         rot_keys, root_keys = {}, []
@@ -1305,9 +1346,7 @@ def refresh_old_imports(log=print, warn=print):
     except Exception:
         version = 0
     if version != CONVERTER_VERSION:
-        for path in (GUARD, SKIP):  # a new converter gets a clean slate, including models that crashed before
-            if os.path.exists(path):
-                os.remove(path)
+        # The models that crashed the editor stay skipped (SKIP): trying them again would only crash it once more.
         os.makedirs(CACHE, exist_ok=True)
         with open(VERSION_FILE, 'w', encoding='utf-8') as f:
             f.write(str(CONVERTER_VERSION))

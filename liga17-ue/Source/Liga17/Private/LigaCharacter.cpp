@@ -526,7 +526,8 @@ void ALigaCharacter::UpdateFocus()
 		if (Dist > 260.f || FMath::Abs(D.Z) > 250.f) continue;
 		const float Facing = FVector::DotProduct(D.GetSafeNormal2D(), Fwd);
 		if (Facing < -0.2f && Dist > 120.f) continue;
-		const float Score = (1.f - Dist / 260.f) + Facing * 0.5f;
+		// Your own Pokémon walks right next to you: it only gets the prompt when nothing else is in front.
+		const float Score = (1.f - Dist / 260.f) + Facing * 0.5f - (A == Follower.Get() ? 0.6f : 0.f);
 		if (!Best || Score > BestScore)
 		{
 			Best = A;

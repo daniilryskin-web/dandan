@@ -27,8 +27,9 @@ public:
 	FVector ToBlender(const FVector& World) const;
 	/** Drops a point onto the ground (terrain / buildings). */
 	FVector Ground(const FVector& World, float Up = 2000.f) const;
-	/** Ground under a layout point. Rooms have ceilings, so indoor points are traced from just above their floor. */
-	FVector GroundAtLayout(const FVector& Blender) const;
+	/** Ground under a layout point. Rooms have ceilings, so indoor points are traced from just above their floor;
+	 *  bLow does the same outdoors (doors under a porch roof). */
+	FVector GroundAtLayout(const FVector& Blender, bool bLow = false) const;
 	/** Height of the sea surface (world units). */
 	float SeaLevelZ() const;
 	/** The named place (room or outdoor area) at a world position, or null. */

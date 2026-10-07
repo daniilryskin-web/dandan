@@ -51,6 +51,7 @@ private:
 	TWeakObjectPtr<APawn> Trainer;
 	float ModelScale = 1.f;   // model units -> the species' height in cm
 	float ModelLift = 0.f;    // model units from the model's origin down to its feet
+	float HeightCm = 60.f;    // how tall it stands in the world
 	float Grow = 0.f;         // 0..1 coming out of the ball, back to 0 when recalled
 	float FlashLevel = 0.f;
 	bool bSkeletal = false;
@@ -69,7 +70,21 @@ private:
 	float QuestCheck = 0.f;
 	float PetTimer = 0.f;
 
+	// ——— body motion on top of the clips (or instead of them for models without a skeleton) ———
+	float GaitPhase = 0.f;    // 0..1 through one step cycle, advanced by the distance walked
+	float GaitTime = 0.f;
+	float PrevYaw = 0.f;
+	float PrevSpeed = 0.f;
+	float Lean = 0.f;
+	float Bank = 0.f;
+	float LookYaw = 0.f;
+	float LookGoal = 0.f;
+	float LookTimer = 2.f;
+	float FidgetTimer = 6.f;
+
 	void PlayClip(bool bWalk);
+	/** Puts the model on the ground with the gait on top: steps, bob, waddle, lean, banking into turns, breathing. */
+	void PoseBody(float Dt, float Speed, float Hop);
 	bool LoadModel(bool bAllowPlaceholder);
 	void TickAmbient(float Dt);
 	bool QuestWantsMe() const;

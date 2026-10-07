@@ -93,6 +93,7 @@ bool ALigaFollower::LoadModel(bool bAllowPlaceholder)
 	const float TargetCm = FMath::Clamp((S ? S->Height : 0.6f) * 100.f, 30.f, 200.f);
 	ModelScale = TargetCm / FMath::Max(1.f, B.BoxExtent.Z * 2.f);
 	ModelLift = -(B.Origin.Z - B.BoxExtent.Z);
+	HeightCm = TargetCm;
 	return true;
 }
 
@@ -106,6 +107,8 @@ bool ALigaFollower::Setup(APawn* InTrainer, int32 InSpecies, bool bInShiny)
 	FlashLevel = 1.f;
 	SetActorLocation(InTrainer->GetActorLocation() + InTrainer->GetActorForwardVector() * 120.f);
 	SetActorRotation(FRotator(0.f, InTrainer->GetActorRotation().Yaw + 180.f, 0.f));
+	PrevYaw = GetActorRotation().Yaw;
+	PetTimer = 0.9f;  // a happy hop out of the ball
 	return true;
 }
 
@@ -121,6 +124,7 @@ bool ALigaFollower::SetupAmbient(int32 InSpecies, const FVector& InHome, float I
 	WanderGoal = Home;
 	WanderWait = FMath::FRandRange(0.5f, 3.f);
 	SetActorLocation(Home);
+	GaitTime = FMath::FRandRange(0.f, 10.f);  // so that a group does not breathe in step
 	bQuestShown = Quest.IsEmpty() || QuestWantsMe();
 	SetActorHiddenInGame(!bQuestShown);
 	return true;
@@ -146,14 +150,39 @@ FString ALigaFollower::GetDisplayName() const
 
 bool ALigaFollower::CanInteract() const
 {
-	return bAmbient && !IsHidden() && !bRecalling;
+	return !IsHidden() && !bRecalling && Grow > 0.9f;
 }
 
 void ALigaFollower::Interact(ALigaPlayerController* PC)
 {
 	if (!PC || !CanInteract()) return;
-	const FString Name = GetDisplayName();
+	FString Name = GetDisplayName();
 	PetTimer = 1.2f;
+	if (!bAmbient)
+	{
+		// Your own Pokémon: how it feels depends on its health.
+		const ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+		const FLigaPokemon* Lead = nullptr;
+		if (GI)
+		{
+			for (const FLigaPokemon& P : GI->Data.Team)
+			{
+				if (!P.IsFainted())
+				{
+					Lead = &P;
+					break;
+				}
+			}
+		}
+		if (Lead) Name = LigaRules::DisplayName(*Lead);
+		static const TCHAR* Happy[] = {
+			TEXT("радостно прыгает вокруг вас!"), TEXT("трётся о вашу ногу."), TEXT("гордо смотрит вперёд — готов к новым битвам!"),
+			TEXT("внимательно принюхивается к чему-то в траве."), TEXT("довольно урчит."),
+		};
+		const bool bTired = Lead && (Lead->HP * 3 < LigaRules::MaxHp(*Lead) || Lead->GetStatus() != EStatus::None);
+		PC->ShowToast(Name + TEXT(" ") + (bTired ? TEXT("выглядит уставшим. Может, заглянуть в покецентр?") : Happy[FMath::RandRange(0, 4)]), 2.5f);
+		return;
+	}
 	if (!Quest.IsEmpty())
 	{
 		// The lost Pokémon of a quest: found! It runs back home.
@@ -265,13 +294,84 @@ void ALigaFollower::TickAmbient(float Dt)
 	SetActorLocationAndRotation(Pos, FRotator(0.f, Rot.Yaw, 0.f));
 	const bool bWalk = Speed > 30.f;
 	if (bWalk != bWalking) PlayClip(bWalk);
-	if (bSkeletal) Skel->SetPlayRate(bWalking && WalkAnim ? FMath::Clamp(Speed / 160.f, 0.6f, 1.8f) : 1.f);
 	// A happy hop when petted.
-	const float Hop = PetTimer > 0.f ? FMath::Abs(FMath::Sin(PetTimer * 9.f)) * 18.f : 0.f;
+	const float Hop = PetTimer > 0.f ? FMath::Abs(FMath::Sin(PetTimer * 9.f)) * FMath::Clamp(HeightCm * 0.3f, 10.f, 24.f) : 0.f;
+	PoseBody(Dt, Speed, Hop);
+}
+
+void ALigaFollower::PoseBody(float Dt, float Speed, float Hop)
+{
+	const float TwoPi = 2.f * PI;
+	const float SafeDt = FMath::Max(Dt, 1e-3f);
+	GaitTime += Dt;
+	const float H = FMath::Max(30.f, HeightCm);
+	// One step cycle covers about the creature's own height; small Pokémon patter, big ones stride.
+	const float Stride = FMath::Max(35.f, H * 1.1f);
+	GaitPhase = FMath::Fmod(GaitPhase + Speed * Dt / Stride, 1.f);
+	const float Move = FMath::Clamp(Speed / 60.f, 0.f, 1.f);                    // 0 standing .. 1 walking
+	const float Run = FMath::Clamp((Speed / H - 3.f) / 3.f, 0.f, 1.f);           // hurrying for its size
+	const float Yaw = GetActorRotation().Yaw;
+	const float YawRate = FMath::FindDeltaAngleDegrees(PrevYaw, Yaw) / SafeDt;
+	PrevYaw = Yaw;
+	const float Accel = (Speed - PrevSpeed) / SafeDt;
+	PrevSpeed = Speed;
+
+	const bool bClipWalks = bSkeletal && WalkAnim && bWalking;
+	if (bClipWalks)
+	{
+		// The legs move as fast as the ground passes under them.
+		const float ClipLen = FMath::Max(0.2f, WalkAnim->GetPlayLength());
+		Skel->SetPlayRate(FMath::Clamp(Speed * ClipLen / Stride, 0.5f, 3.2f));
+	}
+	else if (bSkeletal)
+	{
+		Skel->SetPlayRate(1.f);
+	}
+
+	float Bob = 0.f, Roll = 0.f, Pitch = 0.f, YawOff = 0.f;
+	const float Step = FMath::Abs(FMath::Sin(TwoPi * GaitPhase));  // two footfalls per cycle
+	if (bClipWalks)
+	{
+		// The clip moves the legs and bobs the body; on top, a bounding gait when it has to hurry.
+		Bob = Run * H * 0.1f * Step;
+	}
+	else
+	{
+		// No walk clip (a model without a skeleton): it waddles from foot to foot and hops when it hurries.
+		Bob = Move * H * (0.045f + 0.12f * Run) * Step;
+		Roll = Move * (1.f - 0.5f * Run) * 7.f * FMath::Sin(TwoPi * GaitPhase);
+		Pitch = Move * 3.f * FMath::Cos(2.f * TwoPi * GaitPhase);
+	}
+	// Leans into the walk, sits back when braking, banks into turns.
+	const float WantLean = -Move * (3.f + 6.f * Run) - FMath::Clamp(Accel / 500.f, -1.f, 1.f) * 4.f;
+	Lean = FMath::FInterpTo(Lean, WantLean, Dt, 5.f);
+	const float WantBank = FMath::Clamp(YawRate * Speed / 5000.f, -12.f, 12.f);
+	Bank = FMath::FInterpTo(Bank, WantBank, Dt, 5.f);
+
+	// Standing: breathes, and now and then looks around.
+	const float Still = 1.f - Move;
+	LookTimer -= Dt;
+	if (LookTimer <= 0.f)
+	{
+		LookTimer = FMath::FRandRange(1.5f, 4.5f);
+		LookGoal = FMath::FRand() < 0.45f ? 0.f : FMath::FRandRange(-40.f, 40.f);
+	}
+	LookYaw = FMath::FInterpTo(LookYaw, Still > 0.5f ? LookGoal : 0.f, Dt, 3.f);
+	const bool bClipIdles = bSkeletal && IdleAnim && !bWalking;
+	YawOff = bClipIdles ? LookYaw * 0.35f : LookYaw;  // the idle clip already turns the head
+	if (!bClipIdles) Roll += Still * 1.5f * FMath::Sin(GaitTime * 1.3f);
+	const float Breath = 1.f + Still * (bClipIdles ? 0.008f : 0.022f) * FMath::Sin(GaitTime * 2.3f);
+	// Squashes a little on landing, stretches in the air.
+	const float Air = H > 0.f ? FMath::Clamp((Bob + Hop) / (H * 0.15f), 0.f, 1.f) : 0.f;
+	const float Stretch = 1.f + 0.06f * Air - 0.05f * Move * (1.f - Step) * (bClipWalks ? 0.f : 1.f);
+
 	const float G = FMath::InterpEaseOut(0.f, 1.f, FMath::Clamp(Grow, 0.f, 1.f), 2.f);
 	const float S = ModelScale * FMath::Max(0.01f, G);
-	Body->SetRelativeScale3D(FVector(S));
-	Body->SetRelativeLocation(FVector(0.f, 0.f, ModelLift * S + Hop));
+	const FRotator Tilt(Pitch + Lean, YawOff, Roll + Bank);
+	Body->SetRelativeRotation(Tilt);
+	Body->SetRelativeScale3D(FVector(S, S, S * Breath * Stretch));
+	// Tilt about the feet, not the middle of the model.
+	Body->SetRelativeLocation(Tilt.RotateVector(FVector(0.f, 0.f, ModelLift * S * Breath * Stretch)) + FVector(0.f, 0.f, Bob + Hop));
 }
 
 void ALigaFollower::Recall()
@@ -361,12 +461,20 @@ void ALigaFollower::Tick(float Dt)
 	const FRotator Rot = FMath::RInterpTo(GetActorRotation(), FRotator(0.f, WantYaw, 0.f), Dt, 7.f);
 	SetActorLocationAndRotation(Pos, FRotator(0.f, Rot.Yaw, 0.f));
 
-	const bool bWalk = Speed > 45.f;
+	const bool bWalk = Speed > (bWalking ? 25.f : 45.f);
 	if (bWalk != bWalking) PlayClip(bWalk);
-	if (bSkeletal) Skel->SetPlayRate(bWalking && WalkAnim ? FMath::Clamp(Speed / 220.f, 0.6f, 2.2f) : 1.f);
 
-	const float G = FMath::InterpEaseOut(0.f, 1.f, FMath::Clamp(Grow, 0.f, 1.f), 2.f);
-	const float S = ModelScale * FMath::Max(0.01f, G);
-	Body->SetRelativeScale3D(FVector(S));
-	Body->SetRelativeLocation(FVector(0.f, 0.f, ModelLift * S));
+	// Waiting for the trainer: now and then a little hop or a stretch.
+	PetTimer = FMath::Max(0.f, PetTimer - Dt);
+	if (Speed < 10.f)
+	{
+		FidgetTimer -= Dt;
+		if (FidgetTimer <= 0.f)
+		{
+			FidgetTimer = FMath::FRandRange(6.f, 14.f);
+			PetTimer = FMath::RandBool() ? 0.7f : 0.35f;
+		}
+	}
+	const float Hop = PetTimer > 0.f ? FMath::Abs(FMath::Sin(PetTimer * 9.f)) * FMath::Clamp(HeightCm * 0.3f, 10.f, 24.f) : 0.f;
+	PoseBody(Dt, Speed, Hop);
 }

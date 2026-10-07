@@ -683,6 +683,32 @@ def vrm4u_too_old():
         return False  # plugin without sources: cannot tell, try anyway
 
 
+def enable_vrm4u_in_project():
+    """Unreal switches a plugin off in the .uproject when it once failed to load (or after "Disable" in a dialog), and then
+    never loads it again. Switches VRM4U back on; True if the file was changed."""
+    try:
+        path = os.path.abspath(unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path()))
+        with open(path, encoding='utf-8-sig') as f:
+            data = json.load(f)
+        plugins = data.setdefault('Plugins', [])
+        entry = next((p for p in plugins if p.get('Name') == 'VRM4U'), None)
+        if entry is not None and entry.get('Enabled') is True:
+            return False
+        if entry is None:
+            entry = {'Name': 'VRM4U'}
+            plugins.append(entry)
+        entry['Enabled'] = True
+        entry['Optional'] = True
+        shutil.copyfile(path, path + '.bak')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=True, indent='\t')
+        log(f'VRM4U включён в {path} (старая версия — {os.path.basename(path)}.bak)')
+        return True
+    except Exception as e:
+        warn(f'не удалось включить VRM4U в файле проекта: {e}')
+        return False
+
+
 def srgb_to_linear(c):
     return [((x + 0.055) / 1.055) ** 2.4 if x > 0.04045 else x / 12.92 for x in c]
 
@@ -742,9 +768,15 @@ def import_characters():
     result = {'player_vrm': '', 'player_rtg': '', 'npc_vrm': {}, 'npc_rtg': {}}
     if not hasattr(unreal, 'VrmImporterBPFunctionLibrary'):
         if os.path.exists(os.path.join(PROJECT, 'Plugins', 'VRM4U', 'VRM4U.uplugin')):
-            warn('плагин VRM4U лежит в Plugins, но выключен: люди останутся манекенами. Включите его: Правка → Плагины → '
-                 'найдите VRM4U → поставьте галочку → перезапустите Unreal (или замените Liga17.uproject файлом из архива), '
-                 'затем запустите настройку ещё раз')
+            fixed = enable_vrm4u_in_project()
+            if fixed:
+                warn('плагин VRM4U был выключен в файле проекта — скрипт включил его. Чтобы появились аниме-персонажи: закройте Unreal, '
+                     'откройте Liga17.uproject снова (на вопрос о пересборке ответьте «Да») и запустите настройку ещё раз')
+                REPORT.insert(0, 'ВАЖНО: перезапустите Unreal и запустите настройку ещё раз — плагин VRM4U только что включён.')
+            else:
+                warn('плагин VRM4U включён в проекте, но не загрузился: люди останутся манекенами. Закройте Unreal, удалите папки '
+                     'Plugins/VRM4U/Binaries и Plugins/VRM4U/Intermediate, откройте Liga17.uproject, согласитесь пересобрать '
+                     'и запустите настройку ещё раз. Если не поможет — пришлите Saved/Logs/Liga17.log')
         else:
             warn('плагин VRM4U не найден: люди останутся манекенами. Установка плагина — шаг 4 в Docs/README_RU.md')
         return result
@@ -1075,7 +1107,9 @@ NEXT_STEPS = ('\n\nЧто дальше:\n'
 def summary():
     text = '\n'.join(REPORT)
     unreal.log('[Liga] ===== Итог настройки =====\n' + text)
-    unreal.EditorDialog.show_message('Лига 17 — настройка', 'Готово!\n\n' + text[-1500:] + NEXT_STEPS, unreal.AppMsgType.OK)
+    important = '\n'.join(l for l in REPORT if l.startswith('ВАЖНО'))
+    head = important + '\n\n' if important else ''
+    unreal.EditorDialog.show_message('Лига 17 — настройка', 'Готово!\n\n' + head + text[-1500:] + NEXT_STEPS, unreal.AppMsgType.OK)
 
 
 def wrong_project():

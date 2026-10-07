@@ -41,6 +41,8 @@ public:
 	bool RollWild(const FString& Route, int32& OutSpecies, int32& OutLevel);
 	/** Starts a wild battle; false if the team cannot fight. */
 	bool StartWildBattle(int32 Species, int32 Level, const FString& Place);
+	/** Starts a battle against a trainer (see FLigaBattle::StartTrainer); false if the team cannot fight. */
+	bool StartTrainerBattle(const FString& Trainer, const TArray<FIntPoint>& Team, int32 Prize, const FString& Place);
 	void EndBattle();
 
 	// ——— pictures ———

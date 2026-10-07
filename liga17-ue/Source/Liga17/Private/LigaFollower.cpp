@@ -112,11 +112,13 @@ bool ALigaFollower::Setup(APawn* InTrainer, int32 InSpecies, bool bInShiny)
 	return true;
 }
 
-bool ALigaFollower::SetupAmbient(int32 InSpecies, const FVector& InHome, float InRadius, const FString& InQuest)
+bool ALigaFollower::SetupAmbient(int32 InSpecies, const FVector& InHome, float InRadius, const FString& InQuest, bool bInSwim, float InSwimZ)
 {
 	bAmbient = true;
 	Species = InSpecies;
-	Home = InHome;
+	bSwim = bInSwim;
+	SwimZ = InSwimZ;
+	Home = bSwim ? FVector(InHome.X, InHome.Y, InSwimZ) : InHome;
 	Radius = FMath::Max(50.f, InRadius);
 	Quest = InQuest;
 	if (!LoadModel(!Quest.IsEmpty())) return false;
@@ -285,7 +287,15 @@ void ALigaFollower::TickAmbient(float Dt)
 	// Never drift far from home (a bump or a long frame).
 	const FVector Off = FVector(Pos.X - Home.X, Pos.Y - Home.Y, 0.f);
 	if (Off.Size() > Radius * 1.5f) Pos = FVector(Home.X, Home.Y, Pos.Z) + Off.GetSafeNormal() * Radius * 1.5f;
-	Pos.Z = GroundZ(Pos, Pos.Z);
+	if (bSwim)
+	{
+		// Half under water, rocking on small waves.
+		Pos.Z = SwimZ - HeightCm * 0.35f + FMath::Sin(GaitTime * 1.7f) * 3.f;
+	}
+	else
+	{
+		Pos.Z = GroundZ(Pos, Pos.Z);
+	}
 	const float Speed = Velocity.Size2D();
 	float WantYaw = GetActorRotation().Yaw;
 	if (bNear || PetTimer > 0.f) WantYaw = ToPlayer.Rotation().Yaw;

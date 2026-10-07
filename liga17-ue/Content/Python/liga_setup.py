@@ -1056,11 +1056,11 @@ def finish_level(terrain_mat, sea_mat):
         if sm is None:
             continue
         name = short(sm.get_name())
-        if name == 'terrain' and terrain_mat:
+        if name.startswith('terrain') and terrain_mat:  # Terrain, TerrainJohto
             comp.set_material(0, terrain_mat)
             set_collision(sm, True)
             eal.save_loaded_asset(sm)
-        elif name == 'sea' and sea_mat:
+        elif name.startswith('sea') and sea_mat:  # Sea, SeaPond, SeaJohto
             comp.set_material(0, sea_mat)
             comp.set_collision_enabled(unreal.CollisionEnabled.NO_COLLISION)
         else:

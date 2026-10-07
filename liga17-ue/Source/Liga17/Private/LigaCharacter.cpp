@@ -18,6 +18,7 @@
 #include "LigaGameInstance.h"
 #include "LigaInteractable.h"
 #include "LigaPlayerController.h"
+#include "LigaWorldBuilder.h"
 #include "Misc/PackageName.h"
 #include "UObject/UnrealType.h"
 
@@ -408,6 +409,42 @@ void ALigaCharacter::Tick(float Dt)
 	}
 	UpdateEncounters(Dt);
 	UpdateFollower(Dt);
+	KeepOutOfDeepWater(Dt);
+}
+
+void ALigaCharacter::KeepOutOfDeepWater(float Dt)
+{
+	DeepWarn = FMath::Max(0.f, DeepWarn - Dt);
+	if (!Builder.IsValid())
+	{
+		for (TActorIterator<ALigaWorldBuilder> It(GetWorld()); It; ++It)
+		{
+			Builder = *It;
+			break;
+		}
+		if (!Builder.IsValid()) return;
+	}
+	const FVector Here = GetActorLocation();
+	if (FLigaLayout::IsIndoorPoint(Builder->ToBlender(Here))) return;  // the rooms lie far below the sea level
+	const float Feet = Here.Z - GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+	if (Feet > Builder->WaterZAt(Here) - 55.f || GetCharacterMovement()->IsFalling())
+	{
+		if (!GetCharacterMovement()->IsFalling())
+		{
+			LastDry = Here;
+			bHasDry = true;
+		}
+		return;
+	}
+	if (!bHasDry) return;
+	// Waist-deep: step back to the shore.
+	SetActorLocation(LastDry, false, nullptr, ETeleportType::TeleportPhysics);
+	GetCharacterMovement()->StopMovementImmediately();
+	if (DeepWarn <= 0.f)
+	{
+		DeepWarn = 3.f;
+		if (ALigaPlayerController* PC = LigaPC()) PC->ShowToast(TEXT("Дальше слишком глубоко! Водных покемонов ловят с мостков на удочку."), 3.f);
+	}
 }
 
 void ALigaCharacter::UpdateDoors()

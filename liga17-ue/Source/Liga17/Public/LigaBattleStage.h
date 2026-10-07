@@ -7,6 +7,8 @@
 #include "LigaBattle.h"
 #include "LigaBattleStage.generated.h"
 
+class ALigaWorldBuilder;
+
 class ALigaBattleFx;
 class UAnimSequence;
 class UCameraComponent;
@@ -116,6 +118,8 @@ private:
 	float SleepTimer[2] = {0.f, 0.f};
 	/** Sea surface height (world): battles at the shore keep water Pokémon on the water. */
 	float SeaZ = -1.0e9f;
+	/** For the water level of ponds (Pokémon fished from a pond float on it). */
+	TWeakObjectPtr<ALigaWorldBuilder> Builder;
 
 	bool bBallActive = false;
 	float BallTime = 0.f;

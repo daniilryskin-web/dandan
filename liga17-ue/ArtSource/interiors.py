@@ -719,4 +719,6 @@ def mart(name='int_mart'):
 
 
 def build_interiors():
-    return {'home': home(), 'lab': lab(), 'center': center(), 'mart': mart()}
+    """Pallet Town's rooms, and New Bark Town's Poké Center, Mart and Professor Elm's lab (the same rooms again)."""
+    return {'home': home(), 'lab': lab(), 'center': center(), 'mart': mart(),
+            'center_j': center('int_center_j'), 'mart_j': mart('int_mart_j'), 'elmlab': lab('int_elmlab')}

@@ -60,6 +60,7 @@ void ALigaPlayerController::Tick(float Dt)
 	}
 	UpdateTravel(Dt);
 	UpdatePlace(Dt);
+	UpdateFishing(Dt);
 	if (Mode == ELigaMode::Battle && Stage.IsValid() && !Stage->IsBusy() && BattleMenu == ELigaBattleMenu::None)
 	{
 		ULigaGameInstance* GI = ULigaGameInstance::Get(this);
@@ -84,7 +85,7 @@ void ALigaPlayerController::SetMode(ELigaMode M)
 
 void ALigaPlayerController::ApplyInputMode()
 {
-	if (Mode == ELigaMode::Explore || Mode == ELigaMode::Dialogue)
+	if (Mode == ELigaMode::Explore || Mode == ELigaMode::Dialogue || Mode == ELigaMode::Fishing)
 	{
 		FInputModeGameOnly In;
 		SetInputMode(In);
@@ -115,7 +116,9 @@ void ALigaPlayerController::UpdatePlace(float Dt)
 	if (!P) return;
 	for (TActorIterator<ALigaWorldBuilder> It(GetWorld()); It; ++It)
 	{
-		if (const FLigaPlaceDef* Place = It->PlaceAtWorld(P->GetActorLocation()))
+		const FVector B = It->ToBlender(P->GetActorLocation());
+		const FLigaPlaceDef* Place = It->PlaceAtWorld(P->GetActorLocation());
+		if (Place)
 		{
 			PlaceName = Place->Name;
 			bIndoors = Place->bIndoor;
@@ -123,10 +126,12 @@ void ALigaPlayerController::UpdatePlace(float Dt)
 		else
 		{
 			// Not in a named area (or an old layout.json without them): by how far north or south we are.
-			const FVector B = It->ToBlender(P->GetActorLocation());
 			PlaceName = B.Y > 47.f ? TEXT("Маршрут 1") : B.Y < -36.f ? TEXT("Берег Паллет-тауна") : TEXT("Паллет-таун");
 			bIndoors = false;
 		}
+		// New Bark Town lies far to the east; its rooms are named *_j (and Professor Elm's lab).
+		const bool bJohto = B.X > 600.0 || (Place && (Place->Id.EndsWith(TEXT("_j")) || Place->Id == TEXT("elmlab")));
+		Region = bJohto ? TEXT("ДЖОТО") : TEXT("КАНТО");
 		break;
 	}
 }
@@ -366,10 +371,34 @@ void ALigaPlayerController::TalkToNpc(ALigaNPC* Npc)
 		});
 		return;
 	}
-	// 2. The professor gives the first Pokémon before anything else.
+	// 2. The professor gives the first Pokémon before anything else; a trainer you have not beaten wants a battle;
+	//    the fisherman lends his old rod.
 	if (Id == TEXT("oak") && !GI->HasStarter())
 	{
 		TalkToOak();
+		return;
+	}
+	if (Npc->IsTrainer() && Npc->WantsBattle() && GI->HasStarter() && D.FirstAliveIndex() != INDEX_NONE)
+	{
+		ChallengeTrainer(Npc);
+		return;
+	}
+	if (Id == TEXT("fisher") && GI->HasStarter() && D.ItemCount(TEXT("old-rod")) <= 0)
+	{
+		ShowDialogue(Name, {
+			TEXT("Эй, юный тренер! Любишь рыбалку?"),
+			TEXT("Держи мою старую удочку — я себе новую купил."),
+			TEXT("Встань на краю мостков или пристани и нажми E. Когда клюнет — жми E ещё раз, да побыстрее!"),
+		}, [this]()
+		{
+			if (ULigaGameInstance* G = ULigaGameInstance::Get(this)) G->Data.AddItem(TEXT("old-rod"), 1);
+			ShowToast(TEXT("Получено: Старая удочка"), 4.f);
+		});
+		return;
+	}
+	if (Id == TEXT("elm") && GI->HasStarter() && !D.HasFlag(TEXT("elm_gift")))
+	{
+		TalkToElm(Name);
 		return;
 	}
 	// 3. A new quest.
@@ -387,12 +416,12 @@ void ALigaPlayerController::TalkToNpc(ALigaNPC* Npc)
 		TalkToMom();
 		return;
 	}
-	if (Id == TEXT("nurse"))
+	if (Id.StartsWith(TEXT("nurse")))
 	{
 		NurseHeal(Name);
 		return;
 	}
-	if (Id == TEXT("clerk"))
+	if (Id.StartsWith(TEXT("clerk")))
 	{
 		OpenShop(Name);
 		return;
@@ -604,6 +633,14 @@ void ALigaPlayerController::TryWildEncounter(const FString& Route, const FString
 	int32 Level = 0;
 	if (!GI->RollWild(Route, Species, Level)) return;
 	if (!GI->StartWildBattle(Species, Level, Place.IsEmpty() ? PlaceName : Place)) return;
+	TrainerNpcId.Reset();
+	BeginBattleStage();
+}
+
+void ALigaPlayerController::BeginBattleStage()
+{
+	APawn* P = GetPawn();
+	if (!P) return;
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 	ALigaBattleStage* S = GetWorld()->SpawnActor<ALigaBattleStage>(P->GetActorLocation(), FRotator::ZeroRotator, Params);
@@ -611,7 +648,297 @@ void ALigaPlayerController::TryWildEncounter(const FString& Route, const FString
 	if (ACharacter* C = Cast<ACharacter>(P)) C->GetCharacterMovement()->StopMovementImmediately();
 	BattleMenu = ELigaBattleMenu::None;
 	SetMode(ELigaMode::Battle);
-	S->Begin(P);
+	if (S) S->Begin(P);
+}
+
+// ——— trainers ———
+
+int32 ALigaPlayerController::RivalStarter() const
+{
+	const ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!GI) return 133;
+	// The first Pokémon you ever got has the smallest id.
+	const FLigaPokemon* First = nullptr;
+	for (const TArray<FLigaPokemon>* List : {&GI->Data.Team, &GI->Data.Storage})
+	{
+		for (const FLigaPokemon& Pk : *List)
+		{
+			if (!First || Pk.Uid < First->Uid) First = &Pk;
+		}
+	}
+	const int32 Sp = First ? First->Species : 0;
+	if (Sp >= 1 && Sp <= 3) return 4;   // grass -> the rival takes fire
+	if (Sp >= 4 && Sp <= 6) return 7;   // fire -> water
+	if (Sp >= 7 && Sp <= 9) return 1;   // water -> grass
+	return 133;
+}
+
+void ALigaPlayerController::ChallengeTrainer(ALigaNPC* Npc)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!Npc || !GI || !IsExploring() || GI->Battle) return;
+	const FLigaNpcDef* Def = FLigaLayout::Get().FindNpc(Npc->Id);
+	if (!Def || !Def->bTrainer) return;
+	Npc->Attend(8.f);
+	if (ACharacter* C = Cast<ACharacter>(GetPawn())) C->GetCharacterMovement()->StopMovementImmediately();
+	const FString NpcId = Npc->Id;
+	const FString Name = Npc->DisplayName;
+	TArray<FString> Before = Def->Trainer.Before;
+	if (Before.Num() == 0) Before.Add(TEXT("Эй! Давай сразимся!"));
+	ShowDialogue(Name, Before, [this, NpcId, Name]() { StartTrainerBattle(NpcId, Name); });
+}
+
+void ALigaPlayerController::StartTrainerBattle(const FString& NpcId, const FString& Name)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	const FLigaNpcDef* Def = FLigaLayout::Get().FindNpc(NpcId);
+	if (!GI || !Def || GI->Battle || !GetPawn()) return;
+	TArray<FIntPoint> Team = Def->Trainer.Team;
+	for (FIntPoint& Member : Team)
+	{
+		if (Member.X < 0) Member.X = RivalStarter();
+	}
+	if (!GI->StartTrainerBattle(Name, Team, Def->Trainer.Prize, PlaceName)) return;
+	TrainerNpcId = NpcId;
+	bFishingBattle = false;
+	BeginBattleStage();
+}
+
+void ALigaPlayerController::TalkToElm(const FString& Who)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!GI) return;
+	ShowDialogue(Who, {
+		TEXT("А, гость из Канто! Я — профессор Элм. Изучаю, как покемоны растут и эволюционируют."),
+		TEXT("Раз ты приехал так издалека — возьми одного из покемонов Джото. Они у меня на столе."),
+	}, [this, Who]()
+	{
+		TArray<FLigaChoice> Gifts;
+		const int32 Ids[] = {152, 155, 158};
+		const TCHAR* Notes[] = {TEXT("Травяной · добрый и стойкий"), TEXT("Огненный · робкий, но горячий"), TEXT("Водный · весёлый и кусачий")};
+		const TCHAR* Colors[] = {TEXT("7AC74C"), TEXT("EE8130"), TEXT("6390F0")};
+		for (int32 i = 0; i < 3; ++i)
+		{
+			FLigaChoice C;
+			const FLigaSpecies* S = FLigaDatabase::Get().Species(Ids[i]);
+			C.Label = S ? S->Name : TEXT("?");
+			C.Detail = Notes[i];
+			C.Species = Ids[i];
+			C.Color = PcHex(Colors[i]);
+			Gifts.Add(C);
+		}
+		ShowChoice(TEXT("Кого возьмёшь?"), Gifts, [this, Who](int32 Pick)
+		{
+			ULigaGameInstance* G = ULigaGameInstance::Get(this);
+			if (!G || Pick < 0 || Pick > 2) return;
+			const int32 Ids2[] = {152, 155, 158};
+			FLigaPokemon Gift = LigaRules::CreatePokemon(Ids2[Pick], 5, G->Rng, G->Data.NextUid++, 0);
+			Gift.MetAt = TEXT("Нью-Барк");
+			const bool bToStorage = G->Data.Team.Num() >= LigaRules::MaxTeam;
+			if (bToStorage) G->Data.Storage.Add(Gift);
+			else G->Data.Team.Add(Gift);
+			G->Data.MarkCaught(Gift.Species);
+			G->Data.SetFlag(TEXT("elm_gift"));
+			RememberPosition();
+			G->SaveGame();
+			const FString Name = LigaRules::DisplayName(Gift);
+			TArray<FString> Lines2 = {FString::Printf(TEXT("%s теперь с тобой! Береги его."), *Name)};
+			if (bToStorage) Lines2.Add(TEXT("В команде нет места, поэтому он отправлен в хранилище. Забери его через компьютер в Покецентре."));
+			Lines2.Add(TEXT("На Маршруте 29 к западу отсюда живут покемоны Джото. Удачи!"));
+			ShowDialogue(Who, Lines2, [this]() { CheckQuests(); });
+		}, false, true);
+	});
+}
+
+// ——— the train ———
+
+void ALigaPlayerController::RideTrain(const FString& Title, const FVector& Where, float Yaw)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!GI || !IsExploring()) return;
+	if (!GI->HasStarter())
+	{
+		ShowDialogue(TEXT("Проводница"), {
+			TEXT("Ой, а где твой покемон? Без покемона путешествовать одному нельзя!"),
+			TEXT("Сначала загляни к профессору Оуку."),
+		});
+		return;
+	}
+	FLigaChoice Go;
+	Go.Label = TEXT("Да, поехали!");
+	Go.Detail = TEXT("Поезд отправляется сразу");
+	Go.Color = PcHex(TEXT("2F7BFF"));
+	FLigaChoice Stay;
+	Stay.Label = TEXT("Нет, ещё погуляю");
+	const FVector To = Where;
+	ShowChoice(Title + TEXT("?"), {Go, Stay}, [this, To, Yaw](int32 Pick)
+	{
+		if (Pick != 0) return;
+		if (ULigaGameInstance* G = ULigaGameInstance::Get(this)) LigaQuests::AddCounter(G->Data, TEXT("train_ride"));
+		ShowToast(TEXT("Поезд отправляется… Чух-чух!"), 3.f);
+		TravelTo(To, Yaw);
+	}, true);
+}
+
+// ——— fishing ———
+
+void ALigaPlayerController::StartFishing(const FString& SpotId, const FString& Title)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!GI || !IsExploring()) return;
+	if (GI->Data.ItemCount(TEXT("old-rod")) <= 0)
+	{
+		ShowDialogue(Title, {
+			TEXT("Здесь наверняка хорошо клюёт… но у вас нет удочки."),
+			TEXT("Рыбак Фёдор у пруда в Паллет-тауне охотно одолжит свою."),
+		});
+		return;
+	}
+	if (!GI->HasStarter() || GI->Data.FirstAliveIndex() == INDEX_NONE)
+	{
+		ShowDialogue(Title, {TEXT("Без здорового покемона рыбачить опасно: вдруг клюнет кто-то большой!")});
+		return;
+	}
+	FishSpot = SpotId;
+	bFishBite = false;
+	FishTimer = FMath::FRandRange(1.8f, 5.5f);
+	if (ACharacter* C = Cast<ACharacter>(GetPawn())) C->GetCharacterMovement()->StopMovementImmediately();
+	SetMode(ELigaMode::Fishing);
+}
+
+void ALigaPlayerController::UpdateFishing(float Dt)
+{
+	if (Mode != ELigaMode::Fishing) return;
+	FishTimer -= Dt;
+	if (FishTimer > 0.f) return;
+	if (!bFishBite)
+	{
+		bFishBite = true;  // about a second to press E
+		FishTimer = 1.1f;
+		return;
+	}
+	StopFishing(TEXT("Рыба сорвалась! Жмите E сразу, как увидите «Клюёт!»."));
+}
+
+void ALigaPlayerController::FishingConfirm()
+{
+	if (Mode != ELigaMode::Fishing) return;
+	if (!bFishBite)
+	{
+		StopFishing(TEXT("Слишком рано — рыба испугалась и уплыла."));
+		return;
+	}
+	bFishBite = false;
+	SetMode(ELigaMode::Explore);
+	FString Route = FishSpot;
+	Route.ReplaceInline(TEXT("fish_"), TEXT("fishing_"));
+	if (ULigaGameInstance* GI = ULigaGameInstance::Get(this)) LigaQuests::AddCounter(GI->Data, TEXT("fish_hook"));
+	TryWildEncounter(Route, PlaceName);
+	bFishingBattle = Mode == ELigaMode::Battle;
+}
+
+void ALigaPlayerController::StopFishing(const FString& Message)
+{
+	bFishBite = false;
+	if (Mode == ELigaMode::Fishing) SetMode(ELigaMode::Explore);
+	if (!Message.IsEmpty()) ShowToast(Message, 3.f);
+}
+
+// ——— the bag outside battle ———
+
+void ALigaPlayerController::OpenBag()
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!GI) return;
+	TArray<FLigaChoice> Opts;
+	TArray<FString> Ids;
+	for (const FLigaItem& It : FLigaDatabase::Get().Items())
+	{
+		const int32 N = GI->Data.ItemCount(It.Id);
+		const bool bUsable = It.Kind == TEXT("heal") || It.Kind == TEXT("status") || It.Kind == TEXT("revive") || It.Kind == TEXT("pp");
+		if (N <= 0 || !bUsable) continue;
+		FLigaChoice C;
+		C.Label = FString::Printf(TEXT("%s ×%d"), *It.Name, N);
+		C.Detail = It.Desc;
+		C.Color = It.Kind == TEXT("heal") ? PcHex(TEXT("2F9E5B")) : It.Kind == TEXT("status") ? PcHex(TEXT("C98A1E")) : PcHex(TEXT("7A55C9"));
+		Opts.Add(C);
+		Ids.Add(It.Id);
+	}
+	FLigaChoice Back;
+	Back.Label = TEXT("Назад в меню");
+	Opts.Add(Back);
+	const FString Title = Ids.Num() ? TEXT("Сумка · что использовать?") : TEXT("Сумка · лечебных предметов нет. Их продают в магазине.");
+	ShowChoice(Title, Opts, [this, Ids](int32 Pick)
+	{
+		if (!Ids.IsValidIndex(Pick))
+		{
+			ToggleMenu();
+			return;
+		}
+		UseItemOn(Ids[Pick]);
+	}, true);
+}
+
+void ALigaPlayerController::UseItemOn(const FString& ItemId)
+{
+	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	const FLigaItem* Item = FLigaDatabase::Get().Item(ItemId);
+	if (!GI || !Item) return;
+	TArray<FLigaChoice> Opts;
+	for (const FLigaPokemon& Pk : GI->Data.Team)
+	{
+		FLigaChoice C;
+		C.Label = FString::Printf(TEXT("%s  ур. %d"), *LigaRules::DisplayName(Pk), Pk.Level);
+		FString Detail = FString::Printf(TEXT("HP %d/%d"), Pk.HP, LigaRules::MaxHp(Pk));
+		if (Pk.GetStatus() != EStatus::None) Detail += TEXT(" · ") + LigaTypes::StatusName(Pk.GetStatus());
+		C.Detail = Detail;
+		C.Color = PcHex(TEXT("3B4A7A"));
+		Opts.Add(C);
+	}
+	FLigaChoice Back;
+	Back.Label = TEXT("Назад");
+	Opts.Add(Back);
+	ShowChoice(FString::Printf(TEXT("%s · на кого использовать?"), *Item->Name), Opts, [this, ItemId](int32 Pick)
+	{
+		ULigaGameInstance* G = ULigaGameInstance::Get(this);
+		if (G && G->Data.Team.IsValidIndex(Pick) && G->Data.ItemCount(ItemId) > 0)
+		{
+			FString Msg;
+			if (LigaApplyItem(G->Data.Team[Pick], ItemId, Msg)) G->Data.Bag.FindOrAdd(ItemId) -= 1;
+			ShowToast(Msg, 3.f);
+		}
+		OpenBag();
+	}, true);
+}
+
+// ——— the Pokédex page of the menu ———
+
+void ALigaPlayerController::OpenPokedex()
+{
+	if (Mode != ELigaMode::Menu) return;
+	MenuPage = 1;
+	++UiSerial;
+}
+
+void ALigaPlayerController::TurnDexPage(int32 Delta)
+{
+	constexpr int32 PerPage = 24;
+	constexpr int32 Last = 251;  // Kanto and Johto
+	const int32 Pages = (Last + PerPage - 1) / PerPage;
+	DexPage = (DexPage + Delta + Pages) % Pages;
+	++UiSerial;
+}
+
+void ALigaPlayerController::SelectDex(int32 Species)
+{
+	DexSelected = Species;
+	++UiSerial;
+}
+
+void ALigaPlayerController::CloseMenuPage()
+{
+	MenuPage = 0;
+	++UiSerial;
 }
 
 void ALigaPlayerController::SetBattleMenu(ELigaBattleMenu M)
@@ -767,6 +1094,11 @@ void ALigaPlayerController::FinishBattle()
 {
 	ULigaGameInstance* GI = ULigaGameInstance::Get(this);
 	const bool bLost = GI && GI->Battle && GI->Battle->Result == ELigaBattleResult::Lose;
+	const bool bTrainerWin = GI && GI->Battle && !GI->Battle->bWild && GI->Battle->Result == ELigaBattleResult::Win;
+	const FString Beaten = TrainerNpcId;
+	TrainerNpcId.Reset();
+	const bool bFished = bFishingBattle;
+	bFishingBattle = false;
 	if (Stage.IsValid()) Stage->Finish();
 	Stage = nullptr;
 	if (bLost)
@@ -781,12 +1113,27 @@ void ALigaPlayerController::FinishBattle()
 	RememberPosition();
 	if (GI && GI->Battle && GI->Battle->Result == ELigaBattleResult::Caught)
 	{
-		// Quests count caught Pokémon by type ("catch_type:water").
-		for (EPokeType T : LigaRules::TypesOf(GI->Battle->EnemyMon())) LigaQuests::AddCounter(GI->Data, TEXT("catch_type:") + LigaQuests::TypeId(T));
+		// Quests count caught Pokémon by type ("catch_type:water"), on a rod, and the ones of Johto.
+		const FLigaPokemon& Got = GI->Battle->EnemyMon();
+		for (EPokeType T : LigaRules::TypesOf(Got)) LigaQuests::AddCounter(GI->Data, TEXT("catch_type:") + LigaQuests::TypeId(T));
+		if (bFished) LigaQuests::AddCounter(GI->Data, TEXT("catch_fishing"));
+		if (Got.Species > 151 && Got.Species <= 251) LigaQuests::AddCounter(GI->Data, TEXT("catch_gen2"));
+	}
+	if (GI && bTrainerWin && !Beaten.IsEmpty())
+	{
+		GI->Data.SetFlag(TEXT("beat:") + Beaten);
+		LigaQuests::AddCounter(GI->Data, TEXT("trainer_win"));
 	}
 	if (GI) GI->EndBattle();
 	SetMode(ELigaMode::Explore);
 	CheckQuests();
+	if (bTrainerWin && !Beaten.IsEmpty())
+	{
+		if (const FLigaNpcDef* Def = FLigaLayout::Get().FindNpc(Beaten))
+		{
+			if (Def->Trainer.After.Num()) ShowDialogue(Def->Name, Def->Trainer.After);
+		}
+	}
 	if (bLost) ShowDialogue(TEXT("Мама"), {TEXT("Ох, ты весь в пыли! Отдохни дома."), TEXT("Твои покемоны снова здоровы.")});
 }
 
@@ -794,6 +1141,7 @@ void ALigaPlayerController::FinishBattle()
 
 void ALigaPlayerController::ToggleMenu()
 {
+	MenuPage = 0;
 	if (Mode == ELigaMode::Explore) SetMode(ELigaMode::Menu);
 	else if (Mode == ELigaMode::Menu) SetMode(ELigaMode::Explore);
 }
@@ -830,6 +1178,9 @@ void ALigaPlayerController::OnConfirm()
 	case ELigaMode::Dialogue:
 		AdvanceDialogue();
 		break;
+	case ELigaMode::Fishing:
+		FishingConfirm();
+		break;
 	case ELigaMode::Battle:
 		if (Stage.IsValid() && Stage->IsBusy()) Stage->SkipText();
 		else if (BattleMenu == ELigaBattleMenu::Result) BattleContinue();
@@ -854,9 +1205,14 @@ void ALigaPlayerController::OnBack()
 		}
 		break;
 	case ELigaMode::Menu:
-		SetMode(ELigaMode::Explore);
+		if (MenuPage != 0) CloseMenuPage();
+		else SetMode(ELigaMode::Explore);
+		break;
+	case ELigaMode::Fishing:
+		StopFishing(TEXT("Вы смотали удочку."));
 		break;
 	case ELigaMode::Explore:
+		MenuPage = 0;
 		SetMode(ELigaMode::Menu);
 		break;
 	default:

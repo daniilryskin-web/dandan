@@ -181,7 +181,7 @@ def house(name, W=9.0, D=7.0, H=5.6, wall='wall_cream', roof='roof_red', trim='w
     return mb.build(name, bevel=0.025)
 
 
-def oak_lab(name='oak_lab', W=17.0, D=10.0, H=5.0):
+def oak_lab(name='oak_lab', W=17.0, D=10.0, H=5.0, sign='sign_lab', roof='roof_blue'):
     mb = MB()
     Fh = 0.5
     mb.box('stone', (0, 0, Fh / 2), (W + 0.3, D + 0.3, Fh))
@@ -191,7 +191,7 @@ def oak_lab(name='oak_lab', W=17.0, D=10.0, H=5.0):
             mb.box('wood_blue', (sx * W / 2, sy * D / 2, Fh + H / 2), (0.3, 0.3, H))
     mb.box('wood_blue', (0, -D / 2 - 0.03, Fh + H - 0.2), (W + 0.06, 0.12, 0.4))
     mb.box('wood_blue', (0, D / 2 + 0.03, Fh + H - 0.2), (W + 0.06, 0.12, 0.4))
-    zR, rise = gable_roof(mb, W, D, Fh + H, 'roof_blue', 'wood_white', pitch_deg=22, o=0.7, attic='wall_white')
+    zR, rise = gable_roof(mb, W, D, Fh + H, roof, 'wood_white', pitch_deg=22, o=0.7, attic='wall_white')
     F = facade('front', W, D)
     door(mb, F, 0, Fh, w=2.4, h=2.6, mat='metal_white', trim='wood_blue', canopy=None, steps=3, double=True)
     # flat entrance canopy on posts
@@ -200,7 +200,7 @@ def oak_lab(name='oak_lab', W=17.0, D=10.0, H=5.0):
         mb.cyl('wood_white', (sx * 2.0, -D / 2 - 2.4, 0), 0.13, Fh + 3.0, seg=12)
     # sign above the canopy
     mb.box('wood_blue', (0, -D / 2 - 0.12, Fh + 3.95), (4.4, 0.16, 1.35))
-    mb.face('sign_lab', [(-2.05, -D / 2 - 0.21, Fh + 3.35), (2.05, -D / 2 - 0.21, Fh + 3.35), (2.05, -D / 2 - 0.21, Fh + 4.55), (-2.05, -D / 2 - 0.21, Fh + 4.55)], fit=True)
+    mb.face(sign, [(-2.05, -D / 2 - 0.21, Fh + 3.35), (2.05, -D / 2 - 0.21, Fh + 3.35), (2.05, -D / 2 - 0.21, Fh + 4.55), (-2.05, -D / 2 - 0.21, Fh + 4.55)], fit=True)
     for u in (-6.2, -3.7, 3.7, 6.2):
         window(mb, F, u, Fh + 1.1, w=1.8, h=2.2, trim='wood_blue')
     B = facade('back', W, D)
@@ -534,12 +534,320 @@ def rock(name, seed=1, r=0.8):
     return mb.build(name, smooth_angle=50)
 
 
+# ——— the bigger town: station and train, park, playground, market, lighthouse ———
+
+def station(name='station', W=16.0, D=9.0, H=5.6):
+    """Railway station hall: arched windows, a clock over the entrance and a sign; doors on both long sides
+    (the front faces the town, the back opens onto the platform)."""
+    mb = MB()
+    Fh = 0.4
+    mb.box('stone', (0, 0, Fh / 2), (W + 0.3, D + 0.3, Fh))
+    mb.box('wall_cream', (0, 0, Fh + H / 2), (W, D, H))
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            mb.box('wood_blue', (sx * W / 2, sy * D / 2, Fh + H / 2), (0.32, 0.32, H))
+    mb.box('wood_blue', (0, 0, Fh + H - 0.25), (W + 0.12, D + 0.12, 0.5))
+    zR, rise = gable_roof(mb, W, D, Fh + H, 'roof_blue', 'wood_white', pitch_deg=24, o=0.7, attic='wall_cream')
+    for side in ('front', 'back'):
+        F = facade(side, W, D)
+        door(mb, F, 0, Fh, w=2.6, h=2.8, mat='wood_blue', trim='wood_white', canopy=None, steps=1, double=True)
+        for u in (-W * 0.33, W * 0.33):
+            window(mb, F, u, Fh + 1.0, w=2.0, h=2.6, trim='wood_white', cross=True)
+            m = F @ Matrix.Translation(Vector((u, 0.07, Fh + 3.6))) @ Matrix.Rotation(math.pi / 2, 4, 'X')
+            mb.cyl('wood_white', None, 1.1, 0.12, seg=20, m=m)
+    F = facade('front', W, D)
+    # big clock over the entrance and the station sign
+    m = F @ Matrix.Translation(Vector((0, 0.1, Fh + H + rise * 0.45))) @ Matrix.Rotation(-math.pi / 2, 4, 'X')
+    mb.cyl('wood_blue', None, 0.75, 0.12, seg=28, m=m @ Matrix.Translation(Vector((0, 0, -0.12))))
+    mb.cyl('metal_white', None, 0.62, 0.1, seg=28, m=m)
+    fbox(mb, 'metal_dark', F, (0, 0.24, Fh + H + rise * 0.45 + 0.18), (0.05, 0.03, 0.4))
+    fbox(mb, 'metal_dark', F, (0.14, 0.24, Fh + H + rise * 0.45), (0.3, 0.03, 0.05))
+    sw, sh = 4.6, 1.3
+    zs = Fh + 3.25
+    fbox(mb, 'wood_blue', F, (0, 0.12, zs + sh / 2), (sw + 0.3, 0.16, sh + 0.3))
+    p = [F @ Vector(v) for v in ((-sw / 2, 0.21, zs), (sw / 2, 0.21, zs), (sw / 2, 0.21, zs + sh), (-sw / 2, 0.21, zs + sh))]
+    mb.face('sign_station', [tuple(v) for v in p], fit=True)
+    for side in ('left', 'right'):
+        S = facade(side, W, D)
+        for u in (-D * 0.22, D * 0.22):
+            window(mb, S, u, Fh + 1.2, w=1.3, h=2.0, trim='wood_white')
+    return mb.build(name, bevel=0.025)
+
+
+def platform(name='platform', L=36.0, w=5.0, h=0.4):
+    """Station platform along local Y; the track runs along its +X edge. Canopy, benches, lamps, name boards."""
+    mb = MB()
+    mb.box('stone', (0, 0, h / 2), (w, L, h))
+    mb.box('cobble', (0, 0, h + 0.01), (w - 0.1, L - 0.1, 0.02))
+    mb.box('plastic_yellow', (w / 2 - 0.35, 0, h + 0.025), (0.12, L - 0.2, 0.02))
+    # canopy over the middle on two rows of posts
+    cl = L * 0.6
+    for y in [(-cl / 2 + 1.0) + i * (cl - 2.0) / 4 for i in range(5)]:
+        mb.cyl('wood_blue', (-w * 0.2, y, h), 0.1, 3.4, seg=10)
+    mb.box('wood_white', (0.0, 0, h + 3.45), (w + 0.6, cl, 0.12))
+    p = math.radians(10)
+    m = Matrix.Translation(Vector((0.0, 0, h + 3.62))) @ Matrix.Rotation(p, 4, 'Y')
+    mb.box('roof_blue', None, (w + 1.0, cl + 0.4, 0.14), m=m)
+    for y in (-cl * 0.3, cl * 0.3):
+        mb.box('wood_blue', (-w * 0.2 + 0.05, y, h + 2.7), (0.1, 2.4, 0.7))
+        for sx in (-1, 1):
+            mb.face('sign_station', [(-w * 0.2 + sx * 0.11, y - sx * 1.1, h + 2.42), (-w * 0.2 + sx * 0.11, y + sx * 1.1, h + 2.42),
+                                     (-w * 0.2 + sx * 0.11, y + sx * 1.1, h + 2.98), (-w * 0.2 + sx * 0.11, y - sx * 1.1, h + 2.98)], fit=True)
+    for y in (-cl * 0.15, cl * 0.15, -L * 0.42, L * 0.42):
+        bm = Matrix.Translation(Vector((-w * 0.38, y, h))) @ Matrix.Rotation(math.pi / 2, 4, 'Z')
+        for i in range(4):
+            mb.box('deck', None, (1.8, 0.1, 0.05), m=bm @ Matrix.Translation(Vector((0, -0.18 + i * 0.12, 0.46))))
+        mb.box('deck', None, (1.8, 0.05, 0.25), m=bm @ Matrix.Translation(Vector((0, 0.22, 0.72))))
+        for sx in (-1, 1):
+            mb.box('metal_dark', None, (0.06, 0.46, 0.46), m=bm @ Matrix.Translation(Vector((sx * 0.75, 0, 0.23))))
+    for y in (-L * 0.45, L * 0.45):
+        mb.cyl('metal_dark', (-w * 0.3, y, h), 0.07, 3.2, seg=10)
+        mb.box('lamp_glow', (-w * 0.3, y, h + 3.35), (0.3, 0.3, 0.4))
+    # steps down at both ends
+    for sy in (-1, 1):
+        mb.box('stone', (0, sy * (L / 2 + 0.3), h / 4), (w, 0.6, h / 2))
+    return mb.build(name, bevel=0.01)
+
+
+def rails(name='rails', L=10.0):
+    """One straight piece of track along Y: ballast, sleepers and two rails."""
+    mb = MB()
+    mb.prism('cobble', [(-1.7, -L / 2), (1.7, -L / 2), (1.7, L / 2), (-1.7, L / 2)], -0.05, 0.12)
+    n = int(L / 0.6)
+    for i in range(n):
+        mb.box('wood_brown', (0, -L / 2 + 0.3 + i * 0.6, 0.17), (2.5, 0.24, 0.12))
+    for sx in (-1, 1):
+        mb.box('rail_steel', (sx * 0.72, 0, 0.3), (0.08, L, 0.14))
+        mb.box('rail_steel', (sx * 0.72, 0, 0.24), (0.16, L, 0.03))
+    return mb.build(name, bevel=0.005)
+
+
+def buffer_stop(name='buffer_stop'):
+    mb = MB()
+    for sx in (-1, 1):
+        mb.box('metal_dark', (sx * 0.72, 0, 0.6), (0.18, 0.18, 1.2))
+        m = Matrix.Translation(Vector((sx * 0.72, -0.3, 0.95))) @ Matrix.Rotation(math.pi / 2, 4, 'X')
+        mb.cyl('metal_white', None, 0.16, 0.4, seg=12, m=m)
+    mb.box('red_paint', (0, 0, 0.95), (2.0, 0.25, 0.45))
+    mb.box('metal_white', (0, -0.13, 0.95), (0.5, 0.02, 0.45))
+    mb.box('metal_dark', (0, 0.6, 0.4), (1.8, 1.2, 0.2))
+    return mb.build(name, bevel=0.01)
+
+
+def train_car(mb, y0, L, loco=False):
+    """One carriage along Y from y0 to y0 + L (the front of a locomotive at the +Y end)."""
+    w, h, z0 = 2.9, 3.0, 0.55
+    yc = y0 + L / 2
+    body_l = L - (2.2 if loco else 0.0)
+    mb.box('train_body', (0, y0 + body_l / 2, z0 + h / 2), (w, body_l, h))
+    # rounded roof
+    m = Matrix.Translation(Vector((0, y0 + body_l / 2, z0 + h - 0.15))) @ Matrix.Rotation(math.pi / 2, 4, 'X')
+    mb.cyl('train_body', None, w / 2, body_l, seg=16, m=m @ Matrix.Translation(Vector((0, 0, -body_l / 2))) @ Matrix.Diagonal(Vector((1, 0.35, 1, 1))))
+    for sx in (-1, 1):
+        x = sx * (w / 2 + 0.01)
+        mb.box('train_stripe', (x, y0 + body_l / 2, z0 + 0.75), (0.02, body_l - 0.2, 0.35))
+        mb.box('glass', (x, y0 + body_l / 2, z0 + 1.9), (0.03, body_l - 1.6, 0.9))
+        for dy in (1.6, body_l - 1.6):
+            mb.box('train_stripe', (x, y0 + dy, z0 + 1.35), (0.04, 1.1, 2.2))
+            mb.box('glass', (sx * (w / 2 + 0.03), y0 + dy, z0 + 1.85), (0.03, 0.7, 0.8))
+    if loco:
+        # sloped nose with a big windscreen and headlights
+        yn = y0 + body_l
+        pts = [(0.0, 0.0), (2.2, 0.0), (2.2, 1.2), (0.9, h - 0.2), (0.0, h - 0.2)]
+        nose = Matrix(((0, 0, 1, -w / 2), (1, 0, 0, yn), (0, 1, 0, z0), (0, 0, 0, 1)))
+        mb.prism('train_body', pts, 0.0, w, m=nose)
+        p = [(-w / 2 + 0.25, yn + 1.08, z0 + h - 0.35), (w / 2 - 0.25, yn + 1.08, z0 + h - 0.35), (w / 2 - 0.25, yn + 2.04, z0 + 1.45), (-w / 2 + 0.25, yn + 2.04, z0 + 1.45)]
+        mb.face('glass', p)
+        mb.box('train_stripe', (0, yn + 2.21, z0 + 0.75), (w - 0.1, 0.02, 0.35))
+        for sx in (-1, 1):
+            mb.box('lamp_glow', (sx * 0.95, yn + 2.22, z0 + 0.45), (0.4, 0.04, 0.18))
+    # bogies and wheels
+    for dy in (2.0, L - 2.0):
+        mb.box('metal_dark', (0, y0 + dy, 0.45), (2.2, 2.6, 0.35))
+        for k in (-0.8, 0.8):
+            for sx in (-1, 1):
+                m = Matrix.Translation(Vector((sx * 0.72, y0 + dy + k, 0.45))) @ Matrix.Rotation(math.pi / 2, 4, 'Y')
+                mb.cyl('metal_dark', None, 0.42, 0.12, seg=14, m=m @ Matrix.Translation(Vector((0, 0, -0.06))))
+    mb.box('metal_dark', (0, yc, z0 - 0.05), (w - 0.3, L - 0.6, 0.15))
+
+
+def train(name='train', cars=3, L=14.0):
+    """A short white-and-blue passenger train along Y, centred on the origin; wheels sit on rails 0.3 m high."""
+    mb = MB()
+    total = cars * L + (cars - 1) * 0.6
+    y = -total / 2
+    for i in range(cars):
+        train_car(mb, y, L, loco=(i == cars - 1))
+        if i < cars - 1:
+            mb.box('metal_dark', (0, y + L + 0.3, 1.9), (1.8, 0.7, 2.4))
+        y += L + 0.6
+    obj = mb.build(name, bevel=0.02)
+    obj.data.transform(Matrix.Translation(Vector((0, 0, 0.3))))  # the wheels stand on the rails
+    return obj
+
+
+def tunnel(name='tunnel', w=8.0, h=6.5):
+    """A stone tunnel mouth set into a hillside, facing -Y."""
+    mb = MB()
+    t = 1.2
+    mb.box('stone', (0, 0, h / 2), (w + 4.0, t, h))
+    mb.box('stone', (0, 0.1, h + 0.25), (w + 4.4, t + 0.3, 0.5))
+    # the dark opening: a recess with an arched top
+    pts = [(-w / 2 + 1.0, 0.0), (w / 2 - 1.0, 0.0), (w / 2 - 1.0, h - 2.6)]
+    for i in range(1, 12):
+        a = i / 12 * math.pi
+        pts.append((math.cos(a) * (w / 2 - 1.0), h - 2.6 + math.sin(a) * 1.6))
+    pts.append((-w / 2 + 1.0, h - 2.6))
+    m = Matrix(((1, 0, 0, 0), (0, 0, 1, -t / 2 - 0.02), (0, 1, 0, 0), (0, 0, 0, 1)))
+    mb.prism('metal_dark', pts, 0.0, 0.05, m=m)
+    for sx in (-1, 1):
+        mb.box('stone', (sx * (w / 2 + 1.4), -1.4, h * 0.35), (1.2, 2.0, h * 0.7))
+    return mb.build(name, bevel=0.04)
+
+
+def lighthouse(name='lighthouse', h=15.0):
+    mb = MB()
+    mb.sphere('stone', (0, 0, -0.6), 4.2, subdiv=3, scale=(1.0, 1.0, 0.45), displace=0.2, seed=7, freq=1.3)
+    mb.cyl('stone', (0, 0, 0), 2.6, 1.0, seg=24)
+    bands = 6
+    for i in range(bands):
+        r0 = 2.1 - i * 0.12
+        r1 = 2.1 - (i + 1) * 0.12
+        mb.cyl('wall_white' if i % 2 == 0 else 'red_paint', (0, 0, 1.0 + i * (h - 1.0) / bands), r0, (h - 1.0) / bands, seg=24, r2=r1)
+    top = h
+    mb.cyl('metal_dark', (0, 0, top), 1.9, 0.2, seg=24)
+    for i in range(16):
+        a = i / 16 * math.tau
+        mb.cyl('metal_dark', (math.cos(a) * 1.8, math.sin(a) * 1.8, top + 0.2), 0.03, 0.9, seg=6)
+    mb.cyl('metal_dark', (0, 0, top + 1.05), 1.82, 0.06, seg=24)
+    mb.cyl('glass', (0, 0, top + 0.2), 1.1, 1.6, seg=16)
+    mb.cyl('lamp_glow', (0, 0, top + 0.4), 0.55, 1.1, seg=16)
+    mb.cyl('red_paint', (0, 0, top + 1.8), 1.3, 1.0, seg=16, r2=0.15)
+    mb.sphere('metal_dark', (0, 0, top + 2.9), 0.18, subdiv=1)
+    F = Matrix(((1, 0, 0, 0), (0, -1, 0, -1.95), (0, 0, 1, 0), (0, 0, 0, 1)))
+    door(mb, F, 0, 1.0, w=1.0, h=2.0, mat='wood_blue', trim='wood_white', steps=0)
+    for z in (5.0, 9.0, 12.5):
+        r = 2.1 - 0.72 * (z + 0.45 - 1.0) / (h - 1.0)  # the tower narrows towards the top
+        F2 = Matrix.Rotation(math.pi, 4, 'Z') @ Matrix(((1, 0, 0, 0), (0, -1, 0, -r + 0.03), (0, 0, 1, 0), (0, 0, 0, 1)))
+        window(mb, F2, 0, z, w=0.6, h=0.9, cross=False)
+    return mb.build(name, bevel=0.01)
+
+
+def fountain(name='fountain'):
+    mb = MB()
+    seg = 32
+    mb.cyl('stone', (0, 0, 0), 2.8, 0.1, seg=seg)
+    for i in range(seg):  # the basin rim, a ring of stone blocks
+        a = i / seg * math.tau
+        mb.box('stone', (math.cos(a) * 2.62, math.sin(a) * 2.62, 0.38), (0.36, math.tau * 2.62 / seg + 0.06, 0.76), rz=a)
+    mb.cyl('water_fountain', (0, 0, 0.1), 2.45, 0.42, seg=seg)
+    mb.cyl('stone', (0, 0, 0), 0.45, 1.5, seg=16, r2=0.3)
+    mb.cyl('stone', (0, 0, 1.5), 0.25, 0.25, seg=16, r2=1.2)
+    mb.cyl('water_fountain', (0, 0, 1.74), 1.1, 0.04, seg=24)
+    mb.cyl('stone', (0, 0, 1.75), 0.2, 0.7, seg=12, r2=0.12)
+    mb.cyl('stone', (0, 0, 2.45), 0.12, 0.15, seg=12, r2=0.55)
+    mb.cyl('water_fountain', (0, 0, 2.59), 0.5, 0.03, seg=16)
+    mb.sphere('water_fountain', (0, 0, 2.85), 0.18, subdiv=2, scale=(1, 1, 2.0))
+    # water falling from the upper bowl into the basin: an open cone shell
+    mb.cyl('water_fountain', (0, 0, 0.5), 1.55, 1.24, seg=24, r2=1.15, cap=False)
+    return mb.build(name, bevel=0.02)
+
+
+def playground(name='playground'):
+    """Slide, swings, a sandbox and a seesaw on a soft rubber floor, about 12 x 9 m (front = -Y)."""
+    mb = MB()
+    mb.box('carpet_green', (0, 0, 0.03), (12.0, 9.0, 0.06))
+    # slide: ladder, platform, roof, chute
+    sx0 = -3.5
+    for dx in (-0.55, 0.55):
+        for dy in (-0.55, 0.55):
+            mb.box('plastic_yellow', (sx0 + dx, 1.5 + dy, 1.2), (0.12, 0.12, 2.4))
+    mb.box('plastic_blue', (sx0, 1.5, 1.5), (1.3, 1.3, 0.1))
+    mb.cyl('red_paint', (sx0, 1.5, 2.4), 1.0, 0.8, seg=4, r2=0.05)
+    for i in range(5):
+        mb.box('plastic_yellow', (sx0, 2.4 + 0.12, 0.3 + i * 0.3), (0.9, 0.06, 0.06))
+    for dx in (-0.5, 0.5):
+        mb.box('plastic_yellow', (sx0 + dx, 2.5, 0.8), (0.08, 0.08, 1.6))
+    m = Matrix.Translation(Vector((sx0, -0.3, 0.8))) @ Matrix.Rotation(math.radians(-38), 4, 'X')
+    mb.box('red_paint', None, (0.8, 3.0, 0.08), m=m)
+    for dx in (-0.42, 0.42):
+        mb.box('red_paint', None, (0.06, 3.0, 0.25), m=m @ Matrix.Translation(Vector((dx, 0, 0.1))))
+    # swings
+    wx = 2.5
+    for dx in (-1.8, 1.8):
+        for dy in (-0.7, 0.7):
+            m = Matrix.Translation(Vector((wx + dx, 2.0 + dy * 0.5, 0))) @ Matrix.Rotation(dy * 0.3, 4, 'X')
+            mb.box('plastic_blue', None, (0.1, 0.1, 2.6), m=m @ Matrix.Translation(Vector((0, 0, 1.3))))
+    mb.cyl('plastic_blue', None, 0.06, 3.8, seg=8, m=Matrix.Translation(Vector((wx - 1.9, 2.0, 2.5))) @ Matrix.Rotation(math.pi / 2, 4, 'Y'))
+    for dx in (-0.8, 0.8):
+        for k in (-0.25, 0.25):
+            mb.box('metal_dark', (wx + dx + k, 2.0, 1.55), (0.02, 0.02, 1.9))
+        mb.box('red_paint' if dx < 0 else 'plastic_green', (wx + dx, 2.0, 0.55), (0.6, 0.25, 0.05))
+    # sandbox
+    mb.box('wood_brown', (3.0, -2.6, 0.15), (3.2, 2.4, 0.3))
+    mb.box('sand', (3.0, -2.6, 0.2), (2.9, 2.1, 0.3))
+    mb.sphere('red_paint', (2.4, -2.2, 0.38), 0.15, subdiv=1, scale=(1, 1, 0.7))
+    mb.box('plastic_yellow', (3.5, -3.0, 0.4), (0.25, 0.25, 0.2))
+    # seesaw
+    mb.box('metal_dark', (-3.0, -2.6, 0.25), (0.3, 0.4, 0.5))
+    m = Matrix.Translation(Vector((-3.0, -2.6, 0.55))) @ Matrix.Rotation(0.18, 4, 'Y')
+    mb.box('plastic_green', None, (3.6, 0.3, 0.08), m=m)
+    for dx in (-1.6, 1.6):
+        mb.box('plastic_yellow', None, (0.06, 0.5, 0.06), m=m @ Matrix.Translation(Vector((dx * 0.85, 0, 0.25))))
+    # a low fence round it, open at the front
+    for (x, y, w, d) in ((0, 4.5, 12.0, 0.1), (-6.0, 0, 0.1, 9.0), (6.0, 0, 0.1, 9.0), (-4.0, -4.5, 4.0, 0.1), (4.0, -4.5, 4.0, 0.1)):
+        mb.box('wood_white', (x, y, 0.5), (w, d, 0.08))
+        mb.box('wood_white', (x, y, 0.25), (w, d, 0.06))
+    for x in (-6.0, -2.0, 2.0, 6.0):
+        for y in (-4.5, 4.5):
+            mb.box('wood_white', (x, y, 0.35), (0.12, 0.12, 0.7))
+    return mb.build(name, bevel=0.01)
+
+
+def market_stall(name='market_stall', seed=1, goods='fruit'):
+    """A wooden market stall with a striped awning; the seller stands behind (+Y), customers in front (-Y)."""
+    rnd = random.Random(seed)
+    mb = MB()
+    w, d = 3.6, 1.6
+    mb.box('wood_brown', (0, 0, 0.5), (w, d * 0.6, 1.0))
+    mb.box('deck', (0, -0.05, 1.03), (w + 0.1, d * 0.7, 0.06))
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            mb.box('wood_brown', (sx * (w / 2 - 0.05), sy * (d / 2 - 0.05), 1.3), (0.1, 0.1, 2.6))
+    p = math.radians(18)
+    m = Matrix.Translation(Vector((0, -0.15, 2.75))) @ Matrix.Rotation(p, 4, 'X')
+    mb.box('stripe_awning', None, (w + 0.5, d + 0.8, 0.06), m=m)
+    for i in range(8):
+        x = -w / 2 - 0.25 + (i + 0.5) * (w + 0.5) / 8
+        mb.box('stripe_awning', (x, -0.15 - (d + 0.8) / 2 * math.cos(p) - 0.02, 2.75 - (d + 0.8) / 2 * math.sin(p) - 0.15), (w / 8 + 0.06, 0.03, 0.3))
+    if goods == 'fruit':
+        cols = ('red_paint', 'plastic_orange', 'plastic_yellow', 'plastic_green', 'plastic_purple')
+        for k in range(4):
+            x = -w / 2 + 0.55 + k * (w - 1.1) / 3
+            mb.box('wood_white', (x, -0.1, 1.15), (0.7, 0.5, 0.18))
+            col = cols[k % len(cols)]
+            for j in range(9):
+                mb.sphere(col, (x + rnd.uniform(-0.26, 0.26), -0.1 + rnd.uniform(-0.18, 0.18), 1.3 + rnd.uniform(0, 0.08)), 0.08, subdiv=1)
+    else:
+        for k in range(10):
+            x = -w / 2 + 0.35 + k * (w - 0.7) / 9
+            h = rnd.uniform(0.15, 0.4)
+            if k % 3 == 0:
+                mb.cyl(rnd.choice(('red_paint', 'counter_pink', 'cushion_blue')), (x, -0.1, 1.06), 0.13, h, seg=12, r2=0.09)
+            else:
+                mb.box(rnd.choice(('goods', 'books', 'cushion_blue', 'plastic_teal')), (x, -0.1, 1.06 + h / 2), (0.24, 0.3, h))
+    for i in range(2):
+        mb.box('wood_brown', (w / 2 + 0.45, 0.2 - i * 0.6, 0.25), (0.5, 0.5, 0.5))
+    return mb.build(name, bevel=0.01)
+
+
 def build_kit():
     kit = {}
     kit['house_player'] = house('house_player', wall='wall_cream', roof='roof_red', doormat='wood_red', shutter='wood_red', seed=1)
     kit['house_rival'] = house('house_rival', wall='wall_teal', roof='roof_pink', doormat='wood_blue', shutter=None, tower='wood_blue', chimney=False, seed=2)
     kit['house_small'] = house('house_small', W=7.0, D=6.0, H=3.4, wall='wall_peach', roof='roof_green', doormat='wood_brown', shutter='wood_brown', pitch=38, floors=1, seed=3)
     kit['oak_lab'] = oak_lab()
+    kit['elm_lab'] = oak_lab('elm_lab', sign='sign_elmlab', roof='roof_red')
     kit['pokecenter'] = service_building('pokecenter', 12.0, 10.0, 5.2, 'roof_red', 'red_paint', 'sign_center')
     kit['mart'] = service_building('mart', 10.0, 8.0, 5.0, 'roof_blue', 'wood_blue', 'sign_mart')
     kit['pier'] = pier()
@@ -563,4 +871,26 @@ def build_kit():
     kit['grass_tall_b'] = grass_clump('grass_tall_b', seed=2, blades=30)
     kit['grass_short'] = grass_clump('grass_short', seed=3, blades=22, hmin=0.18, hmax=0.4, spread=0.35, width=0.035)
     kit['rock'] = rock('rock', seed=1)
+    # the bigger town and the second region
+    kit['house_a'] = house('house_a', W=9.5, D=7.5, wall='wall_white', roof='roof_blue', doormat='wood_red', shutter='wood_blue', seed=4)
+    kit['house_b'] = house('house_b', W=8.0, D=6.5, H=3.4, wall='wall_cream', roof='roof_green', doormat='wood_blue', shutter='wood_white', pitch=38, floors=1, seed=5)
+    kit['house_c'] = house('house_c', W=9.0, D=7.0, wall='wall_peach', roof='roof_pink', doormat='wood_brown', shutter='wood_white', seed=6)
+    kit['station'] = station()
+    kit['platform'] = platform()
+    kit['rails'] = rails()
+    kit['buffer_stop'] = buffer_stop()
+    kit['train'] = train()
+    kit['tunnel'] = tunnel()
+    kit['lighthouse'] = lighthouse()
+    kit['fountain'] = fountain()
+    kit['playground'] = playground()
+    kit['market_stall'] = market_stall()
+    kit['market_stall_b'] = market_stall('market_stall_b', seed=2, goods='crafts')
+    kit['dock'] = pier('dock', L=8.0, w=2.2)
+    kit['sign_station'] = town_sign('sign_station', 'sign_station', w=1.8, h=0.9)
+    kit['sign_newbark'] = town_sign('sign_newbark', 'sign_newbark')
+    kit['sign_route29'] = town_sign('sign_route29', 'sign_route29', w=1.6, h=0.8)
+    kit['sign_park'] = town_sign('sign_park', 'sign_park', w=1.6, h=0.8)
+    kit['sign_pond'] = town_sign('sign_pond', 'sign_pond', w=1.6, h=0.8)
+    kit['grass_reed'] = grass_clump('grass_reed', seed=4, blades=16, hmin=1.1, hmax=1.8, spread=0.3, width=0.05)
     return kit

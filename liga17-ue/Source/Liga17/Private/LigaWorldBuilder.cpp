@@ -143,6 +143,12 @@ float ALigaWorldBuilder::SeaLevelZ() const
 	return ToWorld(FVector(0.f, 0.f, FLigaLayout::Get().SeaLevel)).Z;
 }
 
+float ALigaWorldBuilder::WaterZAt(const FVector& World) const
+{
+	const FLigaLayout& L = FLigaLayout::Get();
+	return ToWorld(FVector(0.f, 0.f, L.WaterLevelAt(ToBlender(World)))).Z;
+}
+
 const FLigaPlaceDef* ALigaWorldBuilder::PlaceAtWorld(const FVector& W) const
 {
 	return FLigaLayout::Get().PlaceAt(ToBlender(W));
@@ -339,6 +345,9 @@ void ALigaWorldBuilder::SpawnDoors()
 		ALigaDoor* Door = GetWorld()->SpawnActor<ALigaDoor>(W, FRotator::ZeroRotator, P);
 		if (!Door) continue;
 		Door->Title = Def.Title;
+		Door->SpotId = Def.Id;
+		Door->Lines = Def.Lines;
+		WithRooms.Add(Def.Id);
 		if (Def.Kind == TEXT("enter") || Def.Kind == TEXT("exit"))
 		{
 			Door->Kind = ELigaDoorKind::Portal;
@@ -346,7 +355,24 @@ void ALigaWorldBuilder::SpawnDoors()
 			Door->bWalkIn = true;
 			Door->Target = GroundAtLayout(Def.To, true) + FVector(0, 0, 95.f);
 			Door->TargetYaw = ToWorldYaw(Def.ToFace);
-			WithRooms.Add(Def.Id);
+		}
+		else if (Def.Kind == TEXT("train"))
+		{
+			Door->Kind = ELigaDoorKind::Train;
+			Door->Target = GroundAtLayout(Def.To, true) + FVector(0, 0, 95.f);
+			Door->TargetYaw = ToWorldYaw(Def.ToFace);
+		}
+		else if (Def.Kind == TEXT("fishing"))
+		{
+			Door->Kind = ELigaDoorKind::Fishing;
+		}
+		else if (Def.Kind == TEXT("sign"))
+		{
+			Door->Kind = ELigaDoorKind::Sign;
+		}
+		else if (Def.Kind == TEXT("house"))
+		{
+			Door->Kind = ELigaDoorKind::House;
 		}
 		else
 		{
@@ -393,6 +419,7 @@ void ALigaWorldBuilder::SpawnNpcs()
 			for (const FVector2D& R : N.Route) Points.Add(GroundAtLayout(FVector(R.X, R.Y, N.Pos.Z)) + FVector(0, 0, 92.f));
 			Npc->SetRoute(Points, N.bLoop, N.Speed * (float)AxisX.Size(), N.Pause);
 		}
+		if (N.bTrainer) Npc->SetTrainer(N.Trainer.Sight * (float)AxisX.Size());
 		Npc->FinishSpawning(FTransform(FRotator(0.f, ToWorldYaw(N.Face), 0.f), W));
 	}
 }
@@ -427,6 +454,9 @@ void ALigaWorldBuilder::SpawnAmbient()
 		FActorSpawnParameters P;
 		P.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 		ALigaFollower* Mon = GetWorld()->SpawnActor<ALigaFollower>(W, FRotator(0.f, FMath::FRandRange(0.f, 360.f), 0.f), P);
-		if (Mon && !Mon->SetupAmbient(A.Species, W, A.Radius * (float)AxisX.Size(), A.Quest)) Mon->Destroy();
+		if (!Mon) continue;
+		// Swimmers float on their pond or the sea instead of walking on its bottom.
+		const float SwimZ = A.bSwim ? (float)ToWorld(FVector(0.f, 0.f, A.SwimZ)).Z : 0.f;
+		if (!Mon->SetupAmbient(A.Species, W, A.Radius * (float)AxisX.Size(), A.Quest, A.bSwim, SwimZ)) Mon->Destroy();
 	}
 }

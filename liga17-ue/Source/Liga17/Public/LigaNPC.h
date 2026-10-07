@@ -21,6 +21,11 @@ public:
 	void SetRoute(const TArray<FVector>& Points, bool bInLoop, float SpeedCm, float PauseSeconds);
 	/** Stops walking for a while and faces the player (while talking). */
 	void Attend(float Seconds) { TalkTimer = FMath::Max(TalkTimer, Seconds); }
+	/** A trainer: challenges the player who comes within SightCm in front of them (0 = only when spoken to). */
+	void SetTrainer(float InSightCm);
+	bool IsTrainer() const { return bTrainer; }
+	/** Not beaten yet (a "VS" on the name tag). */
+	bool WantsBattle() const;
 
 	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaSeconds) override;
@@ -53,9 +58,15 @@ private:
 	float StuckTime = 0.f;
 	FVector LastPos = FVector::ZeroVector;
 
-	/** Quest marker currently shown on the name tag ("!", "?", "…" or empty). */
+	/** Quest marker currently shown on the name tag ("!", "?", "…" or empty); "VS" for a trainer still to beat. */
 	FString Marker;
 	float MarkerCheck = 0.f;
+
+	bool bTrainer = false;
+	float SightCm = 0.f;
+	float ChallengeCooldown = 0.f;
+
+	void LookForChallengers(APawn* Player, float Dt);
 
 	void BuildNameTag();
 	void Walk(float Dt);

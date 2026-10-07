@@ -27,7 +27,7 @@ public:
 	bool Setup(APawn* InTrainer, int32 InSpecies, bool bInShiny);
 	/** A Pokémon living in town: wanders within Radius (cm) of Home. With a quest it shows only while that quest needs
 	 *  it (and, without a 3D model, as a glowing ball so the quest can still be done). */
-	bool SetupAmbient(int32 InSpecies, const FVector& InHome, float InRadius, const FString& InQuest);
+	bool SetupAmbient(int32 InSpecies, const FVector& InHome, float InRadius, const FString& InQuest, bool bInSwim = false, float InSwimZ = 0.f);
 	/** Back into the ball: shrinks with a flash, then the actor is destroyed. */
 	void Recall();
 
@@ -69,6 +69,9 @@ private:
 	bool bQuestShown = false;
 	float QuestCheck = 0.f;
 	float PetTimer = 0.f;
+	/** Swims at SwimZ (world) instead of walking on the ground. */
+	bool bSwim = false;
+	float SwimZ = 0.f;
 
 	// ——— body motion on top of the clips (or instead of them for models without a skeleton) ———
 	float GaitPhase = 0.f;    // 0..1 through one step cycle, advanced by the distance walked

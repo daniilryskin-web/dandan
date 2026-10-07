@@ -200,6 +200,31 @@ const FLigaPlaceDef* FLigaLayout::FindPlace(const FString& Id) const
 	return Places.FindByPredicate([&Id](const FLigaPlaceDef& P) { return P.Id == Id; });
 }
 
+float FLigaLayout::WaterLevelAt(const FVector& B) const
+{
+	for (const FLigaWaterDef& W : Waters)
+	{
+		if (W.Contains(B)) return W.Z;
+	}
+	return SeaLevel;
+}
+
+const FLigaNpcDef* FLigaLayout::FindNpc(const FString& Id) const
+{
+	return Npcs.FindByPredicate([&Id](const FLigaNpcDef& N) { return N.Id == Id; });
+}
+
+static TArray<FString> StrArray(const TSharedPtr<FJsonObject>& O, const TCHAR* Key)
+{
+	TArray<FString> Out;
+	const TArray<TSharedPtr<FJsonValue>>* Arr;
+	if (O.IsValid() && O->TryGetArrayField(Key, Arr))
+	{
+		for (const TSharedPtr<FJsonValue>& V : *Arr) Out.Add(V->AsString());
+	}
+	return Out;
+}
+
 void FLigaLayout::Load()
 {
 	const TSharedPtr<FJsonObject> Root = ReadJsonObject(TEXT("layout.json"));
@@ -234,6 +259,7 @@ void FLigaLayout::Load()
 				P.Pos = Vec3(O);
 				P.To = Vec3(O, TEXT("t"));
 				P.ToFace = Num(O, TEXT("tface"), 0.f);
+				P.Lines = StrArray(O, TEXT("lines"));
 				Portals.Add(P);
 			}
 		}
@@ -276,6 +302,12 @@ void FLigaLayout::Load()
 				A.Pos = Vec3(O);
 				A.Radius = Num(O, TEXT("radius"), 3.f);
 				A.Quest = Str(O, TEXT("quest"));
+				double Swim = 0.0;
+				if (O->TryGetNumberField(TEXT("swim_z"), Swim))
+				{
+					A.bSwim = true;
+					A.SwimZ = (float)Swim;
+				}
 				if (A.Species > 0) Ambient.Add(A);
 			}
 		}
@@ -317,8 +349,41 @@ void FLigaLayout::Load()
 				O->TryGetBoolField(TEXT("loop"), N.bLoop);
 				N.Speed = Num(O, TEXT("speed"), 1.2f);
 				N.Pause = Num(O, TEXT("pause"), 2.f);
+				const TSharedPtr<FJsonObject>* Tr;
+				if (O->TryGetObjectField(TEXT("trainer"), Tr) && Tr->IsValid())
+				{
+					N.bTrainer = true;
+					const TArray<TSharedPtr<FJsonValue>>* TeamArr;
+					if ((*Tr)->TryGetArrayField(TEXT("team"), TeamArr))
+					{
+						for (const TSharedPtr<FJsonValue>& M : *TeamArr)
+						{
+							const TArray<TSharedPtr<FJsonValue>>& A = M->AsArray();
+							if (A.Num() >= 2) N.Trainer.Team.Add(FIntPoint((int32)A[0]->AsNumber(), (int32)A[1]->AsNumber()));
+						}
+					}
+					N.Trainer.Prize = (int32)Num(*Tr, TEXT("prize"), 0.f);
+					N.Trainer.Before = StrArray(*Tr, TEXT("before"));
+					N.Trainer.After = StrArray(*Tr, TEXT("after"));
+					N.Trainer.Sight = Num(*Tr, TEXT("sight"), 6.f);
+					N.Trainer.Class = Str(*Tr, TEXT("class"));
+				}
 				Npcs.Add(N);
 			}
+		}
+	}
+	const TArray<TSharedPtr<FJsonValue>>* WaterArr;
+	if (Root->TryGetArrayField(TEXT("waters"), WaterArr))
+	{
+		for (const TSharedPtr<FJsonValue>& V : *WaterArr)
+		{
+			const TSharedPtr<FJsonObject> O = V->AsObject();
+			if (!O) continue;
+			FLigaWaterDef W;
+			W.Center = FVector2D(Num(O, TEXT("x"), 0.f), Num(O, TEXT("y"), 0.f));
+			W.Radius = FVector2D(Num(O, TEXT("rx"), 1.f), Num(O, TEXT("ry"), 1.f));
+			W.Z = Num(O, TEXT("z"), 0.f);
+			Waters.Add(W);
 		}
 	}
 	const TArray<TSharedPtr<FJsonValue>>* ZonesArr;

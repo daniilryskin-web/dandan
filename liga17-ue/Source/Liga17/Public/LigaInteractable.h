@@ -39,6 +39,10 @@ enum class ELigaDoorKind : uint8
 	Portal,
 	/** The Poké Center computer with the Pokémon storage. */
 	Pc,
+	/** The train between Pallet Town and New Bark Town (asks first, then travels to Target). */
+	Train,
+	/** A place to fish from (SpotId picks the water's Pokémon). */
+	Fishing,
 };
 
 /** An invisible interaction point placed at a building's door. */
@@ -76,6 +80,10 @@ public:
 	/** Portal back outside (prompt "Выйти"). */
 	UPROPERTY(EditAnywhere)
 	bool bExit = false;
+
+	/** Layout id of this spot (fishing: which water it is). */
+	UPROPERTY(EditAnywhere)
+	FString SpotId;
 
 	virtual FString GetPromptText() const override;
 	virtual FString GetDisplayName() const override { return Title; }

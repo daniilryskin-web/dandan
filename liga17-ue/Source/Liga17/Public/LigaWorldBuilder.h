@@ -32,6 +32,8 @@ public:
 	FVector GroundAtLayout(const FVector& Blender, bool bLow = false) const;
 	/** Height of the sea surface (world units). */
 	float SeaLevelZ() const;
+	/** World Z of the water surface at a world point: a pond's level inside it, the sea level elsewhere. */
+	float WaterZAt(const FVector& World) const;
 	/** The named place (room or outdoor area) at a world position, or null. */
 	const FLigaPlaceDef* PlaceAtWorld(const FVector& World) const;
 

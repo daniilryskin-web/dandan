@@ -58,6 +58,18 @@ struct FLigaInstance
 	float Scale = 1.f;
 };
 
+/** A trainer who battles the player once: team of {species, level} (species -1: the rival's answer to your starter). */
+struct FLigaTrainerDef
+{
+	TArray<FIntPoint> Team;
+	int32 Prize = 0;
+	TArray<FString> Before;
+	TArray<FString> After;
+	/** Metres in front of the trainer within which they notice you and challenge you; 0 = only when spoken to. */
+	float Sight = 6.f;
+	FString Class;
+};
+
 struct FLigaNpcDef
 {
 	FString Id;
@@ -71,6 +83,8 @@ struct FLigaNpcDef
 	bool bLoop = true;
 	float Speed = 1.2f;   // m/s
 	float Pause = 2.f;    // s at each waypoint
+	bool bTrainer = false;
+	FLigaTrainerDef Trainer;
 };
 
 struct FLigaZoneDef
@@ -93,6 +107,23 @@ struct FLigaPortalDef
 	FVector Pos = FVector::ZeroVector;   // Blender metres
 	FVector To = FVector::ZeroVector;    // where the player appears
 	float ToFace = 0.f;
+	/** Signs and houses: what they say. */
+	TArray<FString> Lines;
+};
+
+/** A pond or lake: an ellipse in Blender metres with its water level (the sea is SeaLevel everywhere else). */
+struct FLigaWaterDef
+{
+	FVector2D Center = FVector2D::ZeroVector;
+	FVector2D Radius = FVector2D(1.0, 1.0);
+	float Z = 0.f;
+
+	bool Contains(const FVector& B) const
+	{
+		const double U = (B.X - Center.X) / FMath::Max(0.01, Radius.X);
+		const double V = (B.Y - Center.Y) / FMath::Max(0.01, Radius.Y);
+		return U * U + V * V <= 1.0;
+	}
 };
 
 /** A named area: a room (indoor, with ceiling lights) or a part of the outdoors. */
@@ -116,6 +147,9 @@ struct FLigaAmbientDef
 	FVector Pos = FVector::ZeroVector;
 	float Radius = 3.f;
 	FString Quest;
+	/** Swims at this water level (Blender metres) instead of walking on the ground. */
+	bool bSwim = false;
+	float SwimZ = 0.f;
 };
 
 struct LIGA17_API FLigaLayout
@@ -132,7 +166,12 @@ struct LIGA17_API FLigaLayout
 	TArray<FLigaAmbientDef> Ambient;
 	TArray<FLigaZoneDef> Zones;
 	TMap<FString, TArray<FLigaInstance>> Instances;
+	TArray<FLigaWaterDef> Waters;
 	float SeaLevel = -0.9f;
+
+	/** Water level (Blender metres) at a point: a pond's surface inside it, the sea level elsewhere. */
+	float WaterLevelAt(const FVector& Blender) const;
+	const FLigaNpcDef* FindNpc(const FString& Id) const;
 
 	/** The most specific named place containing a Blender-space point (rooms first), or null. */
 	const FLigaPlaceDef* PlaceAt(const FVector& Blender) const;

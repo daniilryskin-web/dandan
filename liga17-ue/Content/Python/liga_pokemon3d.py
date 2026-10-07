@@ -28,11 +28,11 @@ import unreal
 COMMIT = '429de1288cea0d43f5b4f56305d2276e94239d65'
 BASE = f'https://raw.githubusercontent.com/Pokemon-3D-api/assets/{COMMIT}/models/opt'
 
-# Pokémon the game can show: starters, every wild Pokémon of Route 1, the forest edge and the shore, and what they
-# evolve into early on.
-GAME_SPECIES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-                28, 29, 30, 32, 33, 39, 43, 44, 46, 47, 48, 49, 52, 53, 54, 55, 56, 57, 60, 61, 69, 70, 72, 73, 79,
-                80, 86, 87, 90, 98, 99, 116, 117, 118, 119, 120, 131, 133, 134, 135, 136]
+# Pokémon the game can show: every Pokémon of Kanto (No. 1–151) and the Pokémon of Johto that live around New Bark Town
+# and on Route 29, Johto's starters and what they evolve into.
+GAME_SPECIES = list(range(1, 152)) + [152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 170,
+                                      171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 183, 184, 187, 188, 189, 190, 191,
+                                      192, 194, 195, 206, 211, 222, 223, 224, 226]
 
 PROJECT = os.path.abspath(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir()))
 CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')
@@ -344,6 +344,55 @@ def _bake_transform(gltf, views, add_view, prim, m):
         nrm = _accessor(gltf, views, prim['attributes']['NORMAL']).astype(np.float64) @ np.linalg.inv(m[:3, :3])
         _set_attribute(gltf, add_view, prim, 'NORMAL', nrm / np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-12))
     prim['attributes'].pop('TANGENT', None)
+
+
+EFFECT_PART = re.compile(r'vine|whip|effect|_eff|beam|flame_fx', re.I)
+
+
+def _drop_effect_parts(gltf):
+    """Some models carry move effects as separate meshes that the games' own animations hide: Chikorita's vines stick
+    out a metre on each side of it. A part named like an effect (vine, whip…) that reaches far outside the body is dropped."""
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    holders = [i for i, n in enumerate(nodes) if 'mesh' in n]
+    if len(holders) < 2:
+        return []
+
+    def box(i):
+        lo = hi = None
+        count = 0
+        for prim in gltf['meshes'][nodes[i]['mesh']]['primitives']:
+            acc = gltf['accessors'][prim['attributes']['POSITION']]
+            if 'min' not in acc or 'max' not in acc:
+                continue
+            a, b = np.array(acc['min'][:3], dtype=np.float64), np.array(acc['max'][:3], dtype=np.float64)
+            if 'skin' not in nodes[i]:  # static parts are placed by their node; skinned ones share the model space
+                m = _world_matrix(gltf, i)
+                corners = np.array([[x, y, z, 1.0] for x in (a[0], b[0]) for y in (a[1], b[1]) for z in (a[2], b[2])]) @ m.T
+                a, b = corners[:, :3].min(axis=0), corners[:, :3].max(axis=0)
+            lo = a if lo is None else np.minimum(lo, a)
+            hi = b if hi is None else np.maximum(hi, b)
+            count += acc['count']
+        return lo, hi, count
+
+    boxes = {i: box(i) for i in holders}
+    boxes = {i: b for i, b in boxes.items() if b[0] is not None}
+    if len(boxes) < 2:
+        return []
+    main = max(boxes, key=lambda i: boxes[i][2])
+    mlo, mhi, _ = boxes[main]
+    body = float(np.max(mhi - mlo))
+    dropped = []
+    for i, (lo, hi, _) in boxes.items():
+        name = (nodes[i].get('name', '') + ' ' + gltf['meshes'][nodes[i]['mesh']].get('name', '')).lower()
+        if i == main or body <= 0 or not EFFECT_PART.search(name):
+            continue
+        beyond = float(max(np.max(mlo - lo), np.max(hi - mhi), 0.0))
+        if beyond > 0.6 * body:
+            dropped.append(nodes[i].get('name') or gltf['meshes'][nodes[i]['mesh']].get('name', '?'))
+            nodes[i].pop('mesh')
+            nodes[i].pop('skin', None)
+    return dropped
 
 
 def _merge_meshes(gltf, views, add_view):
@@ -1200,6 +1249,7 @@ def convert(data):
                 node.pop('mesh')
                 node.pop('skin', None)
 
+    _drop_effect_parts(gltf)
     _sanitize_transforms(gltf, views, add_view)
     _merge_meshes(gltf, views, add_view)
     used = sorted({n['mesh'] for n in gltf.get('nodes', []) if 'mesh' in n})  # unused meshes would become extra assets

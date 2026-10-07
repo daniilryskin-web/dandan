@@ -75,6 +75,9 @@ class LIGA17_API FLigaBattle
 public:
 	/** Starts a wild battle; the intro messages are in Events. Returns null if the player has no healthy Pokémon. */
 	static TUniquePtr<FLigaBattle> StartWild(FLigaGameData& Game, int32 Species, int32 Level, const FString& Place, int32 Seed);
+	/** Starts a battle against a trainer's team of {species, level}; the winner gets Prize coins. Null if nobody can fight. */
+	static TUniquePtr<FLigaBattle> StartTrainer(FLigaGameData& Game, const FString& Trainer, const TArray<FIntPoint>& Team, int32 Prize,
+		const FString& Place, int32 Seed);
 
 	/** Runs one turn. Returns false with OutError if the action is not allowed (nothing happens then). */
 	bool DoTurn(const FLigaBattleAction& Action, FString& OutError);
@@ -101,6 +104,8 @@ public:
 	int32 Turn = 0;
 	int32 RunAttempts = 0;
 	int32 PayDay = 0;
+	/** Coins a trainer pays when beaten. */
+	int32 Prize = 0;
 	ELigaBattlePhase Phase = ELigaBattlePhase::Choose;
 	ELigaBattleResult Result = ELigaBattleResult::None;
 	/** Events produced by the latest Start/DoTurn/ForceSwitch, for the presentation layer. */

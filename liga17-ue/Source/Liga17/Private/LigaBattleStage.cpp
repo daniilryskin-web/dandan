@@ -84,8 +84,9 @@ FVector ALigaBattleStage::GroundAt(const FVector& P) const
 	{
 		G = Hit.ImpactPoint;
 	}
-	// The sea has no collision: a Pokémon in the water floats on the surface instead of standing on the sea floor.
-	G.Z = FMath::Max(G.Z, (double)SeaZ);
+	// Water has no collision: a Pokémon in the sea or a pond floats on the surface instead of standing on the bottom.
+	const float WaterZ = Builder.IsValid() ? Builder->WaterZAt(G) : SeaZ;
+	G.Z = FMath::Max(G.Z, (double)WaterZ);
 	return G;
 }
 
@@ -118,6 +119,7 @@ void ALigaBattleStage::Begin(APawn* PlayerPawn)
 	for (TActorIterator<ALigaWorldBuilder> It(GetWorld()); It; ++It)
 	{
 		SeaZ = It->SeaLevelZ();
+		Builder = *It;
 		break;
 	}
 	FActorSpawnParameters FxParams;

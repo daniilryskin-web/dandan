@@ -575,6 +575,35 @@ TUniquePtr<FLigaBattle> FLigaBattle::StartWild(FLigaGameData& Game, int32 Specie
 	return B;
 }
 
+TUniquePtr<FLigaBattle> FLigaBattle::StartTrainer(FLigaGameData& Game, const FString& Trainer, const TArray<FIntPoint>& Team, int32 InPrize,
+	const FString& InPlace, int32 Seed)
+{
+	const int32 Active = Game.FirstAliveIndex();
+	if (Active == INDEX_NONE) return nullptr;
+	TUniquePtr<FLigaBattle> B = MakeUnique<FLigaBattle>();
+	B->Game = &Game;
+	B->bWild = false;
+	B->TrainerName = Trainer;
+	B->Prize = FMath::Max(0, InPrize);
+	B->Place = InPlace;
+	B->Rng.Initialize(Seed);
+	B->PlayerActive = Active;
+	for (const FIntPoint& Member : Team)
+	{
+		if (!FLigaDatabase::Get().Species(Member.X)) continue;
+		FLigaPokemon Pk = LigaRules::CreatePokemon(Member.X, FMath::Clamp(Member.Y, 1, LigaRules::MaxLevel), B->Rng, Game.NextUid++, 0);
+		Pk.MetAt = InPlace;
+		B->EnemyTeam.Add(Pk);
+	}
+	if (B->EnemyTeam.Num() == 0) return nullptr;
+	B->Participants.Add(Game.Team[Active].Uid);
+	Game.MarkSeen(B->EnemyTeam[0].Species);
+	B->Say(FString::Printf(TEXT("%s вызывает вас на бой!"), *Trainer));
+	B->Say(FString::Printf(TEXT("%s выпускает покемона: %s (ур. %d)!"), *Trainer, *LigaRules::DisplayName(B->EnemyTeam[0]), B->EnemyTeam[0].Level));
+	B->Say(FString::Printf(TEXT("Вперёд, %s!"), *LigaRules::DisplayName(Game.Team[Active])));
+	return B;
+}
+
 bool FLigaBattle::DoTurn(const FLigaBattleAction& Action, FString& OutError)
 {
 	if (Phase != ELigaBattlePhase::Choose)
@@ -914,6 +943,11 @@ void FLigaBattle::Finish(ELigaBattleResult R)
 		const int32 Coins = EnemyTeam[0].Level * 4;
 		Game->Money += Coins;
 		Say(FString::Printf(TEXT("Вы нашли %d монет."), Coins));
+	}
+	if (R == ELigaBattleResult::Win && !bWild && Prize > 0)
+	{
+		Game->Money += Prize;
+		Say(FString::Printf(TEXT("Вы победили: %s! Награда — %d монет."), *TrainerName, Prize));
 	}
 	if (R != ELigaBattleResult::Lose && PayDay > 0)
 	{

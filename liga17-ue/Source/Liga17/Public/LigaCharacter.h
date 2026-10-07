@@ -7,6 +7,7 @@
 #include "LigaCharacter.generated.h"
 
 class ALigaFollower;
+class ALigaWorldBuilder;
 class UCameraComponent;
 class UInputAction;
 class UInputMappingContext;
@@ -73,6 +74,12 @@ private:
 	float LagOffTime = 0.f;
 	FVector LastPos = FVector::ZeroVector;
 
+	/** The pond and the sea are too deep to wade into: the last place where the water was shallow enough. */
+	TWeakObjectPtr<ALigaWorldBuilder> Builder;
+	FVector LastDry = FVector::ZeroVector;
+	bool bHasDry = false;
+	float DeepWarn = 0.f;
+
 	void BuildInput();
 	void OnMove(const FInputActionValue& V);
 	void OnLook(const FInputActionValue& V);
@@ -90,5 +97,6 @@ private:
 	void UpdateFocus();
 	void UpdateDoors();
 	void UpdateEncounters(float Dt);
+	void KeepOutOfDeepWater(float Dt);
 	class ALigaPlayerController* LigaPC() const;
 };

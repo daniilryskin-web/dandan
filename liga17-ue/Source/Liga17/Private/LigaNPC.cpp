@@ -47,6 +47,34 @@ void ALigaNPC::Configure(const FString& InId, const FString& InName, const FStri
 	Lines = InLines;
 }
 
+void ALigaNPC::SetTrainer(float InSightCm)
+{
+	bTrainer = true;
+	SightCm = FMath::Max(0.f, InSightCm);
+}
+
+bool ALigaNPC::WantsBattle() const
+{
+	const ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	return bTrainer && GI && !GI->Data.HasFlag(TEXT("beat:") + Id);
+}
+
+void ALigaNPC::LookForChallengers(APawn* Player, float Dt)
+{
+	ChallengeCooldown = FMath::Max(0.f, ChallengeCooldown - Dt);
+	if (!Player || SightCm <= 0.f || ChallengeCooldown > 0.f || !WantsBattle()) return;
+	ALigaPlayerController* PC = Cast<ALigaPlayerController>(Player->GetController());
+	const ULigaGameInstance* GI = ULigaGameInstance::Get(this);
+	if (!PC || !PC->IsExploring() || !GI || !GI->HasStarter() || GI->Data.FirstAliveIndex() == INDEX_NONE) return;
+	const FVector To = Player->GetActorLocation() - GetActorLocation();
+	if (To.Size2D() > SightCm || FMath::Abs(To.Z) > 250.f) return;
+	// Seen: in front of the trainer (a cone of about 50 degrees each way).
+	if (FVector::DotProduct(To.GetSafeNormal2D(), GetActorForwardVector().GetSafeNormal2D()) < 0.64f) return;
+	ChallengeCooldown = 8.f;
+	Attend(6.f);
+	PC->ChallengeTrainer(this);
+}
+
 void ALigaNPC::SetRoute(const TArray<FVector>& Points, bool bInLoop, float SpeedCm, float PauseSeconds)
 {
 	Route = Points;
@@ -75,7 +103,8 @@ void ALigaNPC::BeginPlay()
 void ALigaNPC::BuildNameTag()
 {
 	// "!" — has a quest for you, "?" — waiting for your report, "…" — a quest of theirs is in progress.
-	const FLinearColor MarkColor = Marker == TEXT("?") ? FLinearColor(0.15f, 0.75f, 0.35f) : Marker == TEXT("!") ? FLinearColor(1.f, 0.62f, 0.05f) : FLinearColor(0.45f, 0.5f, 0.62f);
+	const FLinearColor MarkColor = Marker == TEXT("?") ? FLinearColor(0.15f, 0.75f, 0.35f) : Marker == TEXT("!") ? FLinearColor(1.f, 0.62f, 0.05f)
+		: Marker == TEXT("VS") ? FLinearColor(0.85f, 0.16f, 0.2f) : FLinearColor(0.45f, 0.5f, 0.62f);
 	TSharedRef<SHorizontalBox> Row = SNew(SHorizontalBox);
 	if (!Marker.IsEmpty())
 	{
@@ -175,6 +204,7 @@ void ALigaNPC::Tick(float Dt)
 		SetActorRotation(R);
 	}
 	LastPos = GetActorLocation();
+	if (bTrainer) LookForChallengers(Player, Dt);
 
 	MarkerCheck -= Dt;
 	if (MarkerCheck <= 0.f)
@@ -182,7 +212,8 @@ void ALigaNPC::Tick(float Dt)
 		MarkerCheck = 0.5f;
 		if (const ULigaGameInstance* GI = ULigaGameInstance::Get(this))
 		{
-			const FString Now = LigaQuests::MarkerFor(GI->Data, Id);
+			FString Now = LigaQuests::MarkerFor(GI->Data, Id);
+			if (Now.IsEmpty() && GI->HasStarter() && WantsBattle()) Now = TEXT("VS");
 			if (Now != Marker)
 			{
 				Marker = Now;

@@ -102,6 +102,12 @@ bool ULigaGameInstance::StartWildBattle(int32 Species, int32 Level, const FStrin
 	return Battle.IsValid();
 }
 
+bool ULigaGameInstance::StartTrainerBattle(const FString& Trainer, const TArray<FIntPoint>& Team, int32 Prize, const FString& Place)
+{
+	Battle = FLigaBattle::StartTrainer(Data, Trainer, Team, Prize, Place, Rng.RandRange(1, MAX_int32 - 1));
+	return Battle.IsValid();
+}
+
 void ULigaGameInstance::EndBattle()
 {
 	Battle.Reset();

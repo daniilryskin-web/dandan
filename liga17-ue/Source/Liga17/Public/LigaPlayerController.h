@@ -9,7 +9,7 @@ class ALigaBattleStage;
 class ALigaNPC;
 struct FLigaQuestDef;
 
-enum class ELigaMode : uint8 { Explore, Dialogue, Choice, Battle, Menu };
+enum class ELigaMode : uint8 { Explore, Dialogue, Choice, Battle, Menu, Fishing };
 enum class ELigaBattleMenu : uint8 { None, Main, Fight, Bag, Team, ForceSwitch, Result };
 
 struct FLigaChoice
@@ -36,6 +36,8 @@ public:
 	/** Bumped whenever the HUD needs to rebuild a dynamic panel. */
 	int32 UiSerial = 0;
 	FString CurrentPlaceName() const { return PlaceName; }
+	/** "КАНТО" or "ДЖОТО". */
+	FString RegionName() const { return Region; }
 	bool IsIndoors() const { return bIndoors; }
 	bool IsExploring() const { return Mode == ELigaMode::Explore && !bTraveling; }
 
@@ -65,6 +67,15 @@ public:
 	/** Finishes quests that complete by themselves and announces the ones ready to report. */
 	void CheckQuests();
 
+	// ——— trainers, the train, fishing ———
+	/** A trainer saw the player (or was spoken to): their words, then the battle. */
+	void ChallengeTrainer(ALigaNPC* Npc);
+	/** Asks, then takes the train to the other region. */
+	void RideTrain(const FString& Title, const FVector& Where, float Yaw);
+	/** Casts the rod: after a while something bites, and E must be pressed in time. */
+	void StartFishing(const FString& SpotId, const FString& Title);
+	bool IsFishBiting() const { return Mode == ELigaMode::Fishing && bFishBite; }
+
 	// ——— doors ———
 	/** Fades to black, moves the player (and the walking Pokémon) there, fades back in. */
 	void TravelTo(const FVector& Where, float Yaw);
@@ -85,6 +96,16 @@ public:
 
 	// ——— menu ———
 	void ToggleMenu();
+	/** Use healing and status items outside battle. */
+	void OpenBag();
+	/** The pause menu page: 0 the team and quests, 1 the Pokédex. */
+	int32 MenuPage = 0;
+	int32 DexPage = 0;
+	int32 DexSelected = 1;
+	void OpenPokedex();
+	void TurnDexPage(int32 Delta);
+	void SelectDex(int32 Species);
+	void CloseMenuPage();
 	void SaveFromMenu();
 	void QuitGame();
 
@@ -103,6 +124,13 @@ public:
 
 private:
 	FString PlaceName = TEXT("Паллет-таун");
+	FString Region = TEXT("КАНТО");
+	/** The trainer being fought (layout NPC id), empty in wild battles. */
+	FString TrainerNpcId;
+	bool bFishingBattle = false;
+	float FishTimer = 0.f;
+	bool bFishBite = false;
+	FString FishSpot;
 	bool bIndoors = false;
 	float PlaceCheck = 0.f;
 	bool bTraveling = false;
@@ -128,4 +156,13 @@ private:
 	void StorageList(bool bWithdraw);
 	FString NpcName(const FString& Id) const;
 	void QuestStarted(const FLigaQuestDef& Q);
+	void BeginBattleStage();
+	void StartTrainerBattle(const FString& NpcId, const FString& Name);
+	/** The rival's counter to the player's first Pokémon. */
+	int32 RivalStarter() const;
+	void TalkToElm(const FString& Who);
+	void UpdateFishing(float Dt);
+	void FishingConfirm();
+	void StopFishing(const FString& Message);
+	void UseItemOn(const FString& ItemId);
 };

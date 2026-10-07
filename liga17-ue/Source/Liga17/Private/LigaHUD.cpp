@@ -115,6 +115,8 @@ private:
 	TSharedRef<SWidget> BuildChoice();
 	TSharedRef<SWidget> BuildCommands();
 	TSharedRef<SWidget> BuildMenu();
+	TSharedRef<SWidget> BuildDex();
+	TSharedRef<SWidget> BuildFishing();
 	const FLigaPokemon* ShownMon(int32 Side) const;
 };
 
@@ -143,6 +145,7 @@ void SLigaHUDWidget::Construct(const FArguments& Args)
 		+ SOverlay::Slot()[BuildExplore()]
 		+ SOverlay::Slot()[BuildBattle()]
 		+ SOverlay::Slot()[BuildDialogue()]
+		+ SOverlay::Slot()[BuildFishing()]
 		+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)[SAssignNew(ChoiceBox, SBox)]
 		+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)[SAssignNew(MenuBox, SBox)]
 		// toast
@@ -244,7 +247,7 @@ TSharedRef<SWidget> SLigaHUDWidget::Button(const FString& Label, const FString& 
 TSharedRef<SWidget> SLigaHUDWidget::BuildExplore()
 {
 	return SNew(SOverlay)
-		.Visibility_Lambda([this] { return InMode(ELigaMode::Explore) || InMode(ELigaMode::Dialogue) || InMode(ELigaMode::Menu) ? EVisibility::SelfHitTestInvisible : EVisibility::Collapsed; })
+		.Visibility_Lambda([this] { return InMode(ELigaMode::Explore) || InMode(ELigaMode::Dialogue) || InMode(ELigaMode::Menu) || InMode(ELigaMode::Fishing) ? EVisibility::SelfHitTestInvisible : EVisibility::Collapsed; })
 		// location banner and the quest tracker under it
 		+ SOverlay::Slot().HAlign(HAlign_Left).VAlign(VAlign_Top).Padding(28, 24)
 		[
@@ -254,7 +257,11 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildExplore()
 				SNew(SBorder).BorderImage(&PlateBrush).Padding(FMargin(22, 10, 30, 12))
 				[
 					SNew(SVerticalBox)
-					+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(TEXT("КАНТО"))).Font(Font(10)).ColorAndOpacity(Accent)]
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock).Font(Font(10)).ColorAndOpacity(Accent)
+						.Text_Lambda([this] { return FText::FromString(PC.IsValid() ? PC->RegionName() : FString(TEXT("КАНТО"))); })
+					]
 					+ SVerticalBox::Slot().AutoHeight()
 					[
 						SNew(STextBlock).Font(Font(22)).ColorAndOpacity(Ink)
@@ -274,7 +281,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildExplore()
 			SNew(SBorder).BorderImage(&PanelBrush).Padding(FMargin(16, 10))
 			[
 				SNew(STextBlock).Font(Font(11, false)).ColorAndOpacity(FLinearColor(1, 1, 1, 0.85f))
-				.Text(FText::FromString(TEXT("WASD — ходить   Shift — бег   Пробел — прыжок\nE — действие   Tab — меню   R — покемон   Колесо — камера")))
+				.Text(FText::FromString(TEXT("WASD — ходить   Shift — бег   Пробел — прыжок\nE — действие   Tab — меню, сумка, покедекс   R — покемон   Колесо — камера")))
 			]
 		]
 		// team
@@ -301,6 +308,36 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildExplore()
 				[
 					SNew(STextBlock).Font(Font(16)).ColorAndOpacity(Ink)
 					.Text_Lambda([this] { return FText::FromString(PC.IsValid() ? PC->CurrentPrompt() : FString()); })
+				]
+			]
+		];
+}
+
+TSharedRef<SWidget> SLigaHUDWidget::BuildFishing()
+{
+	return SNew(SBox)
+		.Visibility_Lambda([this] { return InMode(ELigaMode::Fishing) ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+		.HAlign(HAlign_Center).VAlign(VAlign_Bottom).Padding(FMargin(0, 0, 0, 120))
+		[
+			SNew(SBorder).BorderImage(&PanelBrush).Padding(FMargin(34, 18))
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+				[
+					SNew(STextBlock).Justification(ETextJustify::Center)
+					.Font_Lambda([this] { return Font(PC.IsValid() && PC->IsFishBiting() ? 34 : 20); })
+					.ColorAndOpacity_Lambda([this] { return FSlateColor(PC.IsValid() && PC->IsFishBiting() ? Yellow : FLinearColor::White); })
+					.Text_Lambda([this]
+					{
+						if (PC.IsValid() && PC->IsFishBiting()) return FText::FromString(TEXT("!!! КЛЮЁТ !!!  Жми E!"));
+						const int32 Dots = 1 + (int32)(FPlatformTime::Seconds() * 2.0) % 3;
+						return FText::FromString(TEXT("Удочка закинута. Ждём поклёвку") + FString::ChrN(Dots, TEXT('.')));
+					})
+				]
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0, 6, 0, 0)
+				[
+					SNew(STextBlock).Font(Font(12, false)).ColorAndOpacity(FLinearColor(1, 1, 1, 0.75f))
+					.Text(FText::FromString(TEXT("E — подсечь (только когда клюёт!)   Backspace — смотать удочку")))
 				]
 			]
 		];
@@ -719,6 +756,7 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildMenu()
 	FirstFocus.Reset();
 	ULigaGameInstance* G = GI();
 	if (!PC.IsValid() || PC->Mode != ELigaMode::Menu || !G) return SNullWidget::NullWidget;
+	if (PC->MenuPage == 1) return BuildDex();
 	TWeakObjectPtr<ALigaPlayerController> W = PC;
 	TSharedRef<SVerticalBox> Team = SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)[SNew(STextBlock).Text(FText::FromString(TEXT("Команда"))).Font(Font(20)).ColorAndOpacity(Ink)];
@@ -790,6 +828,8 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildMenu()
 		+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(BagText.IsEmpty() ? TEXT("Пусто") : BagText)).Font(Font(13, false)).ColorAndOpacity(Muted)]
 		+ SVerticalBox::Slot().FillHeight(1)[SNew(SSpacer)]
 		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Продолжить"), FString(), ColorButton(Accent), FLinearColor::White, [W] { if (W.IsValid()) W->ToggleMenu(); }, true, 300.f)]
+		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Сумка"), TEXT("Лечить покемонов зельями"), ColorButton(Hex(TEXT("F29A1A"))), FLinearColor::White, [W] { if (W.IsValid()) W->OpenBag(); }, true, 300.f)]
+		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Покедекс"), TEXT("Покемоны Канто и Джото"), ColorButton(Hex(TEXT("D94A3D"))), FLinearColor::White, [W] { if (W.IsValid()) W->OpenPokedex(); }, true, 300.f)]
 		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Сохранить игру"), FString(), ColorButton(Hex(TEXT("22A35A"))), FLinearColor::White, [W] { if (W.IsValid()) W->SaveFromMenu(); }, true, 300.f)]
 		+ SVerticalBox::Slot().AutoHeight()[Button(TEXT("Выйти из игры"), TEXT("Игра сохранится"), &DarkButton, FLinearColor::White, [W] { if (W.IsValid()) W->QuitGame(); }, true, 300.f)];
 
@@ -799,6 +839,125 @@ TSharedRef<SWidget> SLigaHUDWidget::BuildMenu()
 		+ SHorizontalBox::Slot().AutoWidth()[Team]
 		+ SHorizontalBox::Slot().AutoWidth().Padding(36, 0, 0, 0)[SNew(SBox).WidthOverride(300)[BuildQuestLog()]]
 		+ SHorizontalBox::Slot().AutoWidth().Padding(36, 0, 0, 0)[SNew(SBox).WidthOverride(300).MinDesiredHeight(460)[Side]]
+	];
+}
+
+TSharedRef<SWidget> SLigaHUDWidget::BuildDex()
+{
+	ULigaGameInstance* G = GI();
+	if (!PC.IsValid() || !G) return SNullWidget::NullWidget;
+	TWeakObjectPtr<ALigaPlayerController> W = PC;
+	const FLigaDatabase& Db = FLigaDatabase::Get();
+	constexpr int32 PerPage = 24;
+	constexpr int32 Columns = 6;
+	constexpr int32 Last = 251;
+	const int32 First = PC->DexPage * PerPage + 1;
+	int32 Seen = 0;
+	int32 Caught = 0;
+	for (const TPair<int32, uint8>& D : G->Data.Dex)
+	{
+		Seen += 1;
+		Caught += D.Value >= 2 ? 1 : 0;
+	}
+	auto DexState = [G](int32 Species) -> uint8
+	{
+		const uint8* S = G->Data.Dex.Find(Species);
+		return S ? *S : 0;
+	};
+	// the grid of this page
+	TSharedRef<SVerticalBox> Grid = SNew(SVerticalBox);
+	for (int32 Row = 0; Row < PerPage / Columns; ++Row)
+	{
+		TSharedRef<SHorizontalBox> Line = SNew(SHorizontalBox);
+		for (int32 Col = 0; Col < Columns; ++Col)
+		{
+			const int32 Num = First + Row * Columns + Col;
+			if (Num > Last) break;
+			const uint8 St = DexState(Num);
+			const FLigaSpecies* Sp = Db.Species(Num);
+			const FString Label = St > 0 && Sp ? Sp->Name : FString(TEXT("???"));
+			const bool bSel = PC->DexSelected == Num;
+			TSharedRef<SWidget> Pic = St > 0 ? MonImage(Num, false, 64) : StaticCastSharedRef<SWidget>(
+				SNew(SBox).WidthOverride(64).HeightOverride(64).HAlign(HAlign_Center).VAlign(VAlign_Center)
+				[SNew(STextBlock).Text(FText::FromString(TEXT("?"))).Font(Font(30)).ColorAndOpacity(Muted)]);
+			Line->AddSlot().AutoWidth().Padding(3)
+			[
+				SNew(SBox).WidthOverride(112)
+				[
+					SNew(SButton).ButtonStyle(bSel ? ColorButton(Accent) : &LightButton).ContentPadding(FMargin(4, 4))
+					.OnClicked_Lambda([W, Num] { if (W.IsValid()) W->SelectDex(Num); return FReply::Handled(); })
+					[
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)[Pic]
+						+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+						[
+							SNew(STextBlock).Font(Font(10)).ColorAndOpacity(bSel ? FLinearColor::White : Ink)
+							.Text(FText::FromString(FString::Printf(TEXT("%s%03d %s"), St >= 2 ? TEXT("● ") : TEXT(""), Num, *Label)))
+						]
+					]
+				]
+			];
+		}
+		Grid->AddSlot().AutoHeight()[Line];
+	}
+	// details of the selected species
+	const int32 Sel = PC->DexSelected;
+	const uint8 SelState = DexState(Sel);
+	const FLigaSpecies* SelSp = Db.Species(Sel);
+	TSharedRef<SVerticalBox> Info = SNew(SVerticalBox);
+	if (SelSp && SelState > 0)
+	{
+		TSharedRef<SHorizontalBox> Types = SNew(SHorizontalBox);
+		for (EPokeType T : SelSp->Types) Types->AddSlot().AutoWidth().Padding(0, 0, 6, 0)[TypePill(T)];
+		FString Evo;
+		for (const FLigaEvolution& E : SelSp->Evolutions)
+		{
+			const FLigaSpecies* To = Db.Species(E.To);
+			if (!To) continue;
+			Evo += (Evo.IsEmpty() ? FString() : FString(TEXT(", "))) + To->Name + (E.Level > 0 ? FString::Printf(TEXT(" (ур. %d)"), E.Level) : FString(TEXT(" (особым способом)")));
+		}
+		Info->AddSlot().AutoHeight().HAlign(HAlign_Center)[MonImage(Sel, false, 200)];
+		Info->AddSlot().AutoHeight()[SNew(STextBlock).Font(Font(22)).ColorAndOpacity(Ink).Text(FText::FromString(FString::Printf(TEXT("№%03d %s"), Sel, *SelSp->Name)))];
+		Info->AddSlot().AutoHeight().Padding(0, 4)[Types];
+		Info->AddSlot().AutoHeight().Padding(0, 4)
+		[
+			SNew(STextBlock).Font(Font(13, false)).ColorAndOpacity(Ink).AutoWrapText(true)
+			.Text(FText::FromString(FString::Printf(TEXT("%s\nРост: %.1f м · поколение %d\n%s"),
+				SelState >= 2 ? TEXT("Пойман") : TEXT("Встречен, но не пойман"), SelSp->Height, SelSp->Gen,
+				*(Evo.IsEmpty() ? FString(TEXT("Не эволюционирует (или это последняя стадия).")) : TEXT("Эволюция: ") + Evo))))
+		];
+	}
+	else
+	{
+		Info->AddSlot().AutoHeight().Padding(0, 80, 0, 0)
+		[
+			SNew(STextBlock).Font(Font(14, false)).ColorAndOpacity(Muted).AutoWrapText(true)
+			.Text(FText::FromString(FString::Printf(TEXT("№%03d — этот покемон ещё не встречался.\nИщите в траве, у воды и на рыбалке!"), Sel)))
+		];
+	}
+	const int32 Pages = (Last + PerPage - 1) / PerPage;
+	TSharedRef<SHorizontalBox> Nav = SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().AutoWidth()[Button(TEXT("◀"), FString(), &DarkButton, FLinearColor::White, [W] { if (W.IsValid()) W->TurnDexPage(-1); }, true, 90.f)]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(14, 0)
+		[SNew(STextBlock).Font(Font(14)).ColorAndOpacity(Ink).Text(FText::FromString(FString::Printf(TEXT("Страница %d из %d"), PC->DexPage + 1, Pages)))]
+		+ SHorizontalBox::Slot().AutoWidth()[Button(TEXT("▶"), FString(), &DarkButton, FLinearColor::White, [W] { if (W.IsValid()) W->TurnDexPage(1); }, true, 90.f)]
+		+ SHorizontalBox::Slot().FillWidth(1)[SNew(SSpacer)]
+		+ SHorizontalBox::Slot().AutoWidth()[Button(TEXT("← Назад"), TEXT("Backspace"), ColorButton(Accent), FLinearColor::White, [W] { if (W.IsValid()) W->CloseMenuPage(); }, true, 200.f)];
+	return SNew(SBorder).BorderImage(&CardBrush).Padding(FMargin(28, 22))
+	[
+		SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
+		[
+			SNew(STextBlock).Font(Font(22)).ColorAndOpacity(Ink)
+			.Text(FText::FromString(FString::Printf(TEXT("Покедекс · видели %d · поймали %d"), Seen, Caught)))
+		]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth()[Grid]
+			+ SHorizontalBox::Slot().AutoWidth().Padding(24, 0, 0, 0)[SNew(SBox).WidthOverride(320)[Info]]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 10, 0, 0)[Nav]
 	];
 }
 

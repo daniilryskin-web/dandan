@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 import struct
+import sys
 import urllib.request
 
 import unreal
@@ -909,16 +910,15 @@ def pokemon3d_module():
     return _P3D[0]
 
 
-@step('3D-покемоны')
-def import_pokemon3d():
-    """3D models for the Pokémon in the game (starters, Route 1, Pikachu and Eevee lines), see liga_pokemon3d.py."""
-    liga_pokemon3d = pokemon3d_module()
-    ids = liga_pokemon3d.GAME_SPECIES
-    with unreal.ScopedSlowTask(len(ids), '3D-покемоны') as task:
-        task.make_dialog(True)
-        models = liga_pokemon3d.import_species(ids, True, log, warn, task)
-    log(f'3D-покемоны: моделей {len(models)} (остальные покемоны — картинками)')
-    return models
+def pokemon3d_job():
+    """3D models for the Pokémon in the game (Kanto and the Johto Pokémon near New Bark Town), see liga_pokemon3d.py.
+    The job imports one model per editor frame (run_frames below) so the graphics card memory is freed in between."""
+    try:
+        p3d = pokemon3d_module()
+        return p3d.ImportJob(p3d.GAME_SPECIES, True, log, warn)
+    except Exception as e:
+        warn(f'3D-покемоны: {e}')
+        return None
 
 
 # ——— level ———
@@ -1127,14 +1127,82 @@ def wrong_project():
     return True
 
 
-def main():
-    if wrong_project():
-        return
+VSM = 'r.Shadow.Virtual.Enable'
+
+
+def shadows_off():
+    """Virtual shadow maps are off while the setup runs. Every imported skeleton (3D Pokémon, VRoid characters) gets a
+    thumbnail scene of its own, and with virtual shadow maps each took a 512 MB page pool on the graphics card: about
+    thirty of them filled a 12 GB card and Windows reset it ("D3D device removed"). Returns the value to restore."""
+    try:
+        value = unreal.SystemLibrary.get_console_variable_int_value(VSM)
+    except Exception:
+        return 0
+    if value:
+        unreal.SystemLibrary.execute_console_command(None, f'{VSM} 0')
+        log('виртуальные тени выключены на время настройки')
+    return value
+
+
+def shadows_back(value):
+    if value:
+        unreal.SystemLibrary.execute_console_command(None, f'{VSM} {value}')
+
+
+def in_pie():
+    try:
+        return level_sub.is_in_play_in_editor()
+    except Exception:
+        return False
+
+
+def run_frames(steps, then):
+    """Runs (name, fn) steps from the editor's frame ticks, one after another: fn() is called once per frame until it
+    returns True. Between frames the editor renders and frees memory, which one long Python call never lets it do."""
+    state = {'handle': None, 'busy': False, 'i': 0}
+
+    def on_tick(_dt):
+        if state['busy'] or in_pie():  # a progress dialog inside a step ticks the editor's UI again; Play waits
+            return
+        state['busy'] = True
+        try:
+            if state['i'] < len(steps):
+                name, fn = steps[state['i']]
+                try:
+                    finished = fn()
+                except Exception as e:  # keep going: later steps are still useful
+                    warn(f'{name}: {e}')
+                    finished = True
+                if finished:
+                    state['i'] += 1
+                return
+            unreal.unregister_slate_post_tick_callback(state['handle'])
+            try:
+                then()
+            finally:
+                set_busy(False)
+        finally:
+            state['busy'] = False
+
+    state['handle'] = unreal.register_slate_post_tick_callback(on_tick)
+
+
+def busy():
+    """True while an earlier run is still working in the background (the 3D Pokémon, the level)."""
+    return bool(getattr(sys, 'liga17_busy', False))
+
+
+def set_busy(value):
+    sys.liga17_busy = value
+
+
+def first_steps():
+    """Textures, the art kit, materials and characters, in one go (they are few)."""
     os.makedirs(DATA, exist_ok=True)
     src_layout = os.path.join(EXPORTS, 'layout.json')
     if os.path.exists(src_layout):
         shutil.copyfile(src_layout, os.path.join(DATA, 'layout.json'))
-    with unreal.ScopedSlowTask(8, 'Лига 17: настройка проекта') as task:
+    with unreal.ScopedSlowTask(5, 'Лига 17: настройка проекта') as task:
         task.make_dialog(True)
         task.enter_progress_frame(1, 'Текстуры')
         textures = import_textures() or {}
@@ -1153,42 +1221,74 @@ def main():
         task.enter_progress_frame(1, 'Аниме-персонажи (первый раз — несколько минут)')
         chars.update(import_characters() or {})
         write_assets_json(meshes, chars, billboard, fx=fx)  # saved first: the 3D step below can be the slowest and riskiest
-        task.enter_progress_frame(1, '3D-покемоны')
-        models3d = import_pokemon3d() or {}
-        write_assets_json(meshes, chars, billboard, models3d, fx=fx)
-        task.enter_progress_frame(1, 'Уровень')
-        open_fresh_level()
+    return meshes, chars, billboard, fx, terrain, sea
 
-    try:
-        mgr, started = import_scene_interchange()
-    except Exception as e:
-        warn(f'Interchange import_scene недоступен ({e}) — использую запасной вариант')
-        mgr, started = None, False
-    if not started:
-        place_scene_fallback(meshes)
-        finish_level(terrain, sea)
-        summary()
+
+def main():
+    if wrong_project():
         return
+    if busy():
+        unreal.EditorDialog.show_message('Лига 17 — настройка', 'Настройка уже идёт — дождитесь окна «Готово!».\n\n'
+                                         'Если оно так и не появилось, перезапустите Unreal и запустите настройку ещё раз.',
+                                         unreal.AppMsgType.OK)
+        return
+    vsm = shadows_off()
+    try:
+        meshes, chars, billboard, fx, terrain, sea = first_steps()
+    except Exception:
+        shadows_back(vsm)
+        raise
 
-    # Interchange imports asynchronously: finish once it is done.
-    state = {'handle': None, 'ticks': 0}
+    # The rest runs from the editor's frame ticks (run_frames): the 3D Pokémon one model per frame, then the level.
+    job = pokemon3d_job()
+    scene = {'mgr': None, 'started': False, 'ticks': 0}
 
-    def on_tick(_dt):
-        state['ticks'] += 1
-        if mgr.is_interchange_active() and state['ticks'] < 20000:
-            return
-        unreal.unregister_slate_post_tick_callback(state['handle'])
+    def pokemon3d():
+        if job is None:
+            return True
         try:
+            done = job.tick()
+        except Exception:
+            job.end()
+            raise
+        if done:
+            write_assets_json(meshes, chars, billboard, job.result, fx=fx)
+        return done
+
+    def level():
+        with unreal.ScopedSlowTask(1, 'Лига 17: уровень') as task:
+            task.make_dialog(False)
+            task.enter_progress_frame(1, 'Уровень')
+            open_fresh_level()
+            try:
+                scene['mgr'], scene['started'] = import_scene_interchange()
+            except Exception as e:
+                warn(f'Interchange import_scene недоступен ({e}) — использую запасной вариант')
+            if scene['started']:
+                log('импорт сцены запущен…')
+        return True
+
+    def town():
+        # Interchange imports asynchronously: finish once it is done.
+        if scene['started']:
+            scene['ticks'] += 1
+            if scene['mgr'].is_interchange_active() and scene['ticks'] < 20000:
+                return False
             if not any(a.get_actor_label().startswith('MARKER_') for a in actors_sub.get_all_level_actors()):
                 warn('сцена не появилась на уровне — использую запасной вариант')
                 place_scene_fallback(meshes)
-            finish_level(terrain, sea)
-        except Exception as e:
-            warn(f'завершение уровня: {e}')
+        else:
+            place_scene_fallback(meshes)
+        finish_level(terrain, sea)
+        return True
+
+    def wrap_up():
+        shadows_back(vsm)
         summary()
 
-    state['handle'] = unreal.register_slate_post_tick_callback(on_tick)
-    log('импорт сцены запущен…')
+    set_busy(True)
+    run_frames([('3D-покемоны', pokemon3d), ('уровень', level), ('сцена', town)], wrap_up)
+    log('3D-покемоны: импорт по одной модели за кадр…')
 
 
 main()

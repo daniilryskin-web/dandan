@@ -21,6 +21,7 @@ import re
 import struct
 import subprocess
 import sys
+import time
 import urllib.request
 
 import unreal
@@ -48,7 +49,10 @@ DEST = f'{DEST_ROOT}/V{CONVERTER_VERSION}'
 OLD_DESTS = ['/Game/Liga/Pokemon']  # converter versions 1–3
 VERSION_FILE = os.path.join(CACHE, 'converter_version.txt')
 GUARD = os.path.join(CACHE, 'importing.json')   # the model being imported right now
-SKIP = os.path.join(CACHE, 'skip.json')         # models that crashed the editor once: they keep their picture
+CRASHES = os.path.join(CACHE, 'crashes.json')   # {model: how many times the editor died while importing it}
+OLD_SKIP = os.path.join(CACHE, 'skip.json')     # earlier versions skipped a model after one crash
+CRASHES_TO_SKIP = 2  # one crash is often the whole editor running out of memory, not the model: it gets one more try
+VSM = 'r.Shadow.Virtual.Enable'
 
 IDLE = re.compile(r'idle|wait|stand|loop|armatureaction|take ?0*1', re.I)
 ATTACK = re.compile(r'attack|fight|atk|impact|thunder|trueno|bolt|punch|bite|tackle|scratch', re.I)
@@ -1324,28 +1328,53 @@ def _save_json(path, data):
         json.dump(data, f)
 
 
+def crash_counts():
+    counts = _load_json(CRASHES, None)
+    if not isinstance(counts, dict):
+        counts = {tag: 1 for tag in _load_json(OLD_SKIP, [])}
+    return counts
+
+
+def is_skipped(tag):
+    return crash_counts().get(tag, 0) >= CRASHES_TO_SKIP
+
+
 def note_previous_crash(warn=print):
-    """If the editor died while importing a model last time, that model is skipped from now on."""
+    """If the editor died while importing a model last time, that model is tried once more; after a second crash it is
+    skipped from now on (it keeps its picture)."""
     tag = _load_json(GUARD, None)
     if tag:
-        skip = _load_json(SKIP, [])
-        if tag not in skip:
-            skip.append(tag)
-            _save_json(SKIP, skip)
-        warn(f'3D-модель {tag} в прошлый раз уронила редактор при импорте — она пропущена, покемон останется картинкой')
+        counts = crash_counts()
+        counts[tag] = counts.get(tag, 0) + 1
+        _save_json(CRASHES, counts)
+        if counts[tag] >= CRASHES_TO_SKIP:
+            warn(f'3D-модель {tag} уже {counts[tag]} раза роняла редактор при импорте — она пропущена, покемон останется картинкой')
+        else:
+            warn(f'в прошлый раз редактор упал на 3D-модели {tag} — пробую её ещё раз')
         try:
             os.remove(GUARD)
         except OSError:
             pass
 
 
+def model_folder(species, shiny=False):
+    return f'{DEST}/P{species:04d}{"S" if shiny else ""}'
+
+
+def imported_model(species, shiny=False):
+    """The assets of a model imported earlier, or None."""
+    folder = model_folder(species, shiny)
+    return describe(folder) if unreal.EditorAssetLibrary.does_directory_exist(folder) else None
+
+
 def import_one(species, shiny=False, log=print, warn=print):
+    """Downloads, converts and imports one model. Heavy for the graphics card: import one model per editor frame (ImportJob)."""
     tag = f'{species}{"s" if shiny else ""}'
-    folder = f'{DEST}/P{species:04d}{"S" if shiny else ""}'
-    have = describe(folder) if unreal.EditorAssetLibrary.does_directory_exist(folder) else None
+    folder = model_folder(species, shiny)
+    have = imported_model(species, shiny)
     if have:
         return have
-    if tag in _load_json(SKIP, []):
+    if is_skipped(tag):
         return None
     url = f'{BASE}/{"shiny" if shiny else "regular"}/{species}.glb'
     try:
@@ -1365,7 +1394,7 @@ def import_one(species, shiny=False, log=print, warn=print):
     t.automated = True
     t.replace_existing = True
     t.save = True
-    _save_json(GUARD, tag)  # if the import or the save (it draws thumbnails on the GPU) kills the editor, the next run skips this model
+    _save_json(GUARD, tag)  # if the import or the save (it draws thumbnails on the GPU) kills the editor, the next run counts it
     try:
         unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([t])
         unreal.EditorAssetLibrary.save_directory(folder, only_if_is_dirty=True, recursive=True)
@@ -1399,7 +1428,7 @@ def refresh_old_imports(log=print, warn=print):
     except Exception:
         version = 0
     if version != CONVERTER_VERSION:
-        # The models that crashed the editor stay skipped (SKIP): trying them again would only crash it once more.
+        # The crash counts (CRASHES) stay: a model that crashed the editor twice would only crash it once more.
         os.makedirs(CACHE, exist_ok=True)
         with open(VERSION_FILE, 'w', encoding='utf-8') as f:
             f.write(str(CONVERTER_VERSION))
@@ -1416,23 +1445,132 @@ def current_entries(entries):
     return {k: v for k, v in (entries or {}).items() if isinstance(v, dict) and str(v.get('mesh', '')).startswith(DEST + '/')}
 
 
-def import_species(ids, with_shiny=True, log=print, warn=print, task=None):
-    refresh_old_imports(log, warn)  # a new converter gets a clean slate, including models that crashed before
-    note_previous_crash(warn)
-    ensure_packages(log)
-    result = {}
-    for sp in ids:
-        if task is not None:
-            task.enter_progress_frame(1, f'3D-модель #{sp}')
-        for shiny in ((False, True) if with_shiny and sp in SHINY_SPECIES else (False,)):
-            try:
-                got = import_one(sp, shiny, log, warn)
-            except Exception as e:
-                warn(f'3D #{sp}{" shiny" if shiny else ""}: {e}')
-                got = None
+class ImportJob:
+    """Imports the models one at a time, one per editor frame, driven by tick() (run_in_background, or liga_setup.py).
+
+    Imported in one long Python call, as before, the models never let the editor finish a frame, so it could not free
+    what each import leaves on the graphics card (preview and thumbnail scenes, each with a 512 MB pool for virtual
+    shadow maps). After about thirty models a 12 GB card ran out of memory and Windows reset it: "D3D device removed".
+    Now the editor renders a few frames and collects garbage between two imports, and virtual shadow maps are off while
+    the job runs (restored when it ends)."""
+
+    PAUSE_FRAMES = 5    # frames between two imports: the editor renders them and frees what the last import left behind
+    SCAN_SECONDS = 0.3  # per frame, for finding the models imported earlier
+
+    def __init__(self, ids, with_shiny=True, log=print, warn=print, title='3D-покемоны'):
+        self.todo = [(sp, shiny) for sp in ids for shiny in ((False, True) if with_shiny and sp in SHINY_SPECIES else (False,))]
+        self.total = len(self.todo)
+        self.result = {}
+        self.imported = 0
+        self.pause = 0
+        self.vsm = 0
+        self.started = False
+        self.finished = False
+        self.log, self.warn, self.title = log, warn, title
+
+    def begin(self):
+        self.started = True
+        try:
+            self.vsm = unreal.SystemLibrary.get_console_variable_int_value(VSM)
+        except Exception:
+            self.vsm = 0
+        if self.vsm:
+            unreal.SystemLibrary.execute_console_command(None, f'{VSM} 0')
+        refresh_old_imports(self.log, self.warn)  # a new converter gets a clean slate
+        note_previous_crash(self.warn)
+        ensure_packages(self.log)
+
+    def end(self):
+        """Restores the shadows. Safe to call more than once."""
+        if self.vsm:
+            unreal.SystemLibrary.execute_console_command(None, f'{VSM} {self.vsm}')
+            self.vsm = 0
+        if not self.finished:
+            self.finished = True
+            self.log(f'3D-покемоны: моделей {len(self.result)}, импортировано сейчас {self.imported} (остальные покемоны — картинками)')
+
+    def tick(self):
+        """Does the next piece of work; True once every model is done or the import was cancelled."""
+        if self.finished:
+            return True
+        if not self.started:
+            self.begin()
+            return False
+        if self.pause > 0:
+            self.pause -= 1
+            return False
+        t0 = time.time()
+        while self.todo:
+            sp, shiny = self.todo[0]
+            tag = f'{sp}{"s" if shiny else ""}'
+            have = imported_model(sp, shiny)
+            if have or is_skipped(tag):
+                self.todo.pop(0)
+                if have:
+                    self.result[tag] = have
+                if time.time() - t0 > self.SCAN_SECONDS:
+                    return False
+                continue
+            done = self.total - len(self.todo)
+            with unreal.ScopedSlowTask(self.total, f'{self.title}: {done + 1} из {self.total} (№{sp}{" shiny" if shiny else ""})') as task:
+                task.make_dialog(True)
+                task.enter_progress_frame(done)
+                task.enter_progress_frame(1)
+                try:
+                    got = import_one(sp, shiny, self.log, self.warn)
+                except Exception as e:
+                    self.warn(f'3D №{tag}: {e}')
+                    got = None
+                cancelled = task.should_cancel()
+            self.todo.pop(0)
+            self.imported += 1
             if got:
-                result[f'{sp}{"s" if shiny else ""}'] = got
-    return result
+                self.result[tag] = got
+            unreal.SystemLibrary.collect_garbage()  # runs at the start of the next frame
+            self.pause = self.PAUSE_FRAMES
+            if cancelled:
+                self.todo = []
+                self.warn('импорт 3D-моделей остановлен — остальные покемоны пока картинками; запустите настройку ещё раз, чтобы продолжить')
+                break
+            return False
+        self.end()
+        return True
+
+
+def run_in_background(job, then=None):
+    """Drives job from the editor's frame ticks; then(models) runs when it is finished."""
+    state = {'handle': None, 'busy': False}
+
+    def on_tick(_dt):
+        if state['busy']:  # the progress dialog of an import ticks the editor's UI again from inside tick()
+            return
+        state['busy'] = True
+        try:
+            try:
+                done = job.tick()
+            except Exception as e:
+                job.warn(f'3D: {e}')
+                job.end()
+                done = True
+            if done:
+                unreal.unregister_slate_post_tick_callback(state['handle'])
+                set_busy(False)
+                if then:
+                    then(job.result)
+        finally:
+            state['busy'] = False
+
+    set_busy(True)
+    state['handle'] = unreal.register_slate_post_tick_callback(on_tick)
+
+
+def busy():
+    """True while liga_setup.py or liga_pokemon3d_all.py is still working in the background."""
+    return bool(getattr(sys, 'liga17_busy', False))
+
+
+def set_busy(value):
+    sys.liga17_busy = value
 
 
 def merge_into_assets_json(models):
@@ -1448,10 +1586,13 @@ def merge_into_assets_json(models):
 
 def import_all():
     """Every regular model in the repository (≈970). Takes long; already imported ones are skipped."""
-    ids = list(range(1, 1026))
-    with unreal.ScopedSlowTask(len(ids), 'Лига 17: все 3D-покемоны') as task:
-        task.make_dialog(True)
-        models = import_species(ids, with_shiny=False, log=unreal.log, warn=unreal.log_warning, task=task)
-    merge_into_assets_json(models)
-    unreal.EditorDialog.show_message('Лига 17 — 3D-покемоны', f'Готово: моделей {len(models)}.', unreal.AppMsgType.OK)
+    if busy():
+        unreal.EditorDialog.show_message('Лига 17 — 3D-покемоны', 'Импорт уже идёт — дождитесь окна «Готово».', unreal.AppMsgType.OK)
+        return
+    job = ImportJob(list(range(1, 1026)), with_shiny=False, log=unreal.log, warn=unreal.log_warning, title='Все 3D-покемоны')
 
+    def done(models):
+        merge_into_assets_json(models)
+        unreal.EditorDialog.show_message('Лига 17 — 3D-покемоны', f'Готово: моделей {len(models)}.', unreal.AppMsgType.OK)
+
+    run_in_background(job, done)

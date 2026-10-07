@@ -408,6 +408,68 @@ def poster(name, size=(768, 1024)):
     print('wrote', name)
 
 
+def painting(name, size=(1024, 720)):
+    """A framed landscape for living rooms: sky, hills, a lake and a little red-roofed house."""
+    W, H = size
+    img = Image.new('RGB', size, '#9fd0f0')
+    d = ImageDraw.Draw(img)
+    for i in range(H // 2):
+        t = i / (H / 2)
+        c = tuple(int(255 * v) for v in hexcol('#7fbbe8') * (1 - t) + hexcol('#e8f2f6') * t)
+        d.line([(0, i), (W, i)], fill=c)
+    d.ellipse([W * 0.72, H * 0.08, W * 0.84, H * 0.25], fill='#fff4c8')
+    d.polygon([(0, H * 0.62), (W * 0.25, H * 0.32), (W * 0.5, H * 0.58), (W * 0.7, H * 0.36), (W, H * 0.6), (W, H), (0, H)], fill='#6f9fbe')
+    d.polygon([(0, H * 0.7), (W * 0.3, H * 0.55), (W * 0.6, H * 0.66), (W, H * 0.58), (W, H), (0, H)], fill='#6db04f')
+    d.ellipse([W * 0.15, H * 0.76, W * 0.62, H * 0.95], fill='#4c8fc4')
+    d.rectangle([W * 0.7, H * 0.66, W * 0.82, H * 0.76], fill='#f2ead8')
+    d.polygon([(W * 0.68, H * 0.67), (W * 0.76, H * 0.6), (W * 0.84, H * 0.67)], fill='#c2453a')
+    for k in range(9):
+        x = W * (0.05 + k * 0.11)
+        d.ellipse([x, H * 0.62, x + 40, H * 0.7], fill='#3f8a2c')
+    img = img.resize((W // 2, H // 2)).resize(size)
+    img.save(os.path.join(OUT, f'{name}_albedo.png'), optimize=True)
+    print('wrote', name)
+
+
+def awning(name, a='#e2403a', b='#f4efe4', size=512, count=8):
+    """Market-stall awning: wide vertical stripes."""
+    ys, xs = np.mgrid[0:size, 0:size]
+    idx = (xs // (size // count)) % 2
+    col = np.where((idx == 0)[..., None], hexcol(a), hexcol(b))
+    m = fbm(size, 91, base=40, octaves=4)
+    col = col * (0.93 + 0.1 * m)[..., None]
+    save(name, col, m, strength=1.5, rough=0.8)
+
+
+def panel_sign(name, text, bg, fg='#ffffff', size=(1024, 256), px=120):
+    """A plain panel with one line of text (aisle signs, club sign)."""
+    img = Image.new('RGB', size, bg)
+    d = ImageDraw.Draw(img)
+    d.rectangle([8, 8, size[0] - 9, size[1] - 9], outline=fg, width=10)
+    font = ImageFont.truetype(FONT, px)
+    w = d.textlength(text, font=font)
+    while w > size[0] - 60 and px > 20:
+        px -= 6
+        font = ImageFont.truetype(FONT, px)
+        w = d.textlength(text, font=font)
+    d.text(((size[0] - w) / 2, (size[1] - px) / 2 - 8), text, font=font, fill=fg)
+    img.save(os.path.join(OUT, f'{name}_albedo.png'), optimize=True)
+    print('wrote', name)
+
+
+def poster_sale(name, size=(1024, 700)):
+    img = Image.new('RGB', size, '#ffd23f')
+    d = ImageDraw.Draw(img)
+    d.rectangle([14, 14, size[0] - 15, size[1] - 15], outline='#e2403a', width=16)
+    for text, y, px, col in (('СКИДКИ!', 70, 170, '#e2403a'), ('Покеболы и лекарства', 300, 64, '#1d2030'),
+                             ('для начинающих тренеров', 390, 56, '#1d2030'), ('Магазин Паллет-тауна', 540, 52, '#2f63b8')):
+        font = ImageFont.truetype(FONT, px)
+        w = d.textlength(text, font=font)
+        d.text(((size[0] - w) / 2, y), text, font=font, fill=col)
+    img.save(os.path.join(OUT, f'{name}_albedo.png'), optimize=True)
+    print('wrote', name)
+
+
 def build_all():
     shingles('roof_red', '#c2453a', 1)
     shingles('roof_pink', '#b06a8c', 2)
@@ -460,6 +522,15 @@ def build_all():
     flat('window_day', '#cfe8ff', 0.2)
     flat('pokeball_red', '#e2403a', 0.25)
     poster('poster_kanto')
+    painting('painting')
+    awning('awning')
+    panel_sign('sign_aisle_balls', 'ПОКЕБОЛЫ', '#2f63b8')
+    panel_sign('sign_aisle_meds', 'ЛЕКАРСТВА', '#3a9a5a')
+    panel_sign('sign_club', 'КЛУБ ТРЕНЕРОВ', '#2f63b8', size=(1024, 460), px=110)
+    poster_sale('poster_sale')
+    sign('sign_station', [('ВОКЗАЛ', 120), ('Паллет — Нью-Барк', 60)], bg='#2f5f8f')
+    sign('sign_newbark', [('НЬЮ-БАРК', 110), ('Ветер новых начинаний', 50)])
+    sign('sign_route29', [('МАРШРУТ 29', 100), ('→ Черригроув-Сити', 56)])
 
 
 if __name__ == '__main__':

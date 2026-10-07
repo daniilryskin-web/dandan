@@ -33,6 +33,9 @@ BASE = f'https://raw.githubusercontent.com/Pokemon-3D-api/assets/{COMMIT}/models
 GAME_SPECIES = list(range(1, 152)) + [152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 170,
                                       171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 183, 184, 187, 188, 189, 190, 191,
                                       192, 194, 195, 206, 211, 222, 223, 224, 226]
+# Shiny models are imported only for these (a shiny of another species shows its HOME picture): the starters of both
+# regions, Pikachu and Eevee with their evolutions. Importing every shiny would double the first setup.
+SHINY_SPECIES = {1, 2, 3, 4, 5, 6, 7, 8, 9, 25, 26, 133, 134, 135, 136, 152, 153, 154, 155, 156, 157, 158, 159, 160}
 
 PROJECT = os.path.abspath(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir()))
 CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')
@@ -1421,7 +1424,7 @@ def import_species(ids, with_shiny=True, log=print, warn=print, task=None):
     for sp in ids:
         if task is not None:
             task.enter_progress_frame(1, f'3D-модель #{sp}')
-        for shiny in ((False, True) if with_shiny else (False,)):
+        for shiny in ((False, True) if with_shiny and sp in SHINY_SPECIES else (False,)):
             try:
                 got = import_one(sp, shiny, log, warn)
             except Exception as e:

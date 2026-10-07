@@ -20,4 +20,10 @@ public:
 	 *  Returns the VRM asset list, or nullptr. The new assets are not saved. */
 	UFUNCTION(BlueprintCallable, Category = "Liga")
 	static UObject* ImportVrmWithRetargeter(const FString& SourceFile, const FString& DestinationPackagePath, bool bGenerateMipmaps);
+
+	/** Saves the loaded packages (long names, /Game/...) to their files without drawing thumbnails. The editor's own save
+	 *  draws one for every new skeleton, mesh and animation, and keeps a preview scene for each in RAM and video memory:
+	 *  after about a hundred 3D Pokémon a 16 GB computer ran out of memory. Returns how many packages were saved. */
+	UFUNCTION(BlueprintCallable, Category = "Liga")
+	static int32 SavePackagesWithoutThumbnails(const TArray<FString>& PackageNames);
 };

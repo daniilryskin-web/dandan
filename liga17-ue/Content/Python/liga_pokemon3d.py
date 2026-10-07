@@ -1367,6 +1367,71 @@ def imported_model(species, shiny=False):
     return describe(folder) if unreal.EditorAssetLibrary.does_directory_exist(folder) else None
 
 
+def quick_save():
+    """ULigaEditorTools.save_packages_without_thumbnails, or None when the C++ part is older than this script."""
+    tools = getattr(unreal, 'LigaEditorTools', None)
+    return getattr(tools, 'save_packages_without_thumbnails', None) if tools else None
+
+
+def save_model(folder):
+    """Saves the new model's packages without thumbnails. The editor's own save draws a thumbnail for the skeleton, the
+    mesh and every animation, and keeps a preview scene for each of them in RAM and video memory for good: a hundred
+    models filled 16 GB of RAM. Whatever is left unsaved (or everything, without the C++ helper) is saved the usual way."""
+    save = quick_save()
+    if save:
+        try:
+            names = [str(pk.get_name()) for pk in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()]
+        except Exception:
+            names = sorted({p.split('.')[0] for _c, _n, p in _assets(folder)})
+        names = [n for n in names if n.startswith(folder + '/')]
+        if names:
+            save(names)
+    unreal.EditorAssetLibrary.save_directory(folder, only_if_is_dirty=True, recursive=True)
+
+
+def free_memory_mb():
+    """(free RAM, free commit charge) in MB, or None where it cannot be read (not Windows)."""
+    try:
+        import ctypes
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong),
+                        ('total_phys', ctypes.c_ulonglong), ('avail_phys', ctypes.c_ulonglong),
+                        ('total_page', ctypes.c_ulonglong), ('avail_page', ctypes.c_ulonglong),
+                        ('total_virtual', ctypes.c_ulonglong), ('avail_virtual', ctypes.c_ulonglong),
+                        ('avail_extended', ctypes.c_ulonglong)]
+
+        st = MemoryStatus()
+        st.length = ctypes.sizeof(MemoryStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return None
+        return st.avail_phys / 2 ** 20, st.avail_page / 2 ** 20
+    except Exception:
+        return None
+
+
+MIN_FREE_RAM_MB = 2000     # below this the next model waits for the next run: the graphics driver needs RAM too, and
+MIN_FREE_COMMIT_MB = 3000  # when it got none it reset the card ("DXGI_ERROR_DRIVER_INTERNAL_ERROR")
+
+
+def low_memory():
+    """A short text when RAM runs low, else ''."""
+    free = free_memory_mb()
+    if not free:
+        return ''
+    ram, commit = free
+    if ram < MIN_FREE_RAM_MB or commit < MIN_FREE_COMMIT_MB:
+        return f'свободно {ram / 1024:.1f} ГБ оперативной памяти'
+    return ''
+
+
+def frame_count():
+    try:
+        return int(unreal.SystemLibrary.get_frame_count())
+    except Exception:
+        return None
+
+
 def import_one(species, shiny=False, log=print, warn=print):
     """Downloads, converts and imports one model. Heavy for the graphics card: import one model per editor frame (ImportJob)."""
     tag = f'{species}{"s" if shiny else ""}'
@@ -1393,11 +1458,11 @@ def import_one(species, shiny=False, log=print, warn=print):
     t.destination_path = folder
     t.automated = True
     t.replace_existing = True
-    t.save = True
-    _save_json(GUARD, tag)  # if the import or the save (it draws thumbnails on the GPU) kills the editor, the next run counts it
+    t.save = False  # save_model() saves it, without thumbnails
+    _save_json(GUARD, tag)  # if the import or the save kills the editor, the next run counts it
     try:
         unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([t])
-        unreal.EditorAssetLibrary.save_directory(folder, only_if_is_dirty=True, recursive=True)
+        save_model(folder)
         got = describe(folder)
     finally:
         os.remove(GUARD)
@@ -1449,13 +1514,14 @@ class ImportJob:
     """Imports the models one at a time, one per editor frame, driven by tick() (run_in_background, or liga_setup.py).
 
     Imported in one long Python call, as before, the models never let the editor finish a frame, so it could not free
-    what each import leaves on the graphics card (preview and thumbnail scenes, each with a 512 MB pool for virtual
-    shadow maps). After about thirty models a 12 GB card ran out of memory and Windows reset it: "D3D device removed".
-    Now the editor renders a few frames and collects garbage between two imports, and virtual shadow maps are off while
-    the job runs (restored when it ends)."""
+    what each import leaves on the graphics card. Now the editor renders a few frames and collects garbage between two
+    imports; the models are saved without thumbnails (save_model); virtual shadow maps are off while the job runs
+    (restored when it ends); and when free RAM runs low the job stops and the next run carries on, instead of the
+    graphics driver failing ("D3D device removed")."""
 
-    PAUSE_FRAMES = 5    # frames between two imports: the editor renders them and frees what the last import left behind
+    PAUSE_FRAMES = 3    # engine frames between two imports: the editor renders them and frees what the last import left
     SCAN_SECONDS = 0.3  # per frame, for finding the models imported earlier
+    MAX_PAUSE_TICKS = 600
 
     def __init__(self, ids, with_shiny=True, log=print, warn=print, title='3D-покемоны'):
         self.todo = [(sp, shiny) for sp in ids for shiny in ((False, True) if with_shiny and sp in SHINY_SPECIES else (False,))]
@@ -1463,6 +1529,9 @@ class ImportJob:
         self.result = {}
         self.imported = 0
         self.pause = 0
+        self.resume_at = None
+        self.low_memory = ''  # why the job stopped early, if it did
+        self.left = 0         # models not imported because of that
         self.vsm = 0
         self.started = False
         self.finished = False
@@ -1479,6 +1548,9 @@ class ImportJob:
         refresh_old_imports(self.log, self.warn)  # a new converter gets a clean slate
         note_previous_crash(self.warn)
         ensure_packages(self.log)
+        if not quick_save():
+            self.warn('3D-модели сохраняются с миниатюрами (C++ часть проекта старая) — может не хватить памяти. '
+                      'Закройте Unreal, удалите папку Binaries, откройте Liga17.uproject и согласитесь пересобрать')
 
     def end(self):
         """Restores the shadows. Safe to call more than once."""
@@ -1496,9 +1568,17 @@ class ImportJob:
         if not self.started:
             self.begin()
             return False
-        if self.pause > 0:
+        if self.pause > 0 or self.resume_at is not None:
+            # The post-tick callback runs several times per engine frame, so real frames are counted (the callback count
+            # is the fallback, with a cap in case the frame counter stands still).
             self.pause -= 1
-            return False
+            frame = frame_count()
+            if frame is None or self.resume_at is None:
+                if self.pause > 0:
+                    return False
+            elif frame < self.resume_at and self.pause > -self.MAX_PAUSE_TICKS:
+                return False
+            self.pause, self.resume_at = 0, None
         t0 = time.time()
         while self.todo:
             sp, shiny = self.todo[0]
@@ -1511,6 +1591,13 @@ class ImportJob:
                 if time.time() - t0 > self.SCAN_SECONDS:
                     return False
                 continue
+            low = low_memory()
+            if low:
+                self.low_memory, self.left = low, len(self.todo)
+                self.todo = []
+                self.warn(f'3D-покемоны: {low} — остальные {self.left} моделей поставятся при следующем запуске '
+                          '(перезапустите Unreal и запустите настройку ещё раз), пока они картинками')
+                break
             done = self.total - len(self.todo)
             with unreal.ScopedSlowTask(self.total, f'{self.title}: {done + 1} из {self.total} (№{sp}{" shiny" if shiny else ""})') as task:
                 task.make_dialog(True)
@@ -1527,6 +1614,8 @@ class ImportJob:
             if got:
                 self.result[tag] = got
             unreal.SystemLibrary.collect_garbage()  # runs at the start of the next frame
+            frame = frame_count()
+            self.resume_at = None if frame is None else frame + self.PAUSE_FRAMES
             self.pause = self.PAUSE_FRAMES
             if cancelled:
                 self.todo = []
@@ -1593,6 +1682,8 @@ def import_all():
 
     def done(models):
         merge_into_assets_json(models)
-        unreal.EditorDialog.show_message('Лига 17 — 3D-покемоны', f'Готово: моделей {len(models)}.', unreal.AppMsgType.OK)
+        more = (f'\n\nНе хватило памяти ({job.low_memory}): перезапустите Unreal и запустите liga_pokemon3d_all.py ещё раз, '
+                f'осталось моделей: {job.left}.') if job.low_memory else ''
+        unreal.EditorDialog.show_message('Лига 17 — 3D-покемоны', f'Готово: моделей {len(models)}.' + more, unreal.AppMsgType.OK)
 
     run_in_background(job, done)

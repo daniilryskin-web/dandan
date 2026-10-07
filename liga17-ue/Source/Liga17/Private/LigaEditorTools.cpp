@@ -2,6 +2,12 @@
 
 #include "UObject/UnrealType.h"
 
+#if WITH_EDITOR
+#include "Misc/PackageName.h"
+#include "UObject/Package.h"
+#include "UObject/SavePackage.h"
+#endif
+
 DEFINE_LOG_CATEGORY_STATIC(LogLigaEditorTools, Log, All);
 
 #if WITH_EDITOR
@@ -97,5 +103,38 @@ UObject* ULigaEditorTools::ImportVrmWithRetargeter(const FString& SourceFile, co
 	return Result;
 #else
 	return nullptr;
+#endif
+}
+
+int32 ULigaEditorTools::SavePackagesWithoutThumbnails(const TArray<FString>& PackageNames)
+{
+#if WITH_EDITOR
+	int32 Saved = 0;
+	for (const FString& Name : PackageNames)
+	{
+		UPackage* Package = FindPackage(nullptr, *Name);
+		if (!Package)
+		{
+			UE_LOG(LogLigaEditorTools, Warning, TEXT("%s: the package is not loaded"), *Name);
+			continue;
+		}
+		const FString Filename = FPackageName::LongPackageNameToFilename(Name, FPackageName::GetAssetPackageExtension());
+		FSavePackageArgs Args;
+		Args.TopLevelFlags = RF_Public | RF_Standalone;
+		Args.SaveFlags = SAVE_NoError;
+		Args.Error = GWarn;  // the default, GError, would end the editor on a failed save
+		if (UPackage::SavePackage(Package, nullptr, *Filename, Args))
+		{
+			Package->SetDirtyFlag(false);
+			++Saved;
+		}
+		else
+		{
+			UE_LOG(LogLigaEditorTools, Warning, TEXT("%s: could not save %s"), *Name, *Filename);
+		}
+	}
+	return Saved;
+#else
+	return 0;
 #endif
 }

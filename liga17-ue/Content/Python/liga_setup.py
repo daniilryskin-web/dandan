@@ -7,9 +7,9 @@ What it does:
   2. builds materials: wind-animated foliage, vertex-colour terrain blend, sea, Pokémon billboard;
   3. finds the Third Person mannequin; downloads the anime (VRoid, CC0) cast listed in ArtSource/Characters/cast.json
      and imports it with the VRM4U plugin (your own <Role>.vrm in that folder replaces a model);
-     downloads 3D models of the Pokémon the game can show (liga_pokemon3d.py) — on this computer only;
   4. creates /Game/Liga/Maps/PalletTown, imports the town scene into it, adds sky, sun, clouds, fog;
-  5. writes Content/Liga/Data/assets.json for the game code and saves everything.
+  5. downloads 3D models of the Pokémon the game can show (liga_pokemon3d.py) — on this computer only, one per frame;
+  6. writes Content/Liga/Data/assets.json for the game code and saves everything.
 Safe to run again: it rebuilds the level and replaces imported assets.
 """
 import hashlib
@@ -915,6 +915,10 @@ def pokemon3d_job():
     The job imports one model per editor frame (run_frames below) so the graphics card memory is freed in between."""
     try:
         p3d = pokemon3d_module()
+        if not p3d.quick_save():
+            REPORT.insert(0, 'ВАЖНО: C++ часть проекта старая — 3D-покемоны сохраняются с миниатюрами, и может не хватить '
+                             'памяти. Закройте Unreal, удалите папку Binaries, откройте Liga17.uproject, согласитесь '
+                             'пересобрать и запустите настройку ещё раз.')
         return p3d.ImportJob(p3d.GAME_SPECIES, True, log, warn)
     except Exception as e:
         warn(f'3D-покемоны: {e}')
@@ -1239,7 +1243,8 @@ def main():
         shadows_back(vsm)
         raise
 
-    # The rest runs from the editor's frame ticks (run_frames): the 3D Pokémon one model per frame, then the level.
+    # The rest runs from the editor's frame ticks (run_frames): the level first (the game needs it; the 3D models are
+    # optional), then the 3D Pokémon, one model per frame.
     job = pokemon3d_job()
     scene = {'mgr': None, 'started': False, 'ticks': 0}
 
@@ -1253,6 +1258,10 @@ def main():
             raise
         if done:
             write_assets_json(meshes, chars, billboard, job.result, fx=fx)
+            if job.low_memory:
+                REPORT.insert(0, f'ВАЖНО: не хватило оперативной памяти ({job.low_memory}), 3D-покемонов осталось '
+                                 f'поставить: {job.left}. Перезапустите Unreal и запустите настройку ещё раз — импорт '
+                                 'продолжится. Играть можно и сейчас: эти покемоны пока картинками.')
         return done
 
     def level():
@@ -1287,8 +1296,7 @@ def main():
         summary()
 
     set_busy(True)
-    run_frames([('3D-покемоны', pokemon3d), ('уровень', level), ('сцена', town)], wrap_up)
-    log('3D-покемоны: импорт по одной модели за кадр…')
+    run_frames([('уровень', level), ('сцена', town), ('3D-покемоны', pokemon3d)], wrap_up)
 
 
 main()

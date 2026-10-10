@@ -2197,19 +2197,60 @@ def free_memory_mb():
         return None
 
 
-MIN_FREE_RAM_MB = 1000     # below this the next model waits for the next run: the graphics driver needs RAM too, and
-MIN_FREE_COMMIT_MB = 1500  # when it got none (0.4 GB left) it reset the card ("DXGI_ERROR_DRIVER_INTERNAL_ERROR")
+MIN_FREE_RAM_MB = 700      # below either of these the import waits for memory, and then stops for this run: the
+MIN_FREE_COMMIT_MB = 1000  # graphics driver needs memory too, and when it got none (0.4 GB of virtual memory left) it
+                           # reset the card ("DXGI_ERROR_DRIVER_INTERNAL_ERROR")
 
 
-def low_memory():
-    """A short text when RAM runs low, else ''."""
+def memory_text(free):
+    ram, commit = free
+    return f'свободно {ram / 1024:.1f} ГБ оперативной и {commit / 1024:.1f} ГБ виртуальной памяти'
+
+
+def low_memory(extra=0):
+    """A short text when memory runs low (extra: MB more than the minimum), else ''."""
     free = free_memory_mb()
     if not free:
         return ''
     ram, commit = free
-    if ram < MIN_FREE_RAM_MB or commit < MIN_FREE_COMMIT_MB:
-        return f'свободно {ram / 1024:.1f} ГБ оперативной памяти'
+    if ram < MIN_FREE_RAM_MB + extra or commit < MIN_FREE_COMMIT_MB + extra:
+        return memory_text(free)
     return ''
+
+
+def loaded_packages(folder):
+    """The packages under folder that are loaded right now."""
+    find = getattr(unreal, 'find_package', None)
+    paths = {}
+    for _c, _n, p in _assets(folder):
+        paths.setdefault(p.split('.')[0], p)
+    out = []
+    for name, path in sorted(paths.items()):
+        try:
+            if find:
+                pkg = find(name)
+            else:
+                obj = unreal.find_asset(path)  # only finds loaded assets
+                pkg = obj.get_outermost() if obj else None
+        except Exception:
+            pkg = None
+        if pkg:
+            out.append(pkg)
+    return out
+
+
+def unload_folder(folder):
+    """Unloads the saved assets under folder. Unreal keeps every asset it imported or loaded in memory until it closes:
+    the models imported in one run kept taking memory until the import stopped after a dozen of them."""
+    unload = getattr(unreal.EditorLoadingAndSavingUtils, 'unload_packages', None)
+    if not unload:
+        return
+    pkgs = loaded_packages(folder)
+    if pkgs:
+        try:
+            unload(pkgs)
+        except Exception:
+            pass
 
 
 def frame_count():
@@ -2315,13 +2356,16 @@ class ImportJob:
 
     Imported in one long Python call, as before, the models never let the editor finish a frame, so it could not free
     what each import leaves on the graphics card. Now the editor renders a few frames and collects garbage between two
-    imports; the models are saved without thumbnails (save_model); virtual shadow maps are off while the job runs
-    (restored when it ends); and when free RAM runs low the job stops and the next run carries on, instead of the
-    graphics driver failing ("D3D device removed")."""
+    imports; the models are saved without thumbnails (save_model) and unloaded once saved (unload_folder); virtual
+    shadow maps are off while the job runs (restored when it ends); and when free memory runs low (and stays low for
+    WAIT_SECONDS) the job stops and the next run carries on, instead of the graphics driver failing ("D3D device
+    removed")."""
 
     PAUSE_FRAMES = 3    # engine frames between two imports: the editor renders them and frees what the last import left
     SCAN_SECONDS = 0.3  # per frame, for finding the models imported earlier
     MAX_PAUSE_TICKS = 600
+    WAIT_SECONDS = 30   # when memory runs low: how long to wait for it to come back before stopping
+    LOG_EVERY = 10      # models; the free memory goes to the log
 
     def __init__(self, ids, with_shiny=True, log=print, warn=print, title='3D-покемоны'):
         self.todo = [(sp, shiny) for sp in ids for shiny in ((False, True) if with_shiny and sp in SHINY_SPECIES else (False,))]
@@ -2336,6 +2380,7 @@ class ImportJob:
         self.vsm = 0
         self.started = False
         self.finished = False
+        self.wait_until = None  # waiting for memory until then
         self.log, self.warn, self.title = log, warn, title
 
     def begin(self):
@@ -2349,6 +2394,13 @@ class ImportJob:
         refresh_old_imports(self.log, self.warn, delete=False)  # the old models go once the new ones are all in
         note_previous_crash(self.warn)
         ensure_packages(self.log)
+        try:
+            unload_folder(DEST_ROOT)  # models the game loaded (Play in the editor) stay in memory otherwise
+        except Exception as e:
+            self.warn(f'3D-покемоны: не удалось выгрузить загруженные модели ({e})')
+        free = free_memory_mb()
+        if free:
+            self.log(f'3D-покемоны: {memory_text(free)}')
         if not quick_save():
             self.warn('3D-модели сохраняются с миниатюрами (C++ часть проекта старая) — может не хватить памяти. '
                       'Закройте Unreal, удалите папку Binaries, откройте Liga17.uproject и согласитесь пересобрать')
@@ -2394,13 +2446,24 @@ class ImportJob:
                 if time.time() - t0 > self.SCAN_SECONDS:
                     return False
                 continue
-            low = low_memory()
+            low = low_memory(300 if self.wait_until else 0)
+            if low:
+                if self.wait_until is None:
+                    # Unreal frees memory a few frames later (garbage, the shader compilers finishing): give it a chance
+                    self.wait_until = time.time() + self.WAIT_SECONDS
+                    unreal.SystemLibrary.collect_garbage()
+                    self.log(f'3D-покемоны: {low} — жду, пока Unreal освободит память…')
+                    return False
+                if time.time() < self.wait_until:
+                    return False
+                low = low_memory()  # waited long enough: go on unless it is still below the minimum
             if low:
                 self.low_memory, self.left = low, len(self.todo)
                 self.todo = []
                 self.warn(f'3D-покемоны: {low} — остальные {self.left} моделей поставятся при следующем запуске '
-                          '(перезапустите Unreal и запустите настройку ещё раз), пока они картинками')
+                          '(закройте браузер, перезапустите Unreal и запустите настройку ещё раз), пока они картинками')
                 break
+            self.wait_until = None
             done = self.total - len(self.todo)
             with unreal.ScopedSlowTask(self.total, f'{self.title}: {done + 1} из {self.total} (№{sp}{" shiny" if shiny else ""})') as task:
                 task.make_dialog(True)
@@ -2416,7 +2479,15 @@ class ImportJob:
             self.imported += 1
             if got:
                 self.result[tag] = got
+            try:
+                unload_folder(model_folder(sp, shiny))  # saved: it no longer needs to be in memory
+            except Exception as e:
+                self.warn(f'3D №{tag}: не удалось выгрузить ({e})')
             unreal.SystemLibrary.collect_garbage()  # runs at the start of the next frame
+            if self.imported % self.LOG_EVERY == 0:
+                free = free_memory_mb()
+                if free:
+                    self.log(f'3D-покемоны: импортировано {self.imported}, {memory_text(free)}')
             frame = frame_count()
             self.resume_at = None if frame is None else frame + self.PAUSE_FRAMES
             self.pause = self.PAUSE_FRAMES
@@ -2486,7 +2557,7 @@ def import_all():
 
     def done(models):
         merge_into_assets_json(models)
-        more = (f'\n\nНе хватило памяти ({job.low_memory}): перезапустите Unreal и запустите liga_pokemon3d_all.py ещё раз, '
+        more = (f'\n\nНе хватило памяти ({job.low_memory}): закройте браузер, перезапустите Unreal и запустите liga_pokemon3d_all.py ещё раз, '
                 f'осталось моделей: {job.left}.') if job.low_memory else ''
         unreal.EditorDialog.show_message('Лига 17 — 3D-покемоны', f'Готово: моделей {len(models)}.' + more, unreal.AppMsgType.OK)
 

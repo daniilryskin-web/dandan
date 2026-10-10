@@ -1121,8 +1121,9 @@ def summary():
     text = '\n'.join(REPORT)
     unreal.log('[Liga] ===== Итог настройки =====\n' + text)
     important = '\n'.join(l for l in REPORT if l.startswith('ВАЖНО'))
+    rest = '\n'.join(l for l in REPORT if not l.startswith('ВАЖНО'))
     head = important + '\n\n' if important else ''
-    unreal.EditorDialog.show_message('Лига 17 — настройка', 'Готово!\n\n' + head + text[-1500:] + NEXT_STEPS, unreal.AppMsgType.OK)
+    unreal.EditorDialog.show_message('Лига 17 — настройка', 'Готово!\n\n' + head + rest[-1500:] + NEXT_STEPS, unreal.AppMsgType.OK)
 
 
 def wrong_project():
@@ -1268,9 +1269,11 @@ def main():
         if done:
             write_assets_json(meshes, chars, billboard, job.result, fx=fx)
             if job.low_memory:
-                REPORT.insert(0, f'ВАЖНО: не хватило оперативной памяти ({job.low_memory}), 3D-покемонов осталось '
-                                 f'поставить: {job.left}. Перезапустите Unreal и запустите настройку ещё раз — импорт '
-                                 'продолжится. Играть можно и сейчас: эти покемоны пока картинками.')
+                REPORT.insert(0, f'ВАЖНО: Unreal не хватило памяти ({job.low_memory}), 3D-покемонов осталось '
+                                 f'поставить: {job.left}. Закройте браузер и другие программы, перезапустите Unreal и '
+                                 'запустите настройку ещё раз — импорт продолжится. Если снова остановится, увеличьте '
+                                 'файл подкачки Windows (Docs/README_RU.md, «Не хватило памяти»). Играть можно и сейчас: '
+                                 'эти покемоны пока картинками.')
         return done
 
     def level():

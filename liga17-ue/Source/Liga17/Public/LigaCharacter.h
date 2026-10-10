@@ -47,6 +47,8 @@ public:
 
 	/** Distance walked in tall grass since the last encounter roll (cm). */
 	float GrassWalk = 0.f;
+	/** Distance (cm) still to walk in tall grass before a wild Pokémon can appear: set after every encounter. */
+	float GrassCalm = 0.f;
 	/** Distance walked since the team's friendship last grew (cm). */
 	float FriendWalk = 0.f;
 

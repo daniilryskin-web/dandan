@@ -1136,6 +1136,46 @@ void ALigaBattleFx::CaptureSparkles(const FVector& At)
 	Flash(At, Col(1.f, 0.95f, 0.7f), 0.7f);
 }
 
+void ALigaBattleFx::BallTrail(const FVector& At)
+{
+	FLigaFxParticle& P = Add(ELigaFxShape::Disc, At + Jit(3.f), 0.32f, 10.f, 2.f, Col(1.f, 1.f, 1.f), Col(1.f, 0.6f, 0.55f), 5.f);
+	P.Opacity = 0.75f;
+}
+
+void ALigaBattleFx::CaptureBeam(const FVector& From, const FVector& To, float Height)
+{
+	const float K = SizeK(Height);
+	for (int32 i = 0; i < 3; ++i)
+	{
+		FLigaFxParticle& Streak = Add(ELigaFxShape::Beam, From, 0.45f, 7.f * K, 2.f * K, Col(1.f, 0.9f, 0.9f), Col(1.f, 0.15f, 0.12f), 8.f);
+		Streak.BeamEnd = To + Jit(Height * 0.2f);
+		Streak.Delay = i * 0.07f;
+	}
+	FLigaFxParticle& Halo = Add(ELigaFxShape::Disc, To, 0.5f, Height * 0.9f, Height * 0.15f, Col(1.f, 0.4f, 0.35f), Col(1.f, 0.1f, 0.08f), 5.f);
+	Halo.Opacity = 0.7f;
+	// red sparks streaming from the Pokémon into the ball
+	Emit(0.f, 0.4f, 0.025f, [this, From, To, Height](float)
+	{
+		const FVector Start = To + Jit(Height * 0.35f);
+		FLigaFxParticle& Spark = Add(ELigaFxShape::Disc, Start, 0.3f, 9.f, 3.f, Col(1.f, 0.85f, 0.85f), Col(1.f, 0.2f, 0.15f), 6.f);
+		Spark.Vel = (From - Start) / 0.3f;
+	});
+	Flash(From, Col(1.f, 0.35f, 0.3f), 0.9f);
+}
+
+void ALigaBattleFx::BallDust(const FVector& At)
+{
+	FLigaFxParticle& Dust = Add(ELigaFxShape::FlatRing, At + FVector(0.f, 0.f, 2.f), 0.45f, 8.f, 60.f, Col(0.85f, 0.8f, 0.7f), Col(0.7f, 0.65f, 0.55f), 0.6f);
+	Dust.Opacity = 0.6f;
+	for (int32 i = 0; i < 6; ++i)
+	{
+		FLigaFxParticle& Puff = Add(ELigaFxShape::Disc, At + JitXY(8.f) + FVector(0.f, 0.f, 4.f), 0.5f, 8.f, 20.f, Col(0.85f, 0.8f, 0.72f), Col(0.75f, 0.7f, 0.62f), 0.6f);
+		Puff.Opacity = 0.5f;
+		Puff.Vel = FVector(Rf(-80.f, 80.f), Rf(-80.f, 80.f), Rf(20.f, 60.f));
+		Puff.Drag = 3.f;
+	}
+}
+
 void ALigaBattleFx::Faint(const FVector& Base, float Height)
 {
 	const float K = SizeK(Height);

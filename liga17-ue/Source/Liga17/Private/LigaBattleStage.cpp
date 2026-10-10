@@ -22,6 +22,104 @@
 
 namespace
 {
+	constexpr float BallR = 11.f;  // Poké Ball radius, cm
+
+	/** Geometry of a part of the Poké Ball (centre at the origin, front = +X, up = +Z). */
+	struct FBallMesh
+	{
+		TArray<FVector> V;
+		TArray<int32> Tris;
+		TArray<FVector> N;
+		TArray<FVector2D> UV;
+
+		int32 Vert(const FVector& P, const FVector& Nrm)
+		{
+			N.Add(Nrm);
+			UV.Add(FVector2D(P.Y, P.Z) * 0.05f);
+			return V.Add(P);
+		}
+		void Tri(int32 A, int32 B, int32 C, const FVector& Out)
+		{
+			// Unreal's front face has (P1 - P2) ^ (P0 - P2) pointing outwards (as in its procedural mesh tangents).
+			const FVector Face = (V[B] - V[C]) ^ (V[A] - V[C]);
+			if ((Face | Out) < 0.f) Swap(B, C);
+			Tris.Add(A);
+			Tris.Add(B);
+			Tris.Add(C);
+		}
+		/** The sphere surface between two latitudes (degrees, -90 bottom .. 90 top). */
+		void Band(float R, float Lat0, float Lat1, int32 Segs = 48, int32 Rings = 10)
+		{
+			TArray<int32> Idx;
+			for (int32 i = 0; i <= Rings; ++i)
+			{
+				const float Lat = FMath::DegreesToRadians(FMath::Lerp(Lat0, Lat1, float(i) / Rings));
+				for (int32 j = 0; j <= Segs; ++j)
+				{
+					const float Lon = 2.f * PI * j / Segs;
+					const FVector Dir(FMath::Cos(Lat) * FMath::Cos(Lon), FMath::Cos(Lat) * FMath::Sin(Lon), FMath::Sin(Lat));
+					Idx.Add(Vert(Dir * R, Dir));
+				}
+			}
+			for (int32 i = 0; i < Rings; ++i)
+			{
+				for (int32 j = 0; j < Segs; ++j)
+				{
+					const int32 A = Idx[i * (Segs + 1) + j];
+					const int32 B = Idx[(i + 1) * (Segs + 1) + j];
+					const int32 C = Idx[i * (Segs + 1) + j + 1];
+					const int32 D = Idx[(i + 1) * (Segs + 1) + j + 1];
+					const FVector Out = V[A] + V[B] + V[C] + V[D];
+					Tri(A, B, C, Out);
+					Tri(C, B, D, Out);
+				}
+			}
+		}
+		/** A flat disc of radius R at At, facing Normal. */
+		void Disc(const FVector& At, const FVector& Normal, float R, int32 Segs = 48)
+		{
+			const FVector U = FVector::CrossProduct(Normal, FMath::Abs(Normal.Z) < 0.9f ? FVector::UpVector : FVector::ForwardVector).GetSafeNormal();
+			const FVector W = FVector::CrossProduct(Normal, U);
+			const int32 Mid = Vert(At, Normal);
+			TArray<int32> Ring;
+			for (int32 j = 0; j <= Segs; ++j)
+			{
+				const float Ang = 2.f * PI * j / Segs;
+				Ring.Add(Vert(At + (U * FMath::Cos(Ang) + W * FMath::Sin(Ang)) * R, Normal));
+			}
+			for (int32 j = 0; j < Segs; ++j) Tri(Mid, Ring[j], Ring[j + 1], Normal);
+		}
+		/** The side of a cylinder of radius R from At along Axis, Length long. */
+		void Tube(const FVector& At, const FVector& Axis, float R, float Length, int32 Segs = 40)
+		{
+			const FVector U = FVector::CrossProduct(Axis, FMath::Abs(Axis.Z) < 0.9f ? FVector::UpVector : FVector::ForwardVector).GetSafeNormal();
+			const FVector W = FVector::CrossProduct(Axis, U);
+			TArray<int32> Idx;
+			for (int32 j = 0; j <= Segs; ++j)
+			{
+				const float Ang = 2.f * PI * j / Segs;
+				const FVector Dir = U * FMath::Cos(Ang) + W * FMath::Sin(Ang);
+				Idx.Add(Vert(At + Dir * R, Dir));
+				Idx.Add(Vert(At + Dir * R + Axis * Length, Dir));
+			}
+			for (int32 j = 0; j < Segs; ++j)
+			{
+				const int32 A = Idx[2 * j];
+				const int32 B = Idx[2 * j + 1];
+				const int32 C = Idx[2 * j + 2];
+				const int32 D = Idx[2 * j + 3];
+				const FVector Out = N[A] + N[C];
+				Tri(A, B, C, Out);
+				Tri(C, B, D, Out);
+			}
+		}
+		void Into(UProceduralMeshComponent* Part, int32 Section, UMaterialInterface* Mat) const
+		{
+			Part->CreateMeshSection(Section, V, Tris, N, UV, TArray<FColor>(), TArray<FProcMeshTangent>(), false);
+			Part->SetMaterial(Section, Mat);
+		}
+	};
+
 	/** Real height (m) → billboard height (cm), clamped so tiny Pokémon stay visible and giants fit. */
 	float BillboardHeight(int32 Species)
 	{
@@ -63,15 +161,56 @@ ALigaBattleStage::ALigaBattleStage()
 		SM->bCastHiddenShadow = false;
 		Mons[i].Static = SM;
 	}
-	Ball = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Ball"));
+	Ball = CreateDefaultSubobject<USceneComponent>(TEXT("Ball"));
 	Ball->SetupAttachment(Root);
-	Ball->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	Ball->SetVisibility(false);
-	if (UStaticMesh* Sphere = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Sphere.Sphere")))
+	BallLower = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("BallLower"));
+	BallLower->SetupAttachment(Ball);
+	BallHinge = CreateDefaultSubobject<USceneComponent>(TEXT("BallHinge"));
+	BallHinge->SetupAttachment(Ball);
+	BallHinge->SetRelativeLocation(FVector(-BallR, 0.f, 0.f));
+	BallLid = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("BallLid"));
+	BallLid->SetupAttachment(BallHinge);
+	BallLid->SetRelativeLocation(FVector(BallR, 0.f, 0.f));
+	BallLower->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	BallLid->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Ball->SetVisibility(false, true);
+}
+
+void ALigaBattleStage::BuildBall()
+{
+	if (BallMats.Num() > 0) return;
+	UMaterialInterface* Base = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	if (!Base) return;
+	auto MakeMat = [this, Base](const TCHAR* Hex)
 	{
-		Ball->SetStaticMesh(Sphere);
-	}
-	Ball->SetWorldScale3D(FVector(0.22f));
+		UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
+		Mid->SetVectorParameterValue(TEXT("Color"), StageHex(Hex));
+		BallMats.Add(Mid);
+		return Mid;
+	};
+	UMaterialInstanceDynamic* Red = MakeMat(TEXT("E3262B"));
+	UMaterialInstanceDynamic* White = MakeMat(TEXT("F2F2EE"));
+	UMaterialInstanceDynamic* Black = MakeMat(TEXT("1C1C20"));
+	BallButton = MakeMat(TEXT("FAFAFA"));
+	const float R = BallR;
+	const float Belt = 6.f;  // half the width of the black band, degrees of latitude
+	FBallMesh Shell, Band, Button;
+	Shell.Band(R, -90.f, -Belt);
+	Band.Band(R * 1.006f, -Belt, 0.f);
+	Band.Disc(FVector::ZeroVector, FVector::UpVector, R * 0.995f);           // the inside, seen when the lid is open
+	Band.Tube(FVector(R * 0.84f, 0.f, 0.f), FVector::ForwardVector, R * 0.36f, R * 0.17f);  // black ring round the button
+	Band.Disc(FVector(R * 1.01f, 0.f, 0.f), FVector::ForwardVector, R * 0.36f);
+	Button.Tube(FVector(R * 0.97f, 0.f, 0.f), FVector::ForwardVector, R * 0.22f, R * 0.09f);
+	Button.Disc(FVector(R * 1.06f, 0.f, 0.f), FVector::ForwardVector, R * 0.22f);
+	Shell.Into(BallLower, 0, White);
+	Band.Into(BallLower, 1, Black);
+	Button.Into(BallLower, 2, BallButton);
+	FBallMesh Dome, Rim;
+	Dome.Band(R, Belt, 90.f);
+	Rim.Band(R * 1.006f, 0.f, Belt);
+	Rim.Disc(FVector::ZeroVector, -FVector::UpVector, R * 0.995f);
+	Dome.Into(BallLid, 0, Red);
+	Rim.Into(BallLid, 1, Black);
 }
 
 FVector ALigaBattleStage::GroundAt(const FVector& P) const
@@ -428,16 +567,11 @@ void ALigaBattleStage::NextEvent()
 		BallShakes = E.Shakes;
 		bBallCaught = E.bCaught;
 		Focus = 1;
-		if (BallMat == nullptr)
-		{
-			if (UMaterialInterface* M = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial")))
-			{
-				BallMat = UMaterialInstanceDynamic::Create(M, this);
-				Ball->SetMaterial(0, BallMat);
-			}
-		}
-		if (BallMat) BallMat->SetVectorParameterValue(TEXT("Color"), StageHex(TEXT("E53935")));
-		Ball->SetVisibility(true);
+		BallTrailClock = 0.f;
+		BuildBall();
+		BallHinge->SetRelativeRotation(FRotator::ZeroRotator);
+		if (BallButton) BallButton->SetVectorParameterValue(TEXT("Color"), StageHex(TEXT("FAFAFA")));
+		Ball->SetVisibility(true, true);
 		break;
 	case ELigaEvent::Exp:
 		if (E.Uid == ShownUid[0]) AddPopup(0, FString::Printf(TEXT("+%d EXP"), E.Amount), StageHex(TEXT("9FD8FF")));
@@ -543,11 +677,14 @@ void ALigaBattleStage::UpdateMon(int32 Side, float Dt)
 	}
 	else if (M.Anim == TEXT("capture"))
 	{
-		const float P = FMath::Clamp(T / 0.4f, 0.f, 1.f);
-		Scale = FMath::Max(0.01f, 1.f - P);
+		// Drawn into the open ball by its red light: glows, shrinks and flies up into it.
+		const float P = FMath::Clamp(T / 0.45f, 0.f, 1.f);
+		const float Pull = P * P;
+		Scale = FMath::Max(0.01f, 1.f - Pull);
+		Offset = FMath::Lerp(Offset, CaptureTo - M.Home, Pull);
 		Flash = 1.f;
 	}
-	const bool bGone = M.Anim == TEXT("hidden") || (M.Anim == TEXT("faint") && T >= 0.75f) || (M.Anim == TEXT("capture") && T >= 0.4f);
+	const bool bGone = M.Anim == TEXT("hidden") || (M.Anim == TEXT("faint") && T >= 0.75f) || (M.Anim == TEXT("capture") && T >= 0.45f);
 	if (M.bModel)
 	{
 		// 3D model: same motion as the picture; blinks when hit, breathes a little, faces its opponent.
@@ -582,51 +719,148 @@ void ALigaBattleStage::UpdateMon(int32 Side, float Dt)
 
 void ALigaBattleStage::UpdateBall(float Dt)
 {
+	// The throw, step by step (seconds): wind-up behind the trainer, a spinning arc with a trail, a bump off the Pokémon,
+	// the lid opens and its red light draws the Pokémon in, the lid shuts, the ball drops and bounces, wobbles once per
+	// shake with its button blinking, then clicks shut with stars — or bursts open and the Pokémon is out again.
+	const float Was = BallTime;
 	BallTime += Dt;
-	const FVector From = (Trainer ? Trainer->GetActorLocation() : Mons[0].Home) + FVector(0, 0, 60.f);
-	const FVector Top = Mons[1].Home + FVector(0, 0, Mons[1].Height * 0.75f) - Forward * 60.f;
-	const FVector Ground = Mons[1].Home + FVector(0, 0, 22.f) - Forward * 60.f;
-	const float CaptureAt = 0.65f;
-	const float LandAt = 1.25f;
-	const float ResultAt = LandAt + BallShakes * 0.65f + 0.25f;
-	if (BallTime < CaptureAt)
+	const float Now = BallTime;
+	auto Reached = [Was, Now](float At) { return Was < At && Now >= At; };
+	constexpr float WindUp = 0.22f, Flight = 0.95f, Bump = 1.2f, Opened = 1.32f, Shut = 1.8f, Drop = 1.95f, Land = 2.35f, Still = 2.8f;
+	constexpr float ShakeEvery = 1.0f, ShakeFor = 0.6f, LidSpeed = 0.12f, LidOpen = 105.f;
+	const float Decide = Still + BallShakes * ShakeEvery + 0.15f;
+	const float Done = Decide + (bBallCaught ? 1.0f : 0.45f);
+
+	const FVector Up(0.f, 0.f, 1.f);
+	const float FaceYaw = (-Forward).Rotation().Yaw;  // the button looks back at the trainer and the camera
+	const FVector Hand = (Trainer ? Trainer->GetActorLocation() : Mons[0].Home) + Right * 30.f + Up * 60.f;
+	const FVector Cocked = Hand - Forward * 35.f + Up * 45.f;
+	const FVector Hover = Mons[1].Home - Forward * 75.f + Up * (FxHeight(1) * 0.6f + 40.f);
+	const FVector Ground = Mons[1].Home - Forward * 75.f + Up * (BallR + 1.f);
+	CaptureTo = Hover;
+
+	FVector Pos = Hover;
+	float Spin = 0.f;   // pitch: rolling forward in flight
+	float Tilt = 0.f;   // roll: the wobble
+	float Lid = 0.f;    // lid angle
+	float Size = 1.f;
+	if (Now < WindUp)
 	{
-		const float P = BallTime / CaptureAt;
-		Ball->SetWorldLocation(FMath::Lerp(From, Top, P) + FVector(0, 0, FMath::Sin(P * PI) * 220.f));
-		Ball->SetWorldRotation(FRotator(-P * 800.f, 0, 0));
+		const float P = Now / WindUp;
+		const float S = P * P * (3.f - 2.f * P);
+		Pos = FMath::Lerp(Hand, Cocked, S);
+		Size = 0.4f + 0.6f * S;
+		Spin = 40.f * S;
 	}
-	else if (BallTime < LandAt)
+	else if (Now < Flight)
 	{
-		if (Mons[1].Anim != TEXT("capture"))
+		const float P = (Now - WindUp) / (Flight - WindUp);
+		Pos = FMath::Lerp(Cocked, Hover, P) + Up * FMath::Sin(P * PI) * 230.f;
+		Spin = 40.f - 760.f * P;
+		BallTrailClock -= Dt;
+		if (BallTrailClock <= 0.f && Fx)
 		{
-			Animate(1, TEXT("capture"));
-			UpdateAura(1);
-			if (Fx) Fx->BallOpen(Top, FxHeight(1) * 0.6f);
+			BallTrailClock = 0.03f;
+			Fx->BallTrail(Pos);
 		}
-		const float P = (BallTime - CaptureAt) / (LandAt - CaptureAt);
-		Ball->SetWorldLocation(FMath::Lerp(Top, Ground, P * P));
 	}
-	else if (BallTime < ResultAt)
+	else if (Now < Opened)
 	{
-		Ball->SetWorldLocation(Ground);
-		const float Local = FMath::Fmod(BallTime - LandAt, 0.65f);
-		const bool bShaking = BallTime - LandAt < BallShakes * 0.65f && Local < 0.38f;
-		Ball->SetWorldRotation(FRotator(0, 0, bShaking ? FMath::Sin(Local / 0.38f * 2.f * PI) * 28.f : 0.f));
+		// bumps off the Pokémon, back towards the trainer and up, and comes to rest facing the camera
+		const float P = (Now - Flight) / (Opened - Flight);
+		Pos = Hover + (-Forward * 45.f + Up * 30.f) * FMath::Sin(P * PI) * (1.f - 0.5f * P);
+		Spin = -720.f;  // two whole turns: upright again
+		Lid = Now >= Bump ? LidOpen * FMath::Clamp((Now - Bump) / LidSpeed, 0.f, 1.f) : 0.f;
+	}
+	else if (Now < Drop)
+	{
+		Pos = Hover + Up * FMath::Sin((Now - Opened) * 6.f) * 4.f;
+		Lid = Now < Shut ? LidOpen : LidOpen * (1.f - FMath::Clamp((Now - Shut) / LidSpeed, 0.f, 1.f));
+	}
+	else if (Now < Land)
+	{
+		const float P = (Now - Drop) / (Land - Drop);
+		Pos = FMath::Lerp(Hover, Ground, P * P);
+		Spin = 25.f * P;
+	}
+	else if (Now < Still)
+	{
+		// two bounces, the second smaller
+		const float L = Now - Land;
+		const float First = 0.26f;
+		const float H = L < First ? 26.f * FMath::Sin(L / First * PI) : 8.f * FMath::Sin(FMath::Min((L - First) / (Still - Land - First), 1.f) * PI);
+		Pos = Ground + Up * H;
+		Spin = 25.f * (1.f - FMath::Clamp(L / (Still - Land), 0.f, 1.f));
 	}
 	else
 	{
-		bBallActive = false;
-		if (!bBallCaught)
+		Pos = Ground;
+		const float Into = Now - Still;
+		const int32 Wobble = FMath::FloorToInt(Into / ShakeEvery);
+		const float U = (Into - Wobble * ShakeEvery) / ShakeFor;
+		const bool bShaking = Wobble < BallShakes && U < 1.f && Now < Decide;
+		if (bShaking)
 		{
-			Ball->SetVisibility(false);
+			// tips one way, the other way, and settles; each shake a bit weaker than the last
+			Tilt = FMath::Sin(U * 2.f * PI) * (30.f - 6.f * Wobble) * (1.f - U * 0.35f);
+			Pos += Right * FMath::Sin(U * 2.f * PI) * 2.5f;
+		}
+		if (BallButton)
+		{
+			const bool bBlink = bShaking && FMath::Fmod(U * 4.f, 1.f) < 0.5f;
+			const TCHAR* Color = Now >= Decide ? (bBallCaught ? TEXT("9A9A9A") : TEXT("FAFAFA")) : bBlink ? TEXT("FF4636") : TEXT("FAFAFA");
+			BallButton->SetVectorParameterValue(TEXT("Color"), StageHex(Color));
+		}
+		if (Now >= Decide)
+		{
+			const float After = Now - Decide;
+			if (bBallCaught)
+			{
+				Size = 1.f + 0.18f * FMath::Sin(FMath::Clamp(After / 0.18f, 0.f, 1.f) * PI);  // the click
+			}
+			else
+			{
+				Lid = LidOpen * 1.15f * FMath::Clamp(After / 0.07f, 0.f, 1.f);
+				Size = FMath::Max(0.01f, 1.f - After / 0.35f);
+				Pos += Up * 12.f * FMath::Clamp(After / 0.1f, 0.f, 1.f);
+			}
+		}
+	}
+
+	if (Reached(Bump))
+	{
+		Animate(1, TEXT("capture"));
+		UpdateAura(1);
+		if (Fx)
+		{
+			Fx->BallOpen(Hover, FxHeight(1) * 0.55f);
+			Fx->CaptureBeam(Hover, Mons[1].Home + Up * FxHeight(1) * 0.45f, FxHeight(1));
+		}
+	}
+	if (Reached(Shut + LidSpeed) && Fx) Fx->BallTrail(Hover);
+	if (Reached(Land) && Fx) Fx->BallDust(Ground - Up * BallR);
+	if (Reached(Decide))
+	{
+		if (bBallCaught)
+		{
+			if (Fx) Fx->CaptureSparkles(Ground + Up * 15.f);
+		}
+		else
+		{
 			Animate(1, TEXT("appear"));
 			UpdateAura(1);
-			if (Fx) Fx->BallOpen(Ground, FxHeight(1));
+			if (Fx) Fx->BallOpen(Ground + Up * 20.f, FxHeight(1));
 		}
-		else if (Fx)
-		{
-			Fx->CaptureSparkles(Ground + FVector(0, 0, 20.f));
-		}
+	}
+
+	Ball->SetWorldLocation(Pos);
+	Ball->SetWorldRotation(FRotator(Spin, FaceYaw, Tilt));
+	Ball->SetWorldScale3D(FVector(Size));
+	BallHinge->SetRelativeRotation(FRotator(Lid, 0.f, 0.f));
+	if (Now >= Done)
+	{
+		bBallActive = false;
+		if (!bBallCaught) Ball->SetVisibility(false, true);
 		Wait = 0.5f;
 	}
 }

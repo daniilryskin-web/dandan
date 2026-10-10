@@ -78,12 +78,16 @@ void ULigaGameInstance::HealTeam()
 
 bool ULigaGameInstance::RollWild(const FString& Route, int32& OutSpecies, int32& OutLevel)
 {
-	const TArray<FLigaEncounter>* Table = FLigaDatabase::Get().Encounters(Route);
-	if (!Table || Table->Num() == 0) return false;
+	// The route's table, plus its "@night" or "@day" table by the computer clock (owls and ghosts come out at night).
+	TArray<FLigaEncounter> Table;
+	const FLigaDatabase& Db = FLigaDatabase::Get();
+	if (const TArray<FLigaEncounter>* Base = Db.Encounters(Route)) Table.Append(*Base);
+	if (const TArray<FLigaEncounter>* Now = Db.Encounters(Route + (LigaRules::IsDaytime() ? TEXT("@day") : TEXT("@night")))) Table.Append(*Now);
 	int32 Total = 0;
-	for (const FLigaEncounter& E : *Table) Total += E.Weight;
+	for (const FLigaEncounter& E : Table) Total += E.Weight;
+	if (Total <= 0) return false;
 	int32 Roll = Rng.RandRange(0, Total - 1);
-	for (const FLigaEncounter& E : *Table)
+	for (const FLigaEncounter& E : Table)
 	{
 		if (Roll < E.Weight)
 		{

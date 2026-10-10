@@ -106,6 +106,12 @@ public:
 	void Shield(const FVector& Base, float Height);
 	void BallOpen(const FVector& At, float Size);
 	void CaptureSparkles(const FVector& At);
+	/** A glint left behind by the flying Poké Ball. */
+	void BallTrail(const FVector& At);
+	/** The red light of an open Poké Ball drawing a Pokémon in (From: the ball, To: the Pokémon's middle). */
+	void CaptureBeam(const FVector& From, const FVector& To, float Height);
+	/** A puff of dust where the ball lands. */
+	void BallDust(const FVector& At);
 	void Faint(const FVector& Base, float Height);
 	void Miss(const FVector& Base, float Height);
 	/** Keeps showing a status condition around a Pokémon (None turns it off). */

@@ -599,13 +599,22 @@ void ALigaCharacter::UpdateEncounters(float Dt)
 	if (Zones.Num() == 0)
 	{
 		GrassWalk = 0.f;
+		GrassCalm = FMath::Max(GrassCalm, 320.f);  // the first two steps into the grass are always calm
 		return;
 	}
+	if (GrassCalm > 0.f)
+	{
+		GrassCalm -= Moved;
+		return;
+	}
+	// One roll per step (1.6 m), about one Pokémon per 35 m of grass, and ten calm steps after each one: before, a roll
+	// every step with 13% made a battle every two or three seconds in the forest.
 	GrassWalk += Moved;
 	if (GrassWalk < 160.f) return;
 	GrassWalk = 0.f;
-	if (FMath::FRand() < 0.13f)
+	if (FMath::FRand() < 0.045f)
 	{
+		GrassCalm = 1600.f;
 		const ALigaEncounterZone* Z = Cast<ALigaEncounterZone>(Zones[0]);
 		PC->TryWildEncounter(Z ? Z->Route : FString(TEXT("route1")), Z ? Z->Place : FString());
 	}

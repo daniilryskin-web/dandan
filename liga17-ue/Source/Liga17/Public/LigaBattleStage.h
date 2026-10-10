@@ -93,8 +93,14 @@ public:
 private:
 	UPROPERTY() TObjectPtr<USceneComponent> Root;
 	UPROPERTY() FLigaBillboard Mons[2];
-	UPROPERTY() TObjectPtr<UStaticMeshComponent> Ball;
-	UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> BallMat;
+	/** The Poké Ball, built in code (BuildBall): this pivot flies, spins and wobbles; the white lower half carries the
+	 *  button, the red lid opens on a hinge at the back. */
+	UPROPERTY() TObjectPtr<USceneComponent> Ball;
+	UPROPERTY() TObjectPtr<UProceduralMeshComponent> BallLower;
+	UPROPERTY() TObjectPtr<USceneComponent> BallHinge;
+	UPROPERTY() TObjectPtr<UProceduralMeshComponent> BallLid;
+	UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> BallButton;
+	UPROPERTY() TArray<TObjectPtr<UMaterialInstanceDynamic>> BallMats;
 	UPROPERTY() TObjectPtr<APawn> Trainer;
 	/** Move and status effects. */
 	UPROPERTY() TObjectPtr<ALigaBattleFx> Fx;
@@ -125,6 +131,9 @@ private:
 	float BallTime = 0.f;
 	int32 BallShakes = 0;
 	bool bBallCaught = false;
+	float BallTrailClock = 0.f;
+	/** Where the Pokémon is drawn to while it is caught (the open ball). */
+	FVector CaptureTo = FVector::ZeroVector;
 
 	FVector GroundAt(const FVector& P) const;
 	void SetupMon(int32 Side, const FLigaPokemon& P, const FVector& Where);
@@ -134,6 +143,7 @@ private:
 	void UpdateMon(int32 Side, float Dt);
 	void UpdateCamera(float Dt);
 	void UpdateBall(float Dt);
+	void BuildBall();
 	void NextEvent();
 	void AddPopup(int32 Side, const FString& Text, const FLinearColor& Color);
 	/** Height of what is drawn for a side (the model is 80% of the picture size). */

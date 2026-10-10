@@ -7,7 +7,9 @@ this project's repository. Do not publish or sell a game that contains them.
 
 The files use Draco mesh compression and WebP textures. Each one is converted to a plain .glb (DracoPy, Pillow):
 the helper sphere every file carries is dropped, the parts are joined into one mesh, broken bones and animation
-keys are repaired, and the result is imported with Unreal's glTF importer into /Game/Liga/Pokemon/P<id>.
+keys are repaired, a model without a skeleton gets one (_autorig), the body is centred over the origin, grey flame
+masks of Fire types are coloured, and idle / walk / attack / faint clips are made for the body plan (_Rig). The result
+is imported with Unreal's glTF importer into /Game/Liga/Pokemon3D/V<converter version>/P<id>.
 Pokémon without a model, or whose file cannot be repaired, keep their HOME picture.
 
 Used by liga_setup.py for the Pokémon the game can show. To import every available model (about 1 GB and a long
@@ -29,11 +31,9 @@ import unreal
 COMMIT = '429de1288cea0d43f5b4f56305d2276e94239d65'
 BASE = f'https://raw.githubusercontent.com/Pokemon-3D-api/assets/{COMMIT}/models/opt'
 
-# Pokémon the game can show: every Pokémon of Kanto (No. 1–151) and the Pokémon of Johto that live around New Bark Town
-# and on Route 29, Johto's starters and what they evolve into.
-GAME_SPECIES = list(range(1, 152)) + [152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 170,
-                                      171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 183, 184, 187, 188, 189, 190, 191,
-                                      192, 194, 195, 206, 211, 222, 223, 224, 226]
+# Pokémon the game can show: the whole Pokédex of Kanto and Johto (No. 1–251) — the wild ones, and the ones that only
+# come by evolution (Crobat, Espeon, Steelix…) or by trade.
+GAME_SPECIES = list(range(1, 252))
 # Shiny models are imported only for these (a shiny of another species shows its HOME picture): the starters of both
 # regions, Pikachu and Eevee with their evolutions. Importing every shiny would double the first setup.
 SHINY_SPECIES = {1, 2, 3, 4, 5, 6, 7, 8, 9, 25, 26, 133, 134, 135, 136, 152, 153, 154, 155, 156, 157, 158, 159, 160}
@@ -43,7 +43,7 @@ CACHE = os.path.join(PROJECT, 'Saved', 'Liga', 'Pokemon3D')
 SITE = os.path.join(PROJECT, 'Content', 'Python', 'Lib', 'site-packages')
 
 # Bump when convert() changes: models are imported again into a new folder, and the old folders are deleted.
-CONVERTER_VERSION = 6
+CONVERTER_VERSION = 7
 DEST_ROOT = '/Game/Liga/Pokemon3D'
 DEST = f'{DEST_ROOT}/V{CONVERTER_VERSION}'
 OLD_DESTS = ['/Game/Liga/Pokemon']  # converter versions 1–3
@@ -58,12 +58,15 @@ IDLE = re.compile(r'idle|wait|stand|loop|armatureaction|take ?0*1', re.I)
 ATTACK = re.compile(r'attack|fight|atk|impact|thunder|trueno|bolt|punch|bite|tackle|scratch', re.I)
 FAINT = re.compile(r'\bko\b|faint|down|dead|_ko|\|ko|ko$', re.I)
 WALK = re.compile(r'walk|(?<![a-z])run', re.I)
+OTHER = re.compile(r'sleep|landing|jump|turn|dizzy|appear', re.I)  # loops that are no idle (Wigglytuff slept)
 
 
 def clip_role(name):
     """'idle' / 'walk' / 'attack' / 'faint' / None for an animation name (the same rules for files and for assets)."""
     if WALK.search(name):
         return 'walk'
+    if OTHER.search(name):
+        return None
     for role, rx in (('idle', IDLE), ('attack', ATTACK), ('faint', FAINT)):
         if rx.search(name):
             return role
@@ -762,9 +765,16 @@ def _ensure_normals(gltf, views, add_view):
 
 # ——— procedural clips ———
 # Most models in the repository have no animation at all, so a Pokémon would stand frozen in its bind pose (arms
-# straight out). The bones follow one naming scheme (Hips, Spine1, Head, LArm, RThigh, Tail1…), so simple clips can be
-# made for any of them: idle (breathing, arms lowered, tail and head moving), walk, attack (wind-up and lunge), faint.
-# Clips the file already has are kept; only missing roles are added, named liga_<role>.
+# straight out). The bones follow one naming scheme (Hips, Spine1, Head, LArm, RThigh, Tail1…), so clips can be made
+# for any of them. _Rig reads the skeleton (legs, arms, wings, tails, ears, antennae, by name and by where they are),
+# picks a body plan (two legs, four legs, bird, flier, serpent, fish, blob — helped by the species' shape from
+# species.json), gives it a natural stance (arms lowered with bent elbows, a tail held up off the ground, a bird's
+# wings folded) and makes idle, walk, attack and faint clips for that plan. Clips the file already has are kept; only
+# missing roles are added, named liga_<role>.
+#
+# Turns are world-axis rotations about each bone's own pivot. The model faces +Z, up is +Y and its left side is +X:
+# +X swings a hanging limb backwards (and pitches a forward-looking head down, leans an upright spine forwards),
+# +Y turns the front towards the model's left, +Z raises a left wing (side * angle raises either wing).
 
 _SIDE = re.compile(r'^(?:L|R)(?=[A-Z_0-9])')
 
@@ -780,10 +790,10 @@ def _bone_kind(name):
     idx = int(re.findall(r'\d+', n)[-1]) if re.findall(r'\d+', n) else 0
     low = n.lower()
     for kind, words in (('forearm', ('forearm',)), ('arm', ('arm',)), ('shoulder', ('shoulder', 'clavicle')), ('hand', ('hand',)),
-                        ('thigh', ('thigh',)), ('shin', ('leg',)), ('foot', ('foot',)), ('toe', ('toe',)), ('finger', ('finger',)),
+                        ('thigh', ('thigh',)), ('shin', ('leg', 'calf')), ('foot', ('foot',)), ('toe', ('toe',)), ('finger', ('finger',)),
                         ('tail', ('tail',)), ('neck', ('neck',)), ('head', ('head',)), ('jaw', ('jaw', 'beak')), ('ear', ('ear',)),
                         ('wing', ('wing', 'wind')), ('spine', ('spine', 'chest')), ('pelvis', ('hips', 'waist', 'pelvis')),
-                        ('feeler', ('feeler', 'hair'))):
+                        ('feeler', ('feeler', 'hair', 'tentacle'))):
         if any(w in low for w in words):
             return side, kind, idx
     return side, None, idx
@@ -834,241 +844,673 @@ def _quat_conj(q):
     return np.array([-q[0], -q[1], -q[2], q[3]])
 
 
-def _procedural_clips(gltf, views, add_view):
+def _unit(v):
+    import numpy as np
+    v = np.asarray(v, dtype=np.float64)
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else v
+
+
+def _rot_between(a, b):
+    """(axis, degrees) of the smallest turn taking direction a to b, or None when they already agree."""
+    import numpy as np
+    a, b = _unit(a), _unit(b)
+    axis = np.cross(a, b)
+    s, c = float(np.linalg.norm(axis)), float(np.clip(a @ b, -1.0, 1.0))
+    if s < 1e-9:
+        if c > 0:
+            return None
+        axis = np.cross(a, [1.0, 0.0, 0.0] if abs(a[0]) < 0.9 else [0.0, 1.0, 0.0])
+        s = float(np.linalg.norm(axis))
+    return axis / s, float(np.degrees(np.arctan2(s, c)))
+
+
+def _rot_matrix(axis, deg):
+    import numpy as np
+    x, y, z = _unit(axis)
+    a = np.radians(deg)
+    c, s, t = np.cos(a), np.sin(a), 1 - np.cos(a)
+    return np.array([[t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+                     [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+                     [t * x * z - s * y, t * y * z + s * x, t * z * z + c]])
+
+
+def _smooth(a, b, t):
+    import numpy as np
+    x = np.clip((t - a) / (b - a), 0.0, 1.0)
+    return float(x * x * (3 - 2 * x))
+
+
+def _curve(keys, u):
+    """A looping curve through (fraction, value) keys with eased moves between them and holds where values repeat."""
+    for (u0, v0), (u1, v1) in zip(keys, keys[1:]):
+        if u0 <= u <= u1:
+            return v0 + (v1 - v0) * _smooth(u0, u1, u) if u1 > u0 else v1
+    return keys[-1][1]
+
+
+_SPECIES = {}
+
+
+def species_info(species):
+    """The game's data for a species (shape, types…), from Content/Liga/Data/species.json."""
+    if not _SPECIES:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Liga', 'Data', 'species.json')
+        try:
+            with open(path, encoding='utf-8-sig') as f:
+                for s in json.load(f):
+                    _SPECIES[s['id']] = s
+        except Exception:
+            _SPECIES[0] = {}
+    return _SPECIES.get(species, {}) if species else {}
+
+
+class _Rig:
+    """What a skeleton is made of and how its body moves. See the notes above _bone_kind."""
+
+    def __init__(self, gltf, views, info):
+        import numpy as np
+        self.gltf, self.views = gltf, views
+        nodes = gltf['nodes']
+        skin = gltf['skins'][0]
+        self.joints = list(skin['joints'])
+        jset = set(self.joints)
+        self.parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', []) if i in jset and c in jset}
+        self.root = skin.get('skeleton', self.joints[0])
+        self.children = {j: [c for c in nodes[j].get('children', []) if c in jset] for j in self.joints}
+        self.kinds = {j: _bone_kind(nodes[j].get('name', '')) for j in self.joints}
+        self.info = info or {}
+        self.shape = self.info.get('shape', '')
+        self.auto = nodes[self.root].get('name') == AUTO_ROOT  # a skeleton made by _autorig: rough legs, small steps
+
+        # base pose: the rest pose, or the first frame of the file's own idle clip
+        self.base = {j: {p: np.array(nodes[j].get(p, _REST[p]), dtype=np.float64) for p in _REST} for j in self.joints}
+        idle = next((a for a in gltf.get('animations', []) if clip_role(a.get('name', '')) == 'idle'), None)
+        if idle:
+            t0 = min(float(_float_keys(gltf, views, s['input']).min()) for s in idle['samplers'])
+            for (j, p), v in _sample_anim(gltf, views, idle, t0).items():
+                if j in self.base:
+                    self.base[j][p] = v
+        world = {}
+
+        def w(j):
+            if j not in world:
+                local = _local_matrix({p: list(self.base[j][p]) for p in _REST})
+                world[j] = (w(self.parent[j]) @ local) if j in self.parent else local
+            return world[j]
+
+        for j in self.joints:
+            w(j)
+        self.pos = {j: world[j][:3, 3] for j in self.joints}
+        self.qworld = {}
+        for j in self.joints:
+            r = world[j][:3, :3]
+            sc = np.linalg.norm(r, axis=0)
+            self.qworld[j] = _quat_from_matrix(r / np.where(sc > 1e-12, sc, 1.0)) if (sc > 1e-12).all() else np.array([0, 0, 0, 1.0])
+
+        holder = next(n for n in nodes if 'mesh' in n and 'skin' in n)
+        mesh = gltf['meshes'][holder['mesh']]
+        pts = np.concatenate([_accessor(gltf, views, p['attributes']['POSITION']) for p in mesh['primitives']]).astype(np.float64)
+        self.lo, self.hi = pts.min(axis=0), pts.max(axis=0)
+        self.height = max(self.hi[1] - self.lo[1], 1e-6)
+        self.ground = self.lo[1]
+        self._find_parts()
+        self._choose_plan()
+        self._stance()
+
+    # ——— reading the skeleton ———
+
+    def kind(self, j):
+        return self.kinds[j][1]
+
+    def side(self, j):
+        return self.kinds[j][0]
+
+    def ancestors(self, j):
+        out = []
+        while j in self.parent:
+            j = self.parent[j]
+            out.append(j)
+        return out
+
+    def subtree(self, j):
+        out, stack = [], [j]
+        while stack:
+            k = stack.pop()
+            out.append(k)
+            stack.extend(self.children[k])
+        return out
+
+    def chain(self, start, ok):
+        """start and the descendants that pass ok, always following the child with the most of them below it."""
+        def count(j):
+            return sum(1 for k in self.subtree(j) if ok(k))
+        out, j = [start], start
+        while True:
+            kids = [c for c in self.children[j] if ok(c)]
+            if not kids:
+                return out
+            j = max(kids, key=count)
+            out.append(j)
+
+    def direction(self, j, nxt=None):
+        """Where a bone points: to the next bone of its chain (or its first child), else on from its parent."""
+        import numpy as np
+        if nxt is None and self.children[j]:
+            nxt = max(self.children[j], key=lambda c: len(self.subtree(c)))
+        if nxt is not None and np.linalg.norm(self.pos[nxt] - self.pos[j]) > 1e-9:
+            return _unit(self.pos[nxt] - self.pos[j])
+        if j in self.parent and np.linalg.norm(self.pos[j] - self.pos[self.parent[j]]) > 1e-9:
+            return _unit(self.pos[j] - self.pos[self.parent[j]])
+        return np.array([0.0, -1.0, 0.0])
+
+    def lowest(self, j):
+        return min(self.pos[k][1] for k in self.subtree(j))
+
+    def length(self, chain):
+        import numpy as np
+        tip = min(self.subtree(chain[-1]), key=lambda k: -np.linalg.norm(self.pos[k] - self.pos[chain[0]]))
+        return float(np.linalg.norm(self.pos[tip] - self.pos[chain[0]]))
+
+    def _find_parts(self):
+        import numpy as np
+        J, K, S, H = self.joints, self.kind, self.side, self.height
+        top = lambda j, kinds: not (j in self.parent and K(self.parent[j]) in kinds)
+        self.legs = []
+        for j in J:
+            if K(j) == 'thigh' and S(j) != 0 and top(j, ('thigh',)):
+                ch = self.chain(j, lambda c, s=S(j): K(c) in ('thigh', 'shin', 'foot', 'toe') and S(c) == s)
+                pick = lambda kind: next((c for c in ch if K(c) == kind), None)
+                self.legs.append({'side': S(j), 'thigh': j, 'shin': pick('shin'), 'foot': pick('foot'), 'chain': ch,
+                                  'low': self.lowest(j)})
+        self.arms = []
+        for j in J:
+            if K(j) == 'arm' and S(j) != 0 and top(j, ('arm',)):
+                ch = self.chain(j, lambda c, s=S(j): K(c) in ('arm', 'forearm', 'hand') and S(c) == s)
+                fore = next((c for c in ch[1:] if K(c) in ('forearm', 'arm')), None)
+                hand = next((c for c in ch if K(c) == 'hand'), None)
+                shoulder = self.parent.get(j) if K(self.parent.get(j, j)) == 'shoulder' else None
+                self.arms.append({'side': S(j), 'arm': j, 'fore': fore, 'hand': hand, 'shoulder': shoulder, 'chain': ch,
+                                  'low': self.lowest(j), 'len': self.length(ch)})
+        heads = [j for j in J if K(j) == 'head']
+        self.head = min(heads, key=lambda j: len(self.ancestors(j))) if heads else None
+        self.necks = sorted([j for j in J if K(j) == 'neck'], key=lambda j: len(self.ancestors(j)))
+        self.jaws = [j for j in J if K(j) == 'jaw' and S(j) == 0 and 'upper' not in str(self.gltf['nodes'][j].get('name', '')).lower()]
+        self.spines = sorted([j for j in J if K(j) == 'spine'], key=lambda j: len(self.ancestors(j)))
+        self.pelvis = next((j for j in sorted(J, key=lambda j: len(self.ancestors(j))) if K(j) == 'pelvis'), None)
+        on_head = lambda j: any(a == self.head or K(a) in ('head', 'neck', 'jaw') for a in [j] + self.ancestors(j))
+        self.tails = [self.chain(j, lambda c: K(c) == 'tail' and S(c) == 0)
+                      for j in J if K(j) == 'tail' and S(j) == 0 and top(j, ('tail',)) and not on_head(j)]
+        self.ears = [self.chain(j, lambda c, s=S(j): K(c) == 'ear' and S(c) == s) for j in J if K(j) == 'ear' and top(j, ('ear',))]
+        self.wings, self.loose = [], []
+        for j in J:
+            if K(j) in ('wing', 'feeler') and top(j, ('wing', 'feeler')):
+                ch = self.chain(j, lambda c, s=S(j): K(c) in ('wing', 'feeler') and S(c) == s)
+                if S(j) != 0 and not on_head(j) and (K(j) == 'wing' or self.length(ch) >= 0.22 * H):
+                    self.wings.append({'side': S(j), 'chain': ch})
+                else:
+                    self.loose.append(ch)
+        # The last bone of a leg often sits above the sole (the foot's mesh reaches lower), so a leg counts as one to
+        # walk on when its lowest bone is in the lower third of the body.
+        self.walking_legs = [l for l in self.legs if l['low'] < self.ground + 0.35 * H]
+        self.front_legs = [a for a in self.arms if a['low'] < self.ground + 0.2 * H and self.walking_legs
+                           and self.shape in ('quadruped', 'armor', 'legs', '')]
+        self.hands = [a for a in self.arms if a not in self.front_legs]
+
+    def _choose_plan(self):
+        shape, H = self.shape, self.height
+        legs = len(self.walking_legs) >= 2
+        long_arms = [a for a in self.hands if a['len'] > 0.28 * H]
+        if shape == 'wings' and len(long_arms) >= 2:
+            # a bird's arms are its wings; feathery "feelers" on its back just flutter along
+            self.loose += [wg['chain'] for wg in self.wings]
+            self.wings = [{'side': a['side'], 'chain': a['chain'], 'arm': a} for a in long_arms]
+            self.hands = [a for a in self.hands if a not in long_arms]
+        if shape in ('tentacles', 'ball', 'blob', 'heads', 'arms', 'fish'):
+            self.loose += [wg['chain'] for wg in self.wings]  # spikes, fins and tentacles are not wings
+            self.wings = []
+        long_body = len(self.spines) + sum(len(t) for t in self.tails) >= 8
+        if self.front_legs and legs:
+            plan = 'quadruped'
+        elif shape == 'wings':
+            plan = 'bird' if legs else 'flier'
+        elif shape == 'bug-wings':
+            grounded = legs and min(l['low'] for l in self.walking_legs) < self.ground + 0.2 * H
+            plan = 'biped' if grounded else 'flier'
+        elif shape in ('upright', 'humanoid', 'legs'):
+            plan = 'biped' if legs else 'blob'
+        elif shape == 'squiggle' or (shape == 'armor' and not legs and long_body):
+            plan = 'serpent'
+        elif shape in ('fish', 'tentacles'):
+            plan = 'fish'
+        elif shape in ('ball', 'blob', 'heads', 'arms'):
+            plan = 'blob'
+        elif legs:
+            plan = 'biped'
+        elif self.wings:
+            plan = 'flier'
+        elif long_body and not self.legs:
+            plan = 'serpent'
+        else:
+            plan = 'blob'
+        self.plan = plan
+        # fliers and fish hover above the ground; serpents and fish carry their weight on the body
+        self.hover = {'flier': 0.28, 'fish': 0.08}.get(plan, 0.0) * H
+
+    # ——— stance: the pose every clip starts from ———
+
+    def _stance(self):
+        """Posture turns {joint: 3x3 matrix}, each in the frame before its parents' turns (see _aim)."""
+        import numpy as np
+        self.stance = {}
+        if self.plan in ('biped', 'quadruped', 'bird', 'blob', 'flier'):
+            for a in self.hands:
+                if a['fore'] is None:
+                    continue
+                d = self.direction(a['arm'], a['fore'])
+                if np.degrees(np.arccos(np.clip(d @ [0, -1, 0], -1, 1))) > 35.0:  # T-pose or arms out: lower them
+                    self._aim(a['arm'], a['fore'], [a['side'] * 0.42, -1.0, 0.2], 80.0)
+                    if a['hand'] is not None and a['hand'] != a['fore']:
+                        self._aim(a['fore'], a['hand'], [a['side'] * 0.12, -0.55, 1.0], 70.0)
+        if self.plan == 'bird':
+            for wg in self.wings:
+                a = wg.get('arm')
+                if a and a['fore'] is not None:
+                    # folded along the body: upper wing back, forewing forwards again, tips back
+                    self._aim(a['arm'], a['fore'], [a['side'] * 0.45, -0.55, -1.0], 120.0)
+                    if a['hand'] is not None and a['hand'] != a['fore']:
+                        self._aim(a['fore'], a['hand'], [a['side'] * 0.2, -0.25, 1.0], 150.0)
+        if self.plan == 'serpent':
+            self._lie_down()
+        if self.plan in ('biped', 'quadruped', 'bird'):
+            for ch in self.tails:
+                if len(ch) < 2 or self.lowest(ch[0]) > self.ground + 0.25 * self.height or self.length(ch) > 1.3 * self.height:
+                    continue  # long thin tails (Raichu, Mankey) keep their curves
+                # a tail lying on the ground is held up in a gentle curve
+                for k, j in enumerate(ch[:-1]):
+                    want = min(6.0 + 8.0 * k, 40.0)
+                    cur = self._final_dir(j, ch[k + 1])
+                    elev = np.degrees(np.arcsin(np.clip(cur[1], -1, 1)))
+                    if elev < want and cur[2] < 0.5:
+                        horiz = _unit([cur[0], 0.0, cur[2]]) if abs(cur[0]) + abs(cur[2]) > 1e-6 else np.array([0, 0, -1.0])
+                        target = horiz * np.cos(np.radians(want)) + np.array([0, 1.0, 0]) * np.sin(np.radians(want))
+                        self._aim(j, ch[k + 1], target, min(want - elev, 22.0))
+        self.stance_q = {j: _quat_from_matrix(m) for j, m in self.stance.items()}
+        # the stance can lift the body off the ground (a tail held up) or sink it (a snake laid down): every clip is
+        # moved so that the stance stands where the bind pose stood, which is where the game puts the model
+        self.lift = self.ground - self._posed_low() if self.stance else 0.0
+
+    def _lie_down(self):
+        """A snake standing straight up in its file (Ekans, Dratini) lies down: the tail coils on the ground and the front
+        of the body rises in a curve to the head."""
+        import numpy as np
+        H = self.height
+        tail = max(self.tails, key=len) if self.tails else []
+        body = list(self.spines) + list(self.necks)
+        if not tail or len(body) < 2 or self.head is None:
+            return
+        rise = self.pos[self.head] - self.pos[tail[-1]]
+        if abs(rise[1]) < 0.6 * np.linalg.norm(rise):
+            return  # already lying along the ground (Onix, Gyarados)
+        n = len(tail)
+        for k, j in enumerate(tail[:-1]):
+            yaw = np.radians(180.0 + min(26.0 * (k + 1), 300.0) * (1 if n > 5 else 0.5))
+            elev = -25.0 if k == 0 else -3.0
+            target = np.array([np.sin(yaw) * np.cos(np.radians(elev)), np.sin(np.radians(elev)), np.cos(yaw) * np.cos(np.radians(elev))])
+            self._aim(j, tail[k + 1], target, 180.0)
+        m = len(body)
+        for k, j in enumerate(body):
+            nxt = body[k + 1] if k + 1 < m else self.head
+            f = k / max(1, m - 1)
+            elev = 8.0 + 70.0 * f * f if f > 0.25 else -10.0 + 30.0 * f
+            yaw = np.radians(-14.0 * np.sin(np.pi * f))
+            target = np.array([np.sin(yaw) * np.cos(np.radians(elev)), np.sin(np.radians(elev)), np.cos(yaw) * np.cos(np.radians(elev))])
+            self._aim(j, nxt, target, 180.0)
+        if self.head is not None and self.children[self.head]:
+            self._aim(self.head, None, [0.0, -0.15, 1.0], 120.0)
+
+    def _posed_low(self, motion=None):
+        """The lowest vertex of the mesh in the stance, with the turns of `motion` ({joint: [(axis, degrees)…]}) on top
+        (linear blend skinning of the bind-pose vertices)."""
+        import numpy as np
+        g, views = self.gltf, self.views
+        nodes = g['nodes']
+        skin = g['skins'][0]
+        ibm = _accessor(g, views, skin['inverseBindMatrices']).astype(np.float64).reshape(-1, 4, 4).transpose(0, 2, 1)
+        world = {}
+
+        def w(j):
+            if j not in world:
+                q = self.base[j]['rotation']
+                qd = self.stance_q.get(j, np.array([0, 0, 0, 1.0]))
+                for axis, deg in (motion or {}).get(j, []):
+                    qd = _quat_mul(_axis_quat(axis, deg), qd)
+                if abs(abs(qd[3]) - 1.0) > 1e-12:
+                    q = _quat_mul(q, _quat_mul(_quat_conj(self.qworld[j]), _quat_mul(qd, self.qworld[j])))
+                local = _local_matrix({'translation': list(self.base[j]['translation']), 'rotation': list(q),
+                                       'scale': list(self.base[j]['scale'])})
+                world[j] = (w(self.parent[j]) @ local) if j in self.parent else local
+            return world[j]
+
+        mats = np.array([w(j) @ ibm[k] for k, j in enumerate(skin['joints'])])
+        holder = next(n for n in nodes if 'mesh' in n and 'skin' in n)
+        low = None
+        for prim in g['meshes'][holder['mesh']]['primitives']:
+            a = prim['attributes']
+            if 'JOINTS_0' not in a or 'WEIGHTS_0' not in a:
+                continue
+            pos = _accessor(g, views, a['POSITION']).astype(np.float64)
+            jj = np.minimum(_accessor(g, views, a['JOINTS_0']).astype(np.int64), len(mats) - 1)
+            ww = _float_keys(g, views, a['WEIGHTS_0'])
+            y = np.zeros(len(pos))
+            for c in range(jj.shape[1]):
+                m = mats[jj[:, c]]
+                y += ww[:, c] * (np.einsum('nj,nj->n', m[:, 1, :3], pos) + m[:, 1, 3])
+            total = ww.sum(axis=1)
+            ok = total > 1e-6
+            if ok.any():
+                v = float((y[ok] / total[ok]).min())
+                low = v if low is None else min(low, v)
+        return self.ground if low is None else low
+
+    def _acc(self, j):
+        import numpy as np
+        m = np.eye(3)
+        for a in reversed(self.ancestors(j)):
+            if a in self.stance:
+                m = m @ self.stance[a]
+        return m
+
+    def _final_dir(self, j, nxt):
+        return self._acc(j) @ self.stance.get(j, __import__('numpy').eye(3)) @ self.direction(j, nxt)
+
+    def _aim(self, j, nxt, target, limit):
+        """Turns bone j so that it points to target after its parents' turns (limited to `limit` degrees)."""
+        import numpy as np
+        acc = self._acc(j)
+        cur = self.stance.get(j, np.eye(3)) @ self.direction(j, nxt)
+        r = _rot_between(cur, acc.T @ _unit(target))
+        if r is None:
+            return
+        self.stance[j] = _rot_matrix(r[0], min(r[1], limit)) @ self.stance.get(j, np.eye(3))
+
+    # ——— motion ———
+
+    def pose(self, role, t, T):
+        """{joint: [(axis, degrees), …]} world turns on top of the stance, and the root offset, at time t of a clip."""
+        import numpy as np
+        X, Y, Z = np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0])
+        H = self.height
+        rot, off = {}, np.zeros(3)
+        wv = 2 * np.pi * t / T
+        u = t / T
+
+        def add(j, axis, deg):
+            if j is not None and abs(deg) > 1e-6:
+                rot.setdefault(j, []).append((axis, deg))
+
+        def wave(chain, axis, amp, freq, lag, phase=0.0, grow=0.15):
+            for k, j in enumerate(chain[:-1] if len(chain) > 1 else chain):
+                add(j, axis, amp * (1 + grow * k) * np.sin(freq * wv - lag * k + phase))
+
+        plan = self.plan
+        legs = {l['side']: l for l in self.walking_legs}
+        if role == 'idle':
+            breath = np.sin(2 * wv)
+            look = _curve([(0, 0), (.12, 0), (.24, 16), (.42, 16), (.56, -11), (.72, -11), (.86, 0), (1, 0)], u)
+            nod = _curve([(0, 0), (.3, 0), (.38, -5), (.5, -5), (.58, 3), (.66, 0), (1, 0)], u)
+            for k, j in enumerate(self.spines):
+                add(j, X, 1.6 * breath)
+                add(j, Y, 1.5 * np.sin(wv + 0.3 * k))
+            for j in self.necks:
+                add(j, Y, 0.35 * look / max(1, len(self.necks)))
+                add(j, X, 0.4 * nod / max(1, len(self.necks)))
+            add(self.head, Y, 0.65 * look if self.necks else look)
+            add(self.head, X, (0.6 if self.necks else 1.0) * nod + 1.5 * np.sin(2 * wv - 1.0))
+            add(self.head, Z, 3.0 * np.sin(wv + 1.0))
+            for j in self.jaws:
+                add(j, X, 7.0 * _smooth(0.62, 0.68, u) * (1 - _smooth(0.74, 0.82, u)))
+            for a in self.hands:
+                add(a['arm'], X, 3.0 * np.sin(2 * wv + a['side']))
+                add(a['arm'], Z, -a['side'] * 2.0 * breath)
+                add(a['fore'], X, -3.0 * np.sin(2 * wv + 0.6))
+            for ch in self.tails:
+                wave(ch, Y, 5.0, 1, 0.55)
+                wave(ch, X, -1.5, 2, 0.5, 1.0)
+            for ch in self.ears:
+                twitch = _smooth(0.45, 0.48, u) * (1 - _smooth(0.5, 0.56, u))
+                wave(ch, Z, self.side(ch[0]) * 2.5, 2, 0.4)
+                add(ch[0], X, -12.0 * twitch)
+            for ch in self.loose:
+                wave(ch, X, 3.0, 2, 0.6, 0.5)
+                wave(ch, Z, 2.0, 3, 0.5)
+            if plan == 'flier':
+                for wg in self.wings:
+                    wave(wg['chain'], Z, wg['side'] * 26.0, 10, 0.35, 0.0, 0.05)
+                off += Y * (self.hover + 0.04 * H * np.sin(10 * wv - 0.6))
+            else:
+                for wg in self.wings:
+                    ruffle = _smooth(0.55, 0.6, u) * (1 - _smooth(0.62, 0.7, u))
+                    wave(wg['chain'], Z, wg['side'] * (2.0 * breath + 12.0 * ruffle), 1, 0.3, 0.0, 0.0)
+                off += Y * (self.hover + 0.006 * H * (1 + breath))
+            if plan == 'serpent':
+                body = list(reversed(self.spines)) + [j for ch in self.tails for j in ch]
+                wave(body, Y, 3.0, 1, 0.5, 0.0, 0.0)
+            elif plan == 'fish':
+                for ch in self.tails:
+                    wave(ch, Y, 9.0, 3, 0.6)
+                for a in self.arms:
+                    add(a['arm'], Z, a['side'] * 10.0 * np.sin(4 * wv))
+                add(self.root, Y, 4.0 * np.sin(wv))
+            elif plan == 'blob':
+                add(self.root, Z, 2.5 * np.sin(wv))
+                for k, j in enumerate(self.spines):
+                    add(j, X, 3.0 * np.sin(2 * wv - 0.5 * k))
+            else:
+                add(self.root, Z, 1.2 * np.sin(wv))
+                off += X * (0.006 * H * np.sin(wv))
+        elif role == 'walk':
+            if plan == 'biped' and len(legs) >= 2:
+                stride = 0.45 if self.auto else 1.0
+                if self.auto:
+                    add(self.root, Z, 4.0 * np.sin(wv))           # a rough skeleton waddles more than it steps
+                for s, l in legs.items():
+                    x = wv + (0.0 if s > 0 else np.pi)
+                    swing = 28.0 * stride * np.sin(x)              # + back, - forward
+                    knee = 44.0 * stride * max(0.0, -np.cos(x)) ** 1.3  # bends while the foot is in the air
+                    add(l['thigh'], X, swing)
+                    add(l['shin'], X, knee)
+                    add(l['foot'], X, -0.75 * (swing + knee) + 8.0 * max(0.0, np.sin(x)) ** 2)
+                off += Y * (0.03 * H * 0.5 * (1 + np.cos(2 * wv))) + X * (0.012 * H * np.cos(wv))
+                add(self.pelvis or self.root, Y, -5.0 * np.sin(wv))
+                add(self.pelvis or self.root, Z, -2.5 * np.sin(wv))
+                for k, j in enumerate(self.spines):
+                    add(j, Y, 4.0 * np.sin(wv) / max(1, len(self.spines)))
+                    add(j, X, 1.5 + 1.2 * np.cos(2 * wv))
+                for a in self.hands:
+                    x = wv + (np.pi if a['side'] > 0 else 0.0)
+                    add(a['arm'], X, 16.0 * np.sin(x))
+                    add(a['fore'], X, -8.0 * max(0.0, -np.sin(x - 0.5)))
+                for ch in self.tails:
+                    wave(ch, Y, 5.0, 1, 0.5, np.pi / 2)
+                    wave(ch, X, -1.5, 2, 0.5)
+                add(self.head, X, -2.0 * np.cos(2 * wv))
+                add(self.head, Y, 2.0 * np.sin(wv))
+            elif plan == 'quadruped':
+                stride = 0.55 if self.auto else 1.0
+                for s, l in legs.items():
+                    x = wv + (0.0 if s > 0 else np.pi)
+                    add(l['thigh'], X, 24.0 * stride * np.sin(x))
+                    add(l['shin'], X, 30.0 * stride * max(0.0, -np.cos(x)) ** 1.3)
+                    add(l['foot'], X, -14.0 * stride * np.sin(x - 0.6))
+                for a in self.front_legs:
+                    x = wv + (0.0 if a['side'] < 0 else np.pi)      # diagonal pairs, like a trot
+                    add(a['arm'], X, 22.0 * stride * np.sin(x))
+                    add(a['fore'], X, 22.0 * stride * max(0.0, -np.cos(x)) ** 1.3)
+                    add(a['hand'], X, 30.0 * stride * max(0.0, -np.cos(x - 0.3)) ** 2)
+                off += Y * (0.035 * H * 0.5 * (1 - np.cos(2 * wv)))
+                add(self.root, Z, 2.5 * np.sin(wv))
+                for k, j in enumerate(self.spines):
+                    add(j, Y, 3.0 * np.sin(wv - 0.4 * k))
+                    add(j, X, 2.0 * np.sin(2 * wv - 0.5))
+                for j in self.necks + [self.head]:
+                    add(j, X, -2.5 * np.sin(2 * wv - 0.4))
+                for ch in self.tails:
+                    wave(ch, Y, 7.0, 1, 0.6)
+                    wave(ch, X, 2.0, 2, 0.5)
+                for a in self.hands:
+                    add(a['arm'], X, 10.0 * np.sin(wv))
+            elif plan in ('bird', 'blob') or (plan == 'biped' and len(legs) < 2):
+                hop = abs(np.sin(wv))                               # two hops per loop
+                land = max(0.0, np.cos(2 * wv)) ** 3                # knees bend as it lands
+                off += Y * (0.08 * H * hop)
+                for l in legs.values():
+                    add(l['thigh'], X, -14.0 * land)
+                    add(l['shin'], X, 26.0 * land)
+                    add(l['foot'], X, -12.0 * land)
+                for wg in self.wings:
+                    wave(wg['chain'], Z, wg['side'] * 9.0 * hop, 0, 0.3, np.pi / 2, 0.0)
+                add(self.head, X, 6.0 * np.sin(2 * wv + 0.8))
+                if plan == 'blob':
+                    add(self.root, Z, 6.0 * np.sin(wv))
+                    for k, j in enumerate(self.spines):
+                        add(j, X, 5.0 * land)
+                for ch in self.tails:
+                    wave(ch, X, -6.0 * hop, 0, 0.4, np.pi / 2)
+                for a in self.hands:
+                    add(a['arm'], Z, -a['side'] * 8.0 * hop)
+            elif plan == 'flier':
+                for wg in self.wings:
+                    wave(wg['chain'], Z, wg['side'] * 34.0, 2, 0.4, 0.0, 0.05)
+                off += Y * (self.hover + 0.05 * H * np.sin(2 * wv - 0.8))
+                add(self.root, X, 8.0)
+                add(self.head, X, -6.0)
+                for l in self.legs:
+                    add(l['thigh'], X, 12.0 + 5.0 * np.sin(2 * wv))
+                for ch in self.tails + self.loose:
+                    wave(ch, X, 4.0, 2, 0.5)
+            elif plan == 'serpent':
+                body = list(reversed(self.spines)) + [j for ch in self.tails for j in ch]
+                wave(body, Y, 11.0, 1, 0.75, 0.0, 0.0)
+                add(self.head, Y, -6.0 * np.sin(wv + 0.3))
+                for j in self.spines[-2:]:
+                    add(j, X, -4.0)
+            elif plan == 'fish':
+                for ch in self.tails:
+                    wave(ch, Y, 16.0, 2, 0.7)
+                add(self.root, Y, 6.0 * np.sin(2 * wv))
+                for a in self.arms:
+                    add(a['arm'], Z, a['side'] * 16.0 * np.sin(2 * wv + 1.0))
+                off += Y * (self.hover + 0.03 * H * np.sin(2 * wv))
+            for ch in self.ears:
+                wave(ch, X, 6.0, 2, 0.5)
+            for ch in self.loose:
+                wave(ch, X, 5.0, 2, 0.6)
+        elif role == 'attack':
+            a = _smooth(0.0, 0.35, t) - _smooth(0.35, 0.48, t)     # wind-up
+            s = _smooth(0.35, 0.48, t) - _smooth(0.62, 1.0, t)      # strike
+            for j in self.spines:
+                add(j, X, (-10.0 * a + 16.0 * s) / max(1, len(self.spines)) * 2)
+            for j in self.necks:
+                add(j, X, -5.0 * a + 8.0 * s)
+            add(self.head, X, -6.0 * a + 10.0 * s)
+            for j in self.jaws:
+                add(j, X, 8.0 * a + 26.0 * s)
+            for arm in self.hands:
+                main = arm['side'] < 0 or len(self.hands) == 1
+                add(arm['arm'], X, (-75.0 * a + 30.0 * s) if main else (15.0 * a - 10.0 * s))
+                add(arm['fore'], X, -30.0 * a if main else 0.0)
+                add(arm['arm'], Z, arm['side'] * (10.0 * s if main else 0.0))
+            for arm in self.front_legs:
+                add(arm['arm'], X, 10.0 * a - 35.0 * s)
+            for l in self.walking_legs:
+                add(l['thigh'], X, -10.0 * a + 8.0 * s)
+                add(l['shin'], X, 18.0 * a)
+            for wg in self.wings:
+                wave(wg['chain'], Z, wg['side'] * (38.0 * a - 26.0 * s), 0, 0.3, np.pi / 2, 0.0)
+            for ch in self.tails:
+                wave(ch, Y, 12.0 * (a + s), 0, 0.5, np.pi / 2)
+                wave(ch, X, -8.0 * a, 0, 0.3, np.pi / 2)
+            if plan == 'serpent':
+                # rears back and strikes: the raised front of the body coils and uncoils
+                front = self.spines + self.necks
+                for k, j in enumerate(front):
+                    add(j, X, (-28.0 * a + 30.0 * s) / max(1, len(front)))
+            off += Z * (-0.05 * H * a + 0.22 * H * s) + Y * (self.hover - 0.04 * H * a + 0.05 * H * s)
+        elif role == 'faint':
+            f = _smooth(0.0, 0.75, t)
+            buckle = _smooth(0.0, 0.35, t)
+            for l in self.walking_legs:
+                add(l['thigh'], X, -28.0 * buckle)
+                add(l['shin'], X, 45.0 * buckle)
+            if plan != 'serpent':
+                for j in self.spines:
+                    add(j, X, 14.0 * f / max(1, len(self.spines)) * 2)
+                for j in self.necks:
+                    add(j, X, 12.0 * f)
+            add(self.head, X, (10.0 if plan == 'serpent' else 22.0) * f)
+            for j in self.jaws:
+                add(j, X, 10.0 * f)
+            for arm in self.hands:
+                add(arm['arm'], X, 12.0 * f)
+            for wg in self.wings:
+                wave(wg['chain'], Z, -wg['side'] * 20.0 * f, 0, 0.0, np.pi / 2, 0.0)
+            for ch in self.tails:
+                wave(ch, X, 6.0 * f, 0, 0.0, np.pi / 2)
+            if plan == 'serpent':
+                # a snake goes limp: the raised front of the body sinks to the ground, no rolling over
+                front = self.spines + self.necks
+                for k, j in enumerate(front):
+                    add(j, X, 60.0 * f / max(1, len(front)))
+                roll = 12.0 * _smooth(0.15, 0.85, t)
+            else:
+                roll = (95.0 if plan == 'fish' else 78.0) * _smooth(0.15, 0.85, t)  # fish turn belly up
+            add(self.root, Z, roll)
+            if not getattr(self, '_measuring', False):
+                if not hasattr(self, '_lying'):
+                    # where the body ends up: the lowest vertex of the last pose goes onto the ground
+                    self._measuring = True
+                    end, _ = self.pose('faint', T, T)
+                    self._measuring = False
+                    self._lying = self.ground - self._posed_low(end) - self.lift
+                off += Y * (self.hover * (1 - f) + self._lying * _smooth(0.15, 0.85, t))
+        return rot, off
+
+
+def _procedural_clips(gltf, views, add_view, info=None):
     import numpy as np
     nodes = gltf.get('nodes', [])
     skins = gltf.get('skins', [])
     holders = [i for i, n in enumerate(nodes) if 'mesh' in n and 'skin' in n]
     if len(skins) != 1 or len(holders) != 1:
-        return
+        return None
     anims = gltf.get('animations', [])
     have = {clip_role(a.get('name', '')) for a in anims}
     missing = [r for r in ('idle', 'walk', 'attack', 'faint') if r not in have]
     if not missing:
-        return
-    joints = list(skins[0]['joints'])
-    jset = set(joints)
-    parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', [])}
-    root = skins[0].get('skeleton', joints[0])
-    if parent.get(root) is not None:
-        return  # not canonical (see _canonicalize): leave it
-
-    # Base pose: the rest pose, or the first frame of the file's own idle (or first) clip — some rest poses are odd.
-    base = {j: {p: np.array(nodes[j].get(p, _REST[p]), dtype=np.float64) for p in _REST} for j in joints}
-    if anims:
-        src = next((a for a in anims if clip_role(a.get('name', '')) == 'idle'), anims[0])
-        t0 = min(float(_float_keys(gltf, views, s['input']).min()) for s in src['samplers'])
-        for (j, p), v in _sample_anim(gltf, views, src, t0).items():
-            if j in base:
-                base[j][p] = v
-    local = {j: _local_matrix({'translation': list(base[j]['translation']), 'rotation': list(base[j]['rotation']),
-                               'scale': list(base[j]['scale'])}) for j in joints}
-    world = {}
-
-    def w(j):
-        if j not in world:
-            world[j] = (w(parent[j]) @ local[j]) if parent.get(j) in jset else local[j]
-        return world[j]
-
-    for j in joints:
-        w(j)
-    pos = {j: world[j][:3, 3] for j in joints}
-    qworld = {}
-    for j in joints:
-        r = world[j][:3, :3]
-        sc = np.linalg.norm(r, axis=0)
-        qworld[j] = _quat_from_matrix(r / np.where(sc > 1e-12, sc, 1.0)) if (sc > 1e-12).all() else np.array([0, 0, 0, 1.0])
-    children = {j: [c for c in nodes[j].get('children', []) if c in jset] for j in joints}
-    info = {j: _bone_kind(nodes[j].get('name', '')) for j in joints}
-
-    # body size from the mesh (bind pose = rest pose after _canonicalize)
-    mesh = gltf['meshes'][nodes[holders[0]]['mesh']]
-    pts = np.concatenate([_accessor(gltf, views, p['attributes']['POSITION']) for p in mesh['primitives']]).astype(np.float64)
-    lo, hi = pts.min(axis=0), pts.max(axis=0)
-    height = max(hi[1] - lo[1], 1e-6)
-    ground = lo[1]
-
-    def deepest(j):
-        best, stack = j, [j]
-        while stack:
-            k = stack.pop()
-            if pos[k][1] < pos[best][1]:
-                best = k
-            stack.extend(children.get(k, []))
-        return best
-
-    def kind(j):
-        return info[j][1]
-
-    # upper arms: 'LArm' but not the 'LArm2' below it
-    arms = [j for j in joints if kind(j) == 'arm' and info[j][0] != 0 and not (parent.get(j) in jset and kind(parent[j]) == 'arm')]
-    thighs = [j for j in joints if kind(j) == 'thigh' and info[j][0] != 0]
-    front_legs = [j for j in arms if pos[deepest(j)][1] < ground + 0.18 * height]  # quadrupeds walk on their arms
-    hands_up = [j for j in arms if j not in front_legs]
-
-    def lower_rotation(j):
-        """World rotation (axis, degrees) that brings a raised arm (T-pose) down to 45° from vertical."""
-        kids = children.get(j, [])
-        if not kids:
-            return None
-        d = pos[kids[0]] - pos[j]
-        if np.linalg.norm(d) < 1e-9:
-            return None
-        d = d / np.linalg.norm(d)
-        down = np.array([0.0, -1.0, 0.0])
-        ang = np.degrees(np.arccos(np.clip(d @ down, -1, 1)))
-        if ang < 60:
-            return None
-        axis = np.cross(d, down)
-        if np.linalg.norm(axis) < 1e-6:
-            return None
-        return axis / np.linalg.norm(axis), min(ang - 45.0, 70.0)
-
-    lowering = {j: lower_rotation(j) for j in hands_up}
-    tails = sorted([j for j in joints if kind(j) == 'tail' and info[j][0] == 0], key=lambda j: info[j][2])
-    spines = sorted([j for j in joints if kind(j) == 'spine'], key=lambda j: info[j][2])
-    necks = [j for j in joints if kind(j) == 'neck']
-    heads = [j for j in joints if kind(j) == 'head']
-    jaws = [j for j in joints if kind(j) == 'jaw' and info[j][0] == 0]
-    ears = [j for j in joints if kind(j) == 'ear' and children.get(j)]
-    shins = {info[j][0]: j for j in joints if kind(j) == 'shin' and info[j][0] != 0}
-    legless = not thighs and not front_legs
-    X, Y, Z = np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0])
-
-    def smooth(a, b, t):
-        x = np.clip((t - a) / (b - a), 0.0, 1.0)
-        return x * x * (3 - 2 * x)
-
-    wings = [j for j in joints if kind(j) == 'wing' and info[j][0] != 0 and not (parent.get(j) in jset and kind(parent[j]) == 'wing')]
-    feet = {info[j][0]: j for j in joints if kind(j) == 'foot' and info[j][0] != 0}
-
-    def pose_at(role, t, T):
-        """{joint: [(axis, degrees), ...]} world rotations and a root offset for one moment of a clip.
-        Every motion uses whole multiples of the clip's own frequency, so the loops are seamless; several frequencies
-        on top of each other keep the idle from looking mechanical."""
-        rot, off = {}, np.zeros(3)
-        wv = 2 * np.pi * t / T
-
-        def add(j, axis, deg):
-            if abs(deg) > 1e-6:
-                rot.setdefault(j, []).append((axis, deg))
-
-        for j, low in lowering.items():
-            if low is not None:
-                add(j, low[0], low[1])
-        if role == 'idle':
-            breath = np.sin(2 * wv)                      # two breaths per loop
-            for k, j in enumerate(spines):
-                add(j, X, 3.0 * np.sin(2 * wv - 0.4 * k))
-                add(j, Y, 2.0 * np.sin(wv + 0.3 * k))
-            for j in necks:
-                add(j, X, 2.5 * np.sin(2 * wv - 0.8))
-                add(j, Y, 5.0 * np.sin(wv))
-            for j in heads:                               # looks around now and then
-                add(j, Y, 12.0 * np.sin(wv) + 4.0 * np.sin(3 * wv + 0.6))
-                add(j, X, 4.0 * np.sin(2 * wv - 1.0) - 3.0 * max(0.0, np.sin(wv + 2.0)) ** 3)
-                add(j, Z, 5.0 * np.sin(wv + 1.0))
-            for j in jaws:
-                add(j, X, 8.0 * max(0.0, np.sin(wv - 1.2)) ** 4)
-            for j in hands_up:
-                add(j, X, 6.0 * np.sin(2 * wv + info[j][0]))
-                add(j, Z, 4.0 * info[j][0] * np.sin(2 * wv))
-            for j in wings:
-                add(j, Z, info[j][0] * (5.0 * np.sin(2 * wv) + 14.0 * max(0.0, np.sin(4 * wv)) ** 6))
-            for k, j in enumerate(tails):
-                add(j, Y, 14.0 * np.sin(2 * wv + 0.7 * k))
-                add(j, X, 4.0 * np.sin(2 * wv + 0.5 * k + 1.0))
-            for j in ears:                                # slow sway with quick twitches
-                add(j, Z, info[j][0] * (4.0 * np.sin(2 * wv) + 10.0 * max(0.0, np.sin(6 * wv + info[j][0])) ** 8))
-            add(root, Z, 1.8 * np.sin(wv))                # weight shifting from foot to foot
-            off = off + Y * (0.012 * height * 0.5 * (1 + breath)) + X * (0.012 * height * np.sin(wv))
-            if legless:                                   # blobs and floaters bob up and down
-                off = off + Y * (0.04 * height * 0.5 * (1 + np.sin(2 * wv)))
-        elif role == 'walk':
-            for j in thighs:
-                ph = 0.0 if info[j][0] > 0 else np.pi
-                add(j, X, 32.0 * np.sin(wv + ph))
-                shin = shins.get(info[j][0])
-                if shin is not None:                      # knee bends while the leg swings forward
-                    add(shin, X, -34.0 * max(0.0, np.sin(wv + ph + np.pi / 2)))
-                foot = feet.get(info[j][0])
-                if foot is not None:
-                    add(foot, X, 14.0 * np.sin(wv + ph - 0.6))
-            for j in front_legs:                          # diagonal pairs, like a trot
-                ph = 0.0 if info[j][0] < 0 else np.pi
-                add(j, X, 28.0 * np.sin(wv + ph))
-            for j in hands_up:                            # arms swing against the legs
-                ph = np.pi if info[j][0] > 0 else 0.0
-                add(j, X, 22.0 * np.sin(wv + ph))
-            for j in wings:
-                add(j, Z, info[j][0] * 10.0 * np.sin(2 * wv))
-            for k, j in enumerate(spines):
-                if legless:
-                    add(j, Y, 10.0 * np.sin(wv + 0.9 * k))   # slither
-                else:
-                    add(j, Y, 4.0 * np.sin(wv))
-                    add(j, X, 2.5 * np.sin(2 * wv))
-            for j in heads + necks:                       # keeps the head steady against the body's bob
-                add(j, X, -3.0 * np.sin(2 * wv))
-                add(j, Y, -3.0 * np.sin(wv))
-            for k, j in enumerate(tails):
-                add(j, Y, (12.0 if legless else 14.0) * np.sin(wv + 0.7 * k + (0.9 * len(spines) if legless else 0)))
-                add(j, X, 4.0 * np.sin(2 * wv + 0.5 * k))
-            for j in ears:
-                add(j, X, 6.0 * np.sin(2 * wv + 0.5))
-            if legless and not spines and not tails:      # no legs and no body to wiggle: little hops
-                off = off + Y * (0.14 * height * abs(np.sin(wv)))
-                add(root, X, 6.0 * np.sin(2 * wv))
-            else:
-                add(root, Z, 3.5 * np.sin(wv))            # side to side with every step
-                off = off + Y * (0.045 * height * 0.5 * (1 - np.cos(2 * wv)))
-        elif role == 'attack':
-            a = smooth(0.0, 0.35, t) - smooth(0.35, 0.5, t)    # wind-up
-            s = smooth(0.35, 0.5, t) - smooth(0.6, 1.0, t)     # strike
-            for j in spines:
-                add(j, X, -12.0 * a + 20.0 * s)
-            for j in necks + heads:
-                add(j, X, -8.0 * a + 14.0 * s)
-            for j in jaws:
-                add(j, X, 25.0 * s)
-            for j in hands_up:
-                add(j, X, 30.0 * a - 60.0 * s)
-            for j in front_legs:
-                add(j, X, -25.0 * s)
-            for j in wings:
-                add(j, Z, info[j][0] * (25.0 * a - 30.0 * s))
-            for j in thighs:
-                add(j, X, -10.0 * a + 12.0 * s)
-            for k, j in enumerate(tails):
-                add(j, Y, 16.0 * (a + s) * np.sin(np.pi * t / T * 3 + 0.6 * k))
-            off = off + Z * (0.2 * height * s) + Y * (0.06 * height * a + 0.04 * height * s)
-        elif role == 'faint':
-            f = smooth(0.0, 0.6, t)
-            add(root, Z, 80.0 * f)
-            for j in necks + heads:
-                add(j, X, 25.0 * f)
-            for k, j in enumerate(tails):
-                add(j, X, 15.0 * f)
-            off = off - Y * (0.15 * height * f)
-        return rot, off
-
-    specs = {'idle': (4.0, 64, True), 'walk': (0.8, 24, True), 'attack': (1.0, 30, False), 'faint': (0.7, 16, False)}
+        return None
+    root = skins[0].get('skeleton', skins[0]['joints'][0])
+    if any(root in n.get('children', []) for n in nodes):
+        return None  # not canonical (see _canonicalize): leave it
+    rig = _Rig(gltf, views, info)
+    joints = rig.joints
+    specs = {'idle': (4.0, 96, True), 'walk': (0.8, 24, True), 'attack': (1.0, 30, False), 'faint': (1.1, 26, False)}
     for role in missing:
         T, n, loop = specs[role]
         times = np.linspace(0.0, T, n + 1)
         rot_keys, root_keys = {}, []
         for t in times:
-            rot, off = pose_at(role, t, T)
+            rot, off = rig.pose(role, t, T)
             for j in joints:
-                q = base[j]['rotation']
-                if j in rot:
-                    qd = np.array([0, 0, 0, 1.0])
-                    for axis, deg in rot[j]:
-                        qd = _quat_mul(_axis_quat(axis, deg), qd)
+                q = rig.base[j]['rotation']
+                qd = rig.stance_q.get(j, np.array([0, 0, 0, 1.0]))
+                for axis, deg in rot.get(j, []):
+                    qd = _quat_mul(_axis_quat(axis, deg), qd)
+                if abs(abs(qd[3]) - 1.0) > 1e-12:
                     # a world-axis turn about the bone's own pivot, written in the bone's local frame
-                    q = _quat_mul(q, _quat_mul(_quat_conj(qworld[j]), _quat_mul(qd, qworld[j])))
+                    q = _quat_mul(q, _quat_mul(_quat_conj(rig.qworld[j]), _quat_mul(qd, rig.qworld[j])))
                 rot_keys.setdefault(j, []).append(q / np.linalg.norm(q))
-            root_keys.append(base[root]['translation'] + off)
+            root_keys.append(rig.base[root]['translation'] + off + np.array([0.0, rig.lift, 0.0]))
         anim = {'name': f'liga_{role}', 'samplers': [], 'channels': []}
         tarr = np.ascontiguousarray(times.reshape(-1, 1), dtype=np.float32)
         gltf['accessors'].append({'bufferView': add_view(tarr.tobytes()), 'byteOffset': 0, 'componentType': 5126,
@@ -1090,10 +1532,350 @@ def _procedural_clips(gltf, views, add_view):
             for p in ('translation', 'scale'):
                 if j == root and p == 'translation':
                     continue
-                if not np.allclose(base[j][p], nodes[j].get(p, _REST[p]), atol=1e-7):
-                    channel(j, p, np.tile(base[j][p], (len(times), 1)))
+                if not np.allclose(rig.base[j][p], nodes[j].get(p, _REST[p]), atol=1e-7):
+                    channel(j, p, np.tile(rig.base[j][p], (len(times), 1)))
         channel(root, 'translation', np.array(root_keys))
         gltf.setdefault('animations', []).append(anim)
+    return rig
+
+
+# ——— fire, auto-rig, centring ———
+
+def _fire_materials(gltf, views, info):
+    """The flames of Charizard, Rapidash or Magmar come as grey masks that the original games tint in a shader: here they
+    became grey smoke. For Fire-type Pokémon a grey texture (not an eye) becomes a glowing orange-to-yellow flame whose
+    dark parts are cut away."""
+    import numpy as np
+    from PIL import Image
+    if 'fire' not in (info or {}).get('types', []):
+        return
+    textures, images = gltf.get('textures', []), gltf.get('images', [])
+    done = {}
+    for mat in gltf.get('materials', []):
+        ref = mat.get('pbrMetallicRoughness', {}).get('baseColorTexture')
+        if not ref or ref.get('index') is None or ref['index'] >= len(textures):
+            continue
+        src = textures[ref['index']].get('source')
+        if src is None or src >= len(images) or 'bufferView' not in images[src]:
+            continue
+        name = (images[src].get('name') or '') + (mat.get('name') or '')
+        if re.search(r'iris|eye', name, re.I):
+            continue
+        if src not in done:
+            img = Image.open(io.BytesIO(views[images[src]['bufferView']])).convert('RGB')
+            a = np.asarray(img).astype(np.float64) / 255.0
+            if (a.max(axis=2) - a.min(axis=2)).mean() > 0.012:
+                done[src] = False
+                continue
+            lum = a.mean(axis=2)
+            hot = np.clip((lum - 0.15) / 0.75, 0.0, 1.0)[..., None]
+            rgb = np.array([1.0, 0.32, 0.06]) * (1 - hot) + np.array([1.0, 0.86, 0.32]) * hot
+            alpha = np.clip((lum - 0.12) / 0.35, 0.0, 1.0)
+            out = Image.fromarray(np.dstack([rgb * 255, alpha * 255]).round().astype(np.uint8), 'RGBA')
+            buf = io.BytesIO()
+            out.save(buf, 'PNG')
+            views[images[src]['bufferView']] = buf.getvalue()
+            images[src]['mimeType'] = 'image/png'
+            done[src] = True
+        if done[src]:
+            mat['alphaMode'] = 'MASK'
+            mat['alphaCutoff'] = 0.3
+            mat['doubleSided'] = True
+            mat['emissiveTexture'] = {'index': ref['index']}
+            mat['emissiveFactor'] = [1.0, 1.0, 1.0]
+            mat.setdefault('pbrMetallicRoughness', {})['metallicFactor'] = 0.0
+
+
+AUTO_ROOT = 'LigaAutoRoot'  # names the root of a skeleton made by _autorig
+
+
+def _autorig(gltf, views, add_view, info):
+    """A skeleton for a model that came without one, so it can breathe, look around and walk instead of standing still.
+    The bones follow the body plan of its shape (two legs, four legs, wings, a long body, or a blob) and the same names
+    as the real skeletons (Hips, Spine1, Head, LThigh…), so _Rig animates them like any other; every vertex is weighted
+    smoothly along the body and, low down, to the leg under it."""
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    holders = [i for i, n in enumerate(nodes) if 'mesh' in n]
+    if len(holders) != 1 or gltf.get('skins') or 'skin' in nodes[holders[0]]:
+        return
+    mi = holders[0]
+    if any(k in nodes[mi] for k in ('translation', 'rotation', 'scale', 'matrix')):
+        return
+    prims = gltf['meshes'][nodes[mi]['mesh']]['primitives']
+    if any(p.get('mode', 4) != 4 or 'POSITION' not in p['attributes'] for p in prims):
+        return
+    pts = np.concatenate([_accessor(gltf, views, p['attributes']['POSITION']) for p in prims]).astype(np.float64)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    W, H, L = hi - lo
+    if min(H, W, L) <= 1e-6:
+        return
+    cx, cz = (lo[0] + hi[0]) / 2, (lo[2] + hi[2]) / 2
+    y = lambda f: lo[1] + f * H
+    z = lambda f: lo[2] + f * L
+    shape = (info or {}).get('shape', '')
+    if shape in ('quadruped',):
+        plan = 'quadruped'
+    elif shape in ('fish', 'squiggle'):
+        plan = 'long'
+    elif shape in ('wings', 'bug-wings'):
+        plan = 'winged'
+    elif shape in ('upright', 'humanoid', 'legs'):
+        plan = 'biped'
+    else:
+        plan = 'blob'
+
+    bones = []  # (name, parent index, position)
+
+    def bone(name, parent, at):
+        bones.append((name, parent, np.array(at, dtype=np.float64)))
+        return len(bones) - 1
+
+    root = bone(AUTO_ROOT, None, [cx, lo[1], cz])
+    limbs = []  # (bone indices top to bottom, membership function of the points)
+    smooth = lambda a, b, v: np.clip((v - a) / (b - a), 0.0, 1.0) ** 2 * (3 - 2 * np.clip((v - a) / (b - a), 0.0, 1.0))
+    if plan == 'quadruped':
+        hips = bone('Hips', root, [cx, y(0.5), z(0.3)])
+        s1 = bone('Spine1', hips, [cx, y(0.55), z(0.5)])
+        s2 = bone('Spine2', s1, [cx, y(0.58), z(0.68)])
+        neck = bone('Neck', s2, [cx, y(0.68), z(0.8)])
+        head = bone('Head', neck, [cx, y(0.78), z(0.9)])
+        body = [(hips, z(0.3)), (s1, z(0.5)), (s2, z(0.68)), (neck, z(0.8)), (head, z(0.92))]
+        body_axis = 2
+        below = smooth(y(0.38), y(0.26), pts[:, 1])
+        front = smooth(cz - 0.04 * L, cz + 0.04 * L, pts[:, 2])
+        for s, sign in ((1, 1.0), (-1, -1.0)):
+            side = smooth(-0.04 * W, 0.04 * W, sign * (pts[:, 0] - cx))
+            p = 'L' if s > 0 else 'R'
+            x = cx + sign * 0.22 * W
+            t = bone(f'{p}Thigh', hips, [x, y(0.36), z(0.28)])
+            k = bone(f'{p}Leg', t, [x, y(0.18), z(0.28)])
+            f = bone(f'{p}Foot', k, [x, y(0.03), z(0.28)])
+            limbs.append(([t, k, f], below * side * (1 - front)))
+            a = bone(f'{p}Arm', s2, [x, y(0.36), z(0.72)])
+            fa = bone(f'{p}ForeArm', a, [x, y(0.18), z(0.72)])
+            h = bone(f'{p}Hand', fa, [x, y(0.03), z(0.72)])
+            limbs.append(([a, fa, h], below * side * front))
+    elif plan == 'long':
+        hips = bone('Hips', root, [cx, y(0.5), z(0.45)])
+        s1 = bone('Spine1', hips, [cx, y(0.5), z(0.62)])
+        s2 = bone('Spine2', s1, [cx, y(0.5), z(0.78)])
+        head = bone('Head', s2, [cx, y(0.5), z(0.92)])
+        t1 = bone('Tail1', hips, [cx, y(0.5), z(0.3)])
+        t2 = bone('Tail2', t1, [cx, y(0.5), z(0.16)])
+        t3 = bone('Tail3', t2, [cx, y(0.5), z(0.04)])
+        body = [(t3, z(0.04)), (t2, z(0.16)), (t1, z(0.3)), (hips, z(0.45)), (s1, z(0.62)), (s2, z(0.78)), (head, z(0.92))]
+        body_axis = 2
+    else:
+        hips = bone('Hips', root, [cx, y(0.3), cz])
+        s1 = bone('Spine1', hips, [cx, y(0.5), cz])
+        s2 = bone('Spine2', s1, [cx, y(0.66), cz])
+        head = bone('Head', s2, [cx, y(0.8), cz])
+        body = [(hips, y(0.3)), (s1, y(0.5)), (s2, y(0.66)), (head, y(0.82))]
+        body_axis = 1
+        if plan == 'biped':
+            below = smooth(y(0.3), y(0.2), pts[:, 1])
+            arms = _t_pose_arms(pts, lo, hi)
+            for s, sign in ((1, 1.0), (-1, -1.0)):
+                side = smooth(-0.04 * W, 0.04 * W, sign * (pts[:, 0] - cx))
+                p = 'L' if s > 0 else 'R'
+                x = cx + sign * 0.2 * W
+                t = bone(f'{p}Thigh', hips, [x, y(0.26), cz])
+                k = bone(f'{p}Leg', t, [x, y(0.13), cz])
+                f = bone(f'{p}Foot', k, [x, y(0.02), cz])
+                limbs.append(([t, k, f], below * side))
+                if arms:
+                    at, shoulder, reach, band = arms
+                    a = bone(f'{p}Arm', s2, [cx + sign * shoulder, at, cz])
+                    fa = bone(f'{p}ForeArm', a, [cx + sign * (shoulder + reach) / 2, at, cz])
+                    h = bone(f'{p}Hand', fa, [cx + sign * reach * 0.92, at, cz])
+                    out = smooth(shoulder * 0.85, shoulder * 1.1, sign * (pts[:, 0] - cx))
+                    near = smooth(at - band, at - band * 0.6, pts[:, 1]) * smooth(at + band, at + band * 0.6, pts[:, 1])
+                    limbs.append(([a, fa, h], out * near, 0))
+        elif plan == 'winged':
+            for s, sign in ((1, 1.0), (-1, -1.0)):
+                out = smooth(0.18 * W, 0.3 * W, sign * (pts[:, 0] - cx))
+                p = 'L' if s > 0 else 'R'
+                w1 = bone(f'{p}Wing1', s1, [cx + sign * 0.18 * W, y(0.55), cz])
+                w2 = bone(f'{p}Wing2', w1, [cx + sign * 0.36 * W, y(0.55), cz])
+                w3 = bone(f'{p}Wing3', w2, [cx + sign * 0.5 * W, y(0.55), cz])
+                limbs.append(([w1, w2, w3], out))
+    if len(bones) > 60:
+        return
+
+    def along(chain, coord):
+        """Weights (n, len(chain)) blending linearly between the bones placed at the given coordinates."""
+        idx = [b for b, _ in chain]
+        at = np.array([c for _, c in chain])
+        order = np.argsort(at)
+        at, idx = at[order], [idx[i] for i in order]
+        wts = np.zeros((len(coord), len(idx)))
+        c = np.clip(coord, at[0], at[-1])
+        k = np.clip(np.searchsorted(at, c, side='right') - 1, 0, len(at) - 2) if len(at) > 1 else np.zeros(len(c), int)
+        if len(at) == 1:
+            wts[:, 0] = 1.0
+            return idx, wts
+        span = np.maximum(at[k + 1] - at[k], 1e-9)
+        f = (c - at[k]) / span
+        wts[np.arange(len(c)), k] = 1 - f
+        wts[np.arange(len(c)), k + 1] += f
+        return idx, wts
+
+    full = np.zeros((len(pts), len(bones)))
+    used = np.zeros(len(pts))
+    for limb in limbs:
+        chain, member = limb[0], np.clip(limb[1], 0.0, 1.0)
+        axis = limb[2] if len(limb) > 2 else 1  # legs blend by height, arms held out by the distance from the body
+        coord = np.abs(pts[:, 0] - cx) if axis == 0 else pts[:, axis]
+        place = (lambda b: abs(bones[b][2][0] - cx)) if axis == 0 else (lambda b: bones[b][2][axis])
+        idx, wts = along([(b, place(b)) for b in chain], coord)
+        for col, b in enumerate(idx):
+            full[:, b] += member * wts[:, col]
+        used += member
+    idx, wts = along(body, pts[:, body_axis])
+    rest = np.clip(1.0 - used, 0.0, 1.0)
+    for col, b in enumerate(idx):
+        full[:, b] += rest * wts[:, col]
+    top4 = np.argsort(-full, axis=1)[:, :4]
+    w4 = np.take_along_axis(full, top4, axis=1)
+    w4 = w4 / np.maximum(w4.sum(axis=1, keepdims=True), 1e-9)
+    w4[w4.sum(axis=1) < 1e-6, 0] = 1.0
+
+    # nodes, skin, attributes
+    base = len(nodes)
+    for name, parent, at in bones:
+        rel = at - (bones[parent][2] if parent is not None else np.zeros(3))
+        nodes.append({'name': name, 'translation': [float(v) for v in rel]})
+    for b, (name, parent, at) in enumerate(bones):
+        if parent is not None:
+            nodes[base + parent].setdefault('children', []).append(base + b)
+    ibm = np.array([np.linalg.inv(np.array([[1, 0, 0, at[0]], [0, 1, 0, at[1]], [0, 0, 1, at[2]], [0, 0, 0, 1.0]])).T
+                    for _, _, at in bones], dtype=np.float32).reshape(-1, 16)
+    gltf['accessors'].append({'bufferView': add_view(np.ascontiguousarray(ibm).tobytes()), 'byteOffset': 0,
+                              'componentType': 5126, 'count': len(bones), 'type': 'MAT4'})
+    gltf['skins'] = [{'joints': [base + b for b in range(len(bones))], 'skeleton': base,
+                      'inverseBindMatrices': len(gltf['accessors']) - 1}]
+    nodes[mi]['skin'] = 0
+    start = 0
+    for p in prims:
+        n = gltf['accessors'][p['attributes']['POSITION']]['count']
+        jj = np.ascontiguousarray(top4[start:start + n], dtype=np.uint16)
+        ww = np.ascontiguousarray(w4[start:start + n], dtype=np.float32)
+        start += n
+        gltf['accessors'].append({'bufferView': add_view(jj.tobytes(), 34962), 'byteOffset': 0, 'componentType': 5123,
+                                  'count': int(n), 'type': 'VEC4'})
+        p['attributes']['JOINTS_0'] = len(gltf['accessors']) - 1
+        gltf['accessors'].append({'bufferView': add_view(ww.tobytes(), 34962), 'byteOffset': 0, 'componentType': 5126,
+                                  'count': int(n), 'type': 'VEC4'})
+        p['attributes']['WEIGHTS_0'] = len(gltf['accessors']) - 1
+    scene = gltf['scenes'][gltf.get('scene', 0)]
+    scene['nodes'] = [base] + [r for r in scene['nodes'] if r != base]
+
+
+def _t_pose_arms(pts, lo, hi):
+    """(height, shoulder distance, hand distance, half band) of arms held straight out from a model without a skeleton,
+    or None. They show as a band of the body much wider than the hips (Hypno, Electabuzz, Magmar)."""
+    import numpy as np
+    H = hi[1] - lo[1]
+    cx = (lo[0] + hi[0]) / 2
+    half = []
+    for f in np.arange(0.15, 0.9, 0.05):
+        band = np.abs(pts[(pts[:, 1] >= lo[1] + f * H) & (pts[:, 1] < lo[1] + (f + 0.05) * H), 0] - cx)
+        half.append((f, float(np.percentile(band, 99)) if len(band) > 20 else 0.0))
+    body = np.median([w for f, w in half if 0.2 <= f <= 0.45 and w > 0] or [0.0])
+    top = max(((f, w) for f, w in half if 0.4 <= f <= 0.85), key=lambda fw: fw[1], default=(0, 0))
+    if body <= 0 or top[1] < 1.8 * body or top[1] < 0.18 * H:
+        return None
+    return lo[1] + (top[0] + 0.025) * H, body * 1.05, top[1], 0.18 * H
+
+
+def _strip_root_motion(gltf, views, add_view):
+    """Walk and run clips from the games move the body forwards (root motion). The game moves the Pokémon itself and
+    loops the clip, so it jumped back at every loop (Dragonite, Mewtwo, Feraligatr): the forward drift of the top bones
+    is taken out, their bobbing and swaying stay."""
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    if not gltf.get('skins'):
+        return
+    joints = gltf['skins'][0]['joints']
+    parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', [])}
+    depth = lambda j: 0 if j not in parent else 1 + depth(parent[j])
+    top = {j for j in joints if depth(j) <= 3}
+    for anim in gltf.get('animations', []):
+        if clip_role(anim.get('name', '')) != 'walk':
+            continue
+        for ci, ch in enumerate(anim['channels']):
+            if ch['target']['node'] not in top or ch['target'].get('path') != 'translation':
+                continue
+            sampler = dict(anim['samplers'][ch['sampler']])
+            ts = _float_keys(gltf, views, sampler['input']).ravel()
+            out = _float_keys(gltf, views, sampler['output']).astype(np.float64)
+            if len(ts) < 2 or ts[-1] <= ts[0]:  # a steady forward glide has just two keys
+                continue
+            drift = out[-1] - out[0]
+            spread = np.abs(out - out[0]).max(axis=0)
+            if np.hypot(drift[0], drift[2]) < 0.5 * max(spread[0], spread[2], 1e-9) or np.hypot(drift[0], drift[2]) < 1e-6:
+                continue
+            ramp = ((ts - ts[0]) / (ts[-1] - ts[0]))[:, None] * np.array([drift[0], 0.0, drift[2]])
+            arr = np.ascontiguousarray(out - ramp, dtype=np.float32)
+            gltf['accessors'].append({'bufferView': add_view(arr.tobytes()), 'byteOffset': 0, 'componentType': 5126,
+                                      'count': int(len(arr)), 'type': 'VEC3'})
+            sampler['output'] = len(gltf['accessors']) - 1
+            anim['samplers'].append(sampler)
+            anim['channels'][ci] = dict(ch, sampler=len(anim['samplers']) - 1)
+
+
+def _recenter(gltf, views, add_view):
+    """Puts the body over the origin and the feet at height 0. Some files have the Pokémon a third of its height to the
+    side (Charmander, Flareon): in the game it then turned around a point beside itself."""
+    import numpy as np
+    nodes = gltf.get('nodes', [])
+    holders = [i for i, n in enumerate(nodes) if 'mesh' in n]
+    if len(holders) != 1 or any(k in nodes[holders[0]] for k in ('translation', 'rotation', 'scale', 'matrix')):
+        return
+    prims = gltf['meshes'][nodes[holders[0]]['mesh']]['primitives']
+    pts = np.concatenate([_accessor(gltf, views, p['attributes']['POSITION']) for p in prims]).astype(np.float64)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    d = np.array([-(lo[0] + hi[0]) / 2, -lo[1], -(lo[2] + hi[2]) / 2])
+    skins = gltf.get('skins', [])
+    skinned = 'skin' in nodes[holders[0]] and len(skins) == 1
+    if skinned:
+        skin = skins[0]
+        joints = skin['joints']
+        root = skin.get('skeleton', joints[0])
+        if any(root in n.get('children', []) for n in nodes) or 'matrix' in nodes[root]:
+            return
+        parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', [])}
+        depth = lambda j: 0 if j not in parent else 1 + depth(parent[j])
+        pelvis = [j for j in joints if _bone_kind(nodes[j].get('name', ''))[1] == 'pelvis']
+        if pelvis:
+            d[2] = -_world_matrix(gltf, min(pelvis, key=depth))[2, 3]  # turn about the hips, not the middle of a long tail
+    if np.abs(d).max() < 1e-6 * max(1.0, np.abs(hi - lo).max()):
+        return
+    for p in prims:
+        pos = _accessor(gltf, views, p['attributes']['POSITION']).astype(np.float64)
+        _set_attribute(gltf, add_view, p, 'POSITION', pos + d)
+    if not skinned:
+        return
+    nodes[root]['translation'] = [float(v) for v in np.array(nodes[root].get('translation', _REST['translation'])) + d]
+    ibm = _accessor(gltf, views, skin['inverseBindMatrices']).astype(np.float64).reshape(-1, 4, 4).transpose(0, 2, 1)
+    back = np.eye(4)
+    back[:3, 3] = -d
+    ibm = np.array([m @ back for m in ibm]).transpose(0, 2, 1).reshape(-1, 16).astype(np.float32)
+    gltf['accessors'].append({'bufferView': add_view(np.ascontiguousarray(ibm).tobytes()), 'byteOffset': 0,
+                              'componentType': 5126, 'count': len(joints), 'type': 'MAT4'})
+    skin['inverseBindMatrices'] = len(gltf['accessors']) - 1
+    for anim in gltf.get('animations', []):
+        for ci, ch in enumerate(anim['channels']):
+            if ch['target']['node'] != root or ch['target'].get('path') != 'translation':
+                continue
+            sampler = dict(anim['samplers'][ch['sampler']])
+            out = np.ascontiguousarray(_float_keys(gltf, views, sampler['output']) + d, dtype=np.float32)
+            gltf['accessors'].append({'bufferView': add_view(out.tobytes()), 'byteOffset': 0, 'componentType': 5126,
+                                      'count': int(len(out)), 'type': 'VEC3'})
+            sampler['output'] = len(gltf['accessors']) - 1
+            anim['samplers'].append(sampler)
+            anim['channels'][ci] = dict(ch, sampler=len(anim['samplers']) - 1)
 
 
 def _validate(gltf, views):
@@ -1132,8 +1914,8 @@ def _validate(gltf, views):
                         raise ValueError(f'{name}: joint out of range')
 
 
-def convert(data):
-    """Draco + WebP .glb -> plain .glb with PNG textures, without the helper sphere."""
+def convert(data, species=0):
+    """Draco + WebP .glb -> plain .glb with PNG textures, without the helper sphere, with clips for the species."""
     import DracoPy
     import numpy as np
     from PIL import Image
@@ -1265,9 +2047,14 @@ def convert(data):
     for node in gltf.get('nodes', []):
         if 'mesh' in node:
             node['mesh'] = remap[node['mesh']]
+    info = species_info(species)
+    _fire_materials(gltf, views, info)
     _canonicalize(gltf, views, add_view)
     _ensure_normals(gltf, views, add_view)
-    _procedural_clips(gltf, views, add_view)
+    _autorig(gltf, views, add_view, info)
+    _strip_root_motion(gltf, views, add_view)
+    _recenter(gltf, views, add_view)
+    _procedural_clips(gltf, views, add_view, info)
     _validate(gltf, views)
 
     for key in ('extensionsUsed', 'extensionsRequired'):
@@ -1452,7 +2239,7 @@ def import_one(species, shiny=False, log=print, warn=print):
     os.makedirs(CACHE, exist_ok=True)
     path = os.path.join(CACHE, f'P{species:04d}{"S" if shiny else ""}.glb')
     with open(path, 'wb') as f:
-        f.write(convert(raw))
+        f.write(convert(raw, species))
     t = unreal.AssetImportTask()
     t.filename = path
     t.destination_path = folder

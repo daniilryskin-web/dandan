@@ -2197,8 +2197,8 @@ def free_memory_mb():
         return None
 
 
-MIN_FREE_RAM_MB = 2000     # below this the next model waits for the next run: the graphics driver needs RAM too, and
-MIN_FREE_COMMIT_MB = 3000  # when it got none it reset the card ("DXGI_ERROR_DRIVER_INTERNAL_ERROR")
+MIN_FREE_RAM_MB = 1000     # below this the next model waits for the next run: the graphics driver needs RAM too, and
+MIN_FREE_COMMIT_MB = 1500  # when it got none (0.4 GB left) it reset the card ("DXGI_ERROR_DRIVER_INTERNAL_ERROR")
 
 
 def low_memory():
@@ -2271,9 +2271,10 @@ def old_folders():
     return found
 
 
-def refresh_old_imports(log=print, warn=print):
+def refresh_old_imports(log=print, warn=print, delete=True):
     """A new converter imports into its own folder (DEST), so old models never stand in the way. The old folders are
-    deleted when Unreal allows it (it refuses while their assets are loaded; then the next run tries again)."""
+    deleted once every new model is in (until then the game keeps showing the old ones), when Unreal allows it (it
+    refuses while their assets are loaded; then the next run tries again)."""
     try:
         with open(VERSION_FILE, encoding='utf-8') as f:
             version = int(f.read().strip() or 0)
@@ -2284,7 +2285,7 @@ def refresh_old_imports(log=print, warn=print):
         os.makedirs(CACHE, exist_ok=True)
         with open(VERSION_FILE, 'w', encoding='utf-8') as f:
             f.write(str(CONVERTER_VERSION))
-    for folder in old_folders():
+    for folder in old_folders() if delete else []:
         try:
             ok = unreal.EditorAssetLibrary.delete_directory(folder)
         except Exception:
@@ -2293,8 +2294,20 @@ def refresh_old_imports(log=print, warn=print):
 
 
 def current_entries(entries):
-    """assets.json entries that point into this converter's folder (older ones may be broken)."""
-    return {k: v for k, v in (entries or {}).items() if isinstance(v, dict) and str(v.get('mesh', '')).startswith(DEST + '/')}
+    """assets.json entries of models that are still there: this converter's, and older ones not replaced yet."""
+    out = {}
+    for k, v in (entries or {}).items():
+        mesh = str(v.get('mesh', '')) if isinstance(v, dict) else ''
+        if mesh.startswith(DEST + '/'):
+            out[k] = v
+        elif mesh.startswith(DEST_ROOT + '/V'):
+            folder = '/'.join(mesh.split('/')[:6])  # /Game/Liga/Pokemon3D/V6/P0004
+            try:
+                if unreal.EditorAssetLibrary.does_directory_exist(folder):
+                    out[k] = v
+            except Exception:
+                pass
+    return out
 
 
 class ImportJob:
@@ -2319,6 +2332,7 @@ class ImportJob:
         self.resume_at = None
         self.low_memory = ''  # why the job stopped early, if it did
         self.left = 0         # models not imported because of that
+        self.stopped = False  # cancelled in the progress dialog
         self.vsm = 0
         self.started = False
         self.finished = False
@@ -2332,7 +2346,7 @@ class ImportJob:
             self.vsm = 0
         if self.vsm:
             unreal.SystemLibrary.execute_console_command(None, f'{VSM} 0')
-        refresh_old_imports(self.log, self.warn)  # a new converter gets a clean slate
+        refresh_old_imports(self.log, self.warn, delete=False)  # the old models go once the new ones are all in
         note_previous_crash(self.warn)
         ensure_packages(self.log)
         if not quick_save():
@@ -2346,6 +2360,8 @@ class ImportJob:
             self.vsm = 0
         if not self.finished:
             self.finished = True
+            if self.started and not self.todo and not self.low_memory and not self.stopped:
+                refresh_old_imports(self.log, self.warn)  # every new model is in: the old folders can go
             self.log(f'3D-покемоны: моделей {len(self.result)}, импортировано сейчас {self.imported} (остальные покемоны — картинками)')
 
     def tick(self):
@@ -2406,6 +2422,7 @@ class ImportJob:
             self.pause = self.PAUSE_FRAMES
             if cancelled:
                 self.todo = []
+                self.stopped = True
                 self.warn('импорт 3D-моделей остановлен — остальные покемоны пока картинками; запустите настройку ещё раз, чтобы продолжить')
                 break
             return False

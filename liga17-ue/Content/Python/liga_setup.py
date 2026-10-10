@@ -774,6 +774,12 @@ def import_characters():
                 warn('плагин VRM4U был выключен в файле проекта — скрипт включил его. Чтобы появились аниме-персонажи: закройте Unreal, '
                      'откройте Liga17.uproject снова (на вопрос о пересборке ответьте «Да») и запустите настройку ещё раз')
                 REPORT.insert(0, 'ВАЖНО: перезапустите Unreal и запустите настройку ещё раз — плагин VRM4U только что включён.')
+            elif os.path.exists(os.path.join(PROJECT, 'Plugins', 'VRM4U', 'Binaries', 'Win64', 'UnrealEditor-VRM4U.dll')):
+                # After the project was rebuilt at start-up (Binaries deleted) Unreal has already picked its plugins: VRM4U
+                # is built, but only the next start loads it.
+                warn('плагин VRM4U собран, но в этом запуске Unreal ещё не подключил его (так бывает сразу после пересборки проекта)')
+                REPORT.insert(0, 'ВАЖНО: закройте Unreal, откройте Liga17.uproject ещё раз и снова запустите настройку — '
+                                 'тогда подключится плагин VRM4U и появятся аниме-персонажи.')
             else:
                 warn('плагин VRM4U включён в проекте, но не загрузился: люди останутся манекенами. Закройте Unreal, удалите папки '
                      'Plugins/VRM4U/Binaries и Plugins/VRM4U/Intermediate, откройте Liga17.uproject, согласитесь пересобрать '
@@ -1088,7 +1094,10 @@ def write_assets_json(meshes, chars, billboard, models3d=None, fx=None):
         with open(path, encoding='utf-8') as f:
             old = json.load(f)
     data = dict(chars or {})
-    try:  # keeps models added by liga_pokemon3d_all.py, but not those of an older converter (they may be broken)
+    for key in ('player_vrm', 'player_rtg', 'npc_vrm', 'npc_rtg'):
+        if not data.get(key) and old.get(key):
+            data[key] = old[key]  # VRM4U not loaded in this run: the characters imported before stay
+    try:  # keeps models added by liga_pokemon3d_all.py and those of an older converter until they are replaced
         kept = pokemon3d_module().current_entries(old.get('pokemon3d'))
     except Exception:
         kept = {}
@@ -1291,12 +1300,27 @@ def main():
         finish_level(terrain, sea)
         return True
 
+    def free_memory():
+        # The town takes gigabytes of memory; while the 3D Pokémon are imported an empty map is open instead.
+        try:
+            unreal.EditorLoadingAndSavingUtils.new_blank_map(False)
+            unreal.SystemLibrary.collect_garbage()
+            log('город выгружен на время импорта 3D-покемонов')
+        except Exception as e:
+            warn(f'не удалось выгрузить город ({e})')
+        return True
+
+    def town_again():
+        level_sub.load_level(MAP_PATH)
+        return True
+
     def wrap_up():
         shadows_back(vsm)
         summary()
 
     set_busy(True)
-    run_frames([('уровень', level), ('сцена', town), ('3D-покемоны', pokemon3d)], wrap_up)
+    run_frames([('уровень', level), ('сцена', town), ('память', free_memory), ('3D-покемоны', pokemon3d),
+                ('уровень', town_again)], wrap_up)
 
 
 main()

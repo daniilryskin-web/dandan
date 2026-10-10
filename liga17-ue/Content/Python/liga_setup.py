@@ -11,6 +11,9 @@ What it does:
   5. downloads 3D models of the Pokémon the game can show (liga_pokemon3d.py) — on this computer only, one per frame;
   6. writes Content/Liga/Data/assets.json for the game code and saves everything.
 Safe to run again: it rebuilds the level and replaces imported assets.
+
+Unattended (Tools/setup_auto.ps1 sets LIGA_AUTO=1): no dialogs; the report goes to Saved/Liga/setup_report.txt and the
+editor saves everything and closes at the end.
 """
 import hashlib
 import json
@@ -33,6 +36,8 @@ CHAR_STATE = os.path.join(PROJECT, 'Saved', 'Liga', 'characters.json')
 CHAR_GUARD = os.path.join(PROJECT, 'Saved', 'Liga', 'character_importing.json')
 VRM4U_CONVERT = os.path.join(PROJECT, 'Plugins', 'VRM4U', 'Source', 'VRM4ULoader', 'Private', 'VrmConvert.cpp')
 VRM4U_URL = 'https://github.com/ruyo/VRM4U/archive/refs/heads/master.zip'
+REPORT_FILE = os.path.join(PROJECT, 'Saved', 'Liga', 'setup_report.txt')
+AUTO = os.environ.get('LIGA_AUTO') == '1'
 
 ROOT = '/Game/Liga'
 TEX_PATH = ROOT + '/Textures'
@@ -1117,9 +1122,30 @@ NEXT_STEPS = ('\n\nЧто дальше:\n'
               '3. Esc останавливает игру в редакторе; «назад» в меню — Backspace.')
 
 
+def show(text):
+    """A dialog for the person at the editor; only the log when the setup runs unattended."""
+    if AUTO:
+        unreal.log('[Liga] ' + text)
+    else:
+        unreal.EditorDialog.show_message('Лига 17 — настройка', text, unreal.AppMsgType.OK)
+
+
 def summary():
     text = '\n'.join(REPORT)
     unreal.log('[Liga] ===== Итог настройки =====\n' + text)
+    try:
+        os.makedirs(os.path.dirname(REPORT_FILE), exist_ok=True)
+        with open(REPORT_FILE, 'w', encoding='utf-8') as f:
+            f.write(text + '\n')
+    except Exception as e:
+        unreal.log_warning(f'[Liga] {REPORT_FILE}: {e}')
+    if AUTO:
+        try:
+            unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)  # no "save changes?" prompt on quit
+        except Exception as e:
+            unreal.log_warning(f'[Liga] сохранение: {e}')
+        unreal.SystemLibrary.quit_editor()
+        return
     important = '\n'.join(l for l in REPORT if l.startswith('ВАЖНО'))
     rest = '\n'.join(l for l in REPORT if not l.startswith('ВАЖНО'))
     head = important + '\n\n' if important else ''
@@ -1137,7 +1163,7 @@ def wrong_project():
            'Закройте Unreal и откройте Liga17.uproject, который лежит рядом с папками ArtSource, Source и Content. '
            'Папку с новым пустым проектом, созданную Unreal, можно удалить.')
     unreal.log_error('[Liga] ' + msg)
-    unreal.EditorDialog.show_message('Лига 17 — настройка', msg, unreal.AppMsgType.OK)
+    show(msg)
     return True
 
 
@@ -1242,9 +1268,8 @@ def main():
     if wrong_project():
         return
     if busy():
-        unreal.EditorDialog.show_message('Лига 17 — настройка', 'Настройка уже идёт — дождитесь окна «Готово!».\n\n'
-                                         'Если оно так и не появилось, перезапустите Unreal и запустите настройку ещё раз.',
-                                         unreal.AppMsgType.OK)
+        show('Настройка уже идёт — дождитесь окна «Готово!».\n\n'
+             'Если оно так и не появилось, перезапустите Unreal и запустите настройку ещё раз.')
         return
     vsm = shadows_off()
     try:

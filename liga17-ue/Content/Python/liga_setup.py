@@ -12,9 +12,13 @@ What it does:
   6. writes Content/Liga/Data/assets.json for the game code and saves everything.
 Safe to run again: it rebuilds the level and replaces imported assets.
 
+Without the anime characters (people stay mannequins, no VRM4U needed): create a file NO_CHARACTERS.txt next to
+Liga17.uproject, or run Tools/setup_auto.ps1 -NoCharacters. Delete the file to get the characters back.
+
 Unattended (Tools/setup_auto.ps1 sets LIGA_AUTO=1): no dialogs; the report goes to Saved/Liga/setup_report.txt and the
 editor saves everything and closes at the end.
 """
+import glob
 import hashlib
 import json
 import math
@@ -38,6 +42,7 @@ VRM4U_CONVERT = os.path.join(PROJECT, 'Plugins', 'VRM4U', 'Source', 'VRM4ULoader
 VRM4U_URL = 'https://github.com/ruyo/VRM4U/archive/refs/heads/master.zip'
 REPORT_FILE = os.path.join(PROJECT, 'Saved', 'Liga', 'setup_report.txt')
 AUTO = os.environ.get('LIGA_AUTO') == '1'
+SKIP_CHARACTERS = os.environ.get('LIGA_NO_CHARACTERS') == '1' or bool(glob.glob(os.path.join(PROJECT, 'NO_CHARACTERS*')))
 
 ROOT = '/Game/Liga'
 TEX_PATH = ROOT + '/Textures'
@@ -772,6 +777,9 @@ def import_characters():
     together with the IK retargeter from the UE5 mannequin (needs the C++ helper ULigaEditorTools).
     A model is re-imported only when its file changed, so running the setup again is quick."""
     result = {'player_vrm': '', 'player_rtg': '', 'npc_vrm': {}, 'npc_rtg': {}}
+    if SKIP_CHARACTERS:
+        log('аниме-персонажи пропущены (файл NO_CHARACTERS.txt или -NoCharacters): люди остаются манекенами')
+        return result
     if not hasattr(unreal, 'VrmImporterBPFunctionLibrary'):
         if os.path.exists(os.path.join(PROJECT, 'Plugins', 'VRM4U', 'VRM4U.uplugin')):
             fixed = enable_vrm4u_in_project()
@@ -1100,7 +1108,7 @@ def write_assets_json(meshes, chars, billboard, models3d=None, fx=None):
             old = json.load(f)
     data = dict(chars or {})
     for key in ('player_vrm', 'player_rtg', 'npc_vrm', 'npc_rtg'):
-        if not data.get(key) and old.get(key):
+        if not SKIP_CHARACTERS and not data.get(key) and old.get(key):
             data[key] = old[key]  # VRM4U not loaded in this run: the characters imported before stay
     try:  # keeps models added by liga_pokemon3d_all.py and those of an older converter until they are replaced
         kept = pokemon3d_module().current_entries(old.get('pokemon3d'))

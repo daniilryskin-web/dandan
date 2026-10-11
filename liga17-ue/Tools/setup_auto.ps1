@@ -1,10 +1,11 @@
 ﻿<#
 Лига 17: выполняет Content\Python\liga_setup.py в редакторе без окон и ждёт конца.
-  powershell -ExecutionPolicy Bypass -File Tools\setup_auto.ps1
+  powershell -ExecutionPolicy Bypass -File Tools\setup_auto.ps1 [-NoCharacters]
+-NoCharacters: без аниме-персонажей (люди остаются манекенами, плагин VRM4U не нужен).
 Редактор открывается, работает (в первый раз до часа), сохраняет всё и закрывается сам.
 Итог настройки: Saved\Liga\setup_report.txt; лог: Saved\Logs\Liga17.log.
 #>
-param([string]$Engine = 'C:\Program Files\Epic Games\UE_5.8', [int]$TimeoutMinutes = 120)
+param([string]$Engine = 'C:\Program Files\Epic Games\UE_5.8', [int]$TimeoutMinutes = 120, [switch]$NoCharacters)
 $ErrorActionPreference = 'Stop'
 $project = (Resolve-Path "$PSScriptRoot\..").Path
 $editor = Join-Path $Engine 'Engine\Binaries\Win64\UnrealEditor.exe'
@@ -17,6 +18,7 @@ if (Get-Process UnrealEditor -ErrorAction SilentlyContinue) {
 }
 if (Test-Path $report) { Remove-Item $report }
 $env:LIGA_AUTO = '1'
+if ($NoCharacters) { $env:LIGA_NO_CHARACTERS = '1' }
 $p = Start-Process $editor -ArgumentList "`"$project\Liga17.uproject`" -ExecutePythonScript=`"$script`"" -PassThru
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 5 }

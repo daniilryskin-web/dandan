@@ -82,6 +82,14 @@ const SEGMENTS = [
         color: BRAND.ochre,
     },
     {
+        label: 'Работы 2025 года',
+        perTrack: {
+            'ОЦС': ['Работы 2025 года ОЦС', 'Работы 2025 года ОЦС (индикатор)'],
+            'ДК': ['Работы 2025 года ДК', 'Работы 2025 года ДК (индикатор)'],
+        },
+        color: BRAND.teal,
+    },
+    {
         label: 'Оставшиеся',
         remainder: true,
         color: BRAND.violet,

@@ -32,6 +32,8 @@ const fields = [
     {ref: {type: 'title', title: 'Перенос на 2027 ДК'}},
     {ref: {type: 'title', title: 'Исключены работы в 2026 ОЦС'}},
     {ref: {type: 'title', title: 'Исключены работы в 2026 ДК'}},
+    {ref: {type: 'title', title: 'Работы 2025 года ОЦС'}},
+    {ref: {type: 'title', title: 'Работы 2025 года ДК'}},
 ];
 
 module.exports = {

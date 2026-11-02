@@ -4,49 +4,31 @@
 
 Обратная операция к collapse_employees.py. Берёт таблицу, где каждый
 сотрудник занимает одну строку, а его продукты пронумерованы в ячейке,
-и раскладывает её обратно — по строке на продукт:
-
-    было (1 строка)                    стало (3 строки)
-    Продукт (кратко)                   Экспорт (РЭЦ)        Гаспарян А.К.
-      1. Экспорт (РЭЦ)          →      Таможня              Гаспарян А.К.
-      2. Таможня                       Минюст и нотариат    Горбунова А.В.
-      3. Минюст и нотариат
-    Руководитель
-      1. Гаспарян А.К.
-      2. Горбунова А.В.
+и раскладывает её обратно — по строке на продукт.
 
 Запуск:
-    python3 expand_employees.py свёрнуто.xlsx
-    python3 expand_employees.py свёрнуто.xlsx --out развёрнуто.xlsx
+    python expand_employees.py свёрнуто.xlsx
+    python expand_employees.py свёрнуто.xlsx --out развёрнуто.xlsx
 
-ГЛАВНАЯ СЛОЖНОСТЬ. Свёртка выбрасывает повторы в каждом столбце отдельно.
-Три продукта и два руководителя — и из ячейки уже не видно, к кому из двух
-относится второй продукт. Угадывать нельзя: ошибка уведёт продукт в чужую
-ветку дерева, и заметят это нескоро. Поэтому руководитель (и вместе с ним
-ответственный и проект) для каждого продукта определяется так, от точного
-к менее точному:
+ПРАВИЛО ПРОСТОЕ.
 
-    1. значение одно                — оно у всех продуктов
-    2. значений столько же, сколько
-       продуктов                    — по порядку: первое к первому
-    3. первый продукт               — всегда к первому значению: свёртка
-                                      пишет значения в порядке появления
-    4. по справочнику               — у кого-то ещё этот продукт стоит
-                                      однозначно; берём оттуда, если такое
-                                      значение есть у самого сотрудника
-    5. не определено                — ячейка остаётся пустой, а строка
-                                      попадает на лист «Проверить»
+    Продукт, Продукт (кратко)      каждый пункт списка — своя строка
 
-Справочник собирается из самой же таблицы: у сотрудников на одном продукте
-и у мультипродуктовых, разложенных точно, связь «продукт → руководитель»
-видна напрямую. Продукты, которые где-то стоят у двух разных руководителей,
-в справочник не берутся — по ним ответ не однозначен.
+    Ответственный за направление   значение одно — оно во всех строках;
+    Непосредственный руководитель  значений несколько — ячейки пустые
+    Проект / фукнция               и подсвечены жёлтым, заполняются руками
+
+Почему руками. Свёртка выбрасывает повторы в каждом столбце отдельно,
+и при трёх продуктах и двух руководителях из ячейки уже не видно, какой
+продукт у какого руководителя. Подставлять наугад нельзя: ошибка уведёт
+продукт в чужую ветку дерева, и её никто не заметит. Пустую жёлтую ячейку
+заметят все.
 
 Листы на выходе:
 
-    Развёрнуто   вся таблица, по строке на продукт; набор столбцов прежний
-    Проверить    ячейки, заполненные по справочнику или не заполненные вовсе
-    Сводка       сколько развернулось и как
+    Развёрнуто   вся таблица, по строке на продукт; что заполнить — жёлтым
+    Заполнить    те же ячейки списком, с вариантами из свёрнутой строки
+    Сводка       сколько развернулось и сколько осталось заполнить
 """
 
 from __future__ import annotations
@@ -57,28 +39,30 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
-# Столбцы, которые свёртка нумерует. Должны совпадать с collapse_employees.py.
-MULTI_COLUMNS = [
+# Продуктовые столбцы: по ним строится число строк, каждый пункт — строка.
+# Полное название идёт первым: оно различает системы внутри одного продукта.
+PRODUCT_COLUMNS = ["Продукт", "Продукт (кратко)"]
+
+# Столбцы «где работает». Одно значение размножается на все строки,
+# несколько — оставляются пустыми под ручное заполнение.
+ORG_COLUMNS = [
     "Ответственный за направление",
     "Непосредственный руководитель",
     "Проект / фукнция",
-    "Продукт (кратко)",
-    "Продукт",
 ]
-
-# По каким столбцам продукт узнаётся, от точного к грубому. Полное название
-# различает системы внутри одного продукта, поэтому первым идёт оно.
-ANCHOR_COLUMNS = ["Продукт", "Продукт (кратко)"]
 
 NAME_COLUMN = "ФИО (штат)"
 
 EMPTY_MARKERS = {"", "-", "—", "–", "nan", "none", "#н/д", "#n/a"}
 
 # «1. Зазыкин В.Г.» — номер, точка, пробел. Снимается только в многострочных
-# ячейках: в однострочной это может быть часть названия.
+# ячейках: в однострочной это может оказаться частью названия.
 NUMBER_PREFIX = re.compile(r"^\s*\d+\.\s+")
+
+FILL_ME = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
 
 def clean(value) -> str:
@@ -105,8 +89,8 @@ def find_column(frame: pd.DataFrame, name: str) -> str | None:
 def parse_cell(value) -> list[str]:
     """Ячейка → список значений.
 
-    Многострочная ячейка — это нумерованный список свёртки: делим по строкам
-    и снимаем номера. Однострочная — одно значение как есть. Пустая — пусто.
+    Многострочная ячейка — нумерованный список свёртки: делим по строкам
+    и снимаем номера. Однострочная — одно значение как есть.
     Excel при ручной правке ставит то \\n, то \\r\\n, поэтому делим по обоим.
     """
     text = "" if value is None or (isinstance(value, float) and pd.isna(value)) \
@@ -147,114 +131,68 @@ def read_table(path: Path, sheet) -> pd.DataFrame:
     return frame
 
 
-def first_pass(frame: pd.DataFrame, multi: list[str], anchors: list[str]):
-    """Раскладывает всё, что раскладывается точно. Неясное оставляет None.
+def expand(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], list[tuple]]:
+    """Раскладывает свёрнутые строки по продуктам.
 
-    Возвращает список строк-заготовок и список «фактов» — пар
-    (продукт → значение столбца), установленных без догадок. Из фактов
-    потом собирается справочник для второго прохода.
+    Возвращает развёрнутую таблицу, список ячеек к заполнению (для листа
+    «Заполнить») и их координаты (для жёлтой подсветки).
     """
-    drafts, facts = [], []
+    products = [c for c in (find_column(frame, p) for p in PRODUCT_COLUMNS) if c]
+    orgs = [c for c in (find_column(frame, o) for o in ORG_COLUMNS) if c]
+    if not products:
+        sys.exit("В таблице нет ни «Продукт», ни «Продукт (кратко)» — разворачивать нечего")
     name_column = find_column(frame, NAME_COLUMN)
+    number_column = find_column(frame, "№")
 
-    for source_index, row in frame.iterrows():
-        lists = {column: parse_cell(row[column]) for column in multi}
-
-        # Сколько строк получится — по самому подробному продуктовому столбцу.
-        anchor = max(anchors, key=lambda c: len(lists[c])) if anchors else None
-        count = max([len(lists[anchor])] if anchor else [1])
-        count = max(count, 1)
+    rows, to_fill, cells = [], [], []
+    for _, row in frame.iterrows():
+        lists = {c: parse_cell(row[c]) for c in products + orgs}
+        count = max([len(lists[c]) for c in products] + [1])
 
         for i in range(count):
-            draft = {"__источник": source_index, "__номер": i, "__как": {}}
+            record = {}
             for column in frame.columns:
-                if column not in multi:
-                    draft[column] = clean(row[column])
-                    continue
-                values = lists[column]
-                if not values:
-                    draft[column] = ""
-                elif len(values) == 1:
-                    draft[column] = values[0]
-                elif len(values) == count:
-                    draft[column] = values[i]
-                elif i == 0:
-                    # Свёртка пишет значения в порядке появления: первое
-                    # значение пришло из первой строки, а первая строка —
-                    # это первый продукт. Здесь ошибиться нельзя.
-                    draft[column] = values[0]
+                if column in products:
+                    values = lists[column]
+                    if len(values) == count:
+                        record[column] = values[i]
+                    elif len(values) <= 1:
+                        record[column] = values[0] if values else ""
+                    else:
+                        # Продуктов в двух столбцах разное число и не одно —
+                        # например две короткие на три полных. Какое к какому,
+                        # не видно, поэтому тоже руками.
+                        record[column] = None
+                elif column in orgs:
+                    values = lists[column]
+                    record[column] = values[0] if len(values) == 1 else (
+                        "" if not values else None
+                    )
                 else:
-                    draft[column] = None
-                    draft["__как"][column] = values
-            draft["__якорь"] = anchor
-            draft["__ФИО"] = clean(row[name_column]) if name_column else ""
-            drafts.append(draft)
+                    record[column] = clean(row[column])
 
-            # Всё, что встало точно, — факт для справочника.
-            if anchor:
-                key = norm(draft[anchor])
-                for column in multi:
-                    if column in anchors or draft[column] is None:
-                        continue
-                    if key and norm(draft[column]):
-                        facts.append((anchor, key, column, draft[column]))
-    return drafts, facts
+            for column, value in record.items():
+                if value is not None:
+                    continue
+                record[column] = ""
+                options = lists[column]
+                to_fill.append({
+                    "№": clean(row[number_column]) if number_column else "",
+                    "ФИО": clean(row[name_column]) if name_column else "",
+                    "Продукт": record.get(products[0], ""),
+                    "Что заполнить": column,
+                    "Варианты у сотрудника": " | ".join(options),
+                })
+                cells.append((len(rows), column))
+            rows.append(record)
 
-
-def build_reference(facts) -> dict:
-    """Справочник «продукт → значение». Неоднозначное в него не попадает.
-
-    Если у продукта в разных строках разные руководители (такое бывает:
-    продукт поделён между двумя командами), подсказывать по нему нельзя.
-    """
-    seen: dict[tuple, set] = {}
-    spelling: dict[tuple, str] = {}
-    for anchor, key, column, value in facts:
-        slot = (anchor, key, column)
-        seen.setdefault(slot, set()).add(norm(value))
-        spelling.setdefault((slot, norm(value)), value)
-    reference = {}
-    for slot, variants in seen.items():
-        if len(variants) == 1:
-            only = next(iter(variants))
-            reference[slot] = spelling[(slot, only)]
-    return reference
+    expanded = pd.DataFrame(rows, columns=list(frame.columns))
+    return expanded, to_fill, cells
 
 
-def second_pass(drafts, reference) -> list[dict]:
-    """Дозаполняет неясные ячейки по справочнику, остальное отдаёт на проверку."""
-    to_check = []
-    for draft in drafts:
-        for column, options in draft["__как"].items():
-            anchor = draft["__якорь"]
-            product = draft.get(anchor, "")
-            hint = reference.get((anchor, norm(product), column))
-            allowed = {norm(o): o for o in options}
-
-            if hint and norm(hint) in allowed:
-                draft[column] = allowed[norm(hint)]
-                how = "по справочнику"
-            else:
-                draft[column] = ""
-                how = "не определено — заполнить вручную"
-
-            to_check.append({
-                "ФИО": draft["__ФИО"],
-                "Продукт": product,
-                "Столбец": column,
-                "Подставлено": draft[column],
-                "Варианты у сотрудника": " | ".join(options),
-                "Как определено": how,
-            })
-    return to_check
-
-
-def autosize(writer, sheet_name: str, frame: pd.DataFrame) -> None:
-    sheet = writer.sheets[sheet_name]
+def autosize(sheet, frame: pd.DataFrame) -> None:
     for position, column in enumerate(frame.columns, 1):
-        longest = max(
-            [len(str(column))] + [len(str(v)) for v in frame[column].head(400)]
-        )
+        longest = max([len(str(column))] + [len(str(v)) for v in frame[column].head(400)])
         sheet.column_dimensions[get_column_letter(position)].width = min(
             max(longest + 2, 10), 45
         )
@@ -270,30 +208,14 @@ def main() -> None:
     args = parser.parse_args()
 
     frame = read_table(args.source, args.sheet)
-    multi = [c for c in (find_column(frame, m) for m in MULTI_COLUMNS) if c]
-    anchors = [c for c in (find_column(frame, a) for a in ANCHOR_COLUMNS) if c]
-    if not anchors:
-        sys.exit("В таблице нет ни «Продукт», ни «Продукт (кратко)» — разворачивать нечего")
+    expanded, to_fill, cells = expand(frame)
 
-    drafts, facts = first_pass(frame, multi, anchors)
-    reference = build_reference(facts)
-    to_check = second_pass(drafts, reference)
-
-    expanded = pd.DataFrame(
-        [{c: d[c] for c in frame.columns} for d in drafts], columns=list(frame.columns)
-    )
-    check = pd.DataFrame(to_check)
-
-    sources = pd.Series([d["__источник"] for d in drafts])
-    grown = sources.value_counts()
-    unresolved = int((check["Как определено"] != "по справочнику").sum()) if len(check) else 0
-
+    people_to_fill = len({item["ФИО"] for item in to_fill})
     summary = [
         ("Строк в свёрнутой таблице", len(frame)),
         ("Строк после развёртки", len(expanded)),
-        ("Сотрудников развёрнуто в несколько строк", int((grown > 1).sum())),
-        ("Ячеек заполнено по справочнику", len(check) - unresolved),
-        ("Ячеек не определено — заполнить вручную", unresolved),
+        ("Ячеек заполнить вручную", len(to_fill)),
+        ("У скольких сотрудников", people_to_fill),
     ]
 
     with pd.ExcelWriter(args.out, engine="openpyxl") as writer:
@@ -301,19 +223,26 @@ def main() -> None:
             writer, sheet_name="Сводка", index=False
         )
         expanded.to_excel(writer, sheet_name="Развёрнуто", index=False)
-        autosize(writer, "Развёрнуто", expanded)
-        (check if len(check) else pd.DataFrame(
-            [{"Результат": "Всё разложилось точно, проверять нечего"}]
-        )).to_excel(writer, sheet_name="Проверить", index=False)
+        sheet = writer.sheets["Развёрнуто"]
+        autosize(sheet, expanded)
+
+        # Жёлтым — ровно те ячейки, что ждут заполнения. +2: строка
+        # заголовка и нумерация Excel с единицы.
+        positions = {c: i + 1 for i, c in enumerate(expanded.columns)}
+        for row_index, column in cells:
+            sheet.cell(row=row_index + 2, column=positions[column]).fill = FILL_ME
+
+        (pd.DataFrame(to_fill) if to_fill else pd.DataFrame(
+            [{"Результат": "Всё разложилось, заполнять нечего"}]
+        )).to_excel(writer, sheet_name="Заполнить", index=False)
+        autosize(writer.sheets["Заполнить"], pd.DataFrame(to_fill) if to_fill
+                 else pd.DataFrame(columns=["Результат"]))
 
     print()
     for name, value in summary:
         print(f"{name}: {value}")
-    if unresolved:
-        print("\nНе удалось определить — эти ячейки пустые, заполните по листу «Проверить»:")
-        for _, row in check[check["Как определено"] != "по справочнику"].head(10).iterrows():
-            print(f"  · {row['ФИО']} / {row['Продукт']} — {row['Столбец']}: "
-                  f"варианты {row['Варианты у сотрудника']}")
+    if to_fill:
+        print("\nЯчейки подсвечены жёлтым на листе «Развёрнуто»; списком — на «Заполнить».")
     print(f"\nЗаписано: {args.out}")
 
 

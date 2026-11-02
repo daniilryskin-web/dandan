@@ -15,20 +15,25 @@
     Продукт, Продукт (кратко)      каждый пункт списка — своя строка
 
     Ответственный за направление   значение одно — оно во всех строках;
-    Непосредственный руководитель  значений несколько — ячейки пустые
-    Проект / фукнция               и подсвечены жёлтым, заполняются руками
+    Непосредственный руководитель  значений несколько — в ячейке остаются
+    Проект / фукнция               все варианты, каждый с новой строки,
+                                   ячейка подсвечена жёлтым; лишнее
+                                   удаляется вручную
 
-Почему руками. Свёртка выбрасывает повторы в каждом столбце отдельно,
-и при трёх продуктах и двух руководителях из ячейки уже не видно, какой
-продукт у какого руководителя. Подставлять наугад нельзя: ошибка уведёт
-продукт в чужую ветку дерева, и её никто не заметит. Пустую жёлтую ячейку
-заметят все.
+Почему не выбираем сами. Свёртка выбрасывает повторы в каждом столбце
+отдельно, и при трёх продуктах и двух руководителях из ячейки уже не
+видно, какой продукт у какого руководителя. Подставлять наугад нельзя:
+ошибка уведёт продукт в чужую ветку дерева. Поэтому все варианты остаются
+на месте, а правильный оставляет человек.
+
+Номера («1.», «2.») в таких ячейках снимаются: удалили лишнюю строку —
+осталось чистое значение, без хвоста «2.».
 
 Листы на выходе:
 
-    Развёрнуто   вся таблица, по строке на продукт; что заполнить — жёлтым
-    Заполнить    те же ячейки списком, с вариантами из свёрнутой строки
-    Сводка       сколько развернулось и сколько осталось заполнить
+    Развёрнуто   вся таблица, по строке на продукт; где выбрать — жёлтым
+    Проверить    те же ячейки списком
+    Сводка       сколько развернулось и сколько ячеек проверить
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 
 # Продуктовые столбцы: по ним строится число строк, каждый пункт — строка.
@@ -174,14 +179,16 @@ def expand(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], list[tuple]]:
             for column, value in record.items():
                 if value is not None:
                     continue
-                record[column] = ""
                 options = lists[column]
+                # Все варианты остаются в ячейке, каждый с новой строки и без
+                # номера: удалили лишнее — осталось чистое значение.
+                record[column] = "\n".join(options)
                 to_fill.append({
                     "№": clean(row[number_column]) if number_column else "",
                     "ФИО": clean(row[name_column]) if name_column else "",
                     "Продукт": record.get(products[0], ""),
-                    "Что заполнить": column,
-                    "Варианты у сотрудника": " | ".join(options),
+                    "Столбец": column,
+                    "Варианты": " | ".join(options),
                 })
                 cells.append((len(rows), column))
             rows.append(record)
@@ -214,7 +221,7 @@ def main() -> None:
     summary = [
         ("Строк в свёрнутой таблице", len(frame)),
         ("Строк после развёртки", len(expanded)),
-        ("Ячеек заполнить вручную", len(to_fill)),
+        ("Ячеек с выбором — оставить нужное", len(to_fill)),
         ("У скольких сотрудников", people_to_fill),
     ]
 
@@ -226,23 +233,27 @@ def main() -> None:
         sheet = writer.sheets["Развёрнуто"]
         autosize(sheet, expanded)
 
-        # Жёлтым — ровно те ячейки, что ждут заполнения. +2: строка
-        # заголовка и нумерация Excel с единицы.
+        # Жёлтым — ровно те ячейки, где надо оставить один вариант.
+        # Перенос по словам, иначе варианты слипнутся в одну строку.
+        # +2: строка заголовка и нумерация Excel с единицы.
         positions = {c: i + 1 for i, c in enumerate(expanded.columns)}
         for row_index, column in cells:
-            sheet.cell(row=row_index + 2, column=positions[column]).fill = FILL_ME
+            cell = sheet.cell(row=row_index + 2, column=positions[column])
+            cell.fill = FILL_ME
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
 
         (pd.DataFrame(to_fill) if to_fill else pd.DataFrame(
-            [{"Результат": "Всё разложилось, заполнять нечего"}]
-        )).to_excel(writer, sheet_name="Заполнить", index=False)
-        autosize(writer.sheets["Заполнить"], pd.DataFrame(to_fill) if to_fill
+            [{"Результат": "Всё разложилось однозначно, проверять нечего"}]
+        )).to_excel(writer, sheet_name="Проверить", index=False)
+        autosize(writer.sheets["Проверить"], pd.DataFrame(to_fill) if to_fill
                  else pd.DataFrame(columns=["Результат"]))
 
     print()
     for name, value in summary:
         print(f"{name}: {value}")
     if to_fill:
-        print("\nЯчейки подсвечены жёлтым на листе «Развёрнуто»; списком — на «Заполнить».")
+        print("\nГде несколько вариантов — ячейки жёлтые на листе «Развёрнуто»: "
+              "оставьте нужный, остальные удалите. Списком — на листе «Проверить».")
     print(f"\nЗаписано: {args.out}")
 
 
